@@ -1,11 +1,40 @@
 ﻿# Agent Swarms for Cheap, High-Volume, Continuous LLM Work: Frameworks Compared (2025–2026)
 
 ## TL;DR
-- **For disciplined, code-focused "swarms" run locally, Uncle Bob's Swarm Forge is the most interesting recent entrant**, but it is not what the "many cheap calls" strategy needs: it is a lightweight shell/tmux/git-worktree coordinator that runs a handful of role-specialized *premium CLI coding agents* (Specifier → Coder → Cleaner → Architect → Hardener → QA) under a shared "Constitution" of Clean Code rules — not an engine for orchestrating thousands of cheap API calls.
-- **For the actual goal of "throw lots of cheap model calls at problems," the strongest open-source picks are LangGraph (durable, token-efficient, graph-based) plus, for massive parallelism, Ray/Anyscale-based patterns**; CrewAI is fastest to build in but more token-heavy, AutoGen is now in maintenance mode (succeeded by Microsoft Agent Framework 1.0), and OpenAI Swarm is deprecated (superseded by the OpenAI Agents SDK).
-- **The "cheap swarm" strategy only wins when task value exceeds token cost.** Anthropic's multi-agent research system beat a single agent by 90.2% but burned ~15× the tokens; a June 2026 paper found auto-generated multi-agent systems underperform a single Chain-of-Thought agent at up to 10× the cost. The winning production pattern is **LLM–SLM orchestration**: route high-volume narrow tasks to cheap/small models and escalate only on low confidence.
+
+> Scope correction: this ticket evaluates third-party orchestration around hosted Codex versus a direct `codex exec` wrapper. Local-only inference is not a requirement.
+- **Swarm Forge is a specialized pipeline reference, not the current default.** Its role-based handoffs and worktree isolation are relevant design patterns, but the BeeHAIve decision is whether that complexity beats a direct Codex wrapper.
+- The generic cheap-call framework survey below is background only. The current decision compares a third-party orchestrator around Codex with a direct `codex exec` wrapper.
+- **The key tradeoff is integration cost versus coordination value.** A third-party framework must improve quality, throughput, recovery, or provider flexibility enough to repay its adapter, dependency, state, and operational burden.
 
 ## Key Findings
+
+## Decision framing for BeeHAIve
+
+[Issue #12](https://github.com/TychoHenzen/BeeHAIve/issues/12) asks whether BeeHAIve should put a third-party orchestrator at the center of its workflow or wrap Codex execution directly. Hosted Codex is in scope. Local inference is not a requirement for this decision.
+
+The relevant baseline is a thin wrapper around `codex exec`. The wrapper can own ticket intake, worktree isolation, concurrency, timeouts, retries, result storage, and GitHub delivery. Codex can continue to own model execution, repository tools, sandboxing, skills, and approvals.
+
+The third-party option is justified only if it supplies a measured capability the wrapper lacks, such as durable cross-task graph state, fan-out and fan-in, recovery after process loss, or a provider-independent execution layer. If its nodes launch `codex exec`, the framework becomes a second lifecycle and state machine around the Codex harness. If it calls the OpenAI API directly, it measures a different agent harness.
+
+## Integration surfaces
+
+The [Codex CLI documentation](https://developers.openai.com/codex/cli) explicitly supports calling `codex exec` from repeatable workflows and pipelines. The local CLI run used here was version 0.151.0 and emitted JSONL lifecycle and usage events.
+
+The [Codex SDK documentation](https://developers.openai.com/codex/sdk) provides a first-party upgrade path. Its TypeScript and Python libraries can start, continue, and resume local Codex threads. The [app server](https://developers.openai.com/codex/app-server) exposes the Codex lifecycle over JSON-RPC and streams thread, turn, command, and approval events.
+
+LangGraph is a low-level graph runtime. Its [graph API](https://docs.langchain.com/oss/python/langgraph/graph-api) supports parallel outgoing edges and bounded concurrency. Its [persistence layer](https://docs.langchain.com/oss/python/langgraph/persistence) supports checkpoints. CrewAI [Flows](https://docs.crewai.com/v1.15.20/en/concepts/flows) and Microsoft Agent Framework [workflows](https://learn.microsoft.com/en-us/agent-framework/overview/) provide comparable application-level state and routing abstractions.
+
+A Python 3.13 dependency dry-run resolved 23 packages for LangGraph 1.2.11 and 112 packages for CrewAI 1.15.20. The first-party `openai-codex` SDK resolved two packages. These counts measure dependency footprint, not engineering time. The direct wrapper adds no Python framework dependency.
+
+| Option | It adds | BeeHAIve still owns | Integration risk |
+|---|---|---|---|
+| Direct `codex exec` wrapper | Process supervision and JSONL parsing | Scheduling, worktrees, retries, artifacts, and delivery | Lowest. It follows the Codex execution boundary. |
+| LangGraph around Codex | Graph state, routing, fan-out, and checkpoints | A worker adapter plus the same scheduling and artifact policies | Medium. Two runtimes must agree on retries, state, and failures. |
+| CrewAI Flow around Codex | Event-driven flow and role abstractions | A worker adapter plus Codex lifecycle and artifact policies | High. The dependency surface is larger, with no proven benefit yet. |
+| Microsoft Agent Framework around Codex | Graph workflows and checkpointing | A provider or process adapter plus Codex lifecycle policies | High. It is a second workflow runtime to operate. |
+
+This table separates framework capability from integration benefit. A framework feature is not a benefit until the benchmark shows that the direct wrapper cannot deliver the same outcome within its operational limits.
 
 1. **Swarm Forge is real, authored by Robert C. "Uncle Bob" Martin, and philosophically distinctive.** It embeds TDD, mutation testing, and complexity control as a machine-readable "Constitution" every agent must obey, using git worktrees for isolation and tmux for observability. It is deliberately anti-framework: shell scripts and Clojure/Babashka, not cloud infrastructure.
 
@@ -17,7 +46,7 @@
 
 5. **Continuous/long-running work requires durable execution (checkpointing).** LangGraph and Microsoft Agent Framework have first-class checkpointing that survives crashes and multi-day pauses; CrewAI's persistence is lighter (SQLite-backed Flow state); OpenAI Swarm has none.
 
-## Details
+## Background framework notes
 
 ### 1. Uncle Bob's Swarm Forge
 
@@ -87,25 +116,25 @@ The earlier Ollama result is not a valid quality conclusion. I reran the same fi
 
 Luna produced the same perfect accuracy with both topologies. Fan-out added roughly four times the input tokens and 2.5-3.4 times the API-equivalent cost, while the observed parallel wall time was about 9% slower. Local CPU and RAM use cannot be measured for this hosted model.
 
-This fixture is saturated. It is useful as a protocol sanity check, but it cannot show an accuracy improvement because the single-call baseline already reached 100%. It therefore provides no topology decision. The earlier 50% Ollama signal is also not a usable quality reference. A harder, multi-step fixture with room below the accuracy bar is required before selecting a default.
+This fixture is saturated. It is useful as a protocol sanity check, but it cannot show an accuracy improvement because the single-call baseline already reached 100%. It therefore provides no topology decision. The earlier Ollama signal is also not a usable quality reference. A harder, multi-step fixture with room below the accuracy bar is required before selecting a default.
 
-The Luna run does not satisfy the local-only constraint in [issue #12](https://github.com/TychoHenzen/BeeHAIve/issues/12), and it does not by itself qualify a local model or framework. The next fixture must persist raw outputs, score partial findings, and include resource metrics for any local candidate.
+The next fixture must persist raw outputs, score partial findings, and measure the integration burden as well as quality, throughput, latency, retries, and recovery. The central comparison is a direct Codex wrapper versus a third-party graph that uses the same Codex model and task permissions.
 
 ## Recommendations
 
-**If your real goal is high-volume, low-cost, continuous autonomous work:**
+**For BeeHAIve's current decision:**
 
-1. **Start with LangGraph as the orchestrator.** It is the most token-efficient (cheapest per task), supports durable checkpointing for continuous/long-running work, and lets you assign a cheap/small model per node and escalate only where needed. This is the single best default for the "throw lots of cheap calls at it" strategy. Evaluate Microsoft Agent Framework 1.0 instead if you are on the Microsoft/.NET stack.
-2. **Implement LLM–SLM routing explicitly — this matters more than framework choice.** Put a cheap classifier/semantic router in front; send high-volume narrow tasks to a small/cheap model (a small open model self-served on vLLM, a mini/flash-class hosted model, or a coding-specialized cheap model), and escalate low-confidence cases to a frontier model. Log every call's cost. This routing (not the framework) is where 50–90%+ of savings come from.
-3. **Choose the scaling substrate by volume.** For tens of thousands of concurrent cheap calls, run agents as Ray actors (Anyscale pattern) with vLLM/Ray Serve, or self-host small models. For parallel *coding* on one machine, use git-worktree + tmux tooling (dmux/ccmanager/Swarm Forge).
-4. **For software development specifically, borrow Swarm Forge's discipline even if you don't adopt it wholesale**: fixed roles, a machine-readable "constitution" of quality rules, worktree isolation, committed handoffs, and a separate QA/verification agent. Validate actions, not claims (read diffs and check tool-call counts). Run deterministic tools (git merge, linters, tests) before spending an LLM call.
-5. **Put hard cost guardrails in place regardless of framework**: max rounds/iterations, per-run token ceilings, and circuit breakers on recursive sub-agent spawning (the 15× multiplier can compound to 100×+ without caps). This is mandatory for AutoGen-style conversational patterns.
+1. **Start with a thin `codex exec` wrapper.** Keep ticket intake, worktree creation, bounded concurrency, timeouts, retries, raw event capture, and GitHub delivery outside the model.
+2. **Use the Codex SDK instead of a third-party framework only when the wrapper reaches a real process boundary.** The official SDK supports starting, continuing, and resuming local Codex threads. The app server exposes streamed JSON-RPC events when the application needs finer control.
+3. **Evaluate LangGraph first if the wrapper cannot express the needed workflow.** Its graph API supplies explicit parallel branches and bounded concurrency. Its persistence layer supplies checkpointing. Both capabilities matter only if BeeHAIve needs application-owned state across Codex jobs.
+4. **Treat CrewAI and Microsoft Agent Framework as alternatives, not defaults.** They can model event-driven or graph workflows, but each still needs an adapter and an ownership decision for Codex state, approvals, retries, and artifacts.
+5. **Keep hard limits in the wrapper or graph.** Set per-job timeouts, concurrency caps, retry budgets, token budgets, and a circuit breaker for recursive delegation.
 
-**Staged rollout & thresholds:**
-- **PoC (a few days each)**: build the same task in LangGraph and CrewAI; measure cost-per-task and success rate on *your* workload using cheap models.
-- **Escalate to Ray/Anyscale or Swarms** only when you exceed ~5–10 concurrent agents / local resource limits or need tens of thousands of concurrent tasks.
-- **Revert from cheap-swarm to a single frontier call** if your measured multi-agent cost exceeds ~5× the single-agent cost *without* a corresponding accuracy/coverage gain — the "Illusion of Multi-Agent Advantage" threshold.
-- **Commit to multi-agent swarms** when task value clearly exceeds token cost and the work is breadth-first/parallelizable into independent subtasks — the Anthropic threshold.
+**Staged rollout and thresholds:**
+- **Wrapper spike:** implement one `codex exec --json` job, one isolated worktree, one timeout, and one persisted result record. Keep this small enough to inspect and replace.
+- **Third-party spike:** implement the same job in one graph framework, using Codex as the worker. Record adapter code, dependencies, setup steps, and failure handling.
+- **Adopt the framework only if** it delivers at least a 10 percentage-point quality gain, 2x throughput at equal quality, or a required recovery or fan-out capability that the wrapper cannot provide within the agreed operational limits.
+- **Keep the wrapper** when the gain is below those thresholds or when the framework duplicates Codex lifecycle behavior without improving measured outcomes.
 
 ## Caveats
 - **Swarm Forge is young and idiosyncratic** (Clojure/shell, macOS-leaning Terminal integration, small maintainer base). It targets premium CLI coding agents, not cheap API-call swarms; treat it as a design exemplar, not a drop-in high-volume engine.
