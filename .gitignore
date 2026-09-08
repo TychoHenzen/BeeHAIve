@@ -35,6 +35,9 @@ dist/
 .idea/httpRequests/
 .idea/dataSources/
 
+# BeeHAIve runtime state
+.beehaiive/
+
 # Operating-system files
 .DS_Store
 Thumbs.db

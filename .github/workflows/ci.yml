@@ -108,7 +108,7 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --locked --dev
       - name: Run tests with coverage
-        run: uv run pytest -q --cov=main --cov-report=term-missing --cov-fail-under=100
+        run: uv run pytest -q --cov=main --cov=beehaiive --cov-report=term-missing --cov-fail-under=100
 
   python-dependency-audit:
     name: python-dependency-audit
