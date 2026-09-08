@@ -87,7 +87,9 @@ The earlier Ollama result is not a valid quality conclusion. I reran the same fi
 
 Luna produced the same perfect accuracy with both topologies. Fan-out added roughly four times the input tokens and 2.5-3.4 times the API-equivalent cost, while the observed parallel wall time was about 9% slower. Local CPU and RAM use cannot be measured for this hosted model.
 
-This rerun replaces the earlier 50% Ollama quality signal with a 100% Luna reference signal. It does not satisfy the local-only constraint in [issue #12](https://github.com/TychoHenzen/BeeHAIve/issues/12), and it does not by itself qualify a local model or framework. The current evidence favors one call as the default for this workload. A larger persisted fixture is still required before making the final local-first selection.
+This fixture is saturated. It is useful as a protocol sanity check, but it cannot show an accuracy improvement because the single-call baseline already reached 100%. It therefore provides no topology decision. The earlier 50% Ollama signal is also not a usable quality reference. A harder, multi-step fixture with room below the accuracy bar is required before selecting a default.
+
+The Luna run does not satisfy the local-only constraint in [issue #12](https://github.com/TychoHenzen/BeeHAIve/issues/12), and it does not by itself qualify a local model or framework. The next fixture must persist raw outputs, score partial findings, and include resource metrics for any local candidate.
 
 ## Recommendations
 
