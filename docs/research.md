@@ -74,6 +74,21 @@ The evidence is genuinely mixed and hinges on task value:
   - Gandhi, Patwardhan, Vig & Shroff (TCS Research), *"BudgetMLAgent"* (arXiv:2411.07464): a "94.2% reduction in the cost (from $0.931 per run…for GPT-4 single agent system to $0.054)," while *raising* success rate to 32.95% vs 22.72% on MLAgentBench by using a low-cost model for most calls and escalating on failure.
   - Harness-adapted small-model agents can be ~90% cheaper at on-par performance on routine business tasks, and agentic plan caching cuts average serving cost ~46% while retaining ~97% accuracy.
 
+### 6. Codex Luna rerun for issue #12
+
+The earlier Ollama result is not a valid quality conclusion. I reran the same fixed workload with Codex CLI 0.151.0 and model `gpt-5.6-luna` in an isolated, read-only directory on 8 September 2026. The workload had four labeled cases: a documentation-only change, a tested parser refactor, an untested payment-processing change, and a private-variable rename. The expected labels were `SIMPLE`, `COMPLEX`, `REVIEW`, and `SIMPLE`.
+
+| Topology | Repetitions | Correct | Median wall time | Usage per four-case run |
+|---|---:|---:|---:|---:|
+| One Luna call with all four cases | 7 | 28/28 (100%) | 9.34 s* | about 23.5k input and 76-93 output tokens |
+| Four independent Luna calls in parallel | 3 batches | 12/12 (100%) | 10.17 s** | about 93.6k input and 211-278 output tokens |
+
+\* Median of the three final isolated repetitions. ** Median of the slowest call in each parallel batch. The CLI usage stream reported variable prompt-cache hits. At the published Luna API rates, the combined call is about $0.0048 per run and the fan-out batch is about $0.0122-$0.0162. These are API-equivalent estimates, not a Codex subscription invoice. The [official Luna model page](https://developers.openai.com/api/docs/models/gpt-5.6-luna) lists the model ID, structured-output support, and $0.20 input/$1.20 output pricing.
+
+Luna produced the same perfect accuracy with both topologies. Fan-out added roughly four times the input tokens and 2.5-3.4 times the API-equivalent cost, while the observed parallel wall time was about 9% slower. Local CPU and RAM use cannot be measured for this hosted model.
+
+This rerun replaces the earlier 50% Ollama quality signal with a 100% Luna reference signal. It does not satisfy the local-only constraint in [issue #12](https://github.com/TychoHenzen/BeeHAIve/issues/12), and it does not by itself qualify a local model or framework. The current evidence favors one call as the default for this workload. A larger persisted fixture is still required before making the final local-first selection.
+
 ## Recommendations
 
 **If your real goal is high-volume, low-cost, continuous autonomous work:**
