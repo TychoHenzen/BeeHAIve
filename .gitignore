@@ -1,0 +1,40 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.pyright/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments and packaging output
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# Local secrets and runtime logs
+.env
+.env.*
+!.env.example
+*.log
+
+# Local IDE and agent state
+.codex/
+.agents/
+.claude/
+.serena/
+.idea/shelf/
+.idea/workspace.xml
+.idea/httpRequests/
+.idea/dataSources/
+
+# Operating-system files
+.DS_Store
+Thumbs.db

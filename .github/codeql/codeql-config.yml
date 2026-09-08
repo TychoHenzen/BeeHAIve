@@ -1,0 +1,8 @@
+name: beehaiive-codeql
+
+paths-ignore:
+  - .codex
+  - .serena
+  - build
+  - dist
+  - .venv
