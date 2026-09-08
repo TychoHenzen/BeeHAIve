@@ -120,6 +120,15 @@ This fixture is saturated. It is useful as a protocol sanity check, but it canno
 
 The next fixture must persist raw outputs, score partial findings, and measure the integration burden as well as quality, throughput, latency, retries, and recovery. The central comparison is a direct Codex wrapper versus a third-party graph that uses the same Codex model and task permissions.
 
+## Benchmark protocol for the final topology decision
+
+1. Build at least ten real multi-step repository tasks from the target workflow. Each task must start from a clean repository state and include hidden tests or a deterministic acceptance check. Do not include tasks whose expected answer is stated directly in the prompt.
+2. Run the direct wrapper and each included third-party candidate with the same `gpt-5.6-luna` model, prompt content, repository state, sandbox permissions, and maximum retry budget. A third-party candidate must invoke the same Codex worker or be labeled as a different harness comparison.
+3. Repeat every task at least three times. Preserve each candidate's JSONL output, exit status, changed-file diff, test output, token usage, start and end timestamps, retry count, and failure reason.
+4. Score hidden-test or acceptance success, required finding recall, false-positive rate, and artifact validity. Summarize medians and failure distributions instead of reporting only a mean or a best run.
+5. Record integration effort separately: dependency count, adapter lines, configuration steps, state-store requirements, recovery behavior, and operator-visible failure handling. Record peak process and memory use when the runner can observe them.
+6. Adopt the third-party option only when it clears the declared quality, throughput, or recovery threshold and its measured benefit repays the adapter and operational burden. Otherwise keep the direct wrapper and record the framework as evaluated but not selected.
+
 ## Recommendations
 
 **For BeeHAIve's current decision:**
