@@ -1,6 +1,6 @@
 import os
 import secrets
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Mapping
 from pathlib import Path
 from typing import Annotated, Literal, cast
 
@@ -12,6 +12,15 @@ from beehaiive import EnvironmentGitHubProvider, Orchestrator, OrchestratorStore
 from beehaiive.dashboard import build_dashboard_state
 from beehaiive.models import RunState, RunStatus
 from beehaiive.provider import ProviderError
+from beehaiive.review import (
+    PullRequestReviewProvider,
+    ReviewAuthorizer,
+    ReviewConcern,
+    ReviewError,
+    ReviewReader,
+    ReviewService,
+    ReviewStore,
+)
 from beehaiive.storage import (
     DEFAULT_EVENT_LIMIT,
     MAX_EVENT_LIMIT,
@@ -31,6 +40,39 @@ class HandoffRequest(BaseModel):
 
 class FailureRequest(BaseModel):
     error: str
+
+
+class ReviewStartRequest(BaseModel):
+    pull_request_id: str = Field(min_length=1, max_length=200)
+    head_sha: str = Field(min_length=1, max_length=200)
+
+
+class ReviewReadyRequest(BaseModel):
+    pull_request_id: str = Field(min_length=1, max_length=200)
+
+
+class ReviewReaderRequest(BaseModel):
+    concern: Literal["security", "test_coverage", "clean_code", "performance"]
+    status: Literal["pending", "pass", "fail"]
+    findings: list[str] = Field(default_factory=list, max_length=20)
+    reader: str = Field(default="automated", min_length=1, max_length=100)
+
+
+class ReviewFindingRequest(BaseModel):
+    concern: Literal["security", "test_coverage", "clean_code", "performance"]
+    summary: str = Field(min_length=1, max_length=1_000)
+
+
+class ReviewResolutionRequest(BaseModel):
+    resolution: str = Field(min_length=1, max_length=1_000)
+
+
+class ReviewApprovalRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=1_000)
+
+
+class ReviewHandoffRequest(BaseModel):
+    head_sha: str = Field(min_length=1, max_length=200)
 
 
 class DashboardActionBase(BaseModel):
@@ -79,6 +121,11 @@ def create_app(
     orchestrator: Orchestrator | None = None,
     api_key: str | None = None,
     allowed_project_ids: Collection[str] | None = None,
+    review_store: ReviewStore | None = None,
+    review_service: ReviewService | None = None,
+    review_provider: PullRequestReviewProvider | None = None,
+    review_readers: Mapping[ReviewConcern, ReviewReader] | None = None,
+    review_authorizer: ReviewAuthorizer | None = None,
 ) -> FastAPI:
     if orchestrator is None:
         if store is None:
@@ -87,6 +134,25 @@ def create_app(
                 database if database == ":memory:" else Path(database)
             )
         orchestrator = Orchestrator(store, EnvironmentGitHubProvider())
+    if (
+        review_service is not None
+        and review_store is not None
+        and review_service.store is not review_store
+    ):
+        raise ValueError("The review service and API must share one review store")
+    if review_service is not None and any(
+        value is not None
+        for value in (review_provider, review_readers, review_authorizer)
+    ):
+        raise ValueError("Review adapters must be configured on the review service")
+    if review_service is None:
+        review_database = os.environ.get("BEEHAIIVE_REVIEW_DB", ".beehaiive/reviews.db")
+        review_service = ReviewService(
+            review_store or ReviewStore(review_database),
+            provider=review_provider,
+            readers=review_readers,
+            authorizer=review_authorizer,
+        )
 
     app = FastAPI(title="BeeHAIve")
     configured_api_key = (
@@ -94,9 +160,8 @@ def create_app(
     )
     configured_projects = _configured_project_ids(allowed_project_ids)
 
-    def require_mutation_access(
-        request: Request,
-        supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    def require_api_key(
+        supplied_api_key: str | None,
     ) -> None:
         if not configured_api_key:
             raise HTTPException(
@@ -107,6 +172,32 @@ def create_app(
             supplied_api_key, configured_api_key
         ):
             raise HTTPException(status_code=401, detail="Invalid API key")
+
+    def require_review_access(
+        supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
+        actor: str | None = Header(default=None, alias="X-Review-Actor"),
+    ) -> str:
+        require_api_key(supplied_api_key)
+        if actor is None or not actor.strip():
+            raise HTTPException(status_code=401, detail="X-Review-Actor is required")
+        return actor
+
+    @app.post("/reviews/ready")
+    def run_ready_review(  # pyright: ignore[reportUnusedFunction]
+        request: ReviewReadyRequest,
+        actor: str = Depends(require_review_access),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            review_service.authorize(request.pull_request_id, actor, "start")
+            return review_service.run_ready_review(request.pull_request_id).as_dict()
+
+        return _handle_review_error(operation)
+
+    def require_mutation_access(
+        request: Request,
+        supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    ) -> None:
+        require_api_key(supplied_api_key)
 
         path_params = request.path_params
         project_id = path_params.get("project_id")
@@ -129,6 +220,106 @@ def create_app(
         project_id = request.path_params.get("project_id")
         if not isinstance(project_id, str) or project_id not in configured_projects:
             raise HTTPException(status_code=403, detail="Project is not authorized")
+
+    @app.post("/reviews/cycles")
+    def start_review_cycle(  # pyright: ignore[reportUnusedFunction]
+        request: ReviewStartRequest,
+        actor: str = Depends(require_review_access),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            review_service.authorize(request.pull_request_id, actor, "start")
+            return review_service.start_cycle(
+                request.pull_request_id, request.head_sha
+            ).as_dict()
+
+        return _handle_review_error(operation)
+
+    @app.get("/reviews/pull-requests/{pull_request_id}")
+    def review_state(  # pyright: ignore[reportUnusedFunction]
+        pull_request_id: str,
+        actor: str = Depends(require_review_access),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            review_service.authorize(pull_request_id, actor, "read")
+            return review_service.snapshot(pull_request_id).as_dict()
+
+        return _handle_review_error(operation)
+
+    @app.post("/reviews/cycles/{cycle_id}/readers")
+    def record_review_reader(  # pyright: ignore[reportUnusedFunction]
+        cycle_id: str,
+        request: ReviewReaderRequest,
+        actor: str = Depends(require_review_access),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            pull_request_id = review_service.pull_request_id_for_cycle(cycle_id)
+            review_service.authorize(pull_request_id, actor, "reader")
+            return review_service.record_reader(
+                cycle_id,
+                request.concern,
+                request.status,
+                request.findings,
+                request.reader,
+            ).as_dict()
+
+        return _handle_review_error(operation)
+
+    @app.post("/reviews/cycles/{cycle_id}/findings")
+    def add_review_finding(  # pyright: ignore[reportUnusedFunction]
+        cycle_id: str,
+        request: ReviewFindingRequest,
+        actor: str = Depends(require_review_access),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            pull_request_id = review_service.pull_request_id_for_cycle(cycle_id)
+            review_service.authorize(pull_request_id, actor, "writer")
+            return review_service.add_finding(
+                cycle_id, request.concern, request.summary
+            ).as_dict()
+
+        return _handle_review_error(operation)
+
+    @app.post("/reviews/findings/{finding_id}/resolve")
+    def resolve_review_finding(  # pyright: ignore[reportUnusedFunction]
+        finding_id: str,
+        request: ReviewResolutionRequest,
+        actor: str = Depends(require_review_access),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            pull_request_id = review_service.pull_request_id_for_finding(finding_id)
+            review_service.authorize(pull_request_id, actor, "writer")
+            return review_service.resolve_finding(
+                finding_id, request.resolution
+            ).as_dict()
+
+        return _handle_review_error(operation)
+
+    @app.post("/reviews/cycles/{cycle_id}/approve")
+    def approve_review_cycle(  # pyright: ignore[reportUnusedFunction]
+        cycle_id: str,
+        request: ReviewApprovalRequest,
+        actor: str = Depends(require_review_access),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            pull_request_id = review_service.pull_request_id_for_cycle(cycle_id)
+            review_service.authorize(pull_request_id, actor, "approve")
+            return review_service.approve_for_merge(cycle_id, request.reason).as_dict()
+
+        return _handle_review_error(operation)
+
+    @app.post("/reviews/pull-requests/{pull_request_id}/handoff")
+    def review_handoff(  # pyright: ignore[reportUnusedFunction]
+        pull_request_id: str,
+        request: ReviewHandoffRequest,
+        actor: str = Depends(require_review_access),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            review_service.authorize(pull_request_id, actor, "handoff")
+            return review_service.merge_handoff(
+                pull_request_id, request.head_sha
+            ).as_dict()
+
+        return _handle_review_error(operation)
 
     @app.get("/")
     async def root() -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
@@ -415,6 +606,13 @@ def _handle_store_error[T](function: Callable[[], T]) -> T:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ProviderError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+def _handle_review_error[T](function: Callable[[], T]) -> T:
+    try:
+        return function()
+    except ReviewError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 def _run_dict(run: RunState) -> dict[str, object]:
