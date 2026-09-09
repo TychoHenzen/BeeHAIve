@@ -2,15 +2,15 @@ import os
 import secrets
 from collections.abc import Callable, Collection
 from pathlib import Path
-from typing import Literal, cast
+from typing import Annotated, Literal, cast
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from beehaiive import EnvironmentGitHubProvider, Orchestrator, OrchestratorStore, Stage
 from beehaiive.dashboard import build_dashboard_state
-from beehaiive.models import RunState
+from beehaiive.models import RunState, RunStatus
 from beehaiive.provider import ProviderError
 from beehaiive.storage import (
     DEFAULT_EVENT_LIMIT,
@@ -33,15 +33,45 @@ class FailureRequest(BaseModel):
     error: str
 
 
-class DashboardActionRequest(BaseModel):
-    action: Literal["start", "stop", "approve", "clarify"]
+class DashboardActionBase(BaseModel):
     approved: bool = False
+
+
+class DashboardStartRequest(DashboardActionBase):
+    action: Literal["start"]
     repository: str | None = None
-    pbi_number: int | None = None
-    run_id: str | None = None
     worker_id: str | None = None
+
+
+class DashboardStopRequest(DashboardActionBase):
+    action: Literal["stop"]
+    run_id: str
+    repository: str | None = None
     reason: str = ""
+
+
+class DashboardApproveRequest(DashboardActionBase):
+    action: Literal["approve"]
+    repository: str
+    pbi_number: int
+    run_id: str
+
+
+class DashboardClarifyRequest(DashboardActionBase):
+    action: Literal["clarify"]
+    repository: str
+    pbi_number: int
+    run_id: str
     clarification: str = ""
+
+
+DashboardActionRequest = Annotated[
+    DashboardStartRequest
+    | DashboardStopRequest
+    | DashboardApproveRequest
+    | DashboardClarifyRequest,
+    Field(discriminator="action"),
+]
 
 
 def create_app(
@@ -95,6 +125,11 @@ def create_app(
         ):
             raise HTTPException(status_code=403, detail="Repository is not authorized")
 
+    def require_project_access(request: Request) -> None:
+        project_id = request.path_params.get("project_id")
+        if not isinstance(project_id, str) or project_id not in configured_projects:
+            raise HTTPException(status_code=403, detail="Project is not authorized")
+
     @app.get("/")
     async def root() -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         return {"message": "Hello World"}
@@ -121,6 +156,13 @@ def create_app(
     def dashboard_client_script() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
         return FileResponse(
             Path(__file__).parent / "docs" / "dashboard-client.mjs",
+            media_type="application/javascript",
+        )
+
+    @app.get("/dashboard-view.mjs", response_class=FileResponse)
+    def dashboard_view_script() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
+        return FileResponse(
+            Path(__file__).parent / "docs" / "dashboard-view.mjs",
             media_type="application/javascript",
         )
 
@@ -152,6 +194,7 @@ def create_app(
             ge=1,
             le=MAX_EVENT_LIMIT,
         ),
+        _access: None = Depends(require_project_access),
     ) -> dict[str, object]:
         return _handle_store_error(
             lambda: _dashboard_state(orchestrator, project_id, event_limit)
@@ -160,6 +203,7 @@ def create_app(
     @app.get("/projects/{project_id}/actions")
     def dashboard_actions(  # pyright: ignore[reportUnusedFunction]
         project_id: str,
+        _access: None = Depends(require_project_access),
     ) -> dict[str, object]:
         return _handle_store_error(
             lambda: {"actions": orchestrator.store.actions_for_project(project_id)}
@@ -184,11 +228,7 @@ def create_app(
             )
         ):
             raise HTTPException(status_code=403, detail="Repository is not authorized")
-        if request.action == "stop":
-            if request.run_id is None:
-                raise HTTPException(
-                    status_code=400, detail="A run_id is required to stop"
-                )
+        if isinstance(request, DashboardStopRequest):
             run = orchestrator.store.get_run(request.run_id)
             if run is None or run.project_id != project_id:
                 raise HTTPException(status_code=403, detail="Run is not authorized")
@@ -196,26 +236,43 @@ def create_app(
                 raise HTTPException(
                     status_code=403, detail="Repository is not authorized"
                 )
-        if request.action in {"approve", "clarify"}:
-            if request.repository is None or request.pbi_number is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail="A repository and pbi_number are required for this action",
-                )
+        if isinstance(request, (DashboardApproveRequest, DashboardClarifyRequest)):
             pbi = _dashboard_pbi(
                 orchestrator, project_id, request.repository, request.pbi_number
             )
             if pbi is None:
                 raise HTTPException(status_code=403, detail="PBI is not authorized")
-            if request.run_id is not None and pbi.get("run_id") != request.run_id:
-                raise HTTPException(status_code=403, detail="Run is not authorized")
+            _require_active_dashboard_run(
+                orchestrator,
+                project_id,
+                request.repository,
+                request.pbi_number,
+                request.run_id,
+            )
+        pbi_number = (
+            request.pbi_number
+            if isinstance(request, (DashboardApproveRequest, DashboardClarifyRequest))
+            else None
+        )
+        run_id = (
+            request.run_id
+            if isinstance(
+                request,
+                (
+                    DashboardStopRequest,
+                    DashboardApproveRequest,
+                    DashboardClarifyRequest,
+                ),
+            )
+            else None
+        )
         action = orchestrator.store.begin_action(
             project_id,
             request.action,
             request.model_dump(exclude_none=True),
             request.repository,
-            request.pbi_number,
-            request.run_id,
+            pbi_number,
+            run_id,
         )
         try:
             result = _execute_dashboard_action(orchestrator, project_id, request)
@@ -382,6 +439,7 @@ def _run_dict(run: RunState) -> dict[str, object]:
 def _dashboard_state(
     orchestrator: Orchestrator, project_id: str, event_limit: int
 ) -> dict[str, object]:
+    orchestrator.synchronize(project_id)
     state = orchestrator.store.project_state(project_id, event_limit)
     actions = orchestrator.store.actions_for_project(project_id)
     return build_dashboard_state(state, actions)
@@ -392,7 +450,7 @@ def _dashboard_state_or_none(
 ) -> dict[str, object] | None:
     try:
         return _dashboard_state(orchestrator, project_id, event_limit)
-    except StoreError:
+    except (ProviderError, StoreError):
         return None
 
 
@@ -417,12 +475,31 @@ def _dashboard_pbi(
     return None
 
 
+def _require_active_dashboard_run(
+    orchestrator: Orchestrator,
+    project_id: str,
+    repository: str,
+    pbi_number: int,
+    run_id: str,
+) -> RunState:
+    run = orchestrator.store.get_run(run_id)
+    if (
+        run is None
+        or run.project_id != project_id
+        or run.repository != repository
+        or run.pbi_number != pbi_number
+        or run.status is not RunStatus.ACTIVE
+    ):
+        raise HTTPException(status_code=403, detail="Run is not authorized")
+    return run
+
+
 def _execute_dashboard_action(
     orchestrator: Orchestrator,
     project_id: str,
     request: DashboardActionRequest,
 ) -> dict[str, object]:
-    if request.action == "start":
+    if isinstance(request, DashboardStartRequest):
         if request.repository is None:
             return orchestrator.synchronize(project_id)
         run = orchestrator.claim(
@@ -433,9 +510,7 @@ def _execute_dashboard_action(
         if run is None:
             raise StoreError("No claimable PBI is available for this repository")
         return {"run": _public_run_dict(run)}
-    if request.action == "stop":
-        if request.run_id is None:
-            raise StoreError("A run_id is required to stop")
+    if isinstance(request, DashboardStopRequest):
         return {
             "run": _public_run_dict(
                 orchestrator.stop(
@@ -443,7 +518,7 @@ def _execute_dashboard_action(
                 )
             )
         }
-    if request.action == "clarify":
+    if isinstance(request, DashboardClarifyRequest):
         if not request.clarification.strip():
             raise StoreError("A clarification message is required")
         return {"message": request.clarification.strip()}

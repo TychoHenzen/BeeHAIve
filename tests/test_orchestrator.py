@@ -5,6 +5,7 @@ from threading import Event, Lock
 from typing import Any
 
 import pytest
+from conftest import FakeProvider
 
 from beehaiive.models import (
     HandoffRequest,
@@ -22,32 +23,6 @@ from beehaiive.provider import (
     _handoff_marker,
 )
 from beehaiive.storage import OrchestratorStore, StoreError
-
-
-class FakeProvider:
-    def __init__(self, snapshot: ProjectSnapshot) -> None:
-        self.snapshot = snapshot
-        self.handoffs: list[HandoffRequest] = []
-
-    def discover_project(self, project_id: str) -> ProjectSnapshot:
-        assert project_id == self.snapshot.project_id
-        return self.snapshot
-
-    def create_handoff(self, request: HandoffRequest) -> HandoffResult:
-        self.handoffs.append(request)
-        return HandoffResult(
-            branch=request.branch,
-            pull_request_url=f"https://example.test/{request.repository}/pull/1",
-            pull_request_number=1,
-        )
-
-    def resolve_base_branch(self, repository: str, requested: str | None) -> str:
-        return requested or "master"
-
-    def validate_handoff(
-        self, repository: str, branch: str, requested_base: str | None
-    ) -> str:
-        return self.resolve_base_branch(repository, requested_base)
 
 
 class InvalidHandoffProvider(FakeProvider):
@@ -471,7 +446,11 @@ def test_github_provider_maps_live_dashboard_metadata() -> None:
     assert metadata["reviewers"]["#9:tests"]["status"] == "fail"  # type: ignore[index]
     assert metadata["reviewers"]["#9:security"]["status"] == "pass"  # type: ignore[index]
     assert metadata["reviewers"]["#9:bot"]["status"] == "pending"  # type: ignore[index]
-    assert metadata["escalation"] == {"current": 2, "consecutive": 2}
+    assert metadata["escalation"] == {
+        "current": 2,
+        "consecutive": 2,
+        "current_tier": "terra",
+    }
     assert metadata["activity"][0]["action"] == "Started review"  # type: ignore[index]
 
 
@@ -980,6 +959,215 @@ class PaginatedGraphQLClient:
         return {"user": {"projectV2": {"title": "Paged Planning"}}}
 
 
+class NestedMetadataGraphQLClient:
+    def __init__(self) -> None:
+        self.repositories = [{"nameWithOwner": "owner/api"}]
+        self.subtasks = [
+            {
+                "number": number,
+                "title": f"Child {number}",
+                "state": "OPEN",
+                "labels": {
+                    "nodes": [],
+                    "pageInfo": {"hasNextPage": number == 1, "endCursor": "labels-2"},
+                },
+            }
+            for number in range(1, 101)
+        ]
+        self.comments = [
+            {
+                "author": {"login": "writer"},
+                "body": f"Comment {number}",
+                "createdAt": f"2026-09-09T08:{number:02d}:00Z",
+                "url": f"https://example.test/comment/{number}",
+            }
+            for number in range(1, 102)
+        ]
+        self.pull_requests = [
+            {
+                "number": number,
+                "url": f"https://example.test/pull/{number}",
+                "reviewDecision": "APPROVED",
+                "reviewRequests": {
+                    "nodes": (
+                        [{"requestedReviewer": {"login": "reviewer-1"}}]
+                        if number == 1
+                        else []
+                    ),
+                    "pageInfo": {
+                        "hasNextPage": number == 1,
+                        "endCursor": "requests-1" if number == 1 else None,
+                    },
+                },
+                "latestReviews": {
+                    "nodes": (
+                        [{"author": {"login": "reviewer-1"}, "state": "COMMENTED"}]
+                        if number == 1
+                        else []
+                    ),
+                    "pageInfo": {
+                        "hasNextPage": number == 1,
+                        "endCursor": "reviews-1" if number == 1 else None,
+                    },
+                },
+            }
+            for number in range(1, 102)
+        ]
+
+    def execute(self, query: str, variables: dict[str, object]) -> dict[str, Any]:
+        cursor = variables.get("cursor")
+        if "projectV2" in query and "items" in query:
+            issue = {
+                "__typename": "Issue",
+                "number": 1,
+                "title": "Paged issue",
+                "repository": {"nameWithOwner": "owner/api"},
+                "labels": {
+                    "nodes": [{"name": "escalation/terra"}],
+                    "pageInfo": {"hasNextPage": True, "endCursor": "labels-1"},
+                },
+                "subIssues": {
+                    "nodes": self.subtasks,
+                    "pageInfo": {"hasNextPage": True, "endCursor": "subissues-1"},
+                },
+                "comments": {
+                    "nodes": self.comments[:100],
+                    "pageInfo": {"hasNextPage": True, "endCursor": "comments-1"},
+                },
+                "closedByPullRequestsReferences": {
+                    "nodes": self.pull_requests[:100],
+                    "pageInfo": {"hasNextPage": True, "endCursor": "pulls-1"},
+                },
+            }
+            return {
+                "user": {
+                    "projectV2": {
+                        "items": {
+                            "nodes": [
+                                {
+                                    "content": issue,
+                                    "fieldValues": {
+                                        "nodes": [
+                                            {
+                                                "name": "Backlog",
+                                                "field": {"name": "Status"},
+                                            }
+                                        ]
+                                    },
+                                }
+                            ],
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
+                    }
+                }
+            }
+        if "repositories" in query:
+            nodes = self.repositories if cursor is None else []
+            return {
+                "user": {
+                    "projectV2": {
+                        "repositories": {
+                            "nodes": nodes,
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
+                    }
+                }
+            }
+        if "closedByPullRequestsReferences" in query:
+            nodes = self.pull_requests[100:] if cursor == "pulls-1" else []
+            return {
+                "repository": {
+                    "issue": {
+                        "closedByPullRequestsReferences": {
+                            "nodes": nodes,
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
+                    }
+                }
+            }
+        if "subIssues" in query:
+            return {
+                "repository": {
+                    "issue": {
+                        "subIssues": {
+                            "nodes": [
+                                {
+                                    "number": 101,
+                                    "title": "Child 101",
+                                    "state": "OPEN",
+                                    "labels": {
+                                        "nodes": [],
+                                        "pageInfo": {
+                                            "hasNextPage": False,
+                                            "endCursor": None,
+                                        },
+                                    },
+                                }
+                            ],
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
+                    }
+                }
+            }
+        if "comments" in query:
+            return {
+                "repository": {
+                    "issue": {
+                        "comments": {
+                            "nodes": [self.comments[100]],
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
+                    }
+                }
+            }
+        if "reviewRequests" in query:
+            return {
+                "repository": {
+                    "pullRequest": {
+                        "reviewRequests": {
+                            "nodes": [{"requestedReviewer": {"login": "reviewer-101"}}],
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
+                    }
+                }
+            }
+        if "latestReviews" in query:
+            return {
+                "repository": {
+                    "pullRequest": {
+                        "latestReviews": {
+                            "nodes": [
+                                {
+                                    "author": {"login": "reviewer-101"},
+                                    "state": "APPROVED",
+                                }
+                            ],
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
+                    }
+                }
+            }
+        if "labels" in query:
+            labels = (
+                [{"name": "bounces/2"}]
+                if variables.get("number") == 1 and cursor == "labels-1"
+                else [{"name": "stage/implement"}]
+                if variables.get("number") == 1 and cursor == "labels-2"
+                else []
+            )
+            return {
+                "repository": {
+                    "issue": {
+                        "labels": {
+                            "nodes": labels,
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
+                    }
+                }
+            }
+        return {"user": {"projectV2": {"title": "Paged Planning"}}}
+
+
 class HandoffGraphQLClient:
     def __init__(self) -> None:
         self.ref_exists = False
@@ -1088,6 +1276,35 @@ def test_github_provider_paginates_repositories_and_items() -> None:
 
     assert len(discovered.repositories) == 101
     assert [pbi.number for pbi in discovered.repositories[0].pbis] == [1, 2]
+
+
+def test_github_provider_paginates_nested_dashboard_metadata() -> None:
+    provider = GitHubProjectProvider(
+        "owner", 7, "token", client=NestedMetadataGraphQLClient()
+    )
+
+    discovered = provider.discover_project("owner:7")
+    metadata = discovered.repositories[0].pbis[0].metadata
+
+    assert len(metadata["subtasks"]) == 101  # type: ignore[arg-type]
+    assert metadata["subtasks"][0]["labels"] == ["stage/implement"]  # type: ignore[index]
+    assert len(metadata["activity"]) == 101  # type: ignore[arg-type]
+    assert len(metadata["pull_requests"]) == 101  # type: ignore[arg-type]
+    assert metadata["reviewers"]["#1:reviewer-101"]["status"] == "pass"  # type: ignore[index]
+    assert metadata["escalation"] == {
+        "current": 2,
+        "consecutive": 2,
+        "current_tier": "terra",
+    }
+
+
+def test_github_provider_ignores_incomplete_issue_metadata() -> None:
+    provider = GitHubProjectProvider(
+        "owner", 7, "token", client=NestedMetadataGraphQLClient()
+    )
+    issue = {"repository": {}, "number": 1}
+
+    assert provider._complete_issue_metadata(issue) is issue
 
 
 def test_github_provider_reuses_existing_branch_and_pull_request() -> None:

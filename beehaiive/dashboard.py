@@ -5,12 +5,20 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import cast
 
-_DISPLAY_STAGES = ("backlog", "refine", "implement", "review", "merge")
+_DISPLAY_STAGES = (
+    "backlog",
+    "refine",
+    "implement",
+    "review",
+    "pull_request",
+    "merge",
+)
 _DISPLAY_STAGE_LABELS = {
     "backlog": "Backlog",
     "refine": "Refine",
     "implement": "Implement",
     "review": "Review",
+    "pull_request": "Pull request",
     "merge": "Merged",
 }
 
@@ -181,10 +189,17 @@ def _latest_metadata(events: Sequence[Mapping[str, object]]) -> dict[str, object
 
 def _escalation_view(
     metadata: Mapping[str, object], events: Sequence[Mapping[str, object]]
-) -> tuple[dict[str, int], list[object]]:
+) -> tuple[dict[str, object], list[object]]:
     raw_escalation = _mapping(metadata.get("escalation"))
     consecutive = _integer(raw_escalation.get("consecutive"))
     current = _integer(raw_escalation.get("current"))
+    current_tier = raw_escalation.get("current_tier")
+    escalation: dict[str, object] = {
+        "current": current,
+        "consecutive": consecutive,
+    }
+    if isinstance(current_tier, str) and current_tier.strip():
+        escalation["current_tier"] = current_tier
     raw_log: list[object] = list(_sequence(metadata.get("escalation_log")))
     if not raw_log:
         raw_log = [
@@ -192,7 +207,7 @@ def _escalation_view(
             for event in events
             if event.get("type") in {"escalation", "triage"}
         ]
-    return {"current": current, "consecutive": consecutive}, raw_log
+    return escalation, raw_log
 
 
 def _stage_progress(stage: str) -> list[dict[str, str]]:
@@ -215,7 +230,7 @@ def _stage_progress(stage: str) -> list[dict[str, str]]:
 
 def _display_stage(stage: str, status: str) -> str:
     if stage == "pull_request":
-        return "merge" if status == "completed" else "review"
+        return "pull_request" if status == "completed" else "review"
     return stage if stage in _DISPLAY_STAGES else "backlog"
 
 

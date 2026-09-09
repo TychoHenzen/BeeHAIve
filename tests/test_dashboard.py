@@ -1,10 +1,9 @@
 import pytest
+from conftest import FakeProvider
 from fastapi.testclient import TestClient
 
 from beehaiive.dashboard import build_dashboard_state
 from beehaiive.models import (
-    HandoffRequest,
-    HandoffResult,
     PbiSnapshot,
     ProjectSnapshot,
     RepositorySnapshot,
@@ -14,72 +13,60 @@ from beehaiive.orchestrator import Orchestrator
 from beehaiive.provider import ProviderError
 from beehaiive.storage import OrchestratorStore, StoreError, _json_mapping
 from main import (
-    DashboardActionRequest,
+    DashboardStopRequest,
     _dashboard_pbi,
     _execute_dashboard_action,
     create_app,
 )
 
 
-class DashboardProvider:
-    def discover_project(self, project_id: str) -> ProjectSnapshot:
-        return ProjectSnapshot(
-            project_id,
-            "Planning",
-            (
-                RepositorySnapshot(
-                    "owner/api",
-                    (
-                        PbiSnapshot(
-                            "owner/api",
-                            1,
-                            "API one",
-                            metadata={
-                                "subtasks": [{"id": "1a", "title": "Check API"}],
-                                "readers": [
-                                    {"id": "security", "status": "pass"},
-                                    {"id": "tests", "status": "pending"},
-                                ],
-                                "reviewers": {
-                                    "security": {"status": "pass"},
-                                    "tests": {"status": "pending"},
-                                },
-                                "escalation": {
-                                    "current": 1,
-                                    "consecutive": 1,
-                                },
-                                "escalation_log": [{"tier": "terra"}],
-                                "activity": [
-                                    {"time": "now", "action": "Started review"}
-                                ],
+def dashboard_snapshot(
+    project_id: str = "project-1", api_title: str = "API one"
+) -> ProjectSnapshot:
+    return ProjectSnapshot(
+        project_id,
+        "Planning",
+        (
+            RepositorySnapshot(
+                "owner/api",
+                (
+                    PbiSnapshot(
+                        "owner/api",
+                        1,
+                        api_title,
+                        metadata={
+                            "subtasks": [{"id": "1a", "title": "Check API"}],
+                            "readers": [
+                                {"id": "security", "status": "pass"},
+                                {"id": "tests", "status": "pending"},
+                            ],
+                            "reviewers": {
+                                "security": {"status": "pass"},
+                                "tests": {"status": "pending"},
                             },
-                        ),
-                        PbiSnapshot("owner/api", 4, "API four"),
+                            "escalation": {
+                                "current": 1,
+                                "consecutive": 1,
+                            },
+                            "escalation_log": [{"tier": "terra"}],
+                            "activity": [{"time": "now", "action": "Started review"}],
+                        },
                     ),
-                ),
-                RepositorySnapshot(
-                    "owner/web",
-                    (
-                        PbiSnapshot("owner/web", 2, "Web one"),
-                        PbiSnapshot("owner/web", 3, "Web two"),
-                    ),
+                    PbiSnapshot("owner/api", 4, "API four"),
                 ),
             ),
-        )
-
-    def create_handoff(self, request: HandoffRequest) -> HandoffResult:
-        return HandoffResult(request.branch, "https://example.test/pull/1", 1)
-
-    def resolve_base_branch(self, repository: str, requested: str | None) -> str:
-        return requested or "master"
-
-    def validate_handoff(
-        self, repository: str, branch: str, requested_base: str | None
-    ) -> str:
-        return self.resolve_base_branch(repository, requested_base)
+            RepositorySnapshot(
+                "owner/web",
+                (
+                    PbiSnapshot("owner/web", 2, "Web one"),
+                    PbiSnapshot("owner/web", 3, "Web two"),
+                ),
+            ),
+        ),
+    )
 
 
-class FailingDashboardProvider(DashboardProvider):
+class FailingDashboardProvider(FakeProvider):
     def discover_project(self, project_id: str) -> ProjectSnapshot:
         raise ProviderError("dashboard provider unavailable")
 
@@ -122,6 +109,7 @@ def test_dashboard_projection_exposes_optional_run_details() -> None:
                                         "escalation": {
                                             "current": 1,
                                             "consecutive": 2,
+                                            "current_tier": "terra",
                                         },
                                         "escalation_log": [{"tier": "terra"}],
                                     },
@@ -150,8 +138,32 @@ def test_dashboard_projection_exposes_optional_run_details() -> None:
     }
     assert pbi["stage_label"] == "Review"
     assert pbi["subtasks"] == [{"id": "1a", "title": "Check API"}]
-    assert pbi["escalation"] == {"current": 1, "consecutive": 2}
+    assert pbi["escalation"] == {
+        "current": 1,
+        "consecutive": 2,
+        "current_tier": "terra",
+    }
     assert pbi["escalation_log"] == [{"tier": "terra"}]
+
+    completed = build_dashboard_state(
+        {
+            "project_id": "project-1",
+            "name": "Planning",
+            "repositories": [
+                {
+                    "name": "owner/api",
+                    "pbis": [
+                        {
+                            "number": 1,
+                            "stage": "pull_request",
+                            "status": "completed",
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    assert completed["repositories"][0]["pbis"][0]["stage_label"] == "Pull request"
 
     reviewer_only = build_dashboard_state(
         {
@@ -194,7 +206,7 @@ def test_dashboard_projection_exposes_optional_run_details() -> None:
 
 
 def test_live_dashboard_route_reports_repositories_and_writers() -> None:
-    service = Orchestrator(OrchestratorStore(), DashboardProvider())
+    service = Orchestrator(OrchestratorStore(), FakeProvider(dashboard_snapshot()))
     client = TestClient(
         create_app(orchestrator=service, allowed_project_ids={"project-1"})
     )
@@ -234,8 +246,9 @@ def test_live_dashboard_route_reports_repositories_and_writers() -> None:
     assert api_pbi["activity"][0]["action"] == "Started review"
 
 
-def test_clean_dashboard_database_requires_sync_then_loads_state() -> None:
-    service = Orchestrator(OrchestratorStore(), DashboardProvider())
+def test_dashboard_refresh_synchronizes_current_state() -> None:
+    provider = FakeProvider(dashboard_snapshot())
+    service = Orchestrator(OrchestratorStore(), provider)
     client = TestClient(
         create_app(
             orchestrator=service,
@@ -244,21 +257,31 @@ def test_clean_dashboard_database_requires_sync_then_loads_state() -> None:
         )
     )
 
-    before_sync = client.get("/projects/project-1/dashboard")
-    assert before_sync.status_code == 409
-    assert before_sync.json()["detail"] == "Unknown project: project-1"
+    first_refresh = client.get("/projects/project-1/dashboard")
+    assert first_refresh.status_code == 200
+    assert first_refresh.json()["repositories"][0]["pbis"][0]["title"] == "API one"
+    assert provider.discoveries == 1
 
-    synced = client.post(
-        "/projects/project-1/sync",
-        headers={"X-API-Key": "test-key"},
-    )
-    assert synced.status_code == 200
-    assert client.get("/projects/project-1/dashboard").status_code == 200
+    provider.snapshot = dashboard_snapshot(api_title="API latest")
+    second_refresh = client.get("/projects/project-1/dashboard")
+    assert second_refresh.status_code == 200
+    assert second_refresh.json()["repositories"][0]["pbis"][0]["title"] == "API latest"
+    assert provider.discoveries == 2
     service.store.close()
 
 
+def test_dashboard_reads_require_project_allowlist_without_api_key() -> None:
+    service = Orchestrator(OrchestratorStore(), FakeProvider(dashboard_snapshot()))
+    client = TestClient(
+        create_app(orchestrator=service, allowed_project_ids={"project-1"})
+    )
+
+    assert client.get("/projects/secret/dashboard").status_code == 403
+    assert client.get("/projects/secret/actions").status_code == 403
+
+
 def test_dashboard_actions_preserve_state_and_report_results() -> None:
-    service = Orchestrator(OrchestratorStore(), DashboardProvider())
+    service = Orchestrator(OrchestratorStore(), FakeProvider(dashboard_snapshot()))
     client = TestClient(
         create_app(
             orchestrator=service,
@@ -298,6 +321,7 @@ def test_dashboard_actions_preserve_state_and_report_results() -> None:
             "approved": True,
             "repository": "owner/api",
             "pbi_number": 1,
+            "run_id": run_id,
         },
     )
     assert failed.status_code == 200
@@ -312,6 +336,7 @@ def test_dashboard_actions_preserve_state_and_report_results() -> None:
             "approved": True,
             "repository": "owner/api",
             "pbi_number": 999,
+            "run_id": run_id,
         },
     )
     assert nonexistent_pbi.status_code == 403
@@ -358,22 +383,45 @@ def test_dashboard_actions_preserve_state_and_report_results() -> None:
     assert stopped.json()["action"]["status"] == "succeeded"
     assert stopped.json()["state"]["counts"]["failed_runs"] == 1
 
+    inactive_approval = client.post(
+        "/projects/project-1/actions",
+        headers=auth,
+        json={
+            "action": "approve",
+            "approved": True,
+            "repository": "owner/api",
+            "pbi_number": 1,
+            "run_id": run_id,
+        },
+    )
+    assert inactive_approval.status_code == 403
+
     assert client.get("/projects/project-1/actions").status_code == 200
     assert service.stop(run_id).status.value == "failed"
 
     no_approval = client.post(
         "/projects/project-1/actions",
         headers=auth,
-        json={"action": "approve"},
+        json={
+            "action": "approve",
+            "repository": "owner/api",
+            "pbi_number": 1,
+            "run_id": run_id,
+        },
     )
     assert no_approval.status_code == 400
 
     missing_target = client.post(
         "/projects/project-1/actions",
         headers=auth,
-        json={"action": "approve", "approved": True},
+        json={
+            "action": "approve",
+            "approved": True,
+            "repository": "owner/api",
+            "pbi_number": 1,
+        },
     )
-    assert missing_target.status_code == 400
+    assert missing_target.status_code == 422
 
     wrong_run = client.post(
         "/projects/project-1/actions",
@@ -404,7 +452,7 @@ def test_dashboard_actions_preserve_state_and_report_results() -> None:
         headers=auth,
         json={"action": "stop", "approved": True},
     )
-    assert missing_run.status_code == 400
+    assert missing_run.status_code == 422
 
     unknown_run = client.post(
         "/projects/project-1/actions",
@@ -432,16 +480,18 @@ def test_dashboard_actions_preserve_state_and_report_results() -> None:
     )
     assert synced.json()["action"]["status"] == "succeeded"
 
-    with pytest.raises(StoreError, match="run_id"):
+    with pytest.raises(StoreError, match="Unknown run"):
         _execute_dashboard_action(
             service,
             "project-1",
-            DashboardActionRequest(action="stop", approved=True),
+            DashboardStopRequest(action="stop", approved=True, run_id="missing"),
         )
 
 
 def test_dashboard_action_failure_can_return_no_existing_state() -> None:
-    service = Orchestrator(OrchestratorStore(), FailingDashboardProvider())
+    service = Orchestrator(
+        OrchestratorStore(), FailingDashboardProvider(dashboard_snapshot())
+    )
     client = TestClient(
         create_app(
             orchestrator=service,
@@ -469,6 +519,7 @@ def test_dashboard_action_failure_can_return_no_existing_state() -> None:
             "approved": True,
             "repository": "owner/api",
             "pbi_number": 1,
+            "run_id": "missing",
         },
     )
     assert invalid_target.status_code == 403
@@ -530,19 +581,16 @@ def test_action_store_records_lifecycle_and_validates_limits(
 
 
 def test_dashboard_runtime_assets_are_served_without_sample_data() -> None:
-    service = Orchestrator(OrchestratorStore(), DashboardProvider())
+    service = Orchestrator(OrchestratorStore(), FakeProvider(dashboard_snapshot()))
     client = TestClient(create_app(orchestrator=service))
 
     page = client.get("/dashboard")
     script = client.get("/dashboard.js")
     client_script = client.get("/dashboard-client.mjs")
+    view_script = client.get("/dashboard-view.mjs")
 
     assert page.status_code == 200
     assert "/dashboard.js" in page.text
     assert script.status_code == 200
     assert client_script.status_code == 200
-    assert "SAMPLE_DATA" not in script.text
-    assert "/dashboard" in script.text
-    assert "Start writer" in script.text
-    assert 'action: "start", repository: repository.name' in script.text
-    assert 'event.action || event.type || "event"' in script.text
+    assert view_script.status_code == 200

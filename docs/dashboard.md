@@ -20,10 +20,10 @@ stop, approval, and clarification actions. Every action is recorded as
 `pending`, `succeeded`, or `failed`; a response always includes the latest
 available run state.
 
-A new local database has no saved project state. The first read returns `409
-Unknown project` until the project is synchronized. Enter the API key and
-select `Sync project`, or call `POST /projects/{project_id}/sync`, before the
-read-only dashboard refresh.
+A new local database is synchronized from GitHub when the dashboard first
+refreshes. Later refreshes synchronize again before reading the projection, so
+the dashboard does not depend on a manual sync action for current state. The
+project provider must be available, and the project must be allowlisted.
 
 The GitHub provider supplies optional live details during project sync. GitHub
 sub-issues become subtasks, linked pull-request review requests and latest

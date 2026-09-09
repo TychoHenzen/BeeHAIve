@@ -11,14 +11,15 @@ function response(payload, status = 200) {
   };
 }
 
-function harness(fetcher) {
+function harness(fetcher, options = {}) {
   const states = [];
   const statuses = [];
   const busy = [];
   const client = createDashboardClient({
     fetcher,
-    projectId: () => "owner:7",
+    projectId: options.projectId || (() => "owner:7"),
     apiKey: () => "test-key",
+    saveApiKey: options.saveApiKey,
     onState: (state) => states.push(state),
     onStatus: (message, kind = "") => statuses.push({ message, kind }),
     onBusy: (value) => busy.push(value),
@@ -82,4 +83,57 @@ test("actions expose pending, success, and failure states", async () => {
   await failed.client.runAction({ action: "clarify" });
   assert.equal(failed.statuses.at(-1).kind, "failure");
   assert.match(failed.statuses.at(-1).message, /rejected/);
+});
+
+test("clearing the project invalidates an in-flight refresh", async () => {
+  let currentProject = "owner:7";
+  let resolveRequest;
+  const fetcher = () => new Promise((resolve) => {
+    resolveRequest = resolve;
+  });
+  const { client, states, statuses } = harness(fetcher, {
+    projectId: () => currentProject,
+  });
+
+  const pendingRefresh = client.refresh();
+  currentProject = "";
+  await client.refresh();
+  resolveRequest(response({ updated_at: "stale" }));
+  await pendingRefresh;
+
+  assert.deepEqual(states, []);
+  assert.equal(statuses.at(-1).message, "Enter a project ID to load live state.");
+});
+
+test("an action invalidates an older refresh response", async () => {
+  let resolveRefresh;
+  let resolveAction;
+  const fetcher = (url) => new Promise((resolve) => {
+    if (url.endsWith("/dashboard")) resolveRefresh = resolve;
+    else resolveAction = resolve;
+  });
+  const { client, states, statuses } = harness(fetcher);
+
+  const pendingRefresh = client.refresh();
+  const action = client.runAction({ action: "approve" });
+  resolveAction(response({ action: { status: "succeeded" }, state: { version: 2 } }));
+  await action;
+  resolveRefresh(response({ updated_at: "stale" }));
+  await pendingRefresh;
+
+  assert.deepEqual(states, [{ version: 2 }]);
+  assert.equal(statuses.at(-1).kind, "success");
+});
+
+test("storage errors still clear action busy state", async () => {
+  const { client, busy, statuses } = harness(
+    async () => response({ action: { status: "succeeded" } }),
+    { saveApiKey: () => { throw new Error("storage unavailable"); } },
+  );
+
+  await client.runAction({ action: "approve" });
+
+  assert.deepEqual(busy, [true, false]);
+  assert.equal(statuses.at(-1).kind, "failure");
+  assert.match(statuses.at(-1).message, /storage unavailable/);
 });

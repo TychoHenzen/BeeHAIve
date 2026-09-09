@@ -139,14 +139,21 @@ query($owner: String!, $number: Int!, $cursor: String) {
               number
               title
               repository { nameWithOwner }
-              labels(first: 100) { nodes { name } }
+              labels(first: 100) {
+                nodes { name }
+                pageInfo { hasNextPage endCursor }
+              }
               subIssues(first: 100) {
                 nodes {
                   number
                   title
                   state
-                  labels(first: 20) { nodes { name } }
+                  labels(first: 100) {
+                    nodes { name }
+                    pageInfo { hasNextPage endCursor }
+                  }
                 }
+                pageInfo { hasNextPage endCursor }
               }
               comments(first: 50) {
                 nodes {
@@ -155,6 +162,7 @@ query($owner: String!, $number: Int!, $cursor: String) {
                   createdAt
                   url
                 }
+                pageInfo { hasNextPage endCursor }
               }
               closedByPullRequestsReferences(includeClosedPrs: true, first: 100) {
                 nodes {
@@ -168,6 +176,7 @@ query($owner: String!, $number: Int!, $cursor: String) {
                         ... on Team { name }
                       }
                     }
+                    pageInfo { hasNextPage endCursor }
                   }
                   latestReviews(first: 100) {
                     nodes {
@@ -177,8 +186,10 @@ query($owner: String!, $number: Int!, $cursor: String) {
                       submittedAt
                       url
                     }
+                    pageInfo { hasNextPage endCursor }
                   }
                 }
+                pageInfo { hasNextPage endCursor }
               }
             }
           }
@@ -190,6 +201,135 @@ query($owner: String!, $number: Int!, $cursor: String) {
               }
             }
           }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+
+ISSUE_LABELS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      labels(first: 100, after: $cursor) {
+        nodes { name }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+
+ISSUE_SUB_ISSUES_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      subIssues(first: 100, after: $cursor) {
+        nodes {
+          number
+          title
+          state
+          labels(first: 100) {
+            nodes { name }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+
+ISSUE_COMMENTS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      comments(first: 50, after: $cursor) {
+        nodes {
+          author { ... on User { login } ... on Bot { login } }
+          body
+          createdAt
+          url
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+
+ISSUE_PULL_REQUESTS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      closedByPullRequestsReferences(
+        includeClosedPrs: true
+        first: 100
+        after: $cursor
+      ) {
+        nodes {
+          number
+          url
+          reviewDecision
+          reviewRequests(first: 100) {
+            nodes {
+              requestedReviewer {
+                ... on User { login }
+                ... on Team { name }
+              }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+          latestReviews(first: 100) {
+            nodes {
+              author { ... on User { login } ... on Bot { login } }
+              state
+              body
+              submittedAt
+              url
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+
+PULL_REQUEST_REVIEW_REQUESTS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewRequests(first: 100, after: $cursor) {
+        nodes {
+          requestedReviewer {
+            ... on User { login }
+            ... on Team { name }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+
+PULL_REQUEST_LATEST_REVIEWS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      latestReviews(first: 100, after: $cursor) {
+        nodes {
+          author { ... on User { login } ... on Bot { login } }
+          state
+          body
+          submittedAt
+          url
         }
         pageInfo { hasNextPage endCursor }
       }
@@ -285,6 +425,37 @@ def _next_cursor(connection: Mapping[str, Any]) -> tuple[bool, str | None]:
     if has_next and not isinstance(cursor, str):
         raise ProviderError("GitHub GraphQL page did not include an end cursor")
     return has_next, cursor if isinstance(cursor, str) else None
+
+
+def _connection_at(data: Mapping[str, Any], path: tuple[str, ...]) -> Mapping[str, Any]:
+    value: object = data
+    for key in path:
+        value = _mapping(value).get(key)
+    return _mapping(value)
+
+
+def _complete_connection(
+    client: GraphQLClient,
+    initial: object,
+    query: str,
+    variables: Mapping[str, object],
+    response_path: tuple[str, ...],
+) -> dict[str, Any]:
+    connection = _mapping(initial)
+    nodes = list(_nodes(connection))
+    has_next, cursor = _next_cursor(connection)
+    while has_next:
+        page_data = client.execute(
+            query,
+            {**variables, "cursor": cursor},
+        )
+        page = _connection_at(page_data, response_path)
+        nodes.extend(_nodes(page))
+        has_next, cursor = _next_cursor(page)
+    completed = dict(connection)
+    completed["nodes"] = nodes
+    completed["pageInfo"] = {"hasNextPage": False, "endCursor": None}
+    return completed
 
 
 def _stage_from_status(status: str | None) -> Stage | None:
@@ -456,10 +627,13 @@ def _dashboard_metadata(issue: Mapping[str, Any]) -> dict[str, object]:
         if label.lower().startswith("escalation/") and "/" in label
     ]
     if bounce_count or escalation_log:
-        metadata["escalation"] = {
+        escalation: dict[str, object] = {
             "current": bounce_count,
             "consecutive": bounce_count,
         }
+        if escalation_log:
+            escalation["current_tier"] = escalation_log[-1]["tier"]
+        metadata["escalation"] = escalation
         metadata["escalation_log"] = escalation_log
 
     return metadata
@@ -541,6 +715,94 @@ class GitHubProjectProvider:
         self.owner_type = owner_type
         self.project_id = f"{owner}:{project_number}"
         self._client = client or UrllibGraphQLClient(token, endpoint)
+
+    def _complete_issue_metadata(self, issue: Mapping[str, Any]) -> Mapping[str, Any]:
+        repository_name = _mapping(issue.get("repository")).get("nameWithOwner")
+        issue_number = issue.get("number")
+        if not isinstance(repository_name, str) or not isinstance(issue_number, int):
+            return issue
+        repository_owner, repository = self._repository_parts(repository_name)
+        variables = {
+            "owner": repository_owner,
+            "name": repository,
+            "number": issue_number,
+        }
+        completed_issue = dict(issue)
+        completed_issue["labels"] = _complete_connection(
+            self._client,
+            issue.get("labels", {}),
+            ISSUE_LABELS_QUERY,
+            variables,
+            ("repository", "issue", "labels"),
+        )
+        subissues = _complete_connection(
+            self._client,
+            issue.get("subIssues", {}),
+            ISSUE_SUB_ISSUES_QUERY,
+            variables,
+            ("repository", "issue", "subIssues"),
+        )
+        completed_subissues: list[dict[str, Any]] = []
+        for raw_subissue in _nodes(subissues):
+            subissue = dict(raw_subissue)
+            subissue_number = subissue.get("number")
+            if isinstance(subissue_number, int):
+                subissue["labels"] = _complete_connection(
+                    self._client,
+                    subissue.get("labels", {}),
+                    ISSUE_LABELS_QUERY,
+                    {
+                        "owner": repository_owner,
+                        "name": repository,
+                        "number": subissue_number,
+                    },
+                    ("repository", "issue", "labels"),
+                )
+            completed_subissues.append(subissue)
+        subissues["nodes"] = completed_subissues
+        completed_issue["subIssues"] = subissues
+        completed_issue["comments"] = _complete_connection(
+            self._client,
+            issue.get("comments", {}),
+            ISSUE_COMMENTS_QUERY,
+            variables,
+            ("repository", "issue", "comments"),
+        )
+        pull_requests = _complete_connection(
+            self._client,
+            issue.get("closedByPullRequestsReferences", {}),
+            ISSUE_PULL_REQUESTS_QUERY,
+            variables,
+            ("repository", "issue", "closedByPullRequestsReferences"),
+        )
+        completed_pull_requests: list[dict[str, Any]] = []
+        for raw_pull_request in _nodes(pull_requests):
+            pull_request = dict(raw_pull_request)
+            pull_request_number = pull_request.get("number")
+            if isinstance(pull_request_number, int):
+                review_variables = {
+                    "owner": repository_owner,
+                    "name": repository,
+                    "number": pull_request_number,
+                }
+                pull_request["reviewRequests"] = _complete_connection(
+                    self._client,
+                    pull_request.get("reviewRequests", {}),
+                    PULL_REQUEST_REVIEW_REQUESTS_QUERY,
+                    review_variables,
+                    ("repository", "pullRequest", "reviewRequests"),
+                )
+                pull_request["latestReviews"] = _complete_connection(
+                    self._client,
+                    pull_request.get("latestReviews", {}),
+                    PULL_REQUEST_LATEST_REVIEWS_QUERY,
+                    review_variables,
+                    ("repository", "pullRequest", "latestReviews"),
+                )
+            completed_pull_requests.append(pull_request)
+        pull_requests["nodes"] = completed_pull_requests
+        completed_issue["closedByPullRequestsReferences"] = pull_requests
+        return completed_issue
 
     @classmethod
     def from_environment(cls) -> GitHubProjectProvider:
@@ -624,6 +886,7 @@ class GitHubProjectProvider:
                     or not isinstance(title, str)
                 ):
                     continue
+                content = self._complete_issue_metadata(content)
                 status = None
                 for field_value in _nodes(item.get("fieldValues", {})):
                     raw_field = field_value.get("field")
