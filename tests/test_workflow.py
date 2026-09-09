@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Barrier
 
@@ -25,8 +27,9 @@ from beehaiive.workflow import (
     WorkflowService,
     WorkflowStore,
     _checks_from_json,
+    _lease_is_expired,
 )
-from main import create_app
+from main import _production_workflow_service, create_app
 
 CONSTITUTION_PATH = Path(__file__).parents[1] / "constitution.json"
 
@@ -98,17 +101,35 @@ def _service(
     return service, store, repository
 
 
+def test_production_workflow_composition_loads_persistent_dependencies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BEEHAIIVE_WORKFLOW_DB", str(tmp_path / "production.db"))
+    monkeypatch.setenv("BEEHAIIVE_WORKFLOW_REPOSITORY", str(tmp_path))
+
+    service = _production_workflow_service()
+
+    try:
+        assert service.constitution.rules_for(WorkflowRole.WRITER)
+        assert service.worktrees.repository == tmp_path.resolve()
+    finally:
+        service.store.close()
+
+
 def test_constitution_and_check_runner_validate_evidence(tmp_path: Path) -> None:
     constitution = Constitution.load(CONSTITUTION_PATH)
     writer_rules = constitution.rules_for(WorkflowRole.WRITER)
     assert writer_rules == constitution.rules_for("writer")
     assert len(writer_rules) == 6
+    with pytest.raises(TypeError):
+        constitution.sections["project"] = ()  # type: ignore[index]
+    with pytest.raises(TypeError):
+        constitution.roles[WorkflowRole.WRITER] = ()  # type: ignore[index]
     with pytest.raises(WorkflowError, match="Unknown workflow role"):
         constitution.rules_for("unknown")
 
     passing = FixtureCheck("pass")
     empty = FixtureCheck("empty", evidence=" ")
-    mismatch = FixtureCheck("mismatch")
 
     class MismatchCheck:
         name = "mismatch"
@@ -124,7 +145,6 @@ def test_constitution_and_check_runner_validate_evidence(tmp_path: Path) -> None
     assert results[1].passed is False
     assert results[2].evidence.startswith("Check failed to run")
     assert results[3].evidence.startswith("Check failed to run")
-    del mismatch
 
     with pytest.raises(WorkflowError, match="At least one"):
         DeterministicCheckRunner([])
@@ -242,6 +262,10 @@ def test_workflow_store_rejects_corrupt_evidence_and_unknown_records(
         store.acquire_lease("", "branch", "path")
     with pytest.raises(WorkflowError, match="at most"):
         store.acquire_lease("x" * 401, "branch", "path")
+    with pytest.raises(WorkflowError, match="required"):
+        store.acquire_lease("agent", "branch", " ")
+    with pytest.raises(WorkflowError, match="at most"):
+        store.acquire_lease("agent", "branch-long", "x" * 1_001)
     with pytest.raises(WorkflowError, match="Unknown workspace lease"):
         store.release_lease("missing")
     with pytest.raises(WorkflowError, match="Unknown workspace lease"):
@@ -336,6 +360,43 @@ def test_workflow_store_rejects_corrupt_handoff_json(tmp_path: Path) -> None:
     store.close()
 
 
+def test_workflow_store_migrates_legacy_lease_liveness_columns(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "legacy-leases.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.execute(
+        """
+        CREATE TABLE workflow_leases(
+            lease_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
+            branch TEXT NOT NULL, worktree_path TEXT NOT NULL,
+            status TEXT NOT NULL, stop_reason TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO workflow_leases(
+            lease_id, agent_id, branch, worktree_path, status,
+            stop_reason, created_at, updated_at
+        ) VALUES ('legacy', 'agent', 'branch', 'path', 'active', NULL, 'now', 'now')
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    store = WorkflowStore(database)
+
+    try:
+        lease = store.get_lease("legacy")
+        assert lease is not None
+        assert lease.lease_token
+        assert lease.expires_at
+    finally:
+        store.close()
+
+
 def test_workflow_manager_and_service_report_missing_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -379,6 +440,72 @@ def test_workflow_manager_and_service_report_missing_paths(
     )
     assert clean_failure.status is HandoffStatus.BLOCKED
     service_store.close()
+    store.close()
+
+
+def test_workflow_rejects_non_topological_role_handoffs(tmp_path: Path) -> None:
+    service, store, _ = _service(tmp_path)
+    worktree = tmp_path / "role-worktree"
+    lease = service.acquire_workspace("writer", "codex/role", worktree)
+
+    with pytest.raises(WorkflowError, match="not permitted"):
+        service.handoff(
+            lease.lease_id,
+            WorkflowRole.WRITER,
+            WorkflowRole.PLANNER,
+            "sha",
+            "state",
+        )
+    assert store.latest_handoff(lease.lease_id) is None
+    service.release_workspace(lease.lease_id)
+    store.close()
+
+
+def test_handoff_updates_use_compare_and_set_status(tmp_path: Path) -> None:
+    service, store, repository = _service(tmp_path)
+    worktree = tmp_path / "cas-worktree"
+    lease = service.acquire_workspace("writer", "codex/cas", worktree)
+    commit_sha = _commit(worktree, "cas.txt", "cas\n")
+    waiting = service.handoff(
+        lease.lease_id,
+        WorkflowRole.WRITER,
+        WorkflowRole.OPERATOR,
+        commit_sha,
+        "ready",
+    )
+
+    stopped = store.update_handoff(
+        waiting.handoff_id,
+        HandoffStatus.STOPPED,
+        "operator stop",
+        expected_status=HandoffStatus.AWAITING_APPROVAL,
+    )
+    assert stopped.status is HandoffStatus.STOPPED
+    with pytest.raises(WorkflowError, match="transition conflict"):
+        store.update_handoff(
+            waiting.handoff_id,
+            HandoffStatus.ACCEPTED,
+            None,
+            expected_status=HandoffStatus.AWAITING_APPROVAL,
+        )
+    manager = service.worktrees
+    manager._cleanup_stopped_worktree(str(worktree))
+    store.release_lease(lease.lease_id, allow_stopped=True)
+    store.close()
+    assert repository.exists()
+
+
+def test_worktree_path_identity_preserves_internal_whitespace(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    store = WorkflowStore()
+    manager = GitWorktreeManager(repository, store)
+    worktree = tmp_path / "worktree  with  spaces"
+
+    lease = manager.acquire("agent", "codex/spaces", worktree)
+
+    assert lease.worktree_path == str(worktree.resolve())
+    released = manager.release(lease.lease_id)
+    assert released.status is LeaseStatus.RELEASED
     store.close()
 
 
@@ -426,6 +553,120 @@ def test_worktree_leases_prevent_concurrent_duplicate_writes(tmp_path: Path) -> 
     store.close()
 
 
+def test_expired_leases_are_fenced_renewed_and_reclaimed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(WorkflowError, match="TTL"):
+        WorkflowStore(lease_ttl_seconds=0)
+    assert _lease_is_expired(None) is True
+    assert _lease_is_expired("not-a-timestamp") is True
+    repository = _repository(tmp_path)
+    store = WorkflowStore(tmp_path / "leases.sqlite3")
+    manager = GitWorktreeManager(repository, store)
+    worktree = tmp_path / "expired-worktree"
+    lease = manager.acquire("agent", "codex/expired", worktree)
+
+    with pytest.raises(WorkflowError, match="invalid"):
+        store.renew_lease(lease.lease_id, "wrong-token")
+    renewed = store.renew_lease(lease.lease_id, lease.lease_token)
+    assert renewed.expires_at != lease.expires_at
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE workflow_leases SET expires_at = ? WHERE lease_id = ?",
+            (
+                (datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
+                lease.lease_id,
+            ),
+        )
+
+    replacement = manager.acquire("replacement", "codex/expired", worktree)
+
+    assert store.get_lease(lease.lease_id).status is LeaseStatus.STOPPED  # type: ignore[union-attr]
+    assert replacement.status is LeaseStatus.ACTIVE
+    assert replacement.lease_token != lease.lease_token
+    with pytest.raises(WorkflowError, match="Unknown workspace lease"):
+        store.require_lease_token("missing", None)
+    with pytest.raises(WorkflowError, match="Workspace lease is stopped"):
+        store.require_lease_token(lease.lease_id, lease.lease_token)
+    with pytest.raises(WorkflowError, match="Unknown workspace lease"):
+        store.ensure_release_allowed("missing")
+    with pytest.raises(WorkflowError, match="Workspace lease is stopped"):
+        store.ensure_release_allowed(lease.lease_id)
+    with pytest.raises(WorkflowError, match="Unknown workspace lease"):
+        store.renew_lease("missing", None)
+    with pytest.raises(WorkflowError, match="Workspace lease is stopped"):
+        store.renew_lease(lease.lease_id, lease.lease_token)
+    disposable = store.acquire_lease("disposable", "codex/disposable", "path")
+    original_get_lease = store.get_lease
+    monkeypatch.setattr(store, "get_lease", lambda _lease_id: None)
+    with pytest.raises(WorkflowError, match="disappeared"):
+        store.ensure_release_allowed(disposable.lease_id)
+    with pytest.raises(WorkflowError, match="disappeared"):
+        store.renew_lease(disposable.lease_id, disposable.lease_token)
+    monkeypatch.setattr(store, "get_lease", original_get_lease)
+    released = manager.release(replacement.lease_id)
+    assert released.status is LeaseStatus.RELEASED
+    store.close()
+
+
+def test_stopped_lease_cleanup_is_idempotent(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    store = WorkflowStore(tmp_path / "stopped.sqlite3")
+    manager = GitWorktreeManager(repository, store)
+    worktree = tmp_path / "stopped-worktree"
+    lease = manager.acquire("agent", "codex/stopped", worktree)
+
+    stopped = store.stop_lease(lease.lease_id, "operator stop")
+    assert stopped.status is LeaseStatus.STOPPED
+    assert store.release_lease(lease.lease_id).status is LeaseStatus.STOPPED
+    with pytest.raises(WorkflowError, match="Workspace lease is stopped"):
+        store.record_handoff(
+            lease.lease_id,
+            WorkflowRole.WRITER,
+            WorkflowRole.REVIEWER,
+            "sha",
+            "state",
+            HandoffStatus.ACCEPTED,
+            (),
+            (),
+            None,
+        )
+    released = manager.release(lease.lease_id)
+    repeated = manager.release(lease.lease_id)
+    assert store.release_lease(lease.lease_id).status is LeaseStatus.RELEASED
+
+    assert released.status is LeaseStatus.RELEASED
+    assert repeated.status is LeaseStatus.RELEASED
+    assert not worktree.exists()
+    manager._delete_reclaimed_branch("codex/missing")
+    with pytest.raises(WorkflowError, match="checked-out branch"):
+        manager._delete_reclaimed_branch("master")
+    store.close()
+
+
+def test_git_timeout_is_reported_and_failed_acquisition_releases_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = _repository(tmp_path)
+    store = WorkflowStore()
+    with pytest.raises(WorkflowError, match="Git timeout"):
+        GitWorktreeManager(repository, store, git_timeout_seconds=0)
+    manager = GitWorktreeManager(repository, store, git_timeout_seconds=0.25)
+
+    def timeout(*arguments: object, **kwargs: object) -> object:
+        assert kwargs["timeout"] == 0.25
+        raise subprocess.TimeoutExpired("git", 0.25)
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+    with pytest.raises(WorkflowError, match="timed out"):
+        manager.head(tmp_path / "missing")
+    with pytest.raises(WorkflowError, match="timed out"):
+        manager.acquire("agent", "codex/timeout", tmp_path / "timeout-worktree")
+    leases = store.get_lease("missing")
+    assert leases is None
+    store.close()
+
+
 def test_handoffs_store_checks_commits_and_approval_states(tmp_path: Path) -> None:
     approval_check = FixtureCheck("tests")
     service, store, repository = _service(tmp_path, [approval_check])
@@ -469,9 +710,11 @@ def test_handoffs_store_checks_commits_and_approval_states(tmp_path: Path) -> No
         WorkflowRole.OPERATOR,
         approval_sha,
         "needs operator",
-        approval_required=True,
+        approval_required=False,
     )
     assert waiting.status is HandoffStatus.AWAITING_APPROVAL
+    with pytest.raises(WorkflowError, match="unresolved handoff"):
+        store.release_lease(approval_lease.lease_id)
     approval_check.passed = False
     blocked_approval = service.approve_handoff(waiting.handoff_id, "operator-1")
     assert blocked_approval.status is HandoffStatus.BLOCKED
@@ -579,9 +822,58 @@ def test_clarification_stop_and_release_states(tmp_path: Path) -> None:
     store.close()
 
 
+def test_workflow_api_requires_server_configured_operator(tmp_path: Path) -> None:
+    service, store, _ = _service(tmp_path)
+    client = TestClient(
+        create_app(
+            workflow_service=service,
+            api_key="test-key",
+            workflow_actor=WorkflowRole.WRITER,
+        )
+    )
+
+    response = client.post(
+        "/workflow/handoffs/missing/approve",
+        json={"note": "caller cannot choose the actor"},
+        headers={"X-API-Key": "test-key"},
+    )
+
+    assert response.status_code == 403
+    store.close()
+
+
+def test_workflow_api_rejects_missing_or_invalid_operator_configuration(
+    tmp_path: Path,
+) -> None:
+    for actor in (None, "not-a-role"):
+        service_root = tmp_path / (actor or "missing")
+        service_root.mkdir()
+        service, store, _ = _service(service_root)
+        client = TestClient(
+            create_app(
+                workflow_service=service,
+                api_key="test-key",
+                workflow_actor=actor,
+            )
+        )
+        response = client.post(
+            "/workflow/handoffs/missing/approve",
+            json={"note": "operator decision"},
+            headers={"X-API-Key": "test-key"},
+        )
+        assert response.status_code == 503
+        store.close()
+
+
 def test_workflow_api_exposes_gates_and_operator_controls(tmp_path: Path) -> None:
     service, store, _ = _service(tmp_path)
-    client = TestClient(create_app(workflow_service=service, api_key="test-key"))
+    client = TestClient(
+        create_app(
+            workflow_service=service,
+            api_key="test-key",
+            workflow_actor="operator",
+        )
+    )
     auth = {"X-API-Key": "test-key"}
     no_auth = client.post("/workflow/model-calls", json={"lease_id": "missing"})
     assert no_auth.status_code == 401
@@ -598,8 +890,30 @@ def test_workflow_api_exposes_gates_and_operator_controls(tmp_path: Path) -> Non
     )
     assert acquired.status_code == 200
     lease_id = acquired.json()["lease_id"]
+    lease_auth = {
+        **auth,
+        "X-Workflow-Lease-Token": acquired.json()["lease_token"],
+    }
+    invalid_token = client.post(
+        "/workflow/model-calls",
+        json={"lease_id": lease_id},
+        headers=auth,
+    )
+    assert invalid_token.status_code == 409
+    renewed = client.post(f"/workflow/workspaces/{lease_id}/renew", headers=lease_auth)
+    assert renewed.status_code == 200
+    invalid_role = client.post(
+        "/workflow/handoffs",
+        json={
+            "lease_id": lease_id,
+            "source_role": "not-a-role",
+            "target_role": "operator",
+        },
+        headers=lease_auth,
+    )
+    assert invalid_role.status_code == 422
     assert client.post(
-        "/workflow/model-calls", json={"lease_id": lease_id}, headers=auth
+        "/workflow/model-calls", json={"lease_id": lease_id}, headers=lease_auth
     ).json()["allowed"]
     commit_sha = _commit(worktree, "api.txt", "api\n")
 
@@ -613,25 +927,57 @@ def test_workflow_api_exposes_gates_and_operator_controls(tmp_path: Path) -> Non
             "source_state": "ready",
             "approval_required": True,
         },
-        headers=auth,
+        headers=lease_auth,
     )
     assert waiting.status_code == 200
     handoff_id = waiting.json()["handoff_id"]
+    pending_gate = client.post(
+        "/workflow/model-calls",
+        json={"lease_id": lease_id},
+        headers=lease_auth,
+    )
+    assert pending_gate.status_code == 200
+    assert pending_gate.json()["allowed"] is False
+    assert "approval" in pending_gate.json()["required_action"].lower()
+    duplicate_waiting = client.post(
+        "/workflow/handoffs",
+        json={
+            "lease_id": lease_id,
+            "source_role": "writer",
+            "target_role": "operator",
+            "commit_sha": commit_sha,
+            "source_state": "duplicate",
+        },
+        headers=lease_auth,
+    )
+    assert duplicate_waiting.status_code == 409
+    unresolved_release = client.post(
+        f"/workflow/workspaces/{lease_id}/release", headers=lease_auth
+    )
+    assert unresolved_release.status_code == 409
+    assert worktree.exists()
     assert (
         client.get(f"/workflow/handoffs/{handoff_id}", headers=auth).status_code == 200
     )
     clarified = client.post(
         f"/workflow/handoffs/{handoff_id}/clarify",
         json={"question": "Confirm the scope"},
-        headers=auth,
+        headers=lease_auth,
     )
     answered = client.post(
         f"/workflow/handoffs/{handoff_id}/clarify/answer",
         json={"answer": "The API only"},
-        headers=auth,
+        headers=lease_auth,
     )
     assert clarified.status_code == 200
     assert answered.status_code == 200
+    blocked_gate = client.post(
+        "/workflow/model-calls",
+        json={"lease_id": lease_id},
+        headers=lease_auth,
+    )
+    assert blocked_gate.status_code == 200
+    assert blocked_gate.json()["allowed"] is False
     second_waiting = client.post(
         "/workflow/handoffs",
         json={
@@ -642,16 +988,17 @@ def test_workflow_api_exposes_gates_and_operator_controls(tmp_path: Path) -> Non
             "source_state": "ready again",
             "approval_required": True,
         },
-        headers=auth,
+        headers=lease_auth,
     )
     assert second_waiting.status_code == 200
     second_handoff_id = second_waiting.json()["handoff_id"]
     approved = client.post(
         f"/workflow/handoffs/{second_handoff_id}/approve",
-        json={"actor": "operator", "note": "go"},
-        headers=auth,
+        json={"actor": "writer", "note": "go"},
+        headers=lease_auth,
     )
     assert approved.status_code == 200
+    assert approved.json()["approval_actor"] == "operator"
     unknown = client.get("/workflow/handoffs/missing", headers=auth)
     assert unknown.status_code == 409
 
@@ -666,7 +1013,13 @@ def test_workflow_api_exposes_gates_and_operator_controls(tmp_path: Path) -> Non
         headers=auth,
     )
     release_id = release.json()["lease_id"]
-    released = client.post(f"/workflow/workspaces/{release_id}/release", headers=auth)
+    release_auth = {
+        **auth,
+        "X-Workflow-Lease-Token": release.json()["lease_token"],
+    }
+    released = client.post(
+        f"/workflow/workspaces/{release_id}/release", headers=release_auth
+    )
     assert released.status_code == 200
 
     stop_worktree = tmp_path / "api-stop"
@@ -680,12 +1033,19 @@ def test_workflow_api_exposes_gates_and_operator_controls(tmp_path: Path) -> Non
         headers=auth,
     )
     stop_id = stop.json()["lease_id"]
+    stop_auth = {
+        **auth,
+        "X-Workflow-Lease-Token": stop.json()["lease_token"],
+    }
     stopped = client.post(
         f"/workflow/workspaces/{stop_id}/stop",
         json={"reason": "operator stop"},
-        headers=auth,
+        headers=stop_auth,
     )
     assert stopped.status_code == 200
+    cleaned = client.post(f"/workflow/workspaces/{stop_id}/release", headers=stop_auth)
+    assert cleaned.status_code == 200
+    assert not stop_worktree.exists()
     missing_service = TestClient(create_app(api_key="test-key"))
     unavailable = missing_service.post(
         "/workflow/model-calls", json={"lease_id": "missing"}, headers=auth
