@@ -7,7 +7,7 @@ import sqlite3
 from collections.abc import Generator, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from threading import RLock
@@ -17,6 +17,10 @@ from uuid import uuid4
 
 class ReviewError(RuntimeError):
     """Raised when a review cycle cannot accept a state transition."""
+
+
+class ReviewAdapterError(ReviewError):
+    """Raised when a provider or reader adapter fails outside review state."""
 
 
 class ReviewConcern(StrEnum):
@@ -65,10 +69,23 @@ class ReviewReader(Protocol):
     def review(self, target: PullRequestTarget) -> ReaderExecution: ...
 
 
+class ReviewAction(StrEnum):
+    """Closed set of actions that the review authorizer may permit."""
+
+    START = "start"
+    READ = "read"
+    READER = "reader"
+    WRITER = "writer"
+    APPROVE = "approve"
+    HANDOFF = "handoff"
+
+
 class ReviewAuthorizer(Protocol):
     """Authorization policy for review actions."""
 
-    def authorize(self, pull_request_id: str, actor: str, action: str) -> bool: ...
+    def authorize(
+        self, pull_request_id: str, actor: str, action: ReviewAction | str
+    ) -> bool: ...
 
 
 class AllowListReviewAuthorizer:
@@ -84,22 +101,28 @@ class AllowListReviewAuthorizer:
         self._reader_actors = frozenset(reader_actors)
         self._writer_actors = frozenset(writer_actors)
 
-    def authorize(self, pull_request_id: str, actor: str, action: str) -> bool:
+    def authorize(
+        self, pull_request_id: str, actor: str, action: ReviewAction | str
+    ) -> bool:
         del pull_request_id
         normalized_actor = actor.strip()
         if not normalized_actor:
             return False
-        if action == "approve":
-            return normalized_actor in self._human_actors
-        if action == "reader":
-            return normalized_actor in self._reader_actors
-        if action == "writer":
-            return normalized_actor in self._writer_actors
-        if action == "handoff":
-            return normalized_actor in self._human_actors
-        return normalized_actor in (
-            self._human_actors | self._reader_actors | self._writer_actors
-        )
+        try:
+            resolved_action = ReviewAction(action)
+        except ValueError:
+            return False
+        allowed_actors = {
+            ReviewAction.START: self._writer_actors,
+            ReviewAction.READ: self._human_actors
+            | self._reader_actors
+            | self._writer_actors,
+            ReviewAction.READER: self._reader_actors,
+            ReviewAction.WRITER: self._writer_actors,
+            ReviewAction.APPROVE: self._human_actors,
+            ReviewAction.HANDOFF: self._human_actors,
+        }
+        return normalized_actor in allowed_actors[resolved_action]
 
 
 class ReaderStatus(StrEnum):
@@ -131,12 +154,30 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _claim_is_active(expires_at: str | None) -> bool:
+    if not expires_at:
+        return False
+    try:
+        return datetime.fromisoformat(expires_at) > datetime.now(UTC)
+    except ValueError:
+        return False
+
+
 def _required(value: str, label: str, limit: int = 200) -> str:
     normalized = " ".join(value.split())
     if not normalized:
         raise ReviewError(f"{label} is required")
     if len(normalized) > limit:
         raise ReviewError(f"{label} must be at most {limit} characters")
+    return normalized
+
+
+def _head_sha(value: str, label: str = "head SHA") -> str:
+    normalized = _required(value, label)
+    if normalized != value or any(
+        not (character.isalnum() or character in "._/-") for character in normalized
+    ):
+        raise ReviewError(f"{label} has an invalid format")
     return normalized
 
 
@@ -171,6 +212,9 @@ class ReviewCycle:
     required_action: str | None
     created_at: str
     updated_at: str
+    approval_actor: str | None = None
+    approval_reason: str | None = None
+    approval_at: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -183,6 +227,9 @@ class ReviewCycle:
             "required_action": self.required_action,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "approval_actor": self.approval_actor,
+            "approval_reason": self.approval_reason,
+            "approval_at": self.approval_at,
         }
 
 
@@ -260,6 +307,9 @@ class MergeHandoff:
     cycle_id: str
     head_sha: str
     approved_by_human: bool
+    approval_actor: str | None = None
+    approval_reason: str | None = None
+    approval_at: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -267,6 +317,9 @@ class MergeHandoff:
             "cycle_id": self.cycle_id,
             "head_sha": self.head_sha,
             "approved_by_human": self.approved_by_human,
+            "approval_actor": self.approval_actor,
+            "approval_reason": self.approval_reason,
+            "approval_at": self.approval_at,
             "status": "merge_handoff",
         }
 
@@ -313,6 +366,9 @@ class ReviewStore:
                     status TEXT NOT NULL,
                     human_approval INTEGER NOT NULL DEFAULT 0,
                     required_action TEXT,
+                    approval_actor TEXT,
+                    approval_reason TEXT,
+                    approval_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE(pull_request_id, cycle_number)
@@ -324,6 +380,8 @@ class ReviewStore:
                     finding_ids_json TEXT NOT NULL,
                     reader TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
+                    claim_token TEXT,
+                    claim_expires_at TEXT,
                     PRIMARY KEY(cycle_id, concern),
                     FOREIGN KEY(cycle_id) REFERENCES review_cycles(cycle_id)
                 );
@@ -345,6 +403,28 @@ class ReviewStore:
                     ON review_findings(pull_request_id, created_at);
                 """
             )
+            cycle_columns = {
+                str(row["name"])
+                for row in self._connection.execute(
+                    "PRAGMA table_info(review_cycles)"
+                ).fetchall()
+            }
+            for column in ("approval_actor", "approval_reason", "approval_at"):
+                if column not in cycle_columns:
+                    self._connection.execute(
+                        f"ALTER TABLE review_cycles ADD COLUMN {column} TEXT"
+                    )
+            reader_columns = {
+                str(row["name"])
+                for row in self._connection.execute(
+                    "PRAGMA table_info(review_readers)"
+                ).fetchall()
+            }
+            for column in ("claim_token", "claim_expires_at"):
+                if column not in reader_columns:
+                    self._connection.execute(
+                        f"ALTER TABLE review_readers ADD COLUMN {column} TEXT"
+                    )
 
     def _cycle_from_row(self, row: sqlite3.Row) -> ReviewCycle:
         return ReviewCycle(
@@ -357,6 +437,9 @@ class ReviewStore:
             required_action=row["required_action"],
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
+            approval_actor=row["approval_actor"],
+            approval_reason=row["approval_reason"],
+            approval_at=row["approval_at"],
         )
 
     def _reader_from_row(self, row: sqlite3.Row) -> ReaderResult:
@@ -401,6 +484,57 @@ class ReviewStore:
             """,
             (pull_request_id,),
         ).fetchone()
+
+    def current_cycle_id(self, pull_request_id: str) -> str | None:
+        with self._lock:
+            row = self.current_cycle_row(self._connection, pull_request_id)
+        return None if row is None else str(row["cycle_id"])
+
+    def claim_reader(self, cycle_id: str, concern: ReviewConcern) -> str | None:
+        with self.transaction() as connection:
+            cycle = self.cycle_row(connection, cycle_id)
+            if cycle is None:
+                raise ReviewError(f"Unknown review cycle: {cycle_id}")
+            current = self.current_cycle_row(connection, str(cycle["pull_request_id"]))
+            if current is None or str(current["cycle_id"]) != cycle_id:
+                raise ReviewError("Reader result belongs to a stale review cycle")
+            if ReviewCycleStatus(str(cycle["status"])) in {
+                ReviewCycleStatus.SUPERSEDED,
+                ReviewCycleStatus.HUMAN_APPROVED,
+            }:
+                raise ReviewError("Review cycle is no longer accepting reader results")
+            reader = connection.execute(
+                """
+                SELECT status, claim_token, claim_expires_at
+                FROM review_readers
+                WHERE cycle_id = ? AND concern = ?
+                """,
+                (cycle_id, concern.value),
+            ).fetchone()
+            if reader is None:
+                raise ReviewError(f"No reader is configured for {concern.value}")
+            if ReaderStatus(str(reader["status"])) is not ReaderStatus.PENDING:
+                return None
+            if _claim_is_active(reader["claim_expires_at"]):
+                return None
+            claim_token = str(uuid4())
+            claim_expires_at = (datetime.now(UTC) + timedelta(seconds=60)).isoformat()
+            connection.execute(
+                """
+                UPDATE review_readers
+                SET claim_token = ?, claim_expires_at = ?, updated_at = ?
+                WHERE cycle_id = ? AND concern = ? AND status = ?
+                """,
+                (
+                    claim_token,
+                    claim_expires_at,
+                    _now(),
+                    cycle_id,
+                    concern.value,
+                    ReaderStatus.PENDING.value,
+                ),
+            )
+            return claim_token
 
     def _readers(
         self, connection: sqlite3.Connection, cycle_id: str
@@ -486,9 +620,12 @@ class ReviewService:
         self.readers = dict(readers or {})
         self.authorizer = authorizer or AllowListReviewAuthorizer()
 
-    def authorize(self, pull_request_id: str, actor: str, action: str) -> None:
+    def authorize(
+        self, pull_request_id: str, actor: str, action: ReviewAction | str
+    ) -> None:
         pull_request_id = _required(pull_request_id, "pull request id")
         actor = _required(actor, "review actor", 100)
+        action = _enum(action, ReviewAction, "review action")
         if not self.authorizer.authorize(pull_request_id, actor, action):
             raise ReviewError("Review actor is not authorized for this action")
 
@@ -498,15 +635,29 @@ class ReviewService:
     def pull_request_id_for_finding(self, finding_id: str) -> str:
         return self.store.pull_request_id_for_finding(finding_id)
 
-    def run_ready_review(self, pull_request_id: str) -> ReviewSnapshot:
-        pull_request_id = _required(pull_request_id, "pull request id")
+    def _validated_provider_target(self, pull_request_id: str) -> PullRequestTarget:
         if self.provider is None:
             raise ReviewError("A pull-request provider is required for ready reviews")
-        target = self.provider.get_pull_request(pull_request_id)
+        try:
+            target = self.provider.get_pull_request(pull_request_id)
+        except ReviewError:
+            raise
+        except Exception as exc:
+            raise ReviewAdapterError("Pull-request provider failed") from exc
         if target.pull_request_id != pull_request_id:
             raise ReviewError("Pull-request provider returned the wrong pull request")
         if not target.ready:
             raise ReviewError("Pull request is not ready for review")
+        return PullRequestTarget(
+            target.pull_request_id,
+            _head_sha(target.head_sha, "Provider head SHA"),
+            target.ready,
+        )
+
+    def run_ready_review(self, pull_request_id: str) -> ReviewSnapshot:
+        pull_request_id = _required(pull_request_id, "pull request id")
+        expected_cycle_id = self.store.current_cycle_id(pull_request_id)
+        target = self._validated_provider_target(pull_request_id)
         missing = [
             concern.value
             for concern in REQUIRED_CONCERNS
@@ -514,7 +665,9 @@ class ReviewService:
         ]
         if missing:
             raise ReviewError(f"No reader is configured for {', '.join(missing)}")
-        cycle = self._start_cycle(pull_request_id, target.head_sha)
+        cycle = self._start_cycle(
+            pull_request_id, target.head_sha, expected_cycle_id=expected_cycle_id
+        )
         for concern in REQUIRED_CONCERNS:
             reader = self.readers[concern]
             current_reader = next(
@@ -522,34 +675,58 @@ class ReviewService:
             )
             if current_reader.status is not ReaderStatus.PENDING:
                 continue
-            execution = reader.review(target)
+            claim_token = self.store.claim_reader(cycle.cycle.cycle_id, concern)
+            if claim_token is None:
+                continue
+            try:
+                execution = reader.review(target)
+            except Exception as exc:
+                execution = ReaderExecution(
+                    ReaderStatus.FAIL,
+                    (f"{concern.value} reader failed: {exc}",),
+                )
             cycle = self.record_reader(
                 cycle.cycle.cycle_id,
                 concern,
                 execution.status,
                 execution.findings,
                 reader=concern.value,
+                claim_token=claim_token,
             )
         return cycle
 
     def start_cycle(self, pull_request_id: str, head_sha: str) -> ReviewSnapshot:
         pull_request_id = _required(pull_request_id, "pull request id")
-        head_sha = _required(head_sha, "head SHA")
+        head_sha = _head_sha(head_sha)
+        expected_cycle_id = self.store.current_cycle_id(pull_request_id)
         if self.provider is not None:
-            target = self.provider.get_pull_request(pull_request_id)
-            if target.pull_request_id != pull_request_id:
-                raise ReviewError(
-                    "Pull-request provider returned the wrong pull request"
-                )
-            if not target.ready:
-                raise ReviewError("Pull request is not ready for review")
+            target = self._validated_provider_target(pull_request_id)
             if target.head_sha != head_sha:
                 raise ReviewError("Review head does not match the current pull request")
-        return self._start_cycle(pull_request_id, head_sha)
+        return self._start_cycle(
+            pull_request_id, head_sha, expected_cycle_id=expected_cycle_id
+        )
 
-    def _start_cycle(self, pull_request_id: str, head_sha: str) -> ReviewSnapshot:
+    def _start_cycle(
+        self,
+        pull_request_id: str,
+        head_sha: str,
+        *,
+        expected_cycle_id: str | None,
+    ) -> ReviewSnapshot:
         with self.store.transaction() as connection:
             current = self.store.current_cycle_row(connection, pull_request_id)
+            current_cycle_id = None if current is None else str(current["cycle_id"])
+            if current_cycle_id != expected_cycle_id:
+                if (
+                    current is not None
+                    and str(current["head_sha"]) == head_sha
+                    and ReviewCycleStatus(str(current["status"]))
+                    is not ReviewCycleStatus.FAILED
+                ):
+                    assert current_cycle_id is not None
+                    return self.store.snapshot(current_cycle_id)
+                raise ReviewError("Review cycle changed while starting a new cycle")
             if current is not None:
                 current_status = ReviewCycleStatus(str(current["status"]))
                 if (
@@ -617,6 +794,7 @@ class ReviewService:
         status: ReaderStatus | str,
         findings: Iterable[str] = (),
         reader: str = "automated",
+        claim_token: str | None = None,
     ) -> ReviewSnapshot:
         concern = _enum(concern, ReviewConcern, "review concern")
         status = _enum(status, ReaderStatus, "reader status")
@@ -650,6 +828,11 @@ class ReviewService:
                 raise ReviewError(f"No reader is configured for {concern.value}")
             if ReaderStatus(str(existing["status"])) is not ReaderStatus.PENDING:
                 raise ReviewError(f"Reader result already recorded for {concern.value}")
+            if claim_token is not None and (
+                existing["claim_token"] != claim_token
+                or not _claim_is_active(existing["claim_expires_at"])
+            ):
+                raise ReviewError("Reader claim is no longer valid")
             finding_ids: list[str] = []
             timestamp = _now()
             for summary in summaries:
@@ -676,7 +859,8 @@ class ReviewService:
             connection.execute(
                 """
                 UPDATE review_readers
-                SET status = ?, finding_ids_json = ?, reader = ?, updated_at = ?
+                SET status = ?, finding_ids_json = ?, reader = ?, updated_at = ?,
+                    claim_token = NULL, claim_expires_at = NULL
                 WHERE cycle_id = ? AND concern = ?
                 """,
                 (
@@ -791,7 +975,10 @@ class ReviewService:
             cycle_id = str(current["cycle_id"])
         return self.store.snapshot(cycle_id)
 
-    def approve_for_merge(self, cycle_id: str, reason: str) -> ReviewSnapshot:
+    def approve_for_merge(
+        self, cycle_id: str, reason: str, actor: str = "operator"
+    ) -> ReviewSnapshot:
+        actor = _required(actor, "approval actor", 100)
         reason = _required(reason, "approval reason", 1_000)
         with self.store.transaction() as connection:
             cycle = self.store.cycle_row(connection, cycle_id)
@@ -806,23 +993,33 @@ class ReviewService:
                 """
                 UPDATE review_cycles
                 SET status = ?, human_approval = 1, required_action = NULL,
+                    approval_actor = ?, approval_reason = ?, approval_at = ?,
                     updated_at = ?
                 WHERE cycle_id = ?
                 """,
-                (ReviewCycleStatus.HUMAN_APPROVED.value, _now(), cycle_id),
+                (
+                    ReviewCycleStatus.HUMAN_APPROVED.value,
+                    actor,
+                    reason,
+                    _now(),
+                    _now(),
+                    cycle_id,
+                ),
             )
         return self.store.snapshot(cycle_id)
 
     def merge_handoff(self, pull_request_id: str, head_sha: str) -> MergeHandoff:
         pull_request_id = _required(pull_request_id, "pull request id")
-        head_sha = _required(head_sha, "head SHA")
+        head_sha = _head_sha(head_sha)
         if self.provider is None:
             raise ReviewError("A pull-request provider is required for merge handoff")
+        if self.store.current_cycle_id(pull_request_id) is None:
+            raise ReviewError(f"No review cycle exists for {pull_request_id}")
+        target = self._validated_provider_target(pull_request_id)
         with self.store.transaction() as connection:
             current = self.store.current_cycle_row(connection, pull_request_id)
             if current is None:
                 raise ReviewError(f"No review cycle exists for {pull_request_id}")
-            target = self.provider.get_pull_request(pull_request_id)
             if (
                 target.pull_request_id != pull_request_id
                 or not target.ready
@@ -845,6 +1042,9 @@ class ReviewService:
                 snapshot.cycle.cycle_id,
                 head_sha,
                 snapshot.cycle.human_approval,
+                snapshot.cycle.approval_actor,
+                snapshot.cycle.approval_reason,
+                snapshot.cycle.approval_at,
             )
 
     def _set_failed(self, connection: sqlite3.Connection, cycle_id: str) -> None:

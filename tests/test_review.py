@@ -1,4 +1,8 @@
+import sqlite3
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 import pytest
 from fastapi.testclient import TestClient
@@ -17,6 +21,15 @@ from beehaiive.review import (
     ReviewStore,
 )
 from main import create_app
+
+
+@pytest.fixture
+def review_store() -> Iterator[ReviewStore]:
+    store = ReviewStore()
+    try:
+        yield store
+    finally:
+        store.close()
 
 
 class FixtureProvider:
@@ -46,6 +59,42 @@ class ReaderDouble:
         return ReaderExecution(self.status, self.findings)
 
 
+class BlockingReader(ReaderDouble):
+    def __init__(self, started: Event, release: Event) -> None:
+        super().__init__()
+        self.started = started
+        self.release = release
+
+    def review(self, target: PullRequestTarget) -> ReaderExecution:
+        self.calls += 1
+        self.started.set()
+        self.release.wait(timeout=2)
+        return ReaderExecution(ReaderStatus.PASS)
+
+
+class FailingReader:
+    def review(self, target: PullRequestTarget) -> ReaderExecution:
+        raise RuntimeError("reader dependency unavailable")
+
+
+class ExplodingProvider:
+    def get_pull_request(self, pull_request_id: str) -> PullRequestTarget:
+        raise RuntimeError("provider dependency unavailable")
+
+
+class LockInspectingProvider(FixtureProvider):
+    def __init__(
+        self, store: ReviewStore, targets: dict[str, PullRequestTarget]
+    ) -> None:
+        super().__init__(targets)
+        self.store = store
+        self.in_transaction_during_provider_call: bool | None = None
+
+    def get_pull_request(self, pull_request_id: str) -> PullRequestTarget:
+        self.in_transaction_during_provider_call = self.store._connection.in_transaction
+        return super().get_pull_request(pull_request_id)
+
+
 def _reader_doubles(
     status: ReaderStatus = ReaderStatus.PASS,
 ) -> dict[ReviewConcern, ReaderDouble]:
@@ -57,8 +106,10 @@ def _pass_all(service: ReviewService, cycle_id: str) -> None:
         service.record_reader(cycle_id, concern, ReaderStatus.PASS)
 
 
-def test_cycle_starts_with_four_pending_readers_and_is_idempotent() -> None:
-    store = ReviewStore()
+def test_cycle_starts_with_four_pending_readers_and_is_idempotent(
+    review_store: ReviewStore,
+) -> None:
+    store = review_store
     service = ReviewService(store)
 
     started = service.start_cycle("PR-1", "abc123")
@@ -70,37 +121,193 @@ def test_cycle_starts_with_four_pending_readers_and_is_idempotent() -> None:
     assert all(reader.status is ReaderStatus.PENDING for reader in started.readers)
     assert repeated.cycle.cycle_id == started.cycle.cycle_id
     assert repeated.merge_allowed is False
-    store.close()
+
+
+def test_review_authorization_uses_a_closed_action_policy(
+    review_store: ReviewStore,
+) -> None:
+    authorizer = AllowListReviewAuthorizer()
+    assert authorizer.authorize("PR", "reader", "unknown") is False
+
+    store = review_store
+    service = ReviewService(store)
+    with pytest.raises(ReviewError, match="Unknown review action"):
+        service.authorize("PR", "reader", "unknown")
+
+
+def test_reader_claims_are_durable_and_expire(review_store: ReviewStore) -> None:
+    store = review_store
+    service = ReviewService(store)
+    cycle = service.start_cycle("PR-CLAIM", "head-1")
+    claim = store.claim_reader(cycle.cycle.cycle_id, ReviewConcern.SECURITY)
+    assert claim is not None
+    assert store.claim_reader(cycle.cycle.cycle_id, ReviewConcern.SECURITY) is None
+    with pytest.raises(ReviewError, match="no longer valid"):
+        service.record_reader(
+            cycle.cycle.cycle_id,
+            ReviewConcern.SECURITY,
+            ReaderStatus.PASS,
+            claim_token="wrong",
+        )
+
+    with store.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE review_readers
+            SET claim_expires_at = ?
+            WHERE cycle_id = ? AND concern = ?
+            """,
+            ("not-a-timestamp", cycle.cycle.cycle_id, ReviewConcern.SECURITY.value),
+        )
+    renewed_claim = store.claim_reader(cycle.cycle.cycle_id, ReviewConcern.SECURITY)
+    assert renewed_claim is not None
+    service.record_reader(
+        cycle.cycle.cycle_id,
+        ReviewConcern.SECURITY,
+        ReaderStatus.PASS,
+        claim_token=renewed_claim,
+    )
+    assert store.claim_reader(cycle.cycle.cycle_id, ReviewConcern.SECURITY) is None
+    with pytest.raises(ReviewError, match="Unknown review cycle"):
+        store.claim_reader("missing", ReviewConcern.SECURITY)
+
+    newer_cycle = service.start_cycle("PR-CLAIM", "head-2")
+    with pytest.raises(ReviewError, match="stale review cycle"):
+        store.claim_reader(cycle.cycle.cycle_id, ReviewConcern.TEST_COVERAGE)
+    service.approve_for_merge(newer_cycle.cycle.cycle_id, "Operator approved")
+    with pytest.raises(ReviewError, match="no longer accepting"):
+        store.claim_reader(newer_cycle.cycle.cycle_id, ReviewConcern.SECURITY)
+
+
+def test_concurrent_ready_reviews_claim_each_reader_once(
+    review_store: ReviewStore,
+) -> None:
+    store = review_store
+    provider = FixtureProvider(
+        {"PR-CONCURRENT": PullRequestTarget("PR-CONCURRENT", "h1")}
+    )
+    started = Event()
+    release = Event()
+    readers = _reader_doubles()
+    readers[ReviewConcern.SECURITY] = BlockingReader(started, release)
+    first = ReviewService(store, provider=provider, readers=readers)
+    second = ReviewService(store, provider=provider, readers=readers)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(first.run_ready_review, "PR-CONCURRENT")
+        assert started.wait(timeout=2)
+        second_future = executor.submit(second.run_ready_review, "PR-CONCURRENT")
+        second_result = second_future.result(timeout=2)
+        release.set()
+        first_result = first_future.result(timeout=2)
+
+    assert first_result.cycle.status is ReviewCycleStatus.PASSED
+    assert second_result.cycle.status is ReviewCycleStatus.ACTIVE
+    security = next(
+        reader
+        for reader in second_result.readers
+        if reader.concern is ReviewConcern.SECURITY
+    )
+    assert security.status is ReaderStatus.PENDING
+    assert all(reader.calls == 1 for reader in readers.values())
+
+
+def test_reader_failures_are_persisted_as_failed_results(
+    review_store: ReviewStore,
+) -> None:
+    store = review_store
+    provider = FixtureProvider(
+        {"PR-READER-FAIL": PullRequestTarget("PR-READER-FAIL", "h1")}
+    )
+    readers = _reader_doubles()
+    readers[ReviewConcern.SECURITY] = FailingReader()
+    service = ReviewService(store, provider=provider, readers=readers)
+
+    result = service.run_ready_review("PR-READER-FAIL")
+
+    security = next(
+        reader for reader in result.readers if reader.concern is ReviewConcern.SECURITY
+    )
+    assert result.cycle.status is ReviewCycleStatus.FAILED
+    assert security.status is ReaderStatus.FAIL
+    assert "reader failed" in result.findings[0].summary
+
+
+def test_ready_review_rejects_malformed_provider_head_before_persistence(
+    review_store: ReviewStore,
+) -> None:
+    store = review_store
+    provider = FixtureProvider({"PR-BAD-HEAD": PullRequestTarget("PR-BAD-HEAD", " ")})
+    service = ReviewService(store, provider=provider, readers=_reader_doubles())
+
+    with pytest.raises(ReviewError, match="Provider head SHA"):
+        service.run_ready_review("PR-BAD-HEAD")
+    with pytest.raises(ReviewError, match="No review cycle"):
+        service.snapshot("PR-BAD-HEAD")
+
+
+def test_stale_review_start_cannot_replace_a_newer_cycle(
+    review_store: ReviewStore,
+) -> None:
+    store = review_store
+    service = ReviewService(store)
+    initial = service.start_cycle("PR-CAS", "head-0")
+    newer = service._start_cycle(
+        "PR-CAS", "head-2", expected_cycle_id=initial.cycle.cycle_id
+    )
+
+    with pytest.raises(ReviewError, match="changed while starting"):
+        service._start_cycle(
+            "PR-CAS", "head-1", expected_cycle_id=initial.cycle.cycle_id
+        )
+    assert service.snapshot("PR-CAS").cycle.cycle_id == newer.cycle.cycle_id
+
+
+def test_stale_same_head_start_returns_the_current_cycle(
+    review_store: ReviewStore,
+) -> None:
+    service = ReviewService(review_store)
+    initial = service._start_cycle("PR-SAME", "head-1", expected_cycle_id=None)
+
+    repeated = service._start_cycle("PR-SAME", "head-1", expected_cycle_id=None)
+
+    assert repeated.cycle.cycle_id == initial.cycle.cycle_id
 
 
 def test_all_specialized_readers_pass_and_persist_for_merge(tmp_path: Path) -> None:
     database = tmp_path / "reviews.sqlite3"
     provider = FixtureProvider({"PR-2": PullRequestTarget("PR-2", "head-1")})
     first_store = ReviewStore(database)
-    first_service = ReviewService(first_store, provider=provider)
-    cycle = first_service.start_cycle("PR-2", "head-1")
-    _pass_all(first_service, cycle.cycle.cycle_id)
+    try:
+        first_service = ReviewService(first_store, provider=provider)
+        cycle = first_service.start_cycle("PR-2", "head-1")
+        _pass_all(first_service, cycle.cycle.cycle_id)
 
-    passed = first_service.snapshot("PR-2")
-    provider.targets["PR-2"] = PullRequestTarget("PR-2", "head-2")
-    with pytest.raises(ReviewError, match="no current review authorization"):
-        first_service.merge_handoff("PR-2", "head-1")
-    provider.targets["PR-2"] = PullRequestTarget("PR-2", "head-1")
-    handoff = first_service.merge_handoff("PR-2", "head-1")
-    first_store.close()
+        passed = first_service.snapshot("PR-2")
+        provider.targets["PR-2"] = PullRequestTarget("PR-2", "head-2")
+        with pytest.raises(ReviewError, match="no current review authorization"):
+            first_service.merge_handoff("PR-2", "head-1")
+        provider.targets["PR-2"] = PullRequestTarget("PR-2", "head-1")
+        handoff = first_service.merge_handoff("PR-2", "head-1")
+    finally:
+        first_store.close()
 
     second_store = ReviewStore(database)
-    resumed = ReviewService(second_store).snapshot("PR-2")
-    assert passed.cycle.status is ReviewCycleStatus.PASSED
-    assert passed.merge_allowed is True
-    assert handoff.approved_by_human is False
-    assert resumed.cycle.cycle_id == cycle.cycle.cycle_id
-    assert all(reader.status is ReaderStatus.PASS for reader in resumed.readers)
-    second_store.close()
+    try:
+        resumed = ReviewService(second_store).snapshot("PR-2")
+        assert passed.cycle.status is ReviewCycleStatus.PASSED
+        assert passed.merge_allowed is True
+        assert handoff.approved_by_human is False
+        assert resumed.cycle.cycle_id == cycle.cycle.cycle_id
+        assert all(reader.status is ReaderStatus.PASS for reader in resumed.readers)
+    finally:
+        second_store.close()
 
 
-def test_failed_finding_reaches_writer_and_new_cycle_can_pass() -> None:
-    store = ReviewStore()
+def test_failed_finding_reaches_writer_and_new_cycle_can_pass(
+    review_store: ReviewStore,
+) -> None:
+    store = review_store
     provider = FixtureProvider({"PR-3": PullRequestTarget("PR-3", "head-1")})
     service = ReviewService(store, provider=provider)
     first = service.start_cycle("PR-3", "head-1")
@@ -135,11 +342,10 @@ def test_failed_finding_reaches_writer_and_new_cycle_can_pass() -> None:
     )
     _pass_all(service, second.cycle.cycle_id)
     assert service.merge_handoff("PR-3", "head-1").cycle_id == second.cycle.cycle_id
-    store.close()
 
 
-def test_stale_results_cannot_authorize_a_new_head() -> None:
-    store = ReviewStore()
+def test_stale_results_cannot_authorize_a_new_head(review_store: ReviewStore) -> None:
+    store = review_store
     provider = FixtureProvider({"PR-4": PullRequestTarget("PR-4", "head-1")})
     service = ReviewService(store, provider=provider)
     first = service.start_cycle("PR-4", "head-1")
@@ -164,11 +370,10 @@ def test_stale_results_cannot_authorize_a_new_head() -> None:
     handoff = service.merge_handoff("PR-4", "head-2")
     assert approved.cycle.status is ReviewCycleStatus.HUMAN_APPROVED
     assert handoff.approved_by_human is True
-    store.close()
 
 
-def test_changed_finding_invalidates_a_previous_pass() -> None:
-    store = ReviewStore()
+def test_changed_finding_invalidates_a_previous_pass(review_store: ReviewStore) -> None:
+    store = review_store
     provider = FixtureProvider({"PR-5": PullRequestTarget("PR-5", "head-1")})
     service = ReviewService(store, provider=provider)
     cycle = service.start_cycle("PR-5", "head-1")
@@ -192,98 +397,118 @@ def test_changed_finding_invalidates_a_previous_pass() -> None:
         cycle.cycle.cycle_id, "Accepted the residual risk"
     )
     assert approved.merge_allowed is True
-    store.close()
 
 
-def test_review_api_runs_reader_cycle_finding_and_handoff_paths() -> None:
-    store = ReviewStore()
+def test_review_api_runs_reader_cycle_finding_and_handoff_paths(
+    review_store: ReviewStore,
+) -> None:
+    store = review_store
     provider = FixtureProvider({"PR-API": PullRequestTarget("PR-API", "h1")})
-    client = TestClient(
-        create_app(review_store=store, review_provider=provider, api_key="test-key")
-    )
-    reader_auth = {"X-API-Key": "test-key", "X-Review-Actor": "reader"}
-    writer_auth = {"X-API-Key": "test-key", "X-Review-Actor": "writer"}
-    operator_auth = {"X-API-Key": "test-key", "X-Review-Actor": "operator"}
+
+    def client_for(actor: str) -> TestClient:
+        return TestClient(
+            create_app(
+                review_store=store,
+                review_provider=provider,
+                api_key="test-key",
+                review_actor=actor,
+            )
+        )
+
+    reader_client = client_for("reader")
+    writer_client = client_for("writer")
+    operator_client = client_for("operator")
+    api_headers = {"X-API-Key": "test-key"}
 
     assert (
-        client.post(
+        writer_client.post(
             "/reviews/cycles",
             json={"pull_request_id": "PR-API", "head_sha": "h1"},
-            headers=writer_auth,
+            headers=api_headers,
         ).status_code
         == 200
     )
-    unauthorized = client.get("/reviews/pull-requests/PR-API")
+    unauthorized = reader_client.get("/reviews/pull-requests/PR-API")
     assert unauthorized.status_code == 401
-    missing_actor = client.get(
-        "/reviews/pull-requests/PR-API", headers={"X-API-Key": "test-key"}
-    )
-    assert missing_actor.status_code == 401
-    started = client.get("/reviews/pull-requests/PR-API", headers=reader_auth)
+    started = reader_client.get("/reviews/pull-requests/PR-API", headers=api_headers)
     cycle_id = started.json()["cycle"]["cycle_id"]
+    forged_actor = reader_client.post(
+        f"/reviews/cycles/{cycle_id}/approve",
+        json={"reason": "forged"},
+        headers={**api_headers, "X-Review-Actor": "operator"},
+    )
+    assert forged_actor.status_code == 409
 
-    failed = client.post(
+    failed = reader_client.post(
         f"/reviews/cycles/{cycle_id}/readers",
         json={
             "concern": "security",
             "status": "fail",
             "findings": ["Unsafe redirect"],
         },
-        headers=reader_auth,
+        headers=api_headers,
     )
     assert failed.status_code == 200
     finding_id = failed.json()["findings"][0]["finding_id"]
     assert failed.json()["writer_feedback"][0]["finding_id"] == finding_id
-    pending = client.post(
+    pending = reader_client.post(
         f"/reviews/cycles/{cycle_id}/readers",
         json={"concern": "test_coverage", "status": "pending"},
-        headers=reader_auth,
+        headers=api_headers,
     )
     assert pending.status_code == 200
-    added = client.post(
+    assert pending.json()["readers"][1]["concern"] == "test_coverage"
+    assert pending.json()["readers"][1]["status"] == "pending"
+    added = writer_client.post(
         f"/reviews/cycles/{cycle_id}/findings",
         json={"concern": "clean_code", "summary": "Nested responsibility"},
-        headers=writer_auth,
+        headers=api_headers,
     )
     assert added.status_code == 200
-    resolved = client.post(
+    resolved = writer_client.post(
         f"/reviews/findings/{finding_id}/resolve",
         json={"resolution": "Validated redirect target"},
-        headers=writer_auth,
+        headers=api_headers,
     )
     assert resolved.status_code == 200
-    blocked = client.post(
+    blocked = operator_client.post(
         "/reviews/pull-requests/PR-API/handoff",
         json={"head_sha": "h1"},
-        headers=operator_auth,
+        headers=api_headers,
     )
     assert blocked.status_code == 409
 
-    denied_approval = client.post(
+    denied_approval = reader_client.post(
         f"/reviews/cycles/{cycle_id}/approve",
         json={"reason": "Human accepted the remaining findings"},
-        headers=reader_auth,
+        headers=api_headers,
     )
     assert denied_approval.status_code == 409
-    approved = client.post(
+    approved = operator_client.post(
         f"/reviews/cycles/{cycle_id}/approve",
         json={"reason": "Human accepted the remaining findings"},
-        headers=operator_auth,
+        headers=api_headers,
     )
-    handoff = client.post(
+    handoff = operator_client.post(
         "/reviews/pull-requests/PR-API/handoff",
         json={"head_sha": "h1"},
-        headers=operator_auth,
+        headers=api_headers,
     )
     assert approved.status_code == 200
     assert approved.json()["cycle"]["human_approval"] is True
+    assert approved.json()["cycle"]["approval_actor"] == "operator"
+    assert approved.json()["cycle"]["approval_reason"] == (
+        "Human accepted the remaining findings"
+    )
     assert handoff.status_code == 200
     assert handoff.json()["approved_by_human"] is True
-    store.close()
+    assert handoff.json()["approval_actor"] == "operator"
 
 
-def test_ready_review_runs_all_injected_readers_and_requires_all_readers() -> None:
-    store = ReviewStore()
+def test_ready_review_runs_all_injected_readers_and_requires_all_readers(
+    review_store: ReviewStore,
+) -> None:
+    store = review_store
     provider = FixtureProvider(
         {
             "PR-READY": PullRequestTarget("PR-READY", "ready-1"),
@@ -313,6 +538,8 @@ def test_ready_review_runs_all_injected_readers_and_requires_all_readers() -> No
 
     with pytest.raises(ReviewError, match="provider"):
         ReviewService(store).run_ready_review("PR-READY")
+    with pytest.raises(ReviewError, match="Unknown pull request"):
+        service.run_ready_review("PR-UNKNOWN")
     provider.targets["PR-WRONG"] = PullRequestTarget("OTHER", "wrong-1")
     with pytest.raises(ReviewError, match="wrong pull request"):
         service.run_ready_review("PR-WRONG")
@@ -330,11 +557,10 @@ def test_ready_review_runs_all_injected_readers_and_requires_all_readers() -> No
     provider.targets["PR-READY"] = PullRequestTarget("PR-READY", "ready-1", ready=False)
     with pytest.raises(ReviewError, match="not ready"):
         service.run_ready_review("PR-READY")
-    store.close()
 
 
-def test_review_ready_api_runs_reader_doubles() -> None:
-    store = ReviewStore()
+def test_review_ready_api_runs_reader_doubles(review_store: ReviewStore) -> None:
+    store = review_store
     provider = FixtureProvider(
         {"PR-READY-API": PullRequestTarget("PR-READY-API", "api-ready-1")}
     )
@@ -345,29 +571,173 @@ def test_review_ready_api_runs_reader_doubles() -> None:
             review_provider=provider,
             review_readers=readers,
             api_key="test-key",
+            review_actor="writer",
         )
     )
 
     response = client.post(
         "/reviews/ready",
         json={"pull_request_id": "PR-READY-API"},
-        headers={"X-API-Key": "test-key", "X-Review-Actor": "writer"},
+        headers={"X-API-Key": "test-key"},
     )
 
     assert response.status_code == 200
     assert response.json()["cycle"]["status"] == "passed"
     assert all(reader.calls == 1 for reader in readers.values())
-    store.close()
 
 
-def test_review_authorization_and_lookup_errors_are_explicit() -> None:
+def test_review_api_maps_provider_adapter_failures_to_dependency_errors(
+    review_store: ReviewStore,
+) -> None:
+    store = review_store
+    client = TestClient(
+        create_app(
+            review_store=store,
+            review_provider=ExplodingProvider(),
+            review_readers=_reader_doubles(),
+            api_key="test-key",
+            review_actor="writer",
+        )
+    )
+
+    response = client.post(
+        "/reviews/ready",
+        json={"pull_request_id": "PR-FAIL"},
+        headers={"X-API-Key": "test-key"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Pull-request provider failed"
+
+
+def test_review_api_requires_a_configured_server_actor(
+    review_store: ReviewStore,
+) -> None:
+    client = TestClient(create_app(review_store=review_store, api_key="test-key"))
+
+    response = client.get(
+        "/reviews/pull-requests/PR-ACTOR",
+        headers={"X-API-Key": "test-key"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Review actor is not configured"
+
+
+def test_production_app_rejects_missing_review_adapters_at_startup(
+    review_store: ReviewStore,
+) -> None:
+    store = review_store
+    with (
+        pytest.raises(RuntimeError, match="Production review adapters"),
+        TestClient(
+            create_app(
+                review_store=store,
+                require_review_adapters=True,
+            )
+        ),
+    ):
+        pass
+
+
+def test_merge_provider_io_runs_outside_the_review_write_transaction(
+    review_store: ReviewStore,
+) -> None:
+    store = review_store
+    provider = LockInspectingProvider(
+        store, {"PR-LOCK": PullRequestTarget("PR-LOCK", "h1")}
+    )
+    service = ReviewService(store, provider=provider)
+    cycle = service.start_cycle("PR-LOCK", "h1")
+    _pass_all(service, cycle.cycle.cycle_id)
+
+    handoff = service.merge_handoff("PR-LOCK", "h1")
+
+    assert handoff.cycle_id == cycle.cycle.cycle_id
+    assert provider.in_transaction_during_provider_call is False
+
+
+def test_merge_handoff_rechecks_the_cycle_after_provider_io(
+    review_store: ReviewStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = FixtureProvider({"PR-RACE": PullRequestTarget("PR-RACE", "h1")})
+    service = ReviewService(review_store, provider=provider)
+    cycle = service.start_cycle("PR-RACE", "h1")
+    _pass_all(service, cycle.cycle.cycle_id)
+
+    original_current_cycle_row = review_store.current_cycle_row
+    calls = 0
+
+    def disappearing_current_cycle(
+        connection: sqlite3.Connection, pull_request_id: str
+    ) -> sqlite3.Row | None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return original_current_cycle_row(connection, pull_request_id)
+        return None
+
+    monkeypatch.setattr(review_store, "current_cycle_row", disappearing_current_cycle)
+    with pytest.raises(ReviewError, match="No review cycle"):
+        service.merge_handoff("PR-RACE", "h1")
+
+
+def test_review_store_migrates_approval_and_reader_claim_columns(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "legacy-reviews.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE review_cycles(
+            cycle_id TEXT PRIMARY KEY, pull_request_id TEXT NOT NULL,
+            head_sha TEXT NOT NULL, cycle_number INTEGER NOT NULL,
+            status TEXT NOT NULL, human_approval INTEGER NOT NULL DEFAULT 0,
+            required_action TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            UNIQUE(pull_request_id, cycle_number)
+        );
+        CREATE TABLE review_readers(
+            cycle_id TEXT NOT NULL, concern TEXT NOT NULL, status TEXT NOT NULL,
+            finding_ids_json TEXT NOT NULL, reader TEXT NOT NULL,
+            updated_at TEXT NOT NULL, PRIMARY KEY(cycle_id, concern)
+        );
+        CREATE TABLE review_findings(
+            finding_id TEXT PRIMARY KEY, pull_request_id TEXT NOT NULL,
+            cycle_id TEXT NOT NULL, concern TEXT NOT NULL, summary TEXT NOT NULL,
+            status TEXT NOT NULL, resolution TEXT, created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+    connection.close()
+
+    store = ReviewStore(database)
+    try:
+        cycle_columns = {
+            str(row["name"])
+            for row in store._connection.execute("PRAGMA table_info(review_cycles)")
+        }
+        reader_columns = {
+            str(row["name"])
+            for row in store._connection.execute("PRAGMA table_info(review_readers)")
+        }
+        assert {"approval_actor", "approval_reason", "approval_at"} <= cycle_columns
+        assert {"claim_token", "claim_expires_at"} <= reader_columns
+    finally:
+        store.close()
+
+
+def test_review_authorization_and_lookup_errors_are_explicit(
+    review_store: ReviewStore,
+) -> None:
     authorizer = AllowListReviewAuthorizer()
     assert authorizer.authorize("PR", " ", "read") is False
     assert authorizer.authorize("PR", "reader", "reader") is True
     assert authorizer.authorize("PR", "reader", "writer") is False
     assert authorizer.authorize("PR", "writer", "handoff") is False
 
-    store = ReviewStore()
+    store = review_store
     service = ReviewService(store)
     with pytest.raises(ReviewError, match="Unknown review cycle"):
         service.pull_request_id_for_cycle("missing")
@@ -380,22 +750,24 @@ def test_review_authorization_and_lookup_errors_are_explicit() -> None:
     with pytest.raises(ReviewError, match="provider"):
         service.merge_handoff("PR-NO-PROVIDER", "head-2")
     assert cycle.cycle.pull_request_id == "PR-NO-PROVIDER"
-    store.close()
-
     provider_store = ReviewStore()
-    provider_service = ReviewService(
-        provider_store,
-        provider=FixtureProvider(
-            {"PR-MISSING": PullRequestTarget("PR-MISSING", "head-1")}
-        ),
-    )
-    with pytest.raises(ReviewError, match="No review cycle"):
-        provider_service.merge_handoff("PR-MISSING", "head-1")
-    provider_store.close()
+    try:
+        provider_service = ReviewService(
+            provider_store,
+            provider=FixtureProvider(
+                {"PR-MISSING": PullRequestTarget("PR-MISSING", "head-1")}
+            ),
+        )
+        with pytest.raises(ReviewError, match="No review cycle"):
+            provider_service.merge_handoff("PR-MISSING", "head-1")
+    finally:
+        provider_store.close()
 
 
-def test_review_rejects_invalid_or_stale_transitions() -> None:
-    store = ReviewStore()
+def test_review_rejects_invalid_or_stale_transitions(
+    review_store: ReviewStore,
+) -> None:
+    store = review_store
     service = ReviewService(store)
     cycle = service.start_cycle("PR-ERR", "head-1")
 
@@ -403,6 +775,8 @@ def test_review_rejects_invalid_or_stale_transitions() -> None:
         service.start_cycle(" ", "head-1")
     with pytest.raises(ReviewError, match="at most"):
         service.start_cycle("PR-LONG", "x" * 201)
+    with pytest.raises(ReviewError, match="invalid format"):
+        service.start_cycle("PR-INVALID", "head*1")
     with pytest.raises(ReviewError, match="Unknown review concern"):
         service.record_reader(cycle.cycle.cycle_id, "unknown", ReaderStatus.PASS)
     with pytest.raises(ReviewError, match="Unknown reader status"):
@@ -444,11 +818,12 @@ def test_review_rejects_invalid_or_stale_transitions() -> None:
         service.add_finding(
             cycle.cycle.cycle_id, ReviewConcern.TEST_COVERAGE, "finding"
         )
-    store.close()
 
 
-def test_review_reports_stale_and_missing_reader_records() -> None:
-    store = ReviewStore()
+def test_review_reports_stale_and_missing_reader_records(
+    review_store: ReviewStore,
+) -> None:
+    store = review_store
     service = ReviewService(store)
     first = service.start_cycle("PR-STALE", "head-1")
     second = service.start_cycle("PR-STALE", "head-2")
@@ -465,14 +840,17 @@ def test_review_reports_stale_and_missing_reader_records() -> None:
             second.cycle.cycle_id, ReviewConcern.SECURITY, ReaderStatus.PASS
         )
     with pytest.raises(ReviewError, match="No reader"):
+        store.claim_reader(second.cycle.cycle_id, ReviewConcern.SECURITY)
+    with pytest.raises(ReviewError, match="No reader"):
         service.add_finding(
             second.cycle.cycle_id, ReviewConcern.SECURITY, "missing reader"
         )
-    store.close()
 
 
-def test_review_store_rejects_corrupt_reader_finding_json() -> None:
-    store = ReviewStore()
+def test_review_store_rejects_corrupt_reader_finding_json(
+    review_store: ReviewStore,
+) -> None:
+    store = review_store
     service = ReviewService(store)
     cycle = service.start_cycle("PR-CORRUPT", "head-1")
     with store.transaction() as connection:
@@ -505,13 +883,13 @@ def test_review_store_rejects_corrupt_reader_finding_json() -> None:
         )
     with pytest.raises(ReviewError, match="Stored reader findings"):
         store.snapshot(cycle.cycle.cycle_id)
-    store.close()
 
 
 def test_review_store_reports_unknown_cycles_and_missing_current_cycle(
     monkeypatch: pytest.MonkeyPatch,
+    review_store: ReviewStore,
 ) -> None:
-    store = ReviewStore()
+    store = review_store
     service = ReviewService(store)
     cycle = service.start_cycle("PR-MISSING", "head-1")
     with pytest.raises(ReviewError, match="Unknown review cycle"):
@@ -528,26 +906,28 @@ def test_review_store_reports_unknown_cycles_and_missing_current_cycle(
     monkeypatch.setattr(store, "current_cycle_row", lambda _connection, _pr: None)
     with pytest.raises(ReviewError, match="No current review cycle"):
         service.resolve_finding(finding_id, "resolution")
-    store.close()
 
 
 def test_create_app_rejects_conflicting_review_store() -> None:
     service_store = ReviewStore()
     api_store = ReviewStore()
-    with pytest.raises(ValueError, match="share one review store"):
-        create_app(
-            review_service=ReviewService(service_store),
-            review_store=api_store,
-        )
-    service_store.close()
-    api_store.close()
+    try:
+        with pytest.raises(ValueError, match="share one review store"):
+            create_app(
+                review_service=ReviewService(service_store),
+                review_store=api_store,
+            )
+    finally:
+        service_store.close()
+        api_store.close()
 
 
-def test_create_app_rejects_adapters_with_existing_review_service() -> None:
-    store = ReviewStore()
+def test_create_app_rejects_adapters_with_existing_review_service(
+    review_store: ReviewStore,
+) -> None:
+    store = review_store
     with pytest.raises(ValueError, match="adapters"):
         create_app(
             review_service=ReviewService(store),
             review_provider=FixtureProvider({}),
         )
-    store.close()
