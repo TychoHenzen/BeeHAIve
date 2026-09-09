@@ -906,6 +906,12 @@ class OrchestratorStore:
             return self._run_for_id(connection, run_id) or row
 
     def fail(self, run_id: str, error: str, lease_token: str) -> RunState:
+        failed, _ = self.fail_with_transition(run_id, error, lease_token)
+        return failed
+
+    def fail_with_transition(
+        self, run_id: str, error: str, lease_token: str
+    ) -> tuple[RunState, bool]:
         if not error.strip():
             raise StoreError("A failure reason is required")
         with self._transaction() as connection:
@@ -916,7 +922,7 @@ class OrchestratorStore:
             if row.status is RunStatus.COMPLETED:
                 raise StoreError("A completed run cannot fail")
             if row.status is RunStatus.FAILED:
-                return row
+                return row, False
             connection.execute(
                 """
                 UPDATE runs
@@ -943,7 +949,7 @@ class OrchestratorStore:
                 row.stage,
                 {"error": error},
             )
-            return self._run_for_id(connection, run_id) or row
+            return self._run_for_id(connection, run_id) or row, True
 
     def stop(self, run_id: str, reason: str = "Stopped by operator") -> RunState:
         """Stop a run from an authenticated operator action."""
