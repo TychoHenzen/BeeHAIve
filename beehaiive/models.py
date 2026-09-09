@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from enum import StrEnum
 
 
@@ -23,6 +24,10 @@ class RunStatus(StrEnum):
     COMPLETED = "completed"
 
 
+def _empty_metadata() -> dict[str, object]:
+    return {}
+
+
 @dataclass(frozen=True, slots=True)
 class PbiSnapshot:
     """A PBI discovered from a project provider."""
@@ -33,6 +38,7 @@ class PbiSnapshot:
     stage: Stage | None = Stage.BACKLOG
     planning_status: str | None = None
     claimable: bool = True
+    metadata: Mapping[str, object] = field(default_factory=_empty_metadata)
 
 
 @dataclass(frozen=True, slots=True)

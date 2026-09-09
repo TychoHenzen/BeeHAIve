@@ -319,6 +319,162 @@ def test_github_api_double_drives_two_repository_queues() -> None:
     assert renewed.lease_token == api_run.lease_token
 
 
+def test_github_provider_maps_live_dashboard_metadata() -> None:
+    provider = GitHubProjectProvider(
+        "owner",
+        7,
+        "token",
+        client=FakeGraphQLClient(
+            {
+                "user": {
+                    "projectV2": {
+                        "title": "Planning",
+                        "repositories": {"nodes": [{"nameWithOwner": "owner/api"}]},
+                        "items": {
+                            "nodes": [
+                                {
+                                    "content": {
+                                        "__typename": "Issue",
+                                        "number": 1,
+                                        "title": "API one",
+                                        "repository": {"nameWithOwner": "owner/api"},
+                                        "labels": {
+                                            "nodes": [
+                                                {"name": "bounces/2"},
+                                                {"name": "escalation/terra"},
+                                            ]
+                                        },
+                                        "subIssues": {
+                                            "nodes": [
+                                                {"number": "bad", "title": "Ignored"},
+                                                {
+                                                    "number": 2,
+                                                    "title": "API child",
+                                                    "state": "OPEN",
+                                                    "labels": {
+                                                        "nodes": [
+                                                            {"name": "stage/implement"}
+                                                        ]
+                                                    },
+                                                },
+                                            ]
+                                        },
+                                        "comments": {
+                                            "nodes": [
+                                                {"body": "   "},
+                                                {
+                                                    "author": {},
+                                                    "body": "Started review",
+                                                    "createdAt": "2026-09-09T08:00:00Z",
+                                                    "url": "https://example.test/comment/1",
+                                                },
+                                            ]
+                                        },
+                                        "closedByPullRequestsReferences": {
+                                            "nodes": [
+                                                {"number": "bad"},
+                                                {
+                                                    "number": 9,
+                                                    "url": "https://example.test/pull/9",
+                                                    "reviewDecision": (
+                                                        "CHANGES_REQUESTED"
+                                                    ),
+                                                    "reviewRequests": {
+                                                        "nodes": [
+                                                            {"requestedReviewer": None},
+                                                            {"requestedReviewer": {}},
+                                                            {
+                                                                "requestedReviewer": {
+                                                                    "login": "tests"
+                                                                }
+                                                            },
+                                                        ]
+                                                    },
+                                                    "latestReviews": {
+                                                        "nodes": [
+                                                            {
+                                                                "author": None,
+                                                                "state": "COMMENTED",
+                                                            },
+                                                            {
+                                                                "author": {},
+                                                                "state": "COMMENTED",
+                                                            },
+                                                            {
+                                                                "author": {
+                                                                    "login": "bot"
+                                                                },
+                                                                "state": "COMMENTED",
+                                                            },
+                                                            {
+                                                                "author": {
+                                                                    "login": "tests"
+                                                                },
+                                                                "state": (
+                                                                    "CHANGES_REQUESTED"
+                                                                ),
+                                                                "body": (
+                                                                    "Please add a test"
+                                                                ),
+                                                            },
+                                                            {
+                                                                "author": {
+                                                                    "login": "security"
+                                                                },
+                                                                "state": "APPROVED",
+                                                                "body": "Looks good",
+                                                                "submittedAt": (
+                                                                    "2026-09-09T08:01:00Z"
+                                                                ),
+                                                                "url": "https://example.test/review/1",
+                                                            },
+                                                        ]
+                                                    },
+                                                },
+                                            ]
+                                        },
+                                    },
+                                    "fieldValues": {
+                                        "nodes": [
+                                            {
+                                                "name": "In Progress",
+                                                "field": {"name": "Status"},
+                                            }
+                                        ]
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                }
+            }
+        ),
+    )
+
+    discovered = provider.discover_project("owner:7")
+
+    metadata = discovered.repositories[0].pbis[0].metadata
+    assert metadata["subtasks"] == [
+        {
+            "id": "#2",
+            "number": 2,
+            "title": "API child",
+            "status": "open",
+            "labels": ["stage/implement"],
+        }
+    ]
+    assert metadata["readers"] == [
+        {"id": "#9:tests", "name": "tests", "pull_request": 9, "status": "fail"},
+        {"id": "#9:bot", "name": "bot", "pull_request": 9, "status": "pending"},
+        {"id": "#9:security", "name": "security", "pull_request": 9, "status": "pass"},
+    ]
+    assert metadata["reviewers"]["#9:tests"]["status"] == "fail"  # type: ignore[index]
+    assert metadata["reviewers"]["#9:security"]["status"] == "pass"  # type: ignore[index]
+    assert metadata["reviewers"]["#9:bot"]["status"] == "pending"  # type: ignore[index]
+    assert metadata["escalation"] == {"current": 2, "consecutive": 2}
+    assert metadata["activity"][0]["action"] == "Started review"  # type: ignore[index]
+
+
 def test_failure_releases_only_the_failed_repository_writer() -> None:
     provider = FakeProvider(snapshot())
     service = Orchestrator(OrchestratorStore(), provider)
@@ -383,6 +539,44 @@ def test_sync_reconciles_removed_repositories_without_deleting_history() -> None
     assert removed["active"] is False
     assert removed["pbis"][0]["title"] == "Web one"  # type: ignore[index]
     assert service.claim("project-1", "owner/web", "worker-1") is None
+
+
+def test_sync_replaces_removed_dashboard_metadata() -> None:
+    store = OrchestratorStore()
+    rich_snapshot = ProjectSnapshot(
+        project_id="project-1",
+        name="Planning",
+        repositories=(
+            RepositorySnapshot(
+                "owner/api",
+                (
+                    PbiSnapshot(
+                        "owner/api",
+                        1,
+                        "API one",
+                        metadata={"subtasks": [{"id": "child"}]},
+                    ),
+                ),
+            ),
+        ),
+    )
+    empty_snapshot = ProjectSnapshot(
+        project_id="project-1",
+        name="Planning",
+        repositories=(
+            RepositorySnapshot(
+                "owner/api",
+                (PbiSnapshot("owner/api", 1, "API one"),),
+            ),
+        ),
+    )
+
+    store.sync_project(rich_snapshot)
+    store.sync_project(empty_snapshot)
+
+    pbi = store.project_state("project-1")["repositories"][0]["pbis"][0]  # type: ignore[index]
+    assert pbi["metadata"] == {}  # type: ignore[index]
+    store.close()
 
 
 def test_sync_keeps_external_done_from_completing_a_local_run() -> None:

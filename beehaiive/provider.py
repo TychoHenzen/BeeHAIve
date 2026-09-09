@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 from collections.abc import Mapping
 from typing import Any, Protocol, cast
 from urllib.request import Request, urlopen
@@ -138,6 +139,47 @@ query($owner: String!, $number: Int!, $cursor: String) {
               number
               title
               repository { nameWithOwner }
+              labels(first: 100) { nodes { name } }
+              subIssues(first: 100) {
+                nodes {
+                  number
+                  title
+                  state
+                  labels(first: 20) { nodes { name } }
+                }
+              }
+              comments(first: 50) {
+                nodes {
+                  author { ... on User { login } ... on Bot { login } }
+                  body
+                  createdAt
+                  url
+                }
+              }
+              closedByPullRequestsReferences(includeClosedPrs: true, first: 100) {
+                nodes {
+                  number
+                  url
+                  reviewDecision
+                  reviewRequests(first: 100) {
+                    nodes {
+                      requestedReviewer {
+                        ... on User { login }
+                        ... on Team { name }
+                      }
+                    }
+                  }
+                  latestReviews(first: 100) {
+                    nodes {
+                      author { ... on User { login } ... on Bot { login } }
+                      state
+                      body
+                      submittedAt
+                      url
+                    }
+                  }
+                }
+              }
             }
           }
           fieldValues(first: 100) {
@@ -254,6 +296,173 @@ def _stage_from_status(status: str | None) -> Stage | None:
     if normalized == "in progress":
         return Stage.IMPLEMENT
     return None
+
+
+def _actor_name(value: object) -> str | None:
+    if not isinstance(value, Mapping):
+        return None
+    actor = cast(Mapping[str, Any], value)
+    for key in ("login", "name"):
+        name = actor.get(key)
+        if isinstance(name, str) and name:
+            return name
+    return None
+
+
+def _label_names(value: object) -> list[str]:
+    names: list[str] = []
+    for label in _nodes(value):
+        name = label.get("name")
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
+
+
+def _review_status(state: object) -> str:
+    normalized = str(state or "").strip().upper()
+    if normalized == "APPROVED":
+        return "pass"
+    if normalized == "CHANGES_REQUESTED":
+        return "fail"
+    return "pending"
+
+
+def _dashboard_metadata(issue: Mapping[str, Any]) -> dict[str, object]:
+    """Project issue metadata that the dashboard can show without fake state."""
+
+    metadata: dict[str, object] = {}
+    labels = _label_names(issue.get("labels", {}))
+
+    subtasks: list[dict[str, object]] = []
+    for raw_subtask in _nodes(issue.get("subIssues", {})):
+        number = raw_subtask.get("number")
+        title = raw_subtask.get("title")
+        if not isinstance(number, int) or not isinstance(title, str):
+            continue
+        subtask: dict[str, object] = {
+            "id": f"#{number}",
+            "number": number,
+            "title": title,
+        }
+        state = raw_subtask.get("state")
+        if isinstance(state, str):
+            subtask["status"] = state.lower()
+        subtask_labels = _label_names(raw_subtask.get("labels", {}))
+        if subtask_labels:
+            subtask["labels"] = subtask_labels
+        subtasks.append(subtask)
+    if subtasks:
+        metadata["subtasks"] = subtasks
+
+    readers: list[dict[str, object]] = []
+    reviewers: dict[str, dict[str, object]] = {}
+    pull_requests: list[dict[str, object]] = []
+    for raw_pull_request in _nodes(issue.get("closedByPullRequestsReferences", {})):
+        pull_request_number = raw_pull_request.get("number")
+        if not isinstance(pull_request_number, int):
+            continue
+        pull_request_readers: list[dict[str, object]] = []
+        pull_request_reviewers: dict[str, dict[str, object]] = {}
+        for raw_request in _nodes(raw_pull_request.get("reviewRequests", {})):
+            name = _actor_name(raw_request.get("requestedReviewer"))
+            if name is None:
+                continue
+            reader: dict[str, object] = {
+                "id": f"#{pull_request_number}:{name}",
+                "name": name,
+                "pull_request": pull_request_number,
+                "status": "pending",
+            }
+            pull_request_readers.append(reader)
+            readers.append(reader)
+
+        for raw_review in _nodes(raw_pull_request.get("latestReviews", {})):
+            name = _actor_name(raw_review.get("author"))
+            if name is None:
+                continue
+            status = _review_status(raw_review.get("state"))
+            reviewer: dict[str, object] = {
+                "status": status,
+                "pull_request": pull_request_number,
+            }
+            body = raw_review.get("body")
+            if isinstance(body, str) and body.strip():
+                reviewer["comment"] = body
+            submitted_at = raw_review.get("submittedAt")
+            if isinstance(submitted_at, str):
+                reviewer["submitted_at"] = submitted_at
+            reviewer_key = f"#{pull_request_number}:{name}"
+            pull_request_reviewers[reviewer_key] = reviewer
+            reviewers[reviewer_key] = reviewer
+            for reader in pull_request_readers:
+                if reader["name"] == name:
+                    reader["status"] = status
+                    break
+            else:
+                reader = {
+                    "id": reviewer_key,
+                    "name": name,
+                    "pull_request": pull_request_number,
+                    "status": status,
+                }
+                pull_request_readers.append(reader)
+                readers.append(reader)
+
+        pull_request: dict[str, object] = {
+            "number": pull_request_number,
+            "readers": pull_request_readers,
+            "reviewers": pull_request_reviewers,
+        }
+        url = raw_pull_request.get("url")
+        if isinstance(url, str):
+            pull_request["url"] = url
+        decision = raw_pull_request.get("reviewDecision")
+        if isinstance(decision, str):
+            pull_request["review_decision"] = decision.lower()
+        pull_requests.append(pull_request)
+
+    if readers:
+        metadata["readers"] = readers
+    if reviewers:
+        metadata["reviewers"] = reviewers
+    if pull_requests:
+        metadata["pull_requests"] = pull_requests
+
+    activity: list[dict[str, object]] = []
+    for comment in _nodes(issue.get("comments", {})):
+        body = comment.get("body")
+        if not isinstance(body, str) or not body.strip():
+            continue
+        entry: dict[str, object] = {
+            "agent": _actor_name(comment.get("author")) or "github",
+            "action": body,
+        }
+        for source_key, target_key in (("createdAt", "time"), ("url", "url")):
+            value = comment.get(source_key)
+            if isinstance(value, str):
+                entry[target_key] = value
+        activity.append(entry)
+    if activity:
+        metadata["activity"] = activity
+
+    bounce_count = 0
+    for label in labels:
+        match = re.fullmatch(r"bounces?/(\d+)", label.strip(), re.IGNORECASE)
+        if match:
+            bounce_count = max(bounce_count, int(match.group(1)))
+    escalation_log = [
+        {"tier": label.split("/", 1)[1], "resolved": False}
+        for label in labels
+        if label.lower().startswith("escalation/") and "/" in label
+    ]
+    if bounce_count or escalation_log:
+        metadata["escalation"] = {
+            "current": bounce_count,
+            "consecutive": bounce_count,
+        }
+        metadata["escalation_log"] = escalation_log
+
+    return metadata
 
 
 def _validate_branch_name(branch: str) -> None:
@@ -435,6 +644,7 @@ class GitHubProjectProvider:
                         stage,
                         status,
                         stage is not None,
+                        _dashboard_metadata(content),
                     )
                 )
             has_next, item_cursor = _next_cursor(item_connection)

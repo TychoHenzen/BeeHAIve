@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import RLock
+from typing import cast
 from uuid import uuid4
 
 from .models import (
@@ -33,6 +34,8 @@ _STAGE_ORDER = {
 
 DEFAULT_EVENT_LIMIT = 100
 MAX_EVENT_LIMIT = 500
+DEFAULT_ACTION_LIMIT = 50
+MAX_ACTION_LIMIT = 200
 
 
 def _now() -> str:
@@ -46,6 +49,16 @@ def _lease_is_active(expires_at: str | None) -> bool:
         return datetime.fromisoformat(expires_at) > datetime.now(UTC)
     except ValueError:
         return False
+
+
+def _json_mapping(value: object) -> dict[str, object]:
+    if not isinstance(value, str) or not value:
+        return {}
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return cast(dict[str, object], decoded) if isinstance(decoded, dict) else {}
 
 
 class OrchestratorStore:
@@ -110,6 +123,7 @@ class OrchestratorStore:
                     handoff_status TEXT,
                     planning_status TEXT,
                     claimable INTEGER NOT NULL DEFAULT 1,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
                     PRIMARY KEY (project_id, repository_name, number),
                     FOREIGN KEY (project_id, repository_name)
                         REFERENCES repositories(project_id, name) ON DELETE CASCADE
@@ -164,6 +178,24 @@ class OrchestratorStore:
                     created_at TEXT NOT NULL,
                     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS actions (
+                    action_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    repository_name TEXT,
+                    pbi_number INTEGER,
+                    run_id TEXT,
+                    request_json TEXT NOT NULL,
+                    result_json TEXT,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS actions_by_project
+                    ON actions(project_id, created_at DESC);
                 """
             )
             repository_columns = {
@@ -206,11 +238,14 @@ class OrchestratorStore:
                 "handoff_status",
                 "planning_status",
                 "claimable",
+                "metadata_json",
             ):
                 if column not in pbi_columns:
                     definition = (
                         "INTEGER NOT NULL DEFAULT 1"
                         if column == "claimable"
+                        else "TEXT NOT NULL DEFAULT '{}'"
+                        if column == "metadata_json"
                         else "TEXT"
                     )
                     self._connection.execute(
@@ -312,9 +347,10 @@ class OrchestratorStore:
                             """
                             INSERT INTO pbis(
                                 project_id, repository_name, number, title,
-                                stage, active, planning_status, claimable
+                                stage, active, planning_status, claimable,
+                                metadata_json
                             )
-                            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
                             """,
                             (
                                 snapshot.project_id,
@@ -324,6 +360,7 @@ class OrchestratorStore:
                                 (incoming_stage or Stage.BACKLOG).value,
                                 pbi.planning_status,
                                 int(incoming_stage is not None),
+                                json.dumps(dict(pbi.metadata), sort_keys=True),
                             ),
                         )
                         continue
@@ -341,6 +378,7 @@ class OrchestratorStore:
                         """
                         UPDATE pbis
                         SET title = ?, stage = ?, active = 1,
+                            metadata_json = ?,
                             planning_status = ?, claimable = ?,
                             last_error = CASE
                                 WHEN ? = ? THEN last_error
@@ -351,6 +389,7 @@ class OrchestratorStore:
                         (
                             pbi.title,
                             merged_stage.value,
+                            json.dumps(dict(pbi.metadata), sort_keys=True),
                             pbi.planning_status,
                             int(
                                 incoming_stage is not None
@@ -906,6 +945,140 @@ class OrchestratorStore:
             )
             return self._run_for_id(connection, run_id) or row
 
+    def stop(self, run_id: str, reason: str = "Stopped by operator") -> RunState:
+        """Stop a run from an authenticated operator action."""
+
+        if not reason.strip():
+            raise StoreError("A stop reason is required")
+        with self._transaction() as connection:
+            row = self._run_for_id(connection, run_id)
+            if row is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            if row.status in {RunStatus.COMPLETED, RunStatus.FAILED}:
+                return row
+            connection.execute(
+                """
+                UPDATE runs
+                SET status = 'failed', last_error = ?, lease_token = NULL,
+                    lease_expires_at = NULL, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (reason, _now(), run_id),
+            )
+            connection.execute(
+                """
+                UPDATE pbis SET last_error = ?
+                WHERE project_id = ? AND repository_name = ? AND number = ?
+                """,
+                (reason, row.project_id, row.repository, row.pbi_number),
+            )
+            self._record_event(
+                connection,
+                row.project_id,
+                row.repository,
+                row.pbi_number,
+                run_id,
+                "stopped",
+                row.stage,
+                row.stage,
+                {"reason": reason},
+            )
+            return self._run_for_id(connection, run_id) or row
+
+    def begin_action(
+        self,
+        project_id: str,
+        kind: str,
+        request: dict[str, object],
+        repository: str | None = None,
+        pbi_number: int | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, object]:
+        """Persist an operator action before its side effect starts."""
+
+        if not project_id.strip() or not kind.strip():
+            raise StoreError("An action project and kind are required")
+        action_id = str(uuid4())
+        now = _now()
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO actions(
+                    action_id, project_id, kind, status, repository_name,
+                    pbi_number, run_id, request_json, created_at, updated_at
+                ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    action_id,
+                    project_id,
+                    kind,
+                    repository,
+                    pbi_number,
+                    run_id,
+                    json.dumps(request, sort_keys=True),
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM actions WHERE action_id = ?", (action_id,)
+            ).fetchone()
+            if row is None:
+                raise StoreError(f"Could not create action: {action_id}")
+            return self._action_from_row(row)
+
+    def finish_action(
+        self,
+        action_id: str,
+        status: str,
+        result: dict[str, object] | None = None,
+        error: str | None = None,
+    ) -> dict[str, object]:
+        """Record the observable result of an operator action."""
+
+        if status not in {"succeeded", "failed"}:
+            raise StoreError(f"Invalid action status: {status}")
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                UPDATE actions
+                SET status = ?, result_json = ?, error = ?, updated_at = ?
+                WHERE action_id = ?
+                """,
+                (
+                    status,
+                    json.dumps(result, sort_keys=True) if result is not None else None,
+                    error,
+                    _now(),
+                    action_id,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM actions WHERE action_id = ?", (action_id,)
+            ).fetchone()
+            if row is None:
+                raise StoreError(f"Unknown action: {action_id}")
+            return self._action_from_row(row)
+
+    def actions_for_project(
+        self, project_id: str, limit: int = DEFAULT_ACTION_LIMIT
+    ) -> list[dict[str, object]]:
+        """Return recent pending, successful, and failed dashboard actions."""
+
+        if not 1 <= limit <= MAX_ACTION_LIMIT:
+            raise StoreError(f"action_limit must be between 1 and {MAX_ACTION_LIMIT}")
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM actions
+                WHERE project_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (project_id, limit),
+            ).fetchall()
+            return [self._action_from_row(row) for row in rows]
+
     def get_run(self, run_id: str) -> RunState | None:
         with self._lock:
             return self._run_for_id(self._connection, run_id)
@@ -999,6 +1172,8 @@ class OrchestratorStore:
                             "number": pbi_row["number"],
                             "title": pbi_row["title"],
                             "stage": pbi_row["stage"],
+                            "run_id": pbi_row["run_id"],
+                            "metadata": _json_mapping(pbi_row["metadata_json"]),
                             "status": pbi_row["status"],
                             "attempt": pbi_row["attempt"],
                             "branch": pbi_row["branch"],
@@ -1025,6 +1200,29 @@ class OrchestratorStore:
                 "event_limit": event_limit,
                 "repositories": repositories,
             }
+
+    @staticmethod
+    def _action_from_row(row: sqlite3.Row) -> dict[str, object]:
+        request = json.loads(str(row["request_json"]))
+        result = (
+            json.loads(str(row["result_json"]))
+            if row["result_json"] is not None
+            else None
+        )
+        return {
+            "id": row["action_id"],
+            "project_id": row["project_id"],
+            "kind": row["kind"],
+            "status": row["status"],
+            "repository": row["repository_name"],
+            "pbi_number": row["pbi_number"],
+            "run_id": row["run_id"],
+            "request": request,
+            "result": result,
+            "error": row["error"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
 
     def _run_for_id(
         self, connection: sqlite3.Connection, run_id: str

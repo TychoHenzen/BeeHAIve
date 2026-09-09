@@ -2,11 +2,14 @@ import os
 import secrets
 from collections.abc import Callable, Collection
 from pathlib import Path
+from typing import Literal, cast
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from beehaiive import EnvironmentGitHubProvider, Orchestrator, OrchestratorStore, Stage
+from beehaiive.dashboard import build_dashboard_state
 from beehaiive.models import RunState
 from beehaiive.provider import ProviderError
 from beehaiive.storage import (
@@ -28,6 +31,17 @@ class HandoffRequest(BaseModel):
 
 class FailureRequest(BaseModel):
     error: str
+
+
+class DashboardActionRequest(BaseModel):
+    action: Literal["start", "stop", "approve", "clarify"]
+    approved: bool = False
+    repository: str | None = None
+    pbi_number: int | None = None
+    run_id: str | None = None
+    worker_id: str | None = None
+    reason: str = ""
+    clarification: str = ""
 
 
 def create_app(
@@ -89,6 +103,27 @@ def create_app(
     async def say_hello(name: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         return {"message": f"Hello {name}"}
 
+    @app.get("/dashboard", response_class=FileResponse)
+    def dashboard() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
+        return FileResponse(
+            Path(__file__).parent / "docs" / "dashboard.html",
+            media_type="text/html",
+        )
+
+    @app.get("/dashboard.js", response_class=FileResponse)
+    def dashboard_script() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
+        return FileResponse(
+            Path(__file__).parent / "docs" / "dashboard.js",
+            media_type="application/javascript",
+        )
+
+    @app.get("/dashboard-client.mjs", response_class=FileResponse)
+    def dashboard_client_script() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
+        return FileResponse(
+            Path(__file__).parent / "docs" / "dashboard-client.mjs",
+            media_type="application/javascript",
+        )
+
     @app.post("/projects/{project_id}/sync")
     def synchronize(  # pyright: ignore[reportUnusedFunction]
         project_id: str,
@@ -108,6 +143,101 @@ def create_app(
         return _handle_store_error(
             lambda: orchestrator.store.project_state(project_id, event_limit)
         )
+
+    @app.get("/projects/{project_id}/dashboard")
+    def dashboard_state(  # pyright: ignore[reportUnusedFunction]
+        project_id: str,
+        event_limit: int = Query(
+            default=DEFAULT_EVENT_LIMIT,
+            ge=1,
+            le=MAX_EVENT_LIMIT,
+        ),
+    ) -> dict[str, object]:
+        return _handle_store_error(
+            lambda: _dashboard_state(orchestrator, project_id, event_limit)
+        )
+
+    @app.get("/projects/{project_id}/actions")
+    def dashboard_actions(  # pyright: ignore[reportUnusedFunction]
+        project_id: str,
+    ) -> dict[str, object]:
+        return _handle_store_error(
+            lambda: {"actions": orchestrator.store.actions_for_project(project_id)}
+        )
+
+    @app.post("/projects/{project_id}/actions")
+    def dashboard_action(  # pyright: ignore[reportUnusedFunction]
+        project_id: str,
+        request: DashboardActionRequest,
+        _auth: None = Depends(require_mutation_access),
+    ) -> dict[str, object]:
+        if not request.approved:
+            raise HTTPException(
+                status_code=400,
+                detail="Operator approval is required for dashboard actions",
+            )
+        if (
+            request.repository is not None
+            and request.action != "stop"
+            and not orchestrator.store.is_active_repository(
+                project_id, request.repository
+            )
+        ):
+            raise HTTPException(status_code=403, detail="Repository is not authorized")
+        if request.action == "stop":
+            if request.run_id is None:
+                raise HTTPException(
+                    status_code=400, detail="A run_id is required to stop"
+                )
+            run = orchestrator.store.get_run(request.run_id)
+            if run is None or run.project_id != project_id:
+                raise HTTPException(status_code=403, detail="Run is not authorized")
+            if request.repository is not None and run.repository != request.repository:
+                raise HTTPException(
+                    status_code=403, detail="Repository is not authorized"
+                )
+        if request.action in {"approve", "clarify"}:
+            if request.repository is None or request.pbi_number is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="A repository and pbi_number are required for this action",
+                )
+            pbi = _dashboard_pbi(
+                orchestrator, project_id, request.repository, request.pbi_number
+            )
+            if pbi is None:
+                raise HTTPException(status_code=403, detail="PBI is not authorized")
+            if request.run_id is not None and pbi.get("run_id") != request.run_id:
+                raise HTTPException(status_code=403, detail="Run is not authorized")
+        action = orchestrator.store.begin_action(
+            project_id,
+            request.action,
+            request.model_dump(exclude_none=True),
+            request.repository,
+            request.pbi_number,
+            request.run_id,
+        )
+        try:
+            result = _execute_dashboard_action(orchestrator, project_id, request)
+        except (ProviderError, StoreError) as exc:
+            failed = orchestrator.store.finish_action(
+                str(action["id"]), "failed", error=str(exc)
+            )
+            return {
+                "action": failed,
+                "result": None,
+                "state": _dashboard_state_or_none(
+                    orchestrator, project_id, DEFAULT_EVENT_LIMIT
+                ),
+            }
+        completed = orchestrator.store.finish_action(
+            str(action["id"]), "succeeded", result=result
+        )
+        return {
+            "action": completed,
+            "result": result,
+            "state": _dashboard_state(orchestrator, project_id, DEFAULT_EVENT_LIMIT),
+        }
 
     @app.post("/projects/{project_id}/repositories/{repository:path}/claim")
     def claim(  # pyright: ignore[reportUnusedFunction]
@@ -247,6 +377,83 @@ def _run_dict(run: RunState) -> dict[str, object]:
         "lease_token": run.lease_token,
         "lease_expires_at": run.lease_expires_at,
     }
+
+
+def _dashboard_state(
+    orchestrator: Orchestrator, project_id: str, event_limit: int
+) -> dict[str, object]:
+    state = orchestrator.store.project_state(project_id, event_limit)
+    actions = orchestrator.store.actions_for_project(project_id)
+    return build_dashboard_state(state, actions)
+
+
+def _dashboard_state_or_none(
+    orchestrator: Orchestrator, project_id: str, event_limit: int
+) -> dict[str, object] | None:
+    try:
+        return _dashboard_state(orchestrator, project_id, event_limit)
+    except StoreError:
+        return None
+
+
+def _dashboard_pbi(
+    orchestrator: Orchestrator,
+    project_id: str,
+    repository: str,
+    pbi_number: int,
+) -> dict[str, object] | None:
+    try:
+        state = orchestrator.store.project_state(project_id)
+    except StoreError:
+        return None
+    repositories = cast(list[dict[str, object]], state.get("repositories", []))
+    for raw_repository in repositories:
+        if raw_repository.get("name") != repository:
+            continue
+        pbis = cast(list[dict[str, object]], raw_repository.get("pbis", []))
+        for raw_pbi in pbis:
+            if raw_pbi.get("number") == pbi_number:
+                return raw_pbi
+    return None
+
+
+def _execute_dashboard_action(
+    orchestrator: Orchestrator,
+    project_id: str,
+    request: DashboardActionRequest,
+) -> dict[str, object]:
+    if request.action == "start":
+        if request.repository is None:
+            return orchestrator.synchronize(project_id)
+        run = orchestrator.claim(
+            project_id,
+            request.repository,
+            request.worker_id or "dashboard-operator",
+        )
+        if run is None:
+            raise StoreError("No claimable PBI is available for this repository")
+        return {"run": _public_run_dict(run)}
+    if request.action == "stop":
+        if request.run_id is None:
+            raise StoreError("A run_id is required to stop")
+        return {
+            "run": _public_run_dict(
+                orchestrator.stop(
+                    request.run_id, request.reason or "Stopped by operator"
+                )
+            )
+        }
+    if request.action == "clarify":
+        if not request.clarification.strip():
+            raise StoreError("A clarification message is required")
+        return {"message": request.clarification.strip()}
+    return {"approved": True}
+
+
+def _public_run_dict(run: RunState) -> dict[str, object]:
+    result = _run_dict(run)
+    result.pop("lease_token", None)
+    return result
 
 
 app = create_app()

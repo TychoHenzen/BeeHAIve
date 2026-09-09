@@ -136,3 +136,8 @@ class Orchestrator:
 
     def fail(self, run_id: str, error: str, lease_token: str) -> RunState:
         return self.store.fail(run_id, error, lease_token)
+
+    def stop(self, run_id: str, reason: str = "Stopped by operator") -> RunState:
+        """Apply an authenticated operator stop without a worker lease."""
+
+        return self.store.stop(run_id, reason)
