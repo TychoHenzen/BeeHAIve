@@ -15,6 +15,7 @@ from uuid import uuid4
 from .models import (
     HandoffIntent,
     ProjectSnapshot,
+    RoutingFailure,
     RunState,
     RunStatus,
     Stage,
@@ -139,6 +140,7 @@ class OrchestratorStore:
                     owner_id TEXT,
                     lease_token TEXT,
                     lease_expires_at TEXT,
+                    execution_token TEXT,
                     last_error TEXT,
                     updated_at TEXT NOT NULL,
                     UNIQUE (project_id, repository_name, pbi_number),
@@ -194,6 +196,22 @@ class OrchestratorStore:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS routing_failure_outbox (
+                    transition_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    error TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL,
+                    output_tokens INTEGER NOT NULL,
+                    recursive_spawn_depth INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL,
+                    processed_at TEXT,
+                    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS routing_failure_outbox_pending
+                    ON routing_failure_outbox(run_id, status, created_at);
+
                 CREATE INDEX IF NOT EXISTS actions_by_project
                     ON actions(project_id, created_at DESC);
                 """
@@ -227,7 +245,12 @@ class OrchestratorStore:
                     "PRAGMA table_info(runs)"
                 ).fetchall()
             }
-            for column in ("owner_id", "lease_token", "lease_expires_at"):
+            for column in (
+                "owner_id",
+                "lease_token",
+                "lease_expires_at",
+                "execution_token",
+            ):
                 if column not in run_columns:
                     self._connection.execute(
                         f"ALTER TABLE runs ADD COLUMN {column} TEXT"
@@ -440,7 +463,8 @@ class OrchestratorStore:
                 connection.execute(
                     """
                     UPDATE runs
-                    SET status = 'failed', last_error = ?, updated_at = ?
+                    SET status = 'failed', execution_token = NULL,
+                        last_error = ?, updated_at = ?
                     WHERE run_id = ?
                     """,
                     (
@@ -522,7 +546,7 @@ class OrchestratorStore:
                     """
                     UPDATE runs
                     SET owner_id = ?, lease_token = ?, lease_expires_at = ?,
-                        last_error = NULL, updated_at = ?
+                        execution_token = NULL, last_error = NULL, updated_at = ?
                     WHERE run_id = ? AND status = 'active'
                     """,
                     (
@@ -581,7 +605,7 @@ class OrchestratorStore:
                     UPDATE runs
                     SET status = 'active', attempt = attempt + 1,
                         owner_id = ?, lease_token = ?, lease_expires_at = ?,
-                        last_error = NULL, updated_at = ?
+                        execution_token = NULL, last_error = NULL, updated_at = ?
                     WHERE run_id = ?
                     """,
                     (
@@ -756,7 +780,9 @@ class OrchestratorStore:
             )
             connection.execute(
                 """
-                UPDATE runs SET status = 'completed', last_error = NULL, updated_at = ?
+                UPDATE runs
+                SET status = 'completed', execution_token = NULL,
+                    last_error = NULL, updated_at = ?
                 WHERE run_id = ?
                 """,
                 (_now(), run_id),
@@ -905,9 +931,116 @@ class OrchestratorStore:
             self._renew_lease(connection, run_id, lease_token)
             return self._run_for_id(connection, run_id) or row
 
+    def validate_lease(self, run_id: str, lease_token: str) -> RunState:
+        with self._lock:
+            run = self._run_for_id(self._connection, run_id)
+            if run is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            self._require_lease(run, lease_token)
+            return run
+
+    def claim_execution(self, run_id: str, lease_token: str) -> str:
+        with self._transaction() as connection:
+            row = self._run_for_id(connection, run_id)
+            if row is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            self._require_lease(row, lease_token)
+            if row.status is not RunStatus.ACTIVE or row.stage is not Stage.IMPLEMENT:
+                raise StoreError(
+                    "Only an active implementation run can execute a model"
+                )
+            existing = connection.execute(
+                "SELECT execution_token FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if existing is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            if existing["execution_token"] is not None:
+                raise StoreError("A model execution is already active")
+            execution_token = str(uuid4())
+            connection.execute(
+                """
+                UPDATE runs
+                SET execution_token = ?, updated_at = ?
+                WHERE run_id = ? AND status = 'active' AND lease_token = ?
+                """,
+                (execution_token, _now(), run_id, lease_token),
+            )
+            self._renew_lease(connection, run_id, lease_token)
+            return execution_token
+
+    def validate_execution(
+        self, run_id: str, lease_token: str, execution_token: str
+    ) -> None:
+        with self._lock:
+            run = self._run_for_id(self._connection, run_id)
+            if run is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            self._require_lease(run, lease_token)
+            current = self._connection.execute(
+                "SELECT execution_token FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if current is None or current["execution_token"] != execution_token:
+                raise StoreError("Model execution claim is no longer valid")
+
+    def heartbeat_execution(
+        self, run_id: str, lease_token: str, execution_token: str
+    ) -> None:
+        with self._transaction() as connection:
+            current = connection.execute(
+                """
+                SELECT status, lease_token, execution_token
+                FROM runs WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            if current is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            if (
+                current["status"] != RunStatus.ACTIVE.value
+                or current["lease_token"] != lease_token
+                or current["execution_token"] != execution_token
+            ):
+                raise StoreError("Model execution claim is no longer valid")
+            self._renew_lease(connection, run_id, lease_token)
+
+    def release_execution(self, run_id: str, execution_token: str) -> None:
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                UPDATE runs
+                SET execution_token = NULL, updated_at = ?
+                WHERE run_id = ? AND execution_token = ?
+                """,
+                (_now(), run_id, execution_token),
+            )
+
+    @property
+    def lease_heartbeat_seconds(self) -> float:
+        return max(0.05, self._lease_seconds / 3)
+
     def fail(self, run_id: str, error: str, lease_token: str) -> RunState:
+        failed, _ = self.fail_with_transition(run_id, error, lease_token)
+        return failed
+
+    def fail_with_transition(
+        self,
+        run_id: str,
+        error: str,
+        lease_token: str,
+        *,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        recursive_spawn_depth: int = 0,
+        route_failure: bool = False,
+    ) -> tuple[RunState, bool]:
         if not error.strip():
             raise StoreError("A failure reason is required")
+        if input_tokens < 0 or output_tokens < 0:
+            raise StoreError("Token usage must not be negative")
+        if recursive_spawn_depth < 0:
+            raise StoreError("Recursive spawn depth must not be negative")
         with self._transaction() as connection:
             row = self._run_for_id(connection, run_id)
             if row is None:
@@ -916,11 +1049,12 @@ class OrchestratorStore:
             if row.status is RunStatus.COMPLETED:
                 raise StoreError("A completed run cannot fail")
             if row.status is RunStatus.FAILED:
-                return row
+                return row, False
             connection.execute(
                 """
                 UPDATE runs
-                SET status = 'failed', last_error = ?, updated_at = ?
+                SET status = 'failed', execution_token = NULL,
+                    last_error = ?, updated_at = ?
                 WHERE run_id = ?
                 """,
                 (error, _now(), run_id),
@@ -943,7 +1077,60 @@ class OrchestratorStore:
                 row.stage,
                 {"error": error},
             )
-            return self._run_for_id(connection, run_id) or row
+            if route_failure and row.stage is Stage.IMPLEMENT:
+                connection.execute(
+                    """
+                    INSERT INTO routing_failure_outbox(
+                        transition_id, run_id, error, input_tokens, output_tokens,
+                        recursive_spawn_depth, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid4()),
+                        run_id,
+                        error,
+                        input_tokens,
+                        output_tokens,
+                        recursive_spawn_depth,
+                        _now(),
+                    ),
+                )
+            return self._run_for_id(connection, run_id) or row, True
+
+    def pending_routing_failures(self, run_id: str) -> tuple[RoutingFailure, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT transition_id, run_id, error, input_tokens, output_tokens,
+                       recursive_spawn_depth
+                FROM routing_failure_outbox
+                WHERE run_id = ? AND status = 'pending'
+                ORDER BY created_at, transition_id
+                """,
+                (run_id,),
+            ).fetchall()
+        return tuple(
+            RoutingFailure(
+                transition_id=str(row["transition_id"]),
+                run_id=str(row["run_id"]),
+                error=str(row["error"]),
+                input_tokens=int(row["input_tokens"]),
+                output_tokens=int(row["output_tokens"]),
+                recursive_spawn_depth=int(row["recursive_spawn_depth"]),
+            )
+            for row in rows
+        )
+
+    def mark_routing_failure_processed(self, transition_id: str) -> None:
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                UPDATE routing_failure_outbox
+                SET status = 'processed', processed_at = ?
+                WHERE transition_id = ? AND status = 'pending'
+                """,
+                (_now(), transition_id),
+            )
 
     def stop(self, run_id: str, reason: str = "Stopped by operator") -> RunState:
         """Stop a run from an authenticated operator action."""
@@ -959,7 +1146,8 @@ class OrchestratorStore:
             connection.execute(
                 """
                 UPDATE runs
-                SET status = 'failed', last_error = ?, lease_token = NULL,
+                SET status = 'failed', execution_token = NULL,
+                    last_error = ?, lease_token = NULL,
                     lease_expires_at = NULL, updated_at = ?
                 WHERE run_id = ?
                 """,

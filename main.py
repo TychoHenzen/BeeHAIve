@@ -12,6 +12,7 @@ from beehaiive import EnvironmentGitHubProvider, Orchestrator, OrchestratorStore
 from beehaiive.dashboard import build_dashboard_state
 from beehaiive.models import RunState, RunStatus
 from beehaiive.provider import ProviderError
+from beehaiive.routing import ModelExecutor, ModelRouter, RoutingError, RoutingStore
 from beehaiive.storage import (
     DEFAULT_EVENT_LIMIT,
     MAX_EVENT_LIMIT,
@@ -40,6 +41,17 @@ class HandoffRequest(BaseModel):
 
 class FailureRequest(BaseModel):
     error: str
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    recursive_spawn_depth: int = Field(default=0, ge=0)
+
+
+class RoutingAttemptRequest(BaseModel):
+    outcome: Literal["failure", "retry", "success"]
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    failure_context: str = Field(default="", max_length=2_000)
+    recursive_spawn_depth: int = Field(default=0, ge=0)
 
 
 class WorkflowWorkspaceRequest(BaseModel):
@@ -124,16 +136,48 @@ def create_app(
     orchestrator: Orchestrator | None = None,
     api_key: str | None = None,
     allowed_project_ids: Collection[str] | None = None,
+    routing_store: RoutingStore | None = None,
+    model_router: ModelRouter | None = None,
+    model_executor: ModelExecutor | None = None,
     workflow_service: WorkflowService | None = None,
     workflow_actor: WorkflowRole | str | None = None,
 ) -> FastAPI:
+    if orchestrator is not None and orchestrator.model_router is not None:
+        if model_router is not None and model_router is not orchestrator.model_router:
+            raise ValueError("The orchestrator and API must share one model router")
+        if (
+            routing_store is not None
+            and routing_store is not orchestrator.model_router.store
+        ):
+            raise ValueError("The orchestrator and API must share one routing store")
+        routing_service = orchestrator.model_router
+    else:
+        if (
+            model_router is not None
+            and routing_store is not None
+            and model_router.store is not routing_store
+        ):
+            raise ValueError("The model router and API must share one routing store")
+        if model_router is None:
+            routing_database = os.environ.get(
+                "BEEHAIIVE_ROUTING_DB", ".beehaiive/routing.db"
+            )
+            model_router = ModelRouter(routing_store or RoutingStore(routing_database))
+        routing_service = model_router
+
     if orchestrator is None:
         if store is None:
             database = os.environ.get("BEEHAIIVE_STATE_DB", ".beehaiive/state.db")
             store = OrchestratorStore(
                 database if database == ":memory:" else Path(database)
             )
-        orchestrator = Orchestrator(store, EnvironmentGitHubProvider())
+        orchestrator = Orchestrator(
+            store, EnvironmentGitHubProvider(), routing_service, model_executor
+        )
+    else:
+        orchestrator.model_router = routing_service
+    if orchestrator.model_executor is None:
+        orchestrator.model_executor = model_executor
 
     app = FastAPI(title="BeeHAIve")
     configured_api_key = (
@@ -156,6 +200,33 @@ def create_app(
             supplied_api_key, configured_api_key
         ):
             raise HTTPException(status_code=401, detail="Invalid API key")
+
+    def require_routing_run_access(
+        request: Request,
+        supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
+        lease_token: str | None = Header(default=None, alias="X-Lease-Token"),
+    ) -> None:
+        require_api_key(supplied_api_key)
+        run_id = request.path_params.get("run_id")
+        if not isinstance(run_id, str):
+            raise HTTPException(status_code=403, detail="Run is not authorized")
+        run = orchestrator.store.get_run(run_id)
+        if (
+            run is None
+            or run.project_id not in configured_projects
+            or not orchestrator.store.is_active_repository(
+                run.project_id, run.repository
+            )
+        ):
+            raise HTTPException(status_code=403, detail="Run is not authorized")
+        try:
+            orchestrator.store.validate_lease(
+                run_id, _required_header(lease_token, "X-Lease-Token")
+            )
+        except StoreError as exc:
+            raise HTTPException(
+                status_code=403, detail="Run is not authorized"
+            ) from exc
 
     def require_mutation_access(
         request: Request,
@@ -418,6 +489,16 @@ def create_app(
 
         return _handle_workflow_error(operation)
 
+    def routing_snapshot(run_id: str, *, required: bool) -> dict[str, object] | None:
+        router = orchestrator.model_router
+        assert router is not None
+        if not required and router.store.get_problem(run_id) is None:
+            return None
+        try:
+            return router.snapshot(run_id).as_dict()
+        except RoutingError as exc:
+            raise StoreError(str(exc)) from exc
+
     @app.get("/")
     async def root() -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         return {"message": "Hello World"}
@@ -425,6 +506,34 @@ def create_app(
     @app.get("/hello/{name}")
     async def say_hello(name: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         return {"message": f"Hello {name}"}
+
+    @app.get("/runs/{run_id}/routing")
+    def routing_problem(  # pyright: ignore[reportUnusedFunction]
+        run_id: str,
+        _auth: None = Depends(require_routing_run_access),
+    ) -> dict[str, object]:
+        try:
+            return routing_service.snapshot(run_id).as_dict()
+        except RoutingError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/runs/{run_id}/routing/attempts")
+    def record_routing_attempt(  # pyright: ignore[reportUnusedFunction]
+        run_id: str,
+        request: RoutingAttemptRequest,
+        _auth: None = Depends(require_routing_run_access),
+    ) -> dict[str, object]:
+        try:
+            return routing_service.record(
+                run_id,
+                request.outcome,
+                input_tokens=request.input_tokens,
+                output_tokens=request.output_tokens,
+                failure_context=request.failure_context,
+                recursive_spawn_depth=request.recursive_spawn_depth,
+            ).as_dict()
+        except RoutingError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/dashboard", response_class=FileResponse)
     def dashboard() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
@@ -609,15 +718,35 @@ def create_app(
         lease_token: str | None = Header(default=None, alias="X-Lease-Token"),
         _auth: None = Depends(require_mutation_access),
     ) -> dict[str, object]:
-        return _run_dict(
-            _handle_store_error(
-                lambda: orchestrator.advance(
-                    run_id,
-                    request.target,
-                    _required_header(lease_token, "X-Lease-Token"),
-                )
+        run = _handle_store_error(
+            lambda: orchestrator.advance(
+                run_id,
+                request.target,
+                _required_header(lease_token, "X-Lease-Token"),
             )
         )
+        routing = (
+            _handle_store_error(lambda: routing_snapshot(run_id, required=True))
+            if request.target is Stage.IMPLEMENT
+            else None
+        )
+        return _run_dict(run, routing)
+
+    @app.post("/runs/{run_id}/attempt")
+    def run_attempt(  # pyright: ignore[reportUnusedFunction]
+        run_id: str,
+        lease_token: str | None = Header(default=None, alias="X-Lease-Token"),
+        _auth: None = Depends(require_mutation_access),
+    ) -> dict[str, object]:
+        routing = _handle_store_error(
+            lambda: orchestrator.run_implementation_attempt(
+                run_id, _required_header(lease_token, "X-Lease-Token")
+            )
+        )
+        run = orchestrator.store.get_run(run_id)
+        if run is None:  # pragma: no cover - the service already validated the run
+            raise HTTPException(status_code=404, detail="Run not found")
+        return {"run": _run_dict(run), "routing": routing.as_dict()}
 
     @app.post("/runs/{run_id}/lease")
     def renew_lease(  # pyright: ignore[reportUnusedFunction]
@@ -658,15 +787,18 @@ def create_app(
         lease_token: str | None = Header(default=None, alias="X-Lease-Token"),
         _auth: None = Depends(require_mutation_access),
     ) -> dict[str, object]:
-        return _run_dict(
-            _handle_store_error(
-                lambda: orchestrator.fail(
-                    run_id,
-                    request.error,
-                    _required_header(lease_token, "X-Lease-Token"),
-                )
+        failed = _handle_store_error(
+            lambda: orchestrator.fail(
+                run_id,
+                request.error,
+                _required_header(lease_token, "X-Lease-Token"),
+                input_tokens=request.input_tokens,
+                output_tokens=request.output_tokens,
+                recursive_spawn_depth=request.recursive_spawn_depth,
             )
         )
+        routing = _handle_store_error(lambda: routing_snapshot(run_id, required=False))
+        return _run_dict(failed, routing)
 
     return app
 
@@ -712,8 +844,10 @@ def _handle_workflow_error[T](function: Callable[[], T]) -> T:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-def _run_dict(run: RunState) -> dict[str, object]:
-    return {
+def _run_dict(
+    run: RunState, routing: dict[str, object] | None = None
+) -> dict[str, object]:
+    result: dict[str, object] = {
         "run_id": run.run_id,
         "project_id": run.project_id,
         "repository": run.repository,
@@ -729,6 +863,9 @@ def _run_dict(run: RunState) -> dict[str, object]:
         "lease_token": run.lease_token,
         "lease_expires_at": run.lease_expires_at,
     }
+    if routing is not None:
+        result["routing"] = routing
+    return result
 
 
 def _dashboard_state(
