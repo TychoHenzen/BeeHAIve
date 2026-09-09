@@ -17,6 +17,7 @@ from beehaiive.storage import (
     MAX_EVENT_LIMIT,
     StoreError,
 )
+from beehaiive.workflow import WorkflowError, WorkflowService
 
 
 class AdvanceRequest(BaseModel):
@@ -31,6 +32,43 @@ class HandoffRequest(BaseModel):
 
 class FailureRequest(BaseModel):
     error: str
+
+
+class WorkflowWorkspaceRequest(BaseModel):
+    agent_id: str = Field(min_length=1, max_length=400)
+    branch: str = Field(min_length=1, max_length=400)
+    worktree: str = Field(min_length=1, max_length=1_000)
+    base_ref: str = Field(default="HEAD", min_length=1, max_length=400)
+
+
+class WorkflowHandoffRequest(BaseModel):
+    lease_id: str = Field(min_length=1, max_length=100)
+    source_role: Literal["planner", "writer", "reviewer", "operator"]
+    target_role: Literal["planner", "writer", "reviewer", "operator"]
+    commit_sha: str = Field(default="", max_length=200)
+    source_state: str = Field(default="", max_length=1_000)
+    approval_required: bool = False
+
+
+class WorkflowApprovalRequest(BaseModel):
+    actor: str = Field(min_length=1, max_length=400)
+    note: str = Field(default="", max_length=1_000)
+
+
+class WorkflowClarificationRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=1_000)
+
+
+class WorkflowClarificationAnswer(BaseModel):
+    answer: str = Field(min_length=1, max_length=1_000)
+
+
+class WorkflowModelCallRequest(BaseModel):
+    lease_id: str = Field(min_length=1, max_length=100)
+
+
+class WorkflowStopRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=400)
 
 
 class DashboardActionBase(BaseModel):
@@ -79,6 +117,7 @@ def create_app(
     orchestrator: Orchestrator | None = None,
     api_key: str | None = None,
     allowed_project_ids: Collection[str] | None = None,
+    workflow_service: WorkflowService | None = None,
 ) -> FastAPI:
     if orchestrator is None:
         if store is None:
@@ -94,10 +133,7 @@ def create_app(
     )
     configured_projects = _configured_project_ids(allowed_project_ids)
 
-    def require_mutation_access(
-        request: Request,
-        supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
-    ) -> None:
+    def require_api_key(supplied_api_key: str | None) -> None:
         if not configured_api_key:
             raise HTTPException(
                 status_code=503,
@@ -107,6 +143,12 @@ def create_app(
             supplied_api_key, configured_api_key
         ):
             raise HTTPException(status_code=401, detail="Invalid API key")
+
+    def require_mutation_access(
+        request: Request,
+        supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    ) -> None:
+        require_api_key(supplied_api_key)
 
         path_params = request.path_params
         project_id = path_params.get("project_id")
@@ -125,10 +167,142 @@ def create_app(
         ):
             raise HTTPException(status_code=403, detail="Repository is not authorized")
 
+    def require_workflow_access(
+        supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    ) -> None:
+        require_api_key(supplied_api_key)
+
+    def require_workflow_service() -> WorkflowService:
+        if workflow_service is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Workflow coordination is not configured",
+            )
+        return workflow_service
+
     def require_project_access(request: Request) -> None:
         project_id = request.path_params.get("project_id")
         if not isinstance(project_id, str) or project_id not in configured_projects:
             raise HTTPException(status_code=403, detail="Project is not authorized")
+
+    @app.post("/workflow/workspaces")
+    def acquire_workflow_workspace(  # pyright: ignore[reportUnusedFunction]
+        request: WorkflowWorkspaceRequest,
+        _auth: None = Depends(require_workflow_access),
+    ) -> dict[str, object]:
+        return _handle_workflow_error(
+            lambda: (
+                require_workflow_service()
+                .acquire_workspace(
+                    request.agent_id,
+                    request.branch,
+                    request.worktree,
+                    request.base_ref,
+                )
+                .as_dict()
+            )
+        )
+
+    @app.post("/workflow/workspaces/{lease_id}/release")
+    def release_workflow_workspace(  # pyright: ignore[reportUnusedFunction]
+        lease_id: str,
+        _auth: None = Depends(require_workflow_access),
+    ) -> dict[str, object]:
+        return _handle_workflow_error(
+            lambda: require_workflow_service().release_workspace(lease_id).as_dict()
+        )
+
+    @app.post("/workflow/workspaces/{lease_id}/stop")
+    def stop_workflow_workspace(  # pyright: ignore[reportUnusedFunction]
+        lease_id: str,
+        request: WorkflowStopRequest,
+        _auth: None = Depends(require_workflow_access),
+    ) -> dict[str, object]:
+        return _handle_workflow_error(
+            lambda: require_workflow_service().stop(lease_id, request.reason).as_dict()
+        )
+
+    @app.post("/workflow/model-calls")
+    def authorize_workflow_model_call(  # pyright: ignore[reportUnusedFunction]
+        request: WorkflowModelCallRequest,
+        _auth: None = Depends(require_workflow_access),
+    ) -> dict[str, object]:
+        return _handle_workflow_error(
+            lambda: (
+                require_workflow_service().before_model_call(request.lease_id).as_dict()
+            )
+        )
+
+    @app.post("/workflow/handoffs")
+    def create_workflow_handoff(  # pyright: ignore[reportUnusedFunction]
+        request: WorkflowHandoffRequest,
+        _auth: None = Depends(require_workflow_access),
+    ) -> dict[str, object]:
+        return _handle_workflow_error(
+            lambda: (
+                require_workflow_service()
+                .handoff(
+                    request.lease_id,
+                    request.source_role,
+                    request.target_role,
+                    request.commit_sha,
+                    request.source_state,
+                    request.approval_required,
+                )
+                .as_dict()
+            )
+        )
+
+    @app.get("/workflow/handoffs/{handoff_id}")
+    def get_workflow_handoff(  # pyright: ignore[reportUnusedFunction]
+        handoff_id: str,
+        _auth: None = Depends(require_workflow_access),
+    ) -> dict[str, object]:
+        return _handle_workflow_error(
+            lambda: require_workflow_service().get_handoff(handoff_id).as_dict()
+        )
+
+    @app.post("/workflow/handoffs/{handoff_id}/approve")
+    def approve_workflow_handoff(  # pyright: ignore[reportUnusedFunction]
+        handoff_id: str,
+        request: WorkflowApprovalRequest,
+        _auth: None = Depends(require_workflow_access),
+    ) -> dict[str, object]:
+        return _handle_workflow_error(
+            lambda: (
+                require_workflow_service()
+                .approve_handoff(handoff_id, request.actor, request.note)
+                .as_dict()
+            )
+        )
+
+    @app.post("/workflow/handoffs/{handoff_id}/clarify")
+    def request_workflow_clarification(  # pyright: ignore[reportUnusedFunction]
+        handoff_id: str,
+        request: WorkflowClarificationRequest,
+        _auth: None = Depends(require_workflow_access),
+    ) -> dict[str, object]:
+        return _handle_workflow_error(
+            lambda: (
+                require_workflow_service()
+                .request_clarification(handoff_id, request.question)
+                .as_dict()
+            )
+        )
+
+    @app.post("/workflow/handoffs/{handoff_id}/clarify/answer")
+    def answer_workflow_clarification(  # pyright: ignore[reportUnusedFunction]
+        handoff_id: str,
+        request: WorkflowClarificationAnswer,
+        _auth: None = Depends(require_workflow_access),
+    ) -> dict[str, object]:
+        return _handle_workflow_error(
+            lambda: (
+                require_workflow_service()
+                .answer_clarification(handoff_id, request.answer)
+                .as_dict()
+            )
+        )
 
     @app.get("/")
     async def root() -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
@@ -415,6 +589,13 @@ def _handle_store_error[T](function: Callable[[], T]) -> T:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ProviderError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+def _handle_workflow_error[T](function: Callable[[], T]) -> T:
+    try:
+        return function()
+    except WorkflowError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 def _run_dict(run: RunState) -> dict[str, object]:

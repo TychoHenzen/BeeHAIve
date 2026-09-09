@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "sections": {
+    "project": [
+      "Keep the handoff within the approved product scope.",
+      "Record observable evidence for each state transition."
+    ],
+    "engineering": [
+      "Only committed changes may cross a role boundary.",
+      "Required deterministic checks must pass before continuation."
+    ],
+    "workflow": [
+      "Each active agent writes only in its leased worktree and branch.",
+      "Pause for an operator when evidence is missing or approval is required."
+    ]
+  },
+  "roles": {
+    "planner": ["project", "workflow"],
+    "writer": ["project", "engineering", "workflow"],
+    "reviewer": ["engineering", "workflow"],
+    "operator": ["project", "engineering", "workflow"]
+  }
+}
