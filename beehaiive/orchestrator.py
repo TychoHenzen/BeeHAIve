@@ -112,64 +112,70 @@ class Orchestrator:
         body: str,
         lease_token: str,
     ) -> RunState:
-        with self._handoff_locks.acquire(run_id):
-            run = self.store.get_run(run_id)
-            if run is None:
-                raise StoreError(f"Unknown run: {run_id}")
-            if run.status is RunStatus.COMPLETED:
-                self.store.renew_lease(run_id, lease_token)
-                return run
-            if run.status is not RunStatus.ACTIVE or run.stage is not Stage.IMPLEMENT:
-                raise StoreError(
-                    "Only an active implementation run can create a handoff"
-                )
-            pending = self.store.pending_handoff(run_id, lease_token)
-            if pending is not None:
-                if (
-                    pending.branch != branch
-                    or pending.body != body
-                    or (base_branch is not None and pending.base_branch != base_branch)
-                ):
-                    raise StoreError(
-                        "Handoff request does not match the persisted intent"
-                    )
-                intent = self.store.prepare_handoff(
-                    run_id,
-                    pending.branch,
-                    pending.base_branch,
-                    pending.body,
-                    lease_token,
-                )
-            else:
-                resolved_base_branch = self.provider.validate_handoff(
-                    run.repository, branch, base_branch
-                )
-                intent = self.store.prepare_handoff(
-                    run_id, branch, resolved_base_branch, body, lease_token
-                )
-            if intent.run.status is RunStatus.COMPLETED:
-                return intent.run
-            result = self.provider.create_handoff(
-                HandoffRequest(
-                    project_id=intent.run.project_id,
-                    repository=intent.run.repository,
-                    pbi_number=intent.run.pbi_number,
-                    title=intent.run.title,
-                    branch=intent.branch,
-                    base_branch=intent.base_branch,
-                    body=intent.body,
-                    run_id=intent.run.run_id,
-                )
-            )
-            self._complete_routing_problem(run_id)
-            completed = self.store.record_handoff(
+        with self._routing_coordination(run_id), self._handoff_locks.acquire(run_id):
+            return self._handoff_locked(run_id, branch, base_branch, body, lease_token)
+
+    def _handoff_locked(
+        self,
+        run_id: str,
+        branch: str,
+        base_branch: str | None,
+        body: str,
+        lease_token: str,
+    ) -> RunState:
+        run = self.store.get_run(run_id)
+        if run is None:
+            raise StoreError(f"Unknown run: {run_id}")
+        if run.status is RunStatus.COMPLETED:
+            self.store.renew_lease(run_id, lease_token)
+            return run
+        if run.status is not RunStatus.ACTIVE or run.stage is not Stage.IMPLEMENT:
+            raise StoreError("Only an active implementation run can create a handoff")
+        pending = self.store.pending_handoff(run_id, lease_token)
+        if pending is not None:
+            if (
+                pending.branch != branch
+                or pending.body != body
+                or (base_branch is not None and pending.base_branch != base_branch)
+            ):
+                raise StoreError("Handoff request does not match the persisted intent")
+            intent = self.store.prepare_handoff(
                 run_id,
-                result.branch,
-                result.pull_request_url,
-                result.pull_request_number,
+                pending.branch,
+                pending.base_branch,
+                pending.body,
                 lease_token,
             )
-            return completed
+        else:
+            resolved_base_branch = self.provider.validate_handoff(
+                run.repository, branch, base_branch
+            )
+            intent = self.store.prepare_handoff(
+                run_id, branch, resolved_base_branch, body, lease_token
+            )
+        if intent.run.status is RunStatus.COMPLETED:
+            return intent.run
+        result = self.provider.create_handoff(
+            HandoffRequest(
+                project_id=intent.run.project_id,
+                repository=intent.run.repository,
+                pbi_number=intent.run.pbi_number,
+                title=intent.run.title,
+                branch=intent.branch,
+                base_branch=intent.base_branch,
+                body=intent.body,
+                run_id=intent.run.run_id,
+            )
+        )
+        self._complete_routing_problem(run_id)
+        completed = self.store.record_handoff(
+            run_id,
+            result.branch,
+            result.pull_request_url,
+            result.pull_request_number,
+            lease_token,
+        )
+        return completed
 
     def fail(
         self,
@@ -181,7 +187,7 @@ class Orchestrator:
         output_tokens: int = 0,
         recursive_spawn_depth: int = 0,
     ) -> RunState:
-        with self._handoff_locks.acquire(run_id):
+        with self._routing_coordination(run_id), self._handoff_locks.acquire(run_id):
             return self._fail_with_routing(
                 run_id,
                 error,
@@ -190,6 +196,14 @@ class Orchestrator:
                 output_tokens=output_tokens,
                 recursive_spawn_depth=recursive_spawn_depth,
             )
+
+    @contextmanager
+    def _routing_coordination(self, run_id: str) -> Generator[None]:
+        if self.model_router is None:
+            yield
+            return
+        with self.model_router.coordinate(run_id):
+            yield
 
     def _fail_with_routing(
         self,

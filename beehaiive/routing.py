@@ -624,11 +624,19 @@ class ModelRouter:
             self.store.get_attempts(normalized_id),
         )
 
+    @contextmanager
+    def coordinate(self, problem_id: str) -> Generator[None]:
+        """Serialize external run transitions with model execution."""
+
+        normalized_id = _problem_id(problem_id)
+        with self._execution_locks.acquire(normalized_id):
+            yield
+
     def execute(self, problem_id: str, executor: ModelExecutor) -> RoutingResult:
         """Invoke the selected model and persist its measured routing result."""
 
         normalized_id = _problem_id(problem_id)
-        with self._execution_locks.acquire(normalized_id):
+        with self.coordinate(normalized_id):
             current = self.snapshot(normalized_id)
             if current.state.status is not RoutingStatus.ACTIVE:
                 raise RoutingError(
