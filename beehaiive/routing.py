@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -282,6 +282,10 @@ class RoutingDecision:
     bounce_count: int
     total_tokens: int
     total_cost: float
+    remaining_rounds: int
+    remaining_tokens: int
+    remaining_recursive_spawn_depth: int
+    remaining_bounces: int
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -297,6 +301,10 @@ class RoutingDecision:
             "bounce_count": self.bounce_count,
             "total_tokens": self.total_tokens,
             "total_cost": self.total_cost,
+            "remaining_rounds": self.remaining_rounds,
+            "remaining_tokens": self.remaining_tokens,
+            "remaining_recursive_spawn_depth": self.remaining_recursive_spawn_depth,
+            "remaining_bounces": self.remaining_bounces,
         }
 
 
@@ -381,8 +389,26 @@ class RoutingStore:
                     recursive_spawn_depth INTEGER NOT NULL,
                     failure_context TEXT,
                     created_at TEXT NOT NULL,
+                    transition_id TEXT,
                     FOREIGN KEY (problem_id) REFERENCES routing_problems(problem_id)
                 );
+                """
+            )
+            attempt_columns = {
+                str(row["name"])
+                for row in self._connection.execute(
+                    "PRAGMA table_info(routing_attempts)"
+                ).fetchall()
+            }
+            if "transition_id" not in attempt_columns:
+                self._connection.execute(
+                    "ALTER TABLE routing_attempts ADD COLUMN transition_id TEXT"
+                )
+            self._connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS routing_attempt_transition
+                ON routing_attempts(transition_id)
+                WHERE transition_id IS NOT NULL
                 """
             )
 
@@ -437,14 +463,42 @@ class RoutingStore:
             ).fetchall()
         return tuple(_attempt_from_row(row) for row in rows)
 
+    def has_transition(self, transition_id: str) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT 1 FROM routing_attempts WHERE transition_id = ?",
+                (transition_id,),
+            ).fetchone()
+        return row is not None
+
     def save_transition(
         self,
         problem_id: str,
         expected_round: int,
         state: RoutingState,
         attempt: RoutingAttempt,
+        transition_id: str | None = None,
     ) -> tuple[RoutingState, RoutingAttempt]:
         with self._transaction() as connection:
+            if transition_id is not None:
+                existing_attempt = connection.execute(
+                    "SELECT * FROM routing_attempts WHERE transition_id = ?",
+                    (transition_id,),
+                ).fetchone()
+                if existing_attempt is not None:
+                    if str(existing_attempt["problem_id"]) != problem_id:
+                        raise RoutingError(
+                            "Routing transition belongs to another problem"
+                        )
+                    existing_state = connection.execute(
+                        "SELECT * FROM routing_problems WHERE problem_id = ?",
+                        (problem_id,),
+                    ).fetchone()
+                    if existing_state is None:
+                        raise RoutingError(f"Unknown routing problem: {problem_id}")
+                    return _state_from_row(existing_state), _attempt_from_row(
+                        existing_attempt
+                    )
             current = connection.execute(
                 "SELECT round, status FROM routing_problems WHERE problem_id = ?",
                 (problem_id,),
@@ -485,8 +539,9 @@ class RoutingStore:
                 INSERT INTO routing_attempts(
                     problem_id, round, model, tier, reason, outcome,
                     input_tokens, output_tokens, total_tokens, estimated_cost,
-                    bounce_count, recursive_spawn_depth, failure_context, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    bounce_count, recursive_spawn_depth, failure_context,
+                    created_at, transition_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     attempt.problem_id,
@@ -503,6 +558,7 @@ class RoutingStore:
                     attempt.recursive_spawn_depth,
                     attempt.failure_context,
                     attempt.created_at,
+                    transition_id,
                 ),
             )
             attempt_id = cursor.lastrowid
@@ -632,7 +688,12 @@ class ModelRouter:
         with self._execution_locks.acquire(normalized_id):
             yield
 
-    def execute(self, problem_id: str, executor: ModelExecutor) -> RoutingResult:
+    def execute(
+        self,
+        problem_id: str,
+        executor: ModelExecutor,
+        before_record: Callable[[], None] | None = None,
+    ) -> RoutingResult:
         """Invoke the selected model and persist its measured routing result."""
 
         normalized_id = _problem_id(problem_id)
@@ -643,9 +704,48 @@ class ModelRouter:
                     f"Routing problem {current.state.problem_id} is already "
                     f"{current.state.status.value}"
                 )
-            execution = executor.execute(
-                self.config.spec_for(current.state.current_tier), current.decision
+            limit_reason = self._limit_reason(
+                current.state.round,
+                current.state.total_tokens,
+                current.state.recursive_spawn_depth,
+                current.state.bounce_count,
             )
+            if limit_reason is not None:
+                if before_record is not None:
+                    before_record()
+                return self.record(
+                    normalized_id,
+                    AttemptOutcome.FAILURE,
+                    failure_context=f"Model invocation skipped: {limit_reason}",
+                    force_human_reason=limit_reason,
+                )
+            try:
+                execution = executor.execute(
+                    self.config.spec_for(current.state.current_tier), current.decision
+                )
+            except Exception as exc:
+                execution = _failed_model_execution(exc)
+            if before_record is not None:
+                before_record()
+            usage_violation = self._usage_violation(current, execution)
+            if usage_violation is not None:
+                remaining_tokens = current.decision.remaining_tokens
+                bounded_input = min(execution.input_tokens, remaining_tokens)
+                bounded_output = min(
+                    execution.output_tokens, remaining_tokens - bounded_input
+                )
+                return self.record(
+                    normalized_id,
+                    AttemptOutcome.FAILURE,
+                    input_tokens=bounded_input,
+                    output_tokens=bounded_output,
+                    failure_context=usage_violation,
+                    recursive_spawn_depth=min(
+                        execution.recursive_spawn_depth,
+                        self.config.limits.max_recursive_spawn_depth,
+                    ),
+                    force_human_reason=usage_violation,
+                )
             return self.record(
                 normalized_id,
                 execution.outcome,
@@ -664,6 +764,8 @@ class ModelRouter:
         output_tokens: int = 0,
         failure_context: str = "",
         recursive_spawn_depth: int = 0,
+        transition_id: str | None = None,
+        force_human_reason: str | None = None,
     ) -> RoutingResult:
         normalized_id = _problem_id(problem_id)
         try:
@@ -674,6 +776,8 @@ class ModelRouter:
             raise RoutingError("Token usage must not be negative")
         if recursive_spawn_depth < 0:
             raise RoutingError("Recursive spawn depth must not be negative")
+        if force_human_reason is not None and not force_human_reason.strip():
+            raise RoutingError("Human handoff reason must not be empty")
         state = self.store.get_problem(normalized_id)
         if state is None:
             raise RoutingError(f"Unknown routing problem: {normalized_id}")
@@ -740,9 +844,10 @@ class ModelRouter:
             attempt_bounces,
             attempt.estimated_cost,
             consecutive_failures,
+            force_human_reason,
         )
         saved_state, saved_attempt = self.store.save_transition(
-            normalized_id, state.round, next_state, attempt
+            normalized_id, state.round, next_state, attempt, transition_id
         )
         return RoutingResult(
             saved_state,
@@ -762,8 +867,21 @@ class ModelRouter:
         attempt_bounces: int,
         attempt_cost: float,
         consecutive_failures: int,
+        force_human_reason: str | None = None,
     ) -> RoutingState:
         total_cost = round(state.total_cost + attempt_cost, 8)
+        if force_human_reason is not None:
+            return self._human_state(
+                state,
+                attempt_round,
+                total_tokens,
+                total_cost,
+                total_depth,
+                attempt_bounces,
+                force_human_reason,
+                context,
+                consecutive_failures,
+            )
         limit_reason = self._limit_reason(
             attempt_round, total_tokens, total_depth, attempt_bounces
         )
@@ -904,6 +1022,7 @@ class ModelRouter:
 
     def _decision(self, state: RoutingState) -> RoutingDecision:
         spec = self.config.spec_for(state.current_tier)
+        limits = self.config.limits
         return RoutingDecision(
             problem_id=state.problem_id,
             status=state.status,
@@ -917,7 +1036,67 @@ class ModelRouter:
             bounce_count=state.bounce_count,
             total_tokens=state.total_tokens,
             total_cost=state.total_cost,
+            remaining_rounds=max(0, limits.max_rounds - state.round),
+            remaining_tokens=max(0, limits.max_tokens - state.total_tokens),
+            remaining_recursive_spawn_depth=max(
+                0, limits.max_recursive_spawn_depth - state.recursive_spawn_depth
+            ),
+            remaining_bounces=max(0, limits.max_bounces - state.bounce_count),
         )
+
+    def handoff_limit_reason(self, problem_id: str) -> str | None:
+        """Return a limit that blocks resolving a handoff without a model call."""
+
+        state = self.store.get_problem(_problem_id(problem_id))
+        if state is None:
+            raise RoutingError(f"Unknown routing problem: {problem_id}")
+        if state.status is not RoutingStatus.ACTIVE:
+            return None
+        return self._limit_reason(
+            state.round + 1,
+            state.total_tokens,
+            state.recursive_spawn_depth,
+            state.bounce_count,
+        )
+
+    def _usage_violation(
+        self, current: RoutingResult, execution: ModelExecution
+    ) -> str | None:
+        if (
+            execution.input_tokens + execution.output_tokens
+            > current.decision.remaining_tokens
+        ):
+            return (
+                "Token ceiling reached. Model reported more tokens than the "
+                f"remaining routing budget ({current.decision.remaining_tokens})"
+            )
+        if (
+            execution.recursive_spawn_depth
+            > self.config.limits.max_recursive_spawn_depth
+        ):
+            return (
+                "Recursive spawn limit reached. Model reported depth "
+                f"{execution.recursive_spawn_depth} above the configured limit "
+                f"({self.config.limits.max_recursive_spawn_depth})"
+            )
+        return None
+
+
+def _failed_model_execution(error: Exception) -> ModelExecution:
+    def usage_value(name: str) -> int:
+        value = getattr(error, name, 0)
+        return value if isinstance(value, int) and value >= 0 else 0
+
+    failure_context = getattr(error, "failure_context", "")
+    if not isinstance(failure_context, str) or not failure_context.strip():
+        failure_context = f"Model execution failed: {error or type(error).__name__}"
+    return ModelExecution(
+        AttemptOutcome.FAILURE,
+        input_tokens=usage_value("input_tokens"),
+        output_tokens=usage_value("output_tokens"),
+        failure_context=failure_context,
+        recursive_spawn_depth=usage_value("recursive_spawn_depth"),
+    )
 
 
 def _problem_id(value: str) -> str:

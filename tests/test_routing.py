@@ -1,3 +1,5 @@
+import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
@@ -5,7 +7,9 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 from beehaiive.models import (
     HandoffRequest,
@@ -24,6 +28,7 @@ from beehaiive.routing import (
     ModelTier,
     RoutingAttempt,
     RoutingConfig,
+    RoutingDecision,
     RoutingError,
     RoutingLimits,
     RoutingStatus,
@@ -105,6 +110,44 @@ class BlockingRoutingModel:
             input_tokens=1,
             output_tokens=1,
             failure_context="The concurrent model attempt failed.",
+        )
+
+
+class FailingRoutingModel:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def execute(self, _spec: ModelSpec, _decision: object) -> ModelExecution:
+        self.calls += 1
+        error = RuntimeError("provider unavailable")
+        error.input_tokens = 3  # type: ignore[attr-defined]
+        error.output_tokens = 2  # type: ignore[attr-defined]
+        error.failure_context = "The provider rejected the model call."  # type: ignore[attr-defined]
+        raise error
+
+
+class UnannotatedFailingRoutingModel:
+    def execute(self, _spec: ModelSpec, _decision: object) -> ModelExecution:
+        raise RuntimeError("provider unavailable")
+
+
+class OverBudgetRoutingModel:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.budgets: list[tuple[int, int, int]] = []
+
+    def execute(self, _spec: ModelSpec, decision: RoutingDecision) -> ModelExecution:
+        self.calls += 1
+        self.budgets.append(
+            (
+                decision.remaining_tokens,
+                decision.remaining_rounds,
+                decision.remaining_recursive_spawn_depth,
+            )
+        )
+        return ModelExecution(
+            AttemptOutcome.SUCCESS,
+            input_tokens=self.budgets[-1][0] + 1,
         )
 
 
@@ -402,33 +445,45 @@ def test_success_does_not_bypass_configured_limits(
 def test_routing_api_returns_persisted_attempt_accounting() -> None:
     routing_store = RoutingStore()
     orchestrator_store = OrchestratorStore()
+    service = Orchestrator(orchestrator_store, RoutingProvider())
     client = TestClient(
         create_app(
-            store=orchestrator_store,
+            orchestrator=service,
             routing_store=routing_store,
             api_key="test-key",
             allowed_project_ids={"owner:7"},
         )
     )
-    headers = {"X-API-Key": "test-key"}
+    headers = {"X-API-Key": "test-key", "X-Worker-ID": "worker-1"}
 
+    client.post("/projects/owner:7/sync", headers=headers)
+    claim = client.post(
+        "/projects/owner:7/repositories/owner/api/claim", headers=headers
+    )
+    run_id = claim.json()["run_id"]
+    lease_headers = {
+        "X-API-Key": "test-key",
+        "X-Lease-Token": claim.json()["lease_token"],
+    }
     started = client.post(
-        "/routing/problems", json={"problem_id": "api-problem"}, headers=headers
+        f"/runs/{run_id}/advance",
+        json={"target": Stage.IMPLEMENT.value},
+        headers=lease_headers,
     )
     failed = client.post(
-        "/routing/problems/api-problem/attempts",
+        f"/runs/{run_id}/routing/attempts",
         json={
             "outcome": "failure",
             "input_tokens": 20,
             "output_tokens": 5,
             "failure_context": "The API attempt failed.",
         },
-        headers=headers,
+        headers=lease_headers,
     )
-    fetched = client.get("/routing/problems/api-problem", headers=headers)
+    fetched = client.get(f"/runs/{run_id}/routing", headers=lease_headers)
 
     assert started.status_code == 200
-    assert started.json()["decision"]["tier"] == "luna"
+    assert started.json()["routing"]["decision"]["tier"] == "luna"
     assert failed.status_code == 200
     assert failed.json()["decision"]["tier"] == "terra"
     assert failed.json()["attempt"]["model"] == "luna"
@@ -454,14 +509,8 @@ def test_create_app_shares_or_rejects_conflicting_routing_configuration() -> Non
     router = ModelRouter(routing_store, _config())
     orchestrator_store = OrchestratorStore()
     service = Orchestrator(orchestrator_store, RoutingProvider(), router)
-    client = TestClient(create_app(orchestrator=service, api_key="test-key"))
 
-    started = client.post(
-        "/routing/problems",
-        json={"problem_id": "shared-problem"},
-        headers={"X-API-Key": "test-key"},
-    )
-    assert started.status_code == 200
+    router.begin("shared-problem")
     assert router.snapshot("shared-problem").state.problem_id == "shared-problem"
 
     conflicting_router_store = RoutingStore()
@@ -584,7 +633,7 @@ def test_run_failure_api_passes_usage_to_connected_routing() -> None:
         },
         headers=lease_headers,
     )
-    routed = client.get(f"/routing/problems/{run_id}", headers=lease_headers)
+    routed = client.get(f"/runs/{run_id}/routing", headers=lease_headers)
 
     assert failed.status_code == 200
     assert failed.json()["routing"]["decision"]["tier"] == "terra"
@@ -728,6 +777,55 @@ def test_run_attempt_surfaces_router_errors(
     orchestrator_store.close()
 
 
+def test_run_attempt_rejects_a_lost_execution_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    routing_store = RoutingStore()
+    router = ModelRouter(routing_store, _config())
+    model = FakeRoutingModel((AttemptOutcome.SUCCESS,))
+    orchestrator_store = OrchestratorStore()
+    service = Orchestrator(orchestrator_store, RoutingProvider(), router, model)
+    service.synchronize("owner:7")
+    run = service.claim("owner:7", "owner/api", "worker-1")
+    assert run is not None
+    token = run.lease_token or ""
+    service.advance(run.run_id, Stage.IMPLEMENT, token)
+
+    def reject_validation(*args: object, **kwargs: object) -> None:
+        raise StoreError("execution claim lost")
+
+    monkeypatch.setattr(orchestrator_store, "validate_execution", reject_validation)
+    with pytest.raises(StoreError, match="execution claim lost"):
+        service.run_implementation_attempt(run.run_id, token)
+
+    routing_store.close()
+    orchestrator_store.close()
+
+
+def test_complete_routing_problem_rejects_a_non_resolved_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    routing_store = RoutingStore()
+    router = ModelRouter(routing_store, _config())
+    orchestrator_store = OrchestratorStore()
+    service = Orchestrator(orchestrator_store, RoutingProvider(), router)
+    service.synchronize("owner:7")
+    run = service.claim("owner:7", "owner/api", "worker-1")
+    assert run is not None
+    token = run.lease_token or ""
+    service.advance(run.run_id, Stage.IMPLEMENT, token)
+
+    def return_active(*args: object, **kwargs: object) -> object:
+        return SimpleNamespace(state=SimpleNamespace(status=RoutingStatus.ACTIVE))
+
+    monkeypatch.setattr(router, "record", return_active)
+    with pytest.raises(StoreError, match="requires human action"):
+        service._complete_routing_problem(run.run_id)
+
+    routing_store.close()
+    orchestrator_store.close()
+
+
 def test_routing_persists_attempts_across_store_reopen(tmp_path: Path) -> None:
     database = tmp_path / "routing.sqlite3"
     first_store = RoutingStore(database)
@@ -761,6 +859,81 @@ def test_routing_persists_attempts_across_store_reopen(tmp_path: Path) -> None:
     assert attempt.bounce_count == 1
     assert attempt.recursive_spawn_depth == 1
     second_store.close()
+
+
+def test_routing_store_migrates_and_replays_transition_ids(tmp_path: Path) -> None:
+    database = tmp_path / "legacy-routing.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE routing_problems(
+            problem_id TEXT PRIMARY KEY, status TEXT NOT NULL,
+            current_tier TEXT NOT NULL, triage_index INTEGER NOT NULL,
+            consecutive_failures INTEGER NOT NULL, bounce_count INTEGER NOT NULL,
+            round INTEGER NOT NULL, total_tokens INTEGER NOT NULL,
+            total_cost REAL NOT NULL, recursive_spawn_depth INTEGER NOT NULL,
+            last_failure_context TEXT, required_action TEXT,
+            next_reason TEXT NOT NULL, created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE routing_attempts(
+            attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            problem_id TEXT NOT NULL, round INTEGER NOT NULL,
+            model TEXT NOT NULL, tier TEXT NOT NULL, reason TEXT NOT NULL,
+            outcome TEXT NOT NULL, input_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL,
+            estimated_cost REAL NOT NULL, bounce_count INTEGER NOT NULL,
+            recursive_spawn_depth INTEGER NOT NULL, failure_context TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (problem_id) REFERENCES routing_problems(problem_id)
+        );
+        """
+    )
+    connection.close()
+
+    store = RoutingStore(database)
+    columns = {
+        str(row["name"])
+        for row in store._connection.execute("PRAGMA table_info(routing_attempts)")
+    }
+    assert "transition_id" in columns
+
+    router = ModelRouter(store, _config())
+    started = router.begin("transition-problem")
+    recorded = router.record(
+        "transition-problem", AttemptOutcome.SUCCESS, transition_id="transition-1"
+    )
+    assert recorded.attempt is not None
+    replayed = store.save_transition(
+        "transition-problem",
+        started.state.round,
+        recorded.state,
+        recorded.attempt,
+        "transition-1",
+    )
+    assert replayed == (recorded.state, recorded.attempt)
+    with pytest.raises(RoutingError, match="belongs to another problem"):
+        store.save_transition(
+            "other-problem",
+            started.state.round,
+            recorded.state,
+            recorded.attempt,
+            "transition-1",
+        )
+
+    store._connection.execute("PRAGMA foreign_keys = OFF")
+    store._connection.execute(
+        "DELETE FROM routing_problems WHERE problem_id = ?", ("transition-problem",)
+    )
+    with pytest.raises(RoutingError, match="Unknown routing problem"):
+        store.save_transition(
+            "transition-problem",
+            started.state.round,
+            recorded.state,
+            recorded.attempt,
+            "transition-1",
+        )
+    store.close()
 
 
 def test_orchestrator_connects_implementation_failures_to_model_router() -> None:
@@ -888,6 +1061,266 @@ def test_successful_handoff_resolves_a_human_routing_state() -> None:
     orchestrator_store.close()
 
 
+def test_routing_api_requires_the_run_lease_scope() -> None:
+    routing_store = RoutingStore()
+    orchestrator_store = OrchestratorStore()
+    service = Orchestrator(orchestrator_store, RoutingProvider())
+    client = TestClient(
+        create_app(
+            orchestrator=service,
+            routing_store=routing_store,
+            api_key="test-key",
+            allowed_project_ids={"owner:7"},
+        )
+    )
+    worker_headers = {"X-API-Key": "test-key", "X-Worker-ID": "worker-1"}
+    client.post("/projects/owner:7/sync", headers=worker_headers)
+    claim = client.post(
+        "/projects/owner:7/repositories/owner/api/claim", headers=worker_headers
+    )
+    run_id = claim.json()["run_id"]
+    lease_headers = {
+        "X-API-Key": "test-key",
+        "X-Lease-Token": claim.json()["lease_token"],
+    }
+    client.post(
+        f"/runs/{run_id}/advance",
+        json={"target": Stage.IMPLEMENT.value},
+        headers=lease_headers,
+    )
+
+    missing_lease = client.get(
+        f"/runs/{run_id}/routing", headers={"X-API-Key": "test-key"}
+    )
+    wrong_lease = client.get(
+        f"/runs/{run_id}/routing",
+        headers={"X-API-Key": "test-key", "X-Lease-Token": "wrong"},
+    )
+    scoped = client.get(f"/runs/{run_id}/routing", headers=lease_headers)
+
+    assert missing_lease.status_code == 401
+    assert wrong_lease.status_code == 403
+    assert scoped.status_code == 200
+    assert scoped.json()["state"]["problem_id"] == run_id
+
+    routing_store.close()
+    orchestrator_store.close()
+
+
+def test_routing_snapshot_endpoint_maps_errors_and_rejects_missing_path_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    routing_store = RoutingStore()
+    orchestrator_store = OrchestratorStore()
+    router = ModelRouter(routing_store, _config())
+    service = Orchestrator(orchestrator_store, RoutingProvider(), router)
+    app = create_app(
+        orchestrator=service,
+        api_key="test-key",
+        allowed_project_ids={"owner:7"},
+    )
+    client = TestClient(app)
+    worker_headers = {"X-API-Key": "test-key", "X-Worker-ID": "worker-1"}
+    client.post("/projects/owner:7/sync", headers=worker_headers)
+    claim = client.post(
+        "/projects/owner:7/repositories/owner/api/claim", headers=worker_headers
+    )
+    run_id = claim.json()["run_id"]
+    lease_token = claim.json()["lease_token"]
+    lease_headers = {"X-API-Key": "test-key", "X-Lease-Token": lease_token}
+    client.post(
+        f"/runs/{run_id}/advance",
+        json={"target": Stage.IMPLEMENT.value},
+        headers=lease_headers,
+    )
+
+    route = next(
+        route for route in app.routes if route.path == "/runs/{run_id}/routing"
+    )
+    dependency = route.dependant.dependencies[0].call
+    assert dependency is not None
+    with pytest.raises(HTTPException) as missing_path:
+        dependency(
+            Request({"type": "http", "path_params": {}}), "test-key", lease_token
+        )
+    assert missing_path.value.status_code == 403
+
+    def reject_snapshot(*args: object, **kwargs: object) -> object:
+        raise RoutingError("routing snapshot unavailable")
+
+    monkeypatch.setattr(router, "snapshot", reject_snapshot)
+    response = client.get(f"/runs/{run_id}/routing", headers=lease_headers)
+    assert response.status_code == 404
+    assert response.json()["detail"] == "routing snapshot unavailable"
+
+    routing_store.close()
+    orchestrator_store.close()
+
+
+def test_execution_storage_guards_reject_unknown_and_duplicate_claims(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = OrchestratorStore()
+    service = Orchestrator(store, RoutingProvider())
+
+    with pytest.raises(StoreError, match="Unknown run"):
+        store.validate_lease("missing", "missing")
+    with pytest.raises(StoreError, match="Unknown run"):
+        store.claim_execution("missing", "missing")
+    with pytest.raises(StoreError, match="Unknown run"):
+        store.validate_execution("missing", "missing", "missing")
+    with pytest.raises(StoreError, match="Unknown run"):
+        store.heartbeat_execution("missing", "missing", "missing")
+
+    service.synchronize("owner:7")
+    run = service.claim("owner:7", "owner/api", "worker-1")
+    assert run is not None
+    token = run.lease_token or ""
+    with pytest.raises(StoreError, match="implementation run"):
+        store.claim_execution(run.run_id, token)
+    service.advance(run.run_id, Stage.IMPLEMENT, token)
+    execution_token = store.claim_execution(run.run_id, token)
+    with pytest.raises(StoreError, match="already active"):
+        store.claim_execution(run.run_id, token)
+    with pytest.raises(StoreError, match="no longer valid"):
+        store.validate_execution(run.run_id, token, "wrong")
+    with pytest.raises(StoreError, match="no longer valid"):
+        store.heartbeat_execution(run.run_id, token, "wrong")
+    store.release_execution(run.run_id, execution_token)
+
+    with pytest.raises(StoreError, match="Token usage"):
+        store.fail_with_transition(run.run_id, "failure", token, input_tokens=-1)
+    with pytest.raises(StoreError, match="Recursive spawn"):
+        store.fail_with_transition(
+            run.run_id, "failure", token, recursive_spawn_depth=-1
+        )
+
+    original_run_for_id = store._run_for_id
+
+    def delete_after_read(connection: sqlite3.Connection, run_id: str) -> object:
+        row = original_run_for_id(connection, run_id)
+        if row is not None:
+            store._connection.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
+        return row
+
+    monkeypatch.setattr(store, "_run_for_id", delete_after_read)
+    with pytest.raises(StoreError, match="Unknown run"):
+        store.claim_execution(run.run_id, token)
+    store.close()
+
+
+def test_long_model_execution_renews_shared_run_lease(tmp_path: Path) -> None:
+    state_database = tmp_path / "state.sqlite3"
+    routing_database = tmp_path / "routing.sqlite3"
+    first_store = OrchestratorStore(state_database, lease_seconds=1)
+    first_router = ModelRouter(RoutingStore(routing_database), _config())
+    model = BlockingRoutingModel()
+    first_service = Orchestrator(first_store, RoutingProvider(), first_router, model)
+    first_service.synchronize("owner:7")
+    run = first_service.claim("owner:7", "owner/api", "worker-1")
+    assert run is not None
+    token = run.lease_token or ""
+    first_service.advance(run.run_id, Stage.IMPLEMENT, token)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            first_service.run_implementation_attempt, run.run_id, token
+        )
+        assert model.started.wait(timeout=2)
+        second_store = OrchestratorStore(state_database, lease_seconds=1)
+        second_service = Orchestrator(
+            second_store,
+            RoutingProvider(),
+            ModelRouter(RoutingStore(routing_database), _config()),
+            model,
+        )
+        time.sleep(1.2)
+        assert second_service.claim("owner:7", "owner/api", "worker-2") is None
+        model.release.set()
+        result = future.result()
+
+    assert len(result.attempts) == 1
+    second_store.close()
+    first_router.store.close()
+    first_store.close()
+
+
+def test_reclaimed_run_rejects_stale_model_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_database = tmp_path / "state.sqlite3"
+    routing_database = tmp_path / "routing.sqlite3"
+    first_store = OrchestratorStore(state_database, lease_seconds=1)
+    first_router = ModelRouter(RoutingStore(routing_database), _config())
+    model = BlockingRoutingModel()
+    first_service = Orchestrator(first_store, RoutingProvider(), first_router, model)
+    first_service.synchronize("owner:7")
+    run = first_service.claim("owner:7", "owner/api", "worker-1")
+    assert run is not None
+    token = run.lease_token or ""
+    first_service.advance(run.run_id, Stage.IMPLEMENT, token)
+
+    def reject_heartbeat(*args: object, **kwargs: object) -> None:
+        raise StoreError("heartbeat stopped")
+
+    monkeypatch.setattr(first_store, "heartbeat_execution", reject_heartbeat)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            first_service.run_implementation_attempt, run.run_id, token
+        )
+        assert model.started.wait(timeout=2)
+        second_store = OrchestratorStore(state_database, lease_seconds=1)
+        second_service = Orchestrator(
+            second_store,
+            RoutingProvider(),
+            ModelRouter(RoutingStore(routing_database), _config()),
+            model,
+        )
+        time.sleep(1.2)
+        reclaimed = second_service.claim("owner:7", "owner/api", "worker-2")
+        assert reclaimed is not None
+        model.release.set()
+        with pytest.raises(StoreError, match="heartbeat|claim"):
+            future.result()
+
+    assert first_router.snapshot(run.run_id).attempts == ()
+    second_store.close()
+    first_router.store.close()
+    first_store.close()
+
+
+def test_handoff_does_not_complete_when_success_hits_a_routing_limit() -> None:
+    class CountingProvider(RoutingProvider):
+        def __init__(self) -> None:
+            self.handoff_calls = 0
+
+        def create_handoff(self, request: HandoffRequest) -> HandoffResult:
+            self.handoff_calls += 1
+            return super().create_handoff(request)
+
+    routing_store = RoutingStore()
+    router = ModelRouter(routing_store, _config(max_rounds=1, max_bounces=10))
+    orchestrator_store = OrchestratorStore()
+    provider = CountingProvider()
+    service = Orchestrator(orchestrator_store, provider, router)
+
+    service.synchronize("owner:7")
+    run = service.claim("owner:7", "owner/api", "worker-1")
+    assert run is not None
+    token = run.lease_token or ""
+    service.advance(run.run_id, Stage.IMPLEMENT, token)
+
+    with pytest.raises(StoreError, match="requires human action"):
+        service.handoff(run.run_id, "codex/api-1", "master", "Closes #1", token)
+
+    assert provider.handoff_calls == 0
+    assert router.snapshot(run.run_id).state.status is RoutingStatus.ACTIVE
+    assert orchestrator_store.pending_handoff(run.run_id, token) is not None
+
+    routing_store.close()
+    orchestrator_store.close()
+
+
 def test_repeating_a_failed_run_does_not_duplicate_routing_attempts() -> None:
     routing_store = RoutingStore()
     router = ModelRouter(routing_store, _config())
@@ -960,6 +1393,64 @@ def test_failed_run_retries_routing_persistence_after_transient_error(
     assert retried.status.value == "failed"
     assert calls == 2
     assert len(router.snapshot(run.run_id).attempts) == 1
+
+    routing_store.close()
+    orchestrator_store.close()
+
+
+def test_later_failure_replays_only_its_own_pending_routing_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    routing_store = RoutingStore()
+    router = ModelRouter(routing_store, _config())
+    orchestrator_store = OrchestratorStore()
+    service = Orchestrator(orchestrator_store, RoutingProvider(), router)
+
+    service.synchronize("owner:7")
+    run = service.claim("owner:7", "owner/api", "worker-1")
+    assert run is not None
+    token = run.lease_token or ""
+    service.advance(run.run_id, Stage.IMPLEMENT, token)
+    service.fail(run.run_id, "first failure", token, input_tokens=2, output_tokens=1)
+
+    retried = service.claim("owner:7", "owner/api", "worker-1")
+    assert retried is not None
+    retry_token = retried.lease_token or ""
+    original_record = router.record
+    calls = 0
+
+    def fail_once(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RoutingError("temporary routing storage failure")
+        return original_record(*args, **kwargs)
+
+    monkeypatch.setattr(router, "record", fail_once)
+    with pytest.raises(StoreError, match="temporary routing storage failure"):
+        service.fail(
+            retried.run_id,
+            "second failure",
+            retry_token,
+            input_tokens=4,
+            output_tokens=2,
+        )
+
+    service.fail(
+        retried.run_id,
+        "second failure repeated",
+        retry_token,
+        input_tokens=100,
+        output_tokens=100,
+    )
+
+    routed = router.snapshot(run.run_id)
+    assert calls == 2
+    assert len(routed.attempts) == 2
+    assert routed.attempts[-1].input_tokens == 4
+    assert routed.attempts[-1].output_tokens == 2
+    assert routed.state.consecutive_failures == 2
+    assert routed.state.current_tier is ModelTier.SOL
 
     routing_store.close()
     orchestrator_store.close()
@@ -1108,18 +1599,95 @@ def test_model_double_stops_after_human_handoff() -> None:
     decision = router.begin("model-loop").decision
 
     while not decision.requires_human:
-        outcome = model.run()
-        decision = router.record(
-            "model-loop",
-            outcome,
-            failure_context="The fake model did not resolve the problem.",
-        ).decision
+        decision = router.execute("model-loop", model).decision
 
     snapshot = router.snapshot("model-loop")
     assert decision.tier is ModelTier.HUMAN
     assert model.calls == 3
     assert model.calls == len(snapshot.attempts)
     assert snapshot.state.required_action is not None
+    with pytest.raises(RoutingError, match="already human_handoff"):
+        router.execute("model-loop", model)
+    assert model.calls == 3
+    store.close()
+
+
+def test_model_executor_exceptions_become_bounded_failures() -> None:
+    store = RoutingStore()
+    router = ModelRouter(store, _config())
+    model = FailingRoutingModel()
+    router.begin("provider-failure")
+
+    result = router.execute("provider-failure", model)
+
+    assert model.calls == 1
+    assert result.state.current_tier is ModelTier.TERRA
+    assert result.state.last_failure_context == (
+        "The provider rejected the model call."
+    )
+    assert result.attempt is not None
+    assert result.attempt.outcome is AttemptOutcome.FAILURE
+    assert result.attempt.total_tokens == 5
+    store.close()
+
+
+def test_unannotated_model_exception_gets_a_bounded_failure_context() -> None:
+    store = RoutingStore()
+    router = ModelRouter(store, _config())
+    router.begin("unannotated-provider-failure")
+
+    result = router.execute(
+        "unannotated-provider-failure", UnannotatedFailingRoutingModel()
+    )
+
+    assert (
+        result.state.last_failure_context
+        == "Model execution failed: provider unavailable"
+    )
+    store.close()
+
+
+def test_model_executor_receives_budgets_and_overuse_stops_at_human_handoff() -> None:
+    store = RoutingStore()
+    router = ModelRouter(store, _config(max_tokens=5))
+    model = OverBudgetRoutingModel()
+    router.begin("over-budget")
+
+    result = router.execute("over-budget", model)
+
+    assert model.calls == 1
+    assert model.budgets == [(5, 8, 2)]
+    assert result.state.status is RoutingStatus.HUMAN_HANDOFF
+    assert result.state.total_tokens == 5
+    assert result.attempt is not None
+    assert result.attempt.total_tokens == 5
+    assert "Token ceiling reached" in str(result.state.required_action)
+    store.close()
+
+
+def test_model_execution_skips_provider_when_budget_is_already_exhausted() -> None:
+    store = RoutingStore()
+    router = ModelRouter(store, _config(max_tokens=5))
+    model = OverBudgetRoutingModel()
+    router.begin("preflight-budget")
+    store._connection.execute(
+        "UPDATE routing_problems SET total_tokens = ? WHERE problem_id = ?",
+        (5, "preflight-budget"),
+    )
+    before_record_calls: list[str] = []
+
+    result = router.execute(
+        "preflight-budget",
+        model,
+        before_record=lambda: before_record_calls.append("called"),
+    )
+
+    assert model.calls == 0
+    assert before_record_calls == ["called"]
+    assert result.state.status is RoutingStatus.HUMAN_HANDOFF
+    assert result.attempt is not None
+    assert result.attempt.total_tokens == 0
+    assert "Token ceiling reached" in str(result.state.required_action)
     store.close()
 
 
@@ -1218,6 +1786,8 @@ def test_routing_rejects_invalid_transitions_and_persists_transaction_failures()
         router.begin("problem-1")
     with pytest.raises(RoutingError, match="Unknown routing problem"):
         router.snapshot("missing")
+    with pytest.raises(RoutingError, match="Unknown routing problem"):
+        router.handoff_limit_reason("missing")
     with pytest.raises(RoutingError, match="Unknown attempt outcome"):
         router.record("problem-1", "unknown")
     with pytest.raises(RoutingError, match="Unknown routing problem"):
@@ -1226,6 +1796,8 @@ def test_routing_rejects_invalid_transitions_and_persists_transaction_failures()
         router.record("problem-1", AttemptOutcome.SUCCESS, input_tokens=-1)
     with pytest.raises(RoutingError, match="depth"):
         router.record("problem-1", AttemptOutcome.SUCCESS, recursive_spawn_depth=-1)
+    with pytest.raises(RoutingError, match="reason"):
+        router.record("problem-1", AttemptOutcome.SUCCESS, force_human_reason=" ")
     with pytest.raises(RoutingError, match="Failure context"):
         router.record("problem-1", AttemptOutcome.FAILURE)
     with pytest.raises(RoutingError, match="Only a triage"):
@@ -1292,30 +1864,45 @@ def test_bounce_limit_and_long_context_are_recorded() -> None:
 def test_routing_api_maps_duplicate_unknown_and_invalid_requests() -> None:
     routing_store = RoutingStore()
     orchestrator_store = OrchestratorStore()
+    service = Orchestrator(orchestrator_store, RoutingProvider())
     client = TestClient(
         create_app(
-            store=orchestrator_store,
+            orchestrator=service,
             routing_store=routing_store,
             api_key="test-key",
             allowed_project_ids={"owner:7"},
         )
     )
-    headers = {"X-API-Key": "test-key"}
-    client.post("/routing/problems", json={"problem_id": "duplicate"}, headers=headers)
-
+    headers = {"X-API-Key": "test-key", "X-Worker-ID": "worker-1"}
+    client.post("/projects/owner:7/sync", headers=headers)
+    claim = client.post(
+        "/projects/owner:7/repositories/owner/api/claim", headers=headers
+    )
+    run_id = claim.json()["run_id"]
+    lease_headers = {
+        "X-API-Key": "test-key",
+        "X-Lease-Token": claim.json()["lease_token"],
+    }
+    client.post(
+        f"/runs/{run_id}/advance",
+        json={"target": Stage.IMPLEMENT.value},
+        headers=lease_headers,
+    )
     duplicate = client.post(
         "/routing/problems", json={"problem_id": "duplicate"}, headers=headers
     )
-    missing = client.get("/routing/problems/missing", headers=headers)
-    client.post("/routing/problems", json={"problem_id": "writer"}, headers=headers)
+    missing = client.get(
+        "/runs/missing/routing",
+        headers={"X-API-Key": "test-key", "X-Lease-Token": "missing"},
+    )
     invalid_retry = client.post(
-        "/routing/problems/writer/attempts",
+        f"/runs/{run_id}/routing/attempts",
         json={"outcome": "retry", "failure_context": "not allowed"},
-        headers=headers,
+        headers=lease_headers,
     )
 
-    assert duplicate.status_code == 409
-    assert missing.status_code == 404
+    assert duplicate.status_code == 404
+    assert missing.status_code == 403
     assert invalid_retry.status_code == 409
     routing_store.close()
     orchestrator_store.close()

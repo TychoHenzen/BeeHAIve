@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from contextlib import contextmanager
-from threading import Lock
+from threading import Event, Lock, Thread
 
-from .models import HandoffRequest, RunState, RunStatus, Stage
+from .models import HandoffRequest, RoutingFailure, RunState, RunStatus, Stage
 from .provider import ProjectProvider
 from .routing import (
     AttemptOutcome,
@@ -99,10 +99,41 @@ class Orchestrator:
         if run.status is not RunStatus.ACTIVE or run.stage is not Stage.IMPLEMENT:
             raise StoreError("Only an active implementation run can execute a model")
         self._ensure_routing_problem(run_id)
+        execution_token = self.store.claim_execution(run_id, lease_token)
+        stop_heartbeat = Event()
+        heartbeat_errors: list[StoreError] = []
+
+        def heartbeat() -> None:
+            while not stop_heartbeat.wait(self.store.lease_heartbeat_seconds):
+                try:
+                    self.store.heartbeat_execution(run_id, lease_token, execution_token)
+                except StoreError as exc:
+                    heartbeat_errors.append(exc)
+                    return
+
+        heartbeat_thread = Thread(target=heartbeat, daemon=True)
+        heartbeat_thread.start()
+
+        def validate_execution() -> None:
+            if heartbeat_errors:
+                raise RoutingError(str(heartbeat_errors[0]))
+            try:
+                self.store.validate_execution(run_id, lease_token, execution_token)
+            except StoreError as exc:
+                raise RoutingError(str(exc)) from exc
+
         try:
-            return self.model_router.execute(run_id, self.model_executor)
+            return self.model_router.execute(
+                run_id,
+                self.model_executor,
+                before_record=validate_execution,
+            )
         except RoutingError as exc:
             raise StoreError(str(exc)) from exc
+        finally:
+            stop_heartbeat.set()
+            heartbeat_thread.join(timeout=max(self.store.lease_heartbeat_seconds, 1.0))
+            self.store.release_execution(run_id, execution_token)
 
     def handoff(
         self,
@@ -155,6 +186,7 @@ class Orchestrator:
             )
         if intent.run.status is RunStatus.COMPLETED:
             return intent.run
+        self._ensure_handoff_routing_allowed(run_id)
         result = self.provider.create_handoff(
             HandoffRequest(
                 project_id=intent.run.project_id,
@@ -215,36 +247,25 @@ class Orchestrator:
         output_tokens: int = 0,
         recursive_spawn_depth: int = 0,
     ) -> RunState:
-        failed, transitioned = self.store.fail_with_transition(
-            run_id, error, lease_token
+        run_before = self.store.get_run(run_id)
+        route_failure = (
+            self.model_router is not None
+            and run_before is not None
+            and run_before.stage is Stage.IMPLEMENT
         )
-        if (
-            self.model_router is not None
-            and transitioned
-            and failed.stage is Stage.IMPLEMENT
-        ):
+        failed, _ = self.store.fail_with_transition(
+            run_id,
+            error,
+            lease_token,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            recursive_spawn_depth=recursive_spawn_depth,
+            route_failure=route_failure,
+        )
+        if self.model_router is not None and failed.stage is Stage.IMPLEMENT:
             self._ensure_routing_problem(run_id)
-            self._record_failure_routing(
-                run_id,
-                error,
-                input_tokens,
-                output_tokens,
-                recursive_spawn_depth,
-            )
-        elif (
-            self.model_router is not None
-            and not transitioned
-            and failed.stage is Stage.IMPLEMENT
-        ):
-            self._ensure_routing_problem(run_id)
-            if not self.model_router.store.get_attempts(run_id):
-                self._record_failure_routing(
-                    run_id,
-                    error,
-                    input_tokens,
-                    output_tokens,
-                    recursive_spawn_depth,
-                )
+            for failure in self.store.pending_routing_failures(run_id):
+                self._record_failure_routing(failure)
         return failed
 
     def stop(self, run_id: str, reason: str = "Stopped by operator") -> RunState:
@@ -270,35 +291,36 @@ class Orchestrator:
         if state is None or state.status is RoutingStatus.RESOLVED:
             return
         try:
-            self.model_router.record(run_id, AttemptOutcome.SUCCESS)
+            result = self.model_router.record(run_id, AttemptOutcome.SUCCESS)
         except RoutingError as exc:
             raise StoreError(str(exc)) from exc
+        if result.state.status is not RoutingStatus.RESOLVED:
+            raise StoreError("Routing handoff requires human action")
 
-    def _record_failure_routing(
-        self,
-        run_id: str,
-        error: str,
-        input_tokens: int,
-        output_tokens: int,
-        recursive_spawn_depth: int,
-    ) -> None:
+    def _ensure_handoff_routing_allowed(self, run_id: str) -> None:
+        if self.model_router is None:
+            return
+        self._ensure_routing_problem(run_id)
+        reason = self.model_router.handoff_limit_reason(run_id)
+        if reason is not None:
+            raise StoreError(f"Routing handoff requires human action: {reason}")
+
+    def _record_failure_routing(self, failure: RoutingFailure) -> None:
         if self.model_router is None:  # pragma: no cover - guarded by callers
             return
         try:
             self.model_router.record(
-                run_id,
+                failure.run_id,
                 AttemptOutcome.FAILURE,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                failure_context=error,
-                recursive_spawn_depth=recursive_spawn_depth,
+                input_tokens=failure.input_tokens,
+                output_tokens=failure.output_tokens,
+                failure_context=failure.error,
+                recursive_spawn_depth=failure.recursive_spawn_depth,
+                transition_id=failure.transition_id,
             )
         except RoutingError as exc:
-            state = self.model_router.store.get_problem(run_id)
-            if (
-                state is not None
-                and state.status is not RoutingStatus.RESOLVED
-                and self.model_router.store.get_attempts(run_id)
-            ):
+            if self.model_router.store.has_transition(failure.transition_id):
+                self.store.mark_routing_failure_processed(failure.transition_id)
                 return
             raise StoreError(str(exc)) from exc
+        self.store.mark_routing_failure_processed(failure.transition_id)

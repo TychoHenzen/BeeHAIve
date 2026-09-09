@@ -37,10 +37,6 @@ class FailureRequest(BaseModel):
     recursive_spawn_depth: int = Field(default=0, ge=0)
 
 
-class RoutingProblemRequest(BaseModel):
-    problem_id: str = Field(min_length=1, max_length=200)
-
-
 class RoutingAttemptRequest(BaseModel):
     outcome: Literal["failure", "retry", "success"]
     input_tokens: int = Field(default=0, ge=0)
@@ -153,10 +149,32 @@ def create_app(
         ):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
-    def require_routing_access(
+    def require_routing_run_access(
+        request: Request,
         supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
+        lease_token: str | None = Header(default=None, alias="X-Lease-Token"),
     ) -> None:
         require_api_key(supplied_api_key)
+        run_id = request.path_params.get("run_id")
+        if not isinstance(run_id, str):
+            raise HTTPException(status_code=403, detail="Run is not authorized")
+        run = orchestrator.store.get_run(run_id)
+        if (
+            run is None
+            or run.project_id not in configured_projects
+            or not orchestrator.store.is_active_repository(
+                run.project_id, run.repository
+            )
+        ):
+            raise HTTPException(status_code=403, detail="Run is not authorized")
+        try:
+            orchestrator.store.validate_lease(
+                run_id, _required_header(lease_token, "X-Lease-Token")
+            )
+        except StoreError as exc:
+            raise HTTPException(
+                status_code=403, detail="Run is not authorized"
+            ) from exc
 
     def require_mutation_access(
         request: Request,
@@ -204,35 +222,25 @@ def create_app(
     async def say_hello(name: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         return {"message": f"Hello {name}"}
 
-    @app.post("/routing/problems")
-    def start_routing_problem(  # pyright: ignore[reportUnusedFunction]
-        request: RoutingProblemRequest,
-        _auth: None = Depends(require_routing_access),
-    ) -> dict[str, object]:
-        try:
-            return routing_service.begin(request.problem_id).as_dict()
-        except RoutingError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-    @app.get("/routing/problems/{problem_id}")
+    @app.get("/runs/{run_id}/routing")
     def routing_problem(  # pyright: ignore[reportUnusedFunction]
-        problem_id: str,
-        _auth: None = Depends(require_routing_access),
+        run_id: str,
+        _auth: None = Depends(require_routing_run_access),
     ) -> dict[str, object]:
         try:
-            return routing_service.snapshot(problem_id).as_dict()
+            return routing_service.snapshot(run_id).as_dict()
         except RoutingError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    @app.post("/routing/problems/{problem_id}/attempts")
+    @app.post("/runs/{run_id}/routing/attempts")
     def record_routing_attempt(  # pyright: ignore[reportUnusedFunction]
-        problem_id: str,
+        run_id: str,
         request: RoutingAttemptRequest,
-        _auth: None = Depends(require_routing_access),
+        _auth: None = Depends(require_routing_run_access),
     ) -> dict[str, object]:
         try:
             return routing_service.record(
-                problem_id,
+                run_id,
                 request.outcome,
                 input_tokens=request.input_tokens,
                 output_tokens=request.output_tokens,
