@@ -25,10 +25,20 @@ from beehaiive.review import (
     ReviewService,
     ReviewStore,
 )
+from beehaiive.routing import ModelExecutor, ModelRouter, RoutingError, RoutingStore
 from beehaiive.storage import (
     DEFAULT_EVENT_LIMIT,
     MAX_EVENT_LIMIT,
     StoreError,
+)
+from beehaiive.workflow import (
+    CommandCheck,
+    Constitution,
+    DeterministicCheck,
+    WorkflowError,
+    WorkflowRole,
+    WorkflowService,
+    WorkflowStore,
 )
 
 
@@ -44,6 +54,53 @@ class HandoffRequest(BaseModel):
 
 class FailureRequest(BaseModel):
     error: str
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    recursive_spawn_depth: int = Field(default=0, ge=0)
+
+
+class RoutingAttemptRequest(BaseModel):
+    outcome: Literal["failure", "retry", "success"]
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    failure_context: str = Field(default="", max_length=2_000)
+    recursive_spawn_depth: int = Field(default=0, ge=0)
+
+
+class WorkflowWorkspaceRequest(BaseModel):
+    agent_id: str = Field(min_length=1, max_length=400)
+    branch: str = Field(min_length=1, max_length=400)
+    worktree: str = Field(min_length=1, max_length=1_000)
+    base_ref: str = Field(default="HEAD", min_length=1, max_length=400)
+
+
+class WorkflowHandoffRequest(BaseModel):
+    lease_id: str = Field(min_length=1, max_length=100)
+    source_role: WorkflowRole
+    target_role: WorkflowRole
+    commit_sha: str = Field(default="", max_length=200)
+    source_state: str = Field(default="", max_length=1_000)
+    approval_required: bool = False
+
+
+class WorkflowApprovalRequest(BaseModel):
+    note: str = Field(default="", max_length=1_000)
+
+
+class WorkflowClarificationRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=1_000)
+
+
+class WorkflowClarificationAnswer(BaseModel):
+    answer: str = Field(min_length=1, max_length=1_000)
+
+
+class WorkflowModelCallRequest(BaseModel):
+    lease_id: str = Field(min_length=1, max_length=100)
+
+
+class WorkflowStopRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=400)
 
 
 class ReviewStartRequest(BaseModel):
@@ -132,14 +189,48 @@ def create_app(
     review_authorizer: ReviewAuthorizer | None = None,
     review_actor: str | None = None,
     require_review_adapters: bool = False,
+    routing_store: RoutingStore | None = None,
+    model_router: ModelRouter | None = None,
+    model_executor: ModelExecutor | None = None,
+    workflow_service: WorkflowService | None = None,
+    workflow_actor: WorkflowRole | str | None = None,
 ) -> FastAPI:
+    if orchestrator is not None and orchestrator.model_router is not None:
+        if model_router is not None and model_router is not orchestrator.model_router:
+            raise ValueError("The orchestrator and API must share one model router")
+        if (
+            routing_store is not None
+            and routing_store is not orchestrator.model_router.store
+        ):
+            raise ValueError("The orchestrator and API must share one routing store")
+        routing_service = orchestrator.model_router
+    else:
+        if (
+            model_router is not None
+            and routing_store is not None
+            and model_router.store is not routing_store
+        ):
+            raise ValueError("The model router and API must share one routing store")
+        if model_router is None:
+            routing_database = os.environ.get(
+                "BEEHAIIVE_ROUTING_DB", ".beehaiive/routing.db"
+            )
+            model_router = ModelRouter(routing_store or RoutingStore(routing_database))
+        routing_service = model_router
+
     if orchestrator is None:
         if store is None:
             database = os.environ.get("BEEHAIIVE_STATE_DB", ".beehaiive/state.db")
             store = OrchestratorStore(
                 database if database == ":memory:" else Path(database)
             )
-        orchestrator = Orchestrator(store, EnvironmentGitHubProvider())
+        orchestrator = Orchestrator(
+            store, EnvironmentGitHubProvider(), routing_service, model_executor
+        )
+    else:
+        orchestrator.model_router = routing_service
+    if orchestrator.model_executor is None:
+        orchestrator.model_executor = model_executor
     if (
         review_service is not None
         and review_store is not None
@@ -188,10 +279,13 @@ def create_app(
         else os.environ.get("BEEHAIIVE_REVIEW_ACTOR")
     )
     configured_projects = _configured_project_ids(allowed_project_ids)
+    configured_workflow_actor = (
+        workflow_actor
+        if workflow_actor is not None
+        else os.environ.get("BEEHAIIVE_WORKFLOW_ACTOR")
+    )
 
-    def require_api_key(
-        supplied_api_key: str | None,
-    ) -> None:
+    def require_api_key(supplied_api_key: str | None) -> None:
         if not configured_api_key:
             raise HTTPException(
                 status_code=503,
@@ -223,6 +317,33 @@ def create_app(
 
         return _handle_review_error(operation)
 
+    def require_routing_run_access(
+        request: Request,
+        supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
+        lease_token: str | None = Header(default=None, alias="X-Lease-Token"),
+    ) -> None:
+        require_api_key(supplied_api_key)
+        run_id = request.path_params.get("run_id")
+        if not isinstance(run_id, str):
+            raise HTTPException(status_code=403, detail="Run is not authorized")
+        run = orchestrator.store.get_run(run_id)
+        if (
+            run is None
+            or run.project_id not in configured_projects
+            or not orchestrator.store.is_active_repository(
+                run.project_id, run.repository
+            )
+        ):
+            raise HTTPException(status_code=403, detail="Run is not authorized")
+        try:
+            orchestrator.store.validate_lease(
+                run_id, _required_header(lease_token, "X-Lease-Token")
+            )
+        except StoreError as exc:
+            raise HTTPException(
+                status_code=403, detail="Run is not authorized"
+            ) from exc
+
     def require_mutation_access(
         request: Request,
         supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -245,6 +366,50 @@ def create_app(
             project_id, repository
         ):
             raise HTTPException(status_code=403, detail="Repository is not authorized")
+
+    def require_workflow_access(
+        supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    ) -> None:
+        require_api_key(supplied_api_key)
+
+    def require_workflow_service() -> WorkflowService:
+        if workflow_service is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Workflow coordination is not configured",
+            )
+        return workflow_service
+
+    def require_workflow_operator(
+        supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    ) -> str:
+        require_api_key(supplied_api_key)
+        if configured_workflow_actor is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Workflow operator identity is not configured",
+            )
+        try:
+            actor = WorkflowRole(configured_workflow_actor)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Workflow operator identity is not configured",
+            ) from exc
+        if actor is not WorkflowRole.OPERATOR:
+            raise HTTPException(
+                status_code=403,
+                detail="Workflow operator approval is required",
+            )
+        return actor.value
+
+    def require_handoff_lease_token(
+        handoff_id: str,
+        supplied_lease_token: str | None,
+    ) -> None:
+        service = require_workflow_service()
+        handoff = service.get_handoff(handoff_id)
+        service.store.require_lease_token(handoff.lease_id, supplied_lease_token)
 
     def require_project_access(request: Request) -> None:
         project_id = request.path_params.get("project_id")
@@ -353,6 +518,205 @@ def create_app(
 
         return _handle_review_error(operation)
 
+    @app.post("/workflow/workspaces")
+    def acquire_workflow_workspace(  # pyright: ignore[reportUnusedFunction]
+        request: WorkflowWorkspaceRequest,
+        _auth: None = Depends(require_workflow_access),
+    ) -> dict[str, object]:
+        return _handle_workflow_error(
+            lambda: (
+                require_workflow_service()
+                .acquire_workspace(
+                    request.agent_id,
+                    request.branch,
+                    request.worktree,
+                    request.base_ref,
+                )
+                .as_dict()
+            )
+        )
+
+    @app.post("/workflow/workspaces/{lease_id}/release")
+    def release_workflow_workspace(  # pyright: ignore[reportUnusedFunction]
+        lease_id: str,
+        supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
+        supplied_lease_token: str | None = Header(
+            default=None, alias="X-Workflow-Lease-Token"
+        ),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            require_api_key(supplied_api_key)
+            require_workflow_service().store.require_lease_token(
+                lease_id, supplied_lease_token, allow_stopped=True
+            )
+            return require_workflow_service().release_workspace(lease_id).as_dict()
+
+        return _handle_workflow_error(operation)
+
+    @app.post("/workflow/workspaces/{lease_id}/stop")
+    def stop_workflow_workspace(  # pyright: ignore[reportUnusedFunction]
+        lease_id: str,
+        request: WorkflowStopRequest,
+        supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
+        supplied_lease_token: str | None = Header(
+            default=None, alias="X-Workflow-Lease-Token"
+        ),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            require_api_key(supplied_api_key)
+            require_workflow_service().store.require_lease_token(
+                lease_id, supplied_lease_token
+            )
+            return require_workflow_service().stop(lease_id, request.reason).as_dict()
+
+        return _handle_workflow_error(operation)
+
+    @app.post("/workflow/workspaces/{lease_id}/renew")
+    def renew_workflow_workspace(  # pyright: ignore[reportUnusedFunction]
+        lease_id: str,
+        supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
+        supplied_lease_token: str | None = Header(
+            default=None, alias="X-Workflow-Lease-Token"
+        ),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            require_api_key(supplied_api_key)
+            require_workflow_service().store.require_lease_token(
+                lease_id, supplied_lease_token
+            )
+            return (
+                require_workflow_service()
+                .store.renew_lease(lease_id, supplied_lease_token)
+                .as_dict()
+            )
+
+        return _handle_workflow_error(operation)
+
+    @app.post("/workflow/model-calls")
+    def authorize_workflow_model_call(  # pyright: ignore[reportUnusedFunction]
+        request: WorkflowModelCallRequest,
+        supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
+        supplied_lease_token: str | None = Header(
+            default=None, alias="X-Workflow-Lease-Token"
+        ),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            require_api_key(supplied_api_key)
+            require_workflow_service().store.require_lease_token(
+                request.lease_id, supplied_lease_token
+            )
+            return (
+                require_workflow_service().before_model_call(request.lease_id).as_dict()
+            )
+
+        return _handle_workflow_error(operation)
+
+    @app.post("/workflow/handoffs")
+    def create_workflow_handoff(  # pyright: ignore[reportUnusedFunction]
+        request: WorkflowHandoffRequest,
+        supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
+        supplied_lease_token: str | None = Header(
+            default=None, alias="X-Workflow-Lease-Token"
+        ),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            require_api_key(supplied_api_key)
+            require_workflow_service().store.require_lease_token(
+                request.lease_id, supplied_lease_token
+            )
+            return (
+                require_workflow_service()
+                .handoff(
+                    request.lease_id,
+                    request.source_role,
+                    request.target_role,
+                    request.commit_sha,
+                    request.source_state,
+                    request.approval_required,
+                )
+                .as_dict()
+            )
+
+        return _handle_workflow_error(operation)
+
+    @app.get("/workflow/handoffs/{handoff_id}")
+    def get_workflow_handoff(  # pyright: ignore[reportUnusedFunction]
+        handoff_id: str,
+        _auth: None = Depends(require_workflow_access),
+    ) -> dict[str, object]:
+        return _handle_workflow_error(
+            lambda: require_workflow_service().get_handoff(handoff_id).as_dict()
+        )
+
+    @app.post("/workflow/handoffs/{handoff_id}/approve")
+    def approve_workflow_handoff(  # pyright: ignore[reportUnusedFunction]
+        handoff_id: str,
+        request: WorkflowApprovalRequest,
+        actor: str = Depends(require_workflow_operator),
+        supplied_lease_token: str | None = Header(
+            default=None, alias="X-Workflow-Lease-Token"
+        ),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            require_handoff_lease_token(handoff_id, supplied_lease_token)
+            return (
+                require_workflow_service()
+                .approve_handoff(handoff_id, actor, request.note)
+                .as_dict()
+            )
+
+        return _handle_workflow_error(operation)
+
+    @app.post("/workflow/handoffs/{handoff_id}/clarify")
+    def request_workflow_clarification(  # pyright: ignore[reportUnusedFunction]
+        handoff_id: str,
+        request: WorkflowClarificationRequest,
+        supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
+        supplied_lease_token: str | None = Header(
+            default=None, alias="X-Workflow-Lease-Token"
+        ),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            require_api_key(supplied_api_key)
+            require_handoff_lease_token(handoff_id, supplied_lease_token)
+            return (
+                require_workflow_service()
+                .request_clarification(handoff_id, request.question)
+                .as_dict()
+            )
+
+        return _handle_workflow_error(operation)
+
+    @app.post("/workflow/handoffs/{handoff_id}/clarify/answer")
+    def answer_workflow_clarification(  # pyright: ignore[reportUnusedFunction]
+        handoff_id: str,
+        request: WorkflowClarificationAnswer,
+        supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
+        supplied_lease_token: str | None = Header(
+            default=None, alias="X-Workflow-Lease-Token"
+        ),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            require_api_key(supplied_api_key)
+            require_handoff_lease_token(handoff_id, supplied_lease_token)
+            return (
+                require_workflow_service()
+                .answer_clarification(handoff_id, request.answer)
+                .as_dict()
+            )
+
+        return _handle_workflow_error(operation)
+
+    def routing_snapshot(run_id: str, *, required: bool) -> dict[str, object] | None:
+        router = orchestrator.model_router
+        assert router is not None
+        if not required and router.store.get_problem(run_id) is None:
+            return None
+        try:
+            return router.snapshot(run_id).as_dict()
+        except RoutingError as exc:
+            raise StoreError(str(exc)) from exc
+
     @app.get("/")
     async def root() -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         return {"message": "Hello World"}
@@ -360,6 +724,34 @@ def create_app(
     @app.get("/hello/{name}")
     async def say_hello(name: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         return {"message": f"Hello {name}"}
+
+    @app.get("/runs/{run_id}/routing")
+    def routing_problem(  # pyright: ignore[reportUnusedFunction]
+        run_id: str,
+        _auth: None = Depends(require_routing_run_access),
+    ) -> dict[str, object]:
+        try:
+            return routing_service.snapshot(run_id).as_dict()
+        except RoutingError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/runs/{run_id}/routing/attempts")
+    def record_routing_attempt(  # pyright: ignore[reportUnusedFunction]
+        run_id: str,
+        request: RoutingAttemptRequest,
+        _auth: None = Depends(require_routing_run_access),
+    ) -> dict[str, object]:
+        try:
+            return routing_service.record(
+                run_id,
+                request.outcome,
+                input_tokens=request.input_tokens,
+                output_tokens=request.output_tokens,
+                failure_context=request.failure_context,
+                recursive_spawn_depth=request.recursive_spawn_depth,
+            ).as_dict()
+        except RoutingError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/dashboard", response_class=FileResponse)
     def dashboard() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
@@ -544,15 +936,35 @@ def create_app(
         lease_token: str | None = Header(default=None, alias="X-Lease-Token"),
         _auth: None = Depends(require_mutation_access),
     ) -> dict[str, object]:
-        return _run_dict(
-            _handle_store_error(
-                lambda: orchestrator.advance(
-                    run_id,
-                    request.target,
-                    _required_header(lease_token, "X-Lease-Token"),
-                )
+        run = _handle_store_error(
+            lambda: orchestrator.advance(
+                run_id,
+                request.target,
+                _required_header(lease_token, "X-Lease-Token"),
             )
         )
+        routing = (
+            _handle_store_error(lambda: routing_snapshot(run_id, required=True))
+            if request.target is Stage.IMPLEMENT
+            else None
+        )
+        return _run_dict(run, routing)
+
+    @app.post("/runs/{run_id}/attempt")
+    def run_attempt(  # pyright: ignore[reportUnusedFunction]
+        run_id: str,
+        lease_token: str | None = Header(default=None, alias="X-Lease-Token"),
+        _auth: None = Depends(require_mutation_access),
+    ) -> dict[str, object]:
+        routing = _handle_store_error(
+            lambda: orchestrator.run_implementation_attempt(
+                run_id, _required_header(lease_token, "X-Lease-Token")
+            )
+        )
+        run = orchestrator.store.get_run(run_id)
+        if run is None:  # pragma: no cover - the service already validated the run
+            raise HTTPException(status_code=404, detail="Run not found")
+        return {"run": _run_dict(run), "routing": routing.as_dict()}
 
     @app.post("/runs/{run_id}/lease")
     def renew_lease(  # pyright: ignore[reportUnusedFunction]
@@ -593,15 +1005,18 @@ def create_app(
         lease_token: str | None = Header(default=None, alias="X-Lease-Token"),
         _auth: None = Depends(require_mutation_access),
     ) -> dict[str, object]:
-        return _run_dict(
-            _handle_store_error(
-                lambda: orchestrator.fail(
-                    run_id,
-                    request.error,
-                    _required_header(lease_token, "X-Lease-Token"),
-                )
+        failed = _handle_store_error(
+            lambda: orchestrator.fail(
+                run_id,
+                request.error,
+                _required_header(lease_token, "X-Lease-Token"),
+                input_tokens=request.input_tokens,
+                output_tokens=request.output_tokens,
+                recursive_spawn_depth=request.recursive_spawn_depth,
             )
         )
+        routing = _handle_store_error(lambda: routing_snapshot(run_id, required=False))
+        return _run_dict(failed, routing)
 
     return app
 
@@ -649,8 +1064,17 @@ def _handle_review_error[T](function: Callable[[], T]) -> T:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-def _run_dict(run: RunState) -> dict[str, object]:
-    return {
+def _handle_workflow_error[T](function: Callable[[], T]) -> T:
+    try:
+        return function()
+    except WorkflowError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+def _run_dict(
+    run: RunState, routing: dict[str, object] | None = None
+) -> dict[str, object]:
+    result: dict[str, object] = {
         "run_id": run.run_id,
         "project_id": run.project_id,
         "repository": run.repository,
@@ -666,6 +1090,9 @@ def _run_dict(run: RunState) -> dict[str, object]:
         "lease_token": run.lease_token,
         "lease_expires_at": run.lease_expires_at,
     }
+    if routing is not None:
+        result["routing"] = routing
+    return result
 
 
 def _dashboard_state(
@@ -763,4 +1190,29 @@ def _public_run_dict(run: RunState) -> dict[str, object]:
     return result
 
 
-app = create_app(require_review_adapters=True)
+def _production_workflow_service() -> WorkflowService:
+    repository = Path(
+        os.environ.get("BEEHAIIVE_WORKFLOW_REPOSITORY", str(Path(__file__).parent))
+    )
+    database = os.environ.get(
+        "BEEHAIIVE_WORKFLOW_DB",
+        str(repository / ".beehaiive" / "workflow.db"),
+    )
+    constitution_path = Path(__file__).parent / "constitution.json"
+    return WorkflowService(
+        WorkflowStore(database),
+        repository,
+        Constitution.load(constitution_path),
+        (
+            cast(
+                DeterministicCheck, CommandCheck("tests", ("uv", "run", "pytest", "-q"))
+            ),
+        ),
+    )
+
+
+app = create_app(
+    workflow_service=_production_workflow_service(),
+    workflow_actor=os.environ.get("BEEHAIIVE_WORKFLOW_ACTOR"),
+    require_review_adapters=True,
+)
