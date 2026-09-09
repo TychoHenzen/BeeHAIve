@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 from collections.abc import Mapping
 from typing import Any, Protocol, cast
 from urllib.request import Request, urlopen
@@ -138,6 +139,58 @@ query($owner: String!, $number: Int!, $cursor: String) {
               number
               title
               repository { nameWithOwner }
+              labels(first: 100) {
+                nodes { name }
+                pageInfo { hasNextPage endCursor }
+              }
+              subIssues(first: 100) {
+                nodes {
+                  number
+                  title
+                  state
+                  labels(first: 100) {
+                    nodes { name }
+                    pageInfo { hasNextPage endCursor }
+                  }
+                }
+                pageInfo { hasNextPage endCursor }
+              }
+              comments(first: 50) {
+                nodes {
+                  author { ... on User { login } ... on Bot { login } }
+                  body
+                  createdAt
+                  url
+                }
+                pageInfo { hasNextPage endCursor }
+              }
+              closedByPullRequestsReferences(includeClosedPrs: true, first: 100) {
+                nodes {
+                  number
+                  url
+                  reviewDecision
+                  reviewRequests(first: 100) {
+                    nodes {
+                      requestedReviewer {
+                        ... on User { login }
+                        ... on Team { name }
+                      }
+                    }
+                    pageInfo { hasNextPage endCursor }
+                  }
+                  latestReviews(first: 100) {
+                    nodes {
+                      author { ... on User { login } ... on Bot { login } }
+                      state
+                      body
+                      submittedAt
+                      url
+                    }
+                    pageInfo { hasNextPage endCursor }
+                  }
+                }
+                pageInfo { hasNextPage endCursor }
+              }
             }
           }
           fieldValues(first: 100) {
@@ -148,6 +201,135 @@ query($owner: String!, $number: Int!, $cursor: String) {
               }
             }
           }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+
+ISSUE_LABELS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      labels(first: 100, after: $cursor) {
+        nodes { name }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+
+ISSUE_SUB_ISSUES_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      subIssues(first: 100, after: $cursor) {
+        nodes {
+          number
+          title
+          state
+          labels(first: 100) {
+            nodes { name }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+
+ISSUE_COMMENTS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      comments(first: 50, after: $cursor) {
+        nodes {
+          author { ... on User { login } ... on Bot { login } }
+          body
+          createdAt
+          url
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+
+ISSUE_PULL_REQUESTS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      closedByPullRequestsReferences(
+        includeClosedPrs: true
+        first: 100
+        after: $cursor
+      ) {
+        nodes {
+          number
+          url
+          reviewDecision
+          reviewRequests(first: 100) {
+            nodes {
+              requestedReviewer {
+                ... on User { login }
+                ... on Team { name }
+              }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+          latestReviews(first: 100) {
+            nodes {
+              author { ... on User { login } ... on Bot { login } }
+              state
+              body
+              submittedAt
+              url
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+
+PULL_REQUEST_REVIEW_REQUESTS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewRequests(first: 100, after: $cursor) {
+        nodes {
+          requestedReviewer {
+            ... on User { login }
+            ... on Team { name }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+
+PULL_REQUEST_LATEST_REVIEWS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      latestReviews(first: 100, after: $cursor) {
+        nodes {
+          author { ... on User { login } ... on Bot { login } }
+          state
+          body
+          submittedAt
+          url
         }
         pageInfo { hasNextPage endCursor }
       }
@@ -245,6 +427,37 @@ def _next_cursor(connection: Mapping[str, Any]) -> tuple[bool, str | None]:
     return has_next, cursor if isinstance(cursor, str) else None
 
 
+def _connection_at(data: Mapping[str, Any], path: tuple[str, ...]) -> Mapping[str, Any]:
+    value: object = data
+    for key in path:
+        value = _mapping(value).get(key)
+    return _mapping(value)
+
+
+def _complete_connection(
+    client: GraphQLClient,
+    initial: object,
+    query: str,
+    variables: Mapping[str, object],
+    response_path: tuple[str, ...],
+) -> dict[str, Any]:
+    connection = _mapping(initial)
+    nodes = list(_nodes(connection))
+    has_next, cursor = _next_cursor(connection)
+    while has_next:
+        page_data = client.execute(
+            query,
+            {**variables, "cursor": cursor},
+        )
+        page = _connection_at(page_data, response_path)
+        nodes.extend(_nodes(page))
+        has_next, cursor = _next_cursor(page)
+    completed = dict(connection)
+    completed["nodes"] = nodes
+    completed["pageInfo"] = {"hasNextPage": False, "endCursor": None}
+    return completed
+
+
 def _stage_from_status(status: str | None) -> Stage | None:
     normalized = (status or "").strip().lower()
     if normalized == "backlog":
@@ -254,6 +467,176 @@ def _stage_from_status(status: str | None) -> Stage | None:
     if normalized == "in progress":
         return Stage.IMPLEMENT
     return None
+
+
+def _actor_name(value: object) -> str | None:
+    if not isinstance(value, Mapping):
+        return None
+    actor = cast(Mapping[str, Any], value)
+    for key in ("login", "name"):
+        name = actor.get(key)
+        if isinstance(name, str) and name:
+            return name
+    return None
+
+
+def _label_names(value: object) -> list[str]:
+    names: list[str] = []
+    for label in _nodes(value):
+        name = label.get("name")
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
+
+
+def _review_status(state: object) -> str:
+    normalized = str(state or "").strip().upper()
+    if normalized == "APPROVED":
+        return "pass"
+    if normalized == "CHANGES_REQUESTED":
+        return "fail"
+    return "pending"
+
+
+def _dashboard_metadata(issue: Mapping[str, Any]) -> dict[str, object]:
+    """Project issue metadata that the dashboard can show without fake state."""
+
+    metadata: dict[str, object] = {}
+    labels = _label_names(issue.get("labels", {}))
+
+    subtasks: list[dict[str, object]] = []
+    for raw_subtask in _nodes(issue.get("subIssues", {})):
+        number = raw_subtask.get("number")
+        title = raw_subtask.get("title")
+        if not isinstance(number, int) or not isinstance(title, str):
+            continue
+        subtask: dict[str, object] = {
+            "id": f"#{number}",
+            "number": number,
+            "title": title,
+        }
+        state = raw_subtask.get("state")
+        if isinstance(state, str):
+            subtask["status"] = state.lower()
+        subtask_labels = _label_names(raw_subtask.get("labels", {}))
+        if subtask_labels:
+            subtask["labels"] = subtask_labels
+        subtasks.append(subtask)
+    if subtasks:
+        metadata["subtasks"] = subtasks
+
+    readers: list[dict[str, object]] = []
+    reviewers: dict[str, dict[str, object]] = {}
+    pull_requests: list[dict[str, object]] = []
+    for raw_pull_request in _nodes(issue.get("closedByPullRequestsReferences", {})):
+        pull_request_number = raw_pull_request.get("number")
+        if not isinstance(pull_request_number, int):
+            continue
+        pull_request_readers: list[dict[str, object]] = []
+        pull_request_reviewers: dict[str, dict[str, object]] = {}
+        for raw_request in _nodes(raw_pull_request.get("reviewRequests", {})):
+            name = _actor_name(raw_request.get("requestedReviewer"))
+            if name is None:
+                continue
+            reader: dict[str, object] = {
+                "id": f"#{pull_request_number}:{name}",
+                "name": name,
+                "pull_request": pull_request_number,
+                "status": "pending",
+            }
+            pull_request_readers.append(reader)
+            readers.append(reader)
+
+        for raw_review in _nodes(raw_pull_request.get("latestReviews", {})):
+            name = _actor_name(raw_review.get("author"))
+            if name is None:
+                continue
+            status = _review_status(raw_review.get("state"))
+            reviewer: dict[str, object] = {
+                "status": status,
+                "pull_request": pull_request_number,
+            }
+            body = raw_review.get("body")
+            if isinstance(body, str) and body.strip():
+                reviewer["comment"] = body
+            submitted_at = raw_review.get("submittedAt")
+            if isinstance(submitted_at, str):
+                reviewer["submitted_at"] = submitted_at
+            reviewer_key = f"#{pull_request_number}:{name}"
+            pull_request_reviewers[reviewer_key] = reviewer
+            reviewers[reviewer_key] = reviewer
+            for reader in pull_request_readers:
+                if reader["name"] == name:
+                    reader["status"] = status
+                    break
+            else:
+                reader = {
+                    "id": reviewer_key,
+                    "name": name,
+                    "pull_request": pull_request_number,
+                    "status": status,
+                }
+                pull_request_readers.append(reader)
+                readers.append(reader)
+
+        pull_request: dict[str, object] = {
+            "number": pull_request_number,
+            "readers": pull_request_readers,
+            "reviewers": pull_request_reviewers,
+        }
+        url = raw_pull_request.get("url")
+        if isinstance(url, str):
+            pull_request["url"] = url
+        decision = raw_pull_request.get("reviewDecision")
+        if isinstance(decision, str):
+            pull_request["review_decision"] = decision.lower()
+        pull_requests.append(pull_request)
+
+    if readers:
+        metadata["readers"] = readers
+    if reviewers:
+        metadata["reviewers"] = reviewers
+    if pull_requests:
+        metadata["pull_requests"] = pull_requests
+
+    activity: list[dict[str, object]] = []
+    for comment in _nodes(issue.get("comments", {})):
+        body = comment.get("body")
+        if not isinstance(body, str) or not body.strip():
+            continue
+        entry: dict[str, object] = {
+            "agent": _actor_name(comment.get("author")) or "github",
+            "action": body,
+        }
+        for source_key, target_key in (("createdAt", "time"), ("url", "url")):
+            value = comment.get(source_key)
+            if isinstance(value, str):
+                entry[target_key] = value
+        activity.append(entry)
+    if activity:
+        metadata["activity"] = activity
+
+    bounce_count = 0
+    for label in labels:
+        match = re.fullmatch(r"bounces?/(\d+)", label.strip(), re.IGNORECASE)
+        if match:
+            bounce_count = max(bounce_count, int(match.group(1)))
+    escalation_log = [
+        {"tier": label.split("/", 1)[1], "resolved": False}
+        for label in labels
+        if label.lower().startswith("escalation/") and "/" in label
+    ]
+    if bounce_count or escalation_log:
+        escalation: dict[str, object] = {
+            "current": bounce_count,
+            "consecutive": bounce_count,
+        }
+        if escalation_log:
+            escalation["current_tier"] = escalation_log[-1]["tier"]
+        metadata["escalation"] = escalation
+        metadata["escalation_log"] = escalation_log
+
+    return metadata
 
 
 def _validate_branch_name(branch: str) -> None:
@@ -332,6 +715,94 @@ class GitHubProjectProvider:
         self.owner_type = owner_type
         self.project_id = f"{owner}:{project_number}"
         self._client = client or UrllibGraphQLClient(token, endpoint)
+
+    def _complete_issue_metadata(self, issue: Mapping[str, Any]) -> Mapping[str, Any]:
+        repository_name = _mapping(issue.get("repository")).get("nameWithOwner")
+        issue_number = issue.get("number")
+        if not isinstance(repository_name, str) or not isinstance(issue_number, int):
+            return issue
+        repository_owner, repository = self._repository_parts(repository_name)
+        variables = {
+            "owner": repository_owner,
+            "name": repository,
+            "number": issue_number,
+        }
+        completed_issue = dict(issue)
+        completed_issue["labels"] = _complete_connection(
+            self._client,
+            issue.get("labels", {}),
+            ISSUE_LABELS_QUERY,
+            variables,
+            ("repository", "issue", "labels"),
+        )
+        subissues = _complete_connection(
+            self._client,
+            issue.get("subIssues", {}),
+            ISSUE_SUB_ISSUES_QUERY,
+            variables,
+            ("repository", "issue", "subIssues"),
+        )
+        completed_subissues: list[dict[str, Any]] = []
+        for raw_subissue in _nodes(subissues):
+            subissue = dict(raw_subissue)
+            subissue_number = subissue.get("number")
+            if isinstance(subissue_number, int):
+                subissue["labels"] = _complete_connection(
+                    self._client,
+                    subissue.get("labels", {}),
+                    ISSUE_LABELS_QUERY,
+                    {
+                        "owner": repository_owner,
+                        "name": repository,
+                        "number": subissue_number,
+                    },
+                    ("repository", "issue", "labels"),
+                )
+            completed_subissues.append(subissue)
+        subissues["nodes"] = completed_subissues
+        completed_issue["subIssues"] = subissues
+        completed_issue["comments"] = _complete_connection(
+            self._client,
+            issue.get("comments", {}),
+            ISSUE_COMMENTS_QUERY,
+            variables,
+            ("repository", "issue", "comments"),
+        )
+        pull_requests = _complete_connection(
+            self._client,
+            issue.get("closedByPullRequestsReferences", {}),
+            ISSUE_PULL_REQUESTS_QUERY,
+            variables,
+            ("repository", "issue", "closedByPullRequestsReferences"),
+        )
+        completed_pull_requests: list[dict[str, Any]] = []
+        for raw_pull_request in _nodes(pull_requests):
+            pull_request = dict(raw_pull_request)
+            pull_request_number = pull_request.get("number")
+            if isinstance(pull_request_number, int):
+                review_variables = {
+                    "owner": repository_owner,
+                    "name": repository,
+                    "number": pull_request_number,
+                }
+                pull_request["reviewRequests"] = _complete_connection(
+                    self._client,
+                    pull_request.get("reviewRequests", {}),
+                    PULL_REQUEST_REVIEW_REQUESTS_QUERY,
+                    review_variables,
+                    ("repository", "pullRequest", "reviewRequests"),
+                )
+                pull_request["latestReviews"] = _complete_connection(
+                    self._client,
+                    pull_request.get("latestReviews", {}),
+                    PULL_REQUEST_LATEST_REVIEWS_QUERY,
+                    review_variables,
+                    ("repository", "pullRequest", "latestReviews"),
+                )
+            completed_pull_requests.append(pull_request)
+        pull_requests["nodes"] = completed_pull_requests
+        completed_issue["closedByPullRequestsReferences"] = pull_requests
+        return completed_issue
 
     @classmethod
     def from_environment(cls) -> GitHubProjectProvider:
@@ -415,6 +886,7 @@ class GitHubProjectProvider:
                     or not isinstance(title, str)
                 ):
                     continue
+                content = self._complete_issue_metadata(content)
                 status = None
                 for field_value in _nodes(item.get("fieldValues", {})):
                     raw_field = field_value.get("field")
@@ -435,6 +907,7 @@ class GitHubProjectProvider:
                         stage,
                         status,
                         stage is not None,
+                        _dashboard_metadata(content),
                     )
                 )
             has_next, item_cursor = _next_cursor(item_connection)

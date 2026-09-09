@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>BeeHAIve live dashboard</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #111827;
+        color: #e5e7eb;
+      }
+      body { margin: 0; background: #111827; }
+      main { max-width: 1100px; margin: 0 auto; padding: 24px; }
+      header, .toolbar, .card, .repo, .action-log { border: 1px solid #374151; background: #1f2937; border-radius: 10px; }
+      header { padding: 18px; margin-bottom: 14px; }
+      h1, h2, h3, p { margin-top: 0; }
+      h1 { font-size: 1.35rem; margin-bottom: 12px; }
+      h2 { font-size: 1rem; margin-bottom: 10px; }
+      h3 { font-size: .95rem; margin-bottom: 6px; }
+      .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; padding: 12px; }
+      label { display: grid; gap: 4px; color: #9ca3af; font-size: .78rem; }
+      input, button { border: 1px solid #4b5563; border-radius: 6px; background: #111827; color: #e5e7eb; padding: 8px 10px; }
+      input { min-width: 190px; }
+      button { cursor: pointer; background: #1d4ed8; border-color: #2563eb; }
+      button.secondary { background: #374151; border-color: #4b5563; }
+      button.danger { background: #991b1b; border-color: #b91c1c; }
+      button:disabled { cursor: wait; opacity: .65; }
+      .status { min-height: 1.4em; margin: 12px 0; color: #9ca3af; }
+      .status.pending { color: #f59e0b; }
+      .status.success { color: #22c55e; }
+      .status.failure { color: #f87171; }
+      .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; margin: 14px 0; }
+      .card { padding: 12px; }
+      .card .label { color: #9ca3af; font-size: .76rem; }
+      .card .value { color: #60a5fa; font-size: 1.35rem; font-weight: 700; margin-top: 4px; }
+      .repo { margin: 12px 0; overflow: hidden; }
+      .repo-header { display: flex; justify-content: space-between; gap: 10px; padding: 12px; border-bottom: 1px solid #374151; }
+      .repo-body { padding: 10px; }
+      .writer { color: #9ca3af; font-size: .8rem; }
+      .writer.active { color: #22c55e; }
+      .pbi { background: #111827; border: 1px solid #374151; border-radius: 8px; padding: 12px; margin: 8px 0; }
+      .pbi-header { display: flex; justify-content: space-between; gap: 10px; }
+      .pbi-title { color: #f3f4f6; }
+      .muted { color: #9ca3af; font-size: .8rem; }
+      .mono { color: #93c5fd; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+      .pill { display: inline-block; border-radius: 999px; padding: 3px 8px; background: #374151; color: #d1d5db; font-size: .74rem; }
+      .pill.active { background: #1e3a8a; color: #bfdbfe; }
+      .pill.failed { background: #7f1d1d; color: #fecaca; }
+      .pill.completed { background: #14532d; color: #bbf7d0; }
+      .progress { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; padding: 0; list-style: none; }
+      .progress li { border-radius: 999px; padding: 4px 8px; background: #374151; color: #9ca3af; font-size: .74rem; }
+      .progress li.complete { background: #14532d; color: #bbf7d0; }
+      .progress li.current { background: #1e3a8a; color: #bfdbfe; }
+      .details { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin-top: 10px; }
+      .details section { border-top: 1px solid #374151; padding-top: 9px; }
+      ul { margin: 6px 0 0; padding-left: 18px; }
+      li { margin: 3px 0; }
+      .actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+      .action-log { margin-top: 14px; padding: 12px; }
+      .action-row { display: flex; flex-wrap: wrap; gap: 8px; border-top: 1px solid #374151; padding: 8px 0; font-size: .8rem; }
+      .action-row:first-child { border-top: 0; }
+      .empty { padding: 18px; border: 1px dashed #4b5563; border-radius: 8px; color: #9ca3af; }
+      @media (max-width: 600px) { main { padding: 12px; } input { min-width: 0; width: 100%; } label { flex: 1 1 100%; } }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>BeeHAIve live dashboard</h1>
+        <p class="muted">The view is read from the service and refreshes every five seconds.</p>
+        <div class="toolbar">
+          <label>Project ID <input id="project-id" autocomplete="off" placeholder="owner:project-number"></label>
+          <label>API key for operator actions <input id="api-key" type="password" autocomplete="off"></label>
+          <button id="refresh" class="secondary" type="button">Refresh</button>
+          <button id="start" type="button">Sync project</button>
+        </div>
+      </header>
+      <div id="state-status" class="status" role="status" aria-live="polite">Enter a project ID to load live state.</div>
+      <section id="summary" class="summary" aria-label="Project counts"></section>
+      <section id="dashboard" aria-live="polite"></section>
+      <section id="action-log" class="action-log" hidden>
+        <h2>Operator actions</h2>
+        <div id="actions"></div>
+      </section>
+    </main>
+    <script type="module" src="/dashboard.js"></script>
+  </body>
+</html>
