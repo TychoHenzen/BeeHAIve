@@ -1,6 +1,6 @@
 import os
 import secrets
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Mapping
 from pathlib import Path
 from typing import Annotated, Literal, cast
 
@@ -12,6 +12,19 @@ from beehaiive import EnvironmentGitHubProvider, Orchestrator, OrchestratorStore
 from beehaiive.dashboard import build_dashboard_state
 from beehaiive.models import RunState, RunStatus
 from beehaiive.provider import ProviderError
+from beehaiive.review import (
+    REQUIRED_CONCERNS,
+    PullRequestReviewProvider,
+    ReaderStatus,
+    ReviewAction,
+    ReviewAdapterError,
+    ReviewAuthorizer,
+    ReviewConcern,
+    ReviewError,
+    ReviewReader,
+    ReviewService,
+    ReviewStore,
+)
 from beehaiive.routing import ModelExecutor, ModelRouter, RoutingError, RoutingStore
 from beehaiive.storage import (
     DEFAULT_EVENT_LIMIT,
@@ -90,6 +103,39 @@ class WorkflowStopRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=400)
 
 
+class ReviewStartRequest(BaseModel):
+    pull_request_id: str = Field(min_length=1, max_length=200)
+    head_sha: str = Field(min_length=1, max_length=200)
+
+
+class ReviewReadyRequest(BaseModel):
+    pull_request_id: str = Field(min_length=1, max_length=200)
+
+
+class ReviewReaderRequest(BaseModel):
+    concern: ReviewConcern
+    status: ReaderStatus
+    findings: list[str] = Field(default_factory=list, max_length=20)
+    reader: str = Field(default="automated", min_length=1, max_length=100)
+
+
+class ReviewFindingRequest(BaseModel):
+    concern: ReviewConcern
+    summary: str = Field(min_length=1, max_length=1_000)
+
+
+class ReviewResolutionRequest(BaseModel):
+    resolution: str = Field(min_length=1, max_length=1_000)
+
+
+class ReviewApprovalRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=1_000)
+
+
+class ReviewHandoffRequest(BaseModel):
+    head_sha: str = Field(min_length=1, max_length=200)
+
+
 class DashboardActionBase(BaseModel):
     approved: bool = False
 
@@ -136,6 +182,13 @@ def create_app(
     orchestrator: Orchestrator | None = None,
     api_key: str | None = None,
     allowed_project_ids: Collection[str] | None = None,
+    review_store: ReviewStore | None = None,
+    review_service: ReviewService | None = None,
+    review_provider: PullRequestReviewProvider | None = None,
+    review_readers: Mapping[ReviewConcern, ReviewReader] | None = None,
+    review_authorizer: ReviewAuthorizer | None = None,
+    review_actor: str | None = None,
+    require_review_adapters: bool = False,
     routing_store: RoutingStore | None = None,
     model_router: ModelRouter | None = None,
     model_executor: ModelExecutor | None = None,
@@ -178,10 +231,52 @@ def create_app(
         orchestrator.model_router = routing_service
     if orchestrator.model_executor is None:
         orchestrator.model_executor = model_executor
+    if (
+        review_service is not None
+        and review_store is not None
+        and review_service.store is not review_store
+    ):
+        raise ValueError("The review service and API must share one review store")
+    if review_service is not None and any(
+        value is not None
+        for value in (review_provider, review_readers, review_authorizer)
+    ):
+        raise ValueError("Review adapters must be configured on the review service")
+    if review_service is None:
+        review_database = os.environ.get("BEEHAIIVE_REVIEW_DB", ".beehaiive/reviews.db")
+        review_service = ReviewService(
+            review_store or ReviewStore(review_database),
+            provider=review_provider,
+            readers=review_readers,
+            authorizer=review_authorizer,
+        )
 
     app = FastAPI(title="BeeHAIve")
+
+    if require_review_adapters:
+
+        @app.on_event("startup")  # pyright: ignore[reportDeprecated]
+        async def require_configured_review_adapters() -> None:  # pyright: ignore[reportUnusedFunction]
+            missing = [
+                concern.value
+                for concern in REQUIRED_CONCERNS
+                if concern not in review_service.readers
+            ]
+            if review_service.provider is None or missing:
+                configured = "pull-request provider"
+                if missing:
+                    configured = f"{configured} and readers: {', '.join(missing)}"
+                raise RuntimeError(
+                    f"Production review adapters are not configured: {configured}"
+                )
+
     configured_api_key = (
         api_key if api_key is not None else os.environ.get("BEEHAIIVE_API_KEY")
+    )
+    configured_review_actor = (
+        review_actor
+        if review_actor is not None
+        else os.environ.get("BEEHAIIVE_REVIEW_ACTOR")
     )
     configured_projects = _configured_project_ids(allowed_project_ids)
     configured_workflow_actor = (
@@ -200,6 +295,27 @@ def create_app(
             supplied_api_key, configured_api_key
         ):
             raise HTTPException(status_code=401, detail="Invalid API key")
+
+    def require_review_access(
+        supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    ) -> str:
+        require_api_key(supplied_api_key)
+        if configured_review_actor is None or not configured_review_actor.strip():
+            raise HTTPException(
+                status_code=503, detail="Review actor is not configured"
+            )
+        return configured_review_actor
+
+    @app.post("/reviews/ready")
+    def run_ready_review(  # pyright: ignore[reportUnusedFunction]
+        request: ReviewReadyRequest,
+        actor: str = Depends(require_review_access),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            review_service.authorize(request.pull_request_id, actor, ReviewAction.START)
+            return review_service.run_ready_review(request.pull_request_id).as_dict()
+
+        return _handle_review_error(operation)
 
     def require_routing_run_access(
         request: Request,
@@ -299,6 +415,108 @@ def create_app(
         project_id = request.path_params.get("project_id")
         if not isinstance(project_id, str) or project_id not in configured_projects:
             raise HTTPException(status_code=403, detail="Project is not authorized")
+
+    @app.post("/reviews/cycles")
+    def start_review_cycle(  # pyright: ignore[reportUnusedFunction]
+        request: ReviewStartRequest,
+        actor: str = Depends(require_review_access),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            review_service.authorize(request.pull_request_id, actor, ReviewAction.START)
+            return review_service.start_cycle(
+                request.pull_request_id, request.head_sha
+            ).as_dict()
+
+        return _handle_review_error(operation)
+
+    @app.get("/reviews/pull-requests/{pull_request_id}")
+    def review_state(  # pyright: ignore[reportUnusedFunction]
+        pull_request_id: str,
+        actor: str = Depends(require_review_access),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            review_service.authorize(pull_request_id, actor, ReviewAction.READ)
+            return review_service.snapshot(pull_request_id).as_dict()
+
+        return _handle_review_error(operation)
+
+    @app.post("/reviews/cycles/{cycle_id}/readers")
+    def record_review_reader(  # pyright: ignore[reportUnusedFunction]
+        cycle_id: str,
+        request: ReviewReaderRequest,
+        actor: str = Depends(require_review_access),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            pull_request_id = review_service.pull_request_id_for_cycle(cycle_id)
+            review_service.authorize(pull_request_id, actor, ReviewAction.READER)
+            return review_service.record_reader(
+                cycle_id,
+                request.concern,
+                request.status,
+                request.findings,
+                request.reader,
+            ).as_dict()
+
+        return _handle_review_error(operation)
+
+    @app.post("/reviews/cycles/{cycle_id}/findings")
+    def add_review_finding(  # pyright: ignore[reportUnusedFunction]
+        cycle_id: str,
+        request: ReviewFindingRequest,
+        actor: str = Depends(require_review_access),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            pull_request_id = review_service.pull_request_id_for_cycle(cycle_id)
+            review_service.authorize(pull_request_id, actor, ReviewAction.WRITER)
+            return review_service.add_finding(
+                cycle_id, request.concern, request.summary
+            ).as_dict()
+
+        return _handle_review_error(operation)
+
+    @app.post("/reviews/findings/{finding_id}/resolve")
+    def resolve_review_finding(  # pyright: ignore[reportUnusedFunction]
+        finding_id: str,
+        request: ReviewResolutionRequest,
+        actor: str = Depends(require_review_access),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            pull_request_id = review_service.pull_request_id_for_finding(finding_id)
+            review_service.authorize(pull_request_id, actor, ReviewAction.WRITER)
+            return review_service.resolve_finding(
+                finding_id, request.resolution
+            ).as_dict()
+
+        return _handle_review_error(operation)
+
+    @app.post("/reviews/cycles/{cycle_id}/approve")
+    def approve_review_cycle(  # pyright: ignore[reportUnusedFunction]
+        cycle_id: str,
+        request: ReviewApprovalRequest,
+        actor: str = Depends(require_review_access),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            pull_request_id = review_service.pull_request_id_for_cycle(cycle_id)
+            review_service.authorize(pull_request_id, actor, ReviewAction.APPROVE)
+            return review_service.approve_for_merge(
+                cycle_id, request.reason, actor
+            ).as_dict()
+
+        return _handle_review_error(operation)
+
+    @app.post("/reviews/pull-requests/{pull_request_id}/handoff")
+    def review_handoff(  # pyright: ignore[reportUnusedFunction]
+        pull_request_id: str,
+        request: ReviewHandoffRequest,
+        actor: str = Depends(require_review_access),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            review_service.authorize(pull_request_id, actor, ReviewAction.HANDOFF)
+            return review_service.merge_handoff(
+                pull_request_id, request.head_sha
+            ).as_dict()
+
+        return _handle_review_error(operation)
 
     @app.post("/workflow/workspaces")
     def acquire_workflow_workspace(  # pyright: ignore[reportUnusedFunction]
@@ -837,6 +1055,15 @@ def _handle_store_error[T](function: Callable[[], T]) -> T:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+def _handle_review_error[T](function: Callable[[], T]) -> T:
+    try:
+        return function()
+    except ReviewAdapterError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except ReviewError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 def _handle_workflow_error[T](function: Callable[[], T]) -> T:
     try:
         return function()
@@ -987,4 +1214,5 @@ def _production_workflow_service() -> WorkflowService:
 app = create_app(
     workflow_service=_production_workflow_service(),
     workflow_actor=os.environ.get("BEEHAIIVE_WORKFLOW_ACTOR"),
+    require_review_adapters=True,
 )

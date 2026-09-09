@@ -12,9 +12,9 @@ from beehaiive.models import (
 from beehaiive.orchestrator import Orchestrator
 from beehaiive.provider import ProviderError
 from beehaiive.storage import OrchestratorStore
-from main import _configured_project_ids, app, create_app
+from main import _configured_project_ids, create_app
 
-client = TestClient(app)
+client = TestClient(create_app())
 
 
 class ApiProvider:
