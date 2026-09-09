@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 from collections.abc import Mapping
@@ -93,6 +94,13 @@ class ProjectProvider(Protocol):
 
         ...
 
+    def validate_handoff(
+        self, repository: str, branch: str, requested_base: str | None
+    ) -> str:
+        """Validate handoff names and return the existing base branch."""
+
+        ...
+
 
 PROJECT_QUERY = """
 query($owner: String!, $number: Int!) {
@@ -164,7 +172,7 @@ query(
       after: $pullRequestCursor
       states: [OPEN, CLOSED, MERGED]
     ) {
-      nodes { number url headRefName baseRefName }
+      nodes { number url headRefName baseRefName body }
       pageInfo { hasNextPage endCursor }
     }
   }
@@ -217,9 +225,15 @@ def _nodes(value: object) -> list[Mapping[str, Any]]:
     return [_mapping(node) for node in node_values if node is not None]
 
 
-def _project(data: Mapping[str, Any]) -> Mapping[str, Any]:
-    user = _mapping(data.get("user"))
-    return _mapping(user.get("projectV2"))
+def _project(data: Mapping[str, Any], owner_type: str = "user") -> Mapping[str, Any]:
+    owner = _mapping(data.get(owner_type))
+    return _mapping(owner.get("projectV2"))
+
+
+def _owner_query(query: str, owner_type: str) -> str:
+    if owner_type not in {"user", "organization"}:
+        raise ProviderError("GitHub Project owner type must be user or organization")
+    return query.replace("user(login:", f"{owner_type}(login:")
 
 
 def _next_cursor(connection: Mapping[str, Any]) -> tuple[bool, str | None]:
@@ -231,7 +245,7 @@ def _next_cursor(connection: Mapping[str, Any]) -> tuple[bool, str | None]:
     return has_next, cursor if isinstance(cursor, str) else None
 
 
-def _stage_from_status(status: str | None) -> Stage:
+def _stage_from_status(status: str | None) -> Stage | None:
     normalized = (status or "").strip().lower()
     if normalized == "backlog":
         return Stage.BACKLOG
@@ -239,13 +253,66 @@ def _stage_from_status(status: str | None) -> Stage:
         return Stage.REFINE
     if normalized == "in progress":
         return Stage.IMPLEMENT
-    if normalized == "done":
-        return Stage.PULL_REQUEST
-    return Stage.BACKLOG
+    return None
+
+
+def _validate_branch_name(branch: str) -> None:
+    if (
+        not branch
+        or branch.strip() != branch
+        or branch in {".", "..", "@"}
+        or ".." in branch
+        or "@{" in branch
+        or branch.startswith("/")
+        or branch.endswith("/")
+        or branch.startswith(".")
+        or branch.endswith(".")
+        or branch.endswith(".lock")
+        or "//" in branch
+        or any(ord(char) < 32 or char in " ~^:?*[\\" for char in branch)
+    ):
+        raise ProviderError("GitHub branch name is invalid")
+
+
+def _handoff_marker(request: HandoffRequest) -> str:
+    if not request.run_id.strip():
+        raise ProviderError("Handoff run identity is required")
+    payload = json.dumps(
+        {
+            "pbi_number": request.pbi_number,
+            "project_id": request.project_id,
+            "repository": request.repository,
+            "run_id": request.run_id,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    return f"<!-- beehaiive-handoff:{encoded} -->"
+
+
+def _handoff_body(body: str, marker: str) -> str:
+    if marker in body:
+        return body
+    return f"{body.rstrip()}\n\n{marker}" if body.strip() else marker
+
+
+def _pull_request_matches(
+    pull_request: Mapping[str, Any],
+    branch: str,
+    base_branch: str,
+    identity_marker: str,
+) -> bool:
+    return (
+        pull_request.get("headRefName") == branch
+        and pull_request.get("baseRefName") == base_branch
+        and isinstance(pull_request.get("body"), str)
+        and identity_marker in pull_request["body"]
+    )
 
 
 class GitHubProjectProvider:
-    """GitHub ProjectV2 provider for a user-owned project."""
+    """GitHub ProjectV2 provider for a user- or organization-owned project."""
 
     def __init__(
         self,
@@ -254,9 +321,15 @@ class GitHubProjectProvider:
         token: str,
         client: GraphQLClient | None = None,
         endpoint: str = "https://api.github.com/graphql",
+        owner_type: str = "user",
     ) -> None:
+        if owner_type not in {"user", "organization"}:
+            raise ProviderError(
+                "GitHub Project owner type must be user or organization"
+            )
         self.owner = owner
         self.project_number = project_number
+        self.owner_type = owner_type
         self.project_id = f"{owner}:{project_number}"
         self._client = client or UrllibGraphQLClient(token, endpoint)
 
@@ -265,6 +338,7 @@ class GitHubProjectProvider:
         token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
         owner = os.environ.get("GITHUB_PROJECT_OWNER")
         number_text = os.environ.get("GITHUB_PROJECT_NUMBER")
+        owner_type = os.environ.get("GITHUB_PROJECT_OWNER_TYPE", "user")
         if not token or not owner or not number_text:
             raise ProviderError(
                 "Set GITHUB_TOKEN, GITHUB_PROJECT_OWNER, and GITHUB_PROJECT_NUMBER"
@@ -273,7 +347,7 @@ class GitHubProjectProvider:
             number = int(number_text)
         except ValueError as exc:
             raise ProviderError("GITHUB_PROJECT_NUMBER must be an integer") from exc
-        return cls(owner, number, token)
+        return cls(owner, number, token, owner_type=owner_type)
 
     def discover_project(self, project_id: str) -> ProjectSnapshot:
         if project_id != self.project_id:
@@ -282,18 +356,18 @@ class GitHubProjectProvider:
             )
 
         data = self._client.execute(
-            PROJECT_QUERY,
+            _owner_query(PROJECT_QUERY, self.owner_type),
             {
                 "owner": self.owner,
                 "number": self.project_number,
             },
         )
-        project = _project(data)
+        project = _project(data, self.owner_type)
         repositories: dict[str, list[PbiSnapshot]] = {}
         repository_cursor: str | None = None
         while True:
             repository_data = self._client.execute(
-                REPOSITORIES_QUERY,
+                _owner_query(REPOSITORIES_QUERY, self.owner_type),
                 {
                     "owner": self.owner,
                     "number": self.project_number,
@@ -301,7 +375,7 @@ class GitHubProjectProvider:
                 },
             )
             repository_connection = _mapping(
-                _project(repository_data).get("repositories")
+                _project(repository_data, self.owner_type).get("repositories")
             )
             for repository in _nodes(repository_connection):
                 name = repository.get("nameWithOwner")
@@ -314,14 +388,16 @@ class GitHubProjectProvider:
         item_cursor: str | None = None
         while True:
             item_data = self._client.execute(
-                ITEMS_QUERY,
+                _owner_query(ITEMS_QUERY, self.owner_type),
                 {
                     "owner": self.owner,
                     "number": self.project_number,
                     "cursor": item_cursor,
                 },
             )
-            item_connection = _mapping(_project(item_data).get("items"))
+            item_connection = _mapping(
+                _project(item_data, self.owner_type).get("items")
+            )
             for item in _nodes(item_connection):
                 content_value = item.get("content")
                 if content_value is None:
@@ -350,12 +426,15 @@ class GitHubProjectProvider:
                     ):
                         status = field_value["name"]
                         break
+                stage = _stage_from_status(status)
                 repositories.setdefault(repository_name, []).append(
                     PbiSnapshot(
                         repository_name,
                         number,
                         title,
-                        _stage_from_status(status),
+                        stage,
+                        status,
+                        stage is not None,
                     )
                 )
             has_next, item_cursor = _next_cursor(item_connection)
@@ -374,140 +453,137 @@ class GitHubProjectProvider:
             raise ProviderError("GitHub Project did not include a title")
         return ProjectSnapshot(self.project_id, project_name, repository_snapshots)
 
-    def resolve_base_branch(self, repository: str, requested: str | None) -> str:
-        if requested:
-            return requested
+    @staticmethod
+    def _repository_parts(repository: str) -> tuple[str, str]:
         owner, separator, name = repository.partition("/")
         if not separator or not owner or not name:
             raise ProviderError(f"Repository must use owner/name format: {repository}")
+        return owner, name
+
+    def _resolve_custom_base_branch(
+        self, owner: str, name: str, requested: str
+    ) -> tuple[str, str]:
+        data = self._client.execute(
+            BASE_BRANCH_QUERY,
+            {
+                "owner": owner,
+                "name": name,
+                "qualifiedBranch": f"refs/heads/{requested}",
+            },
+        )
+        base_ref = _mapping(_mapping(data.get("repository")).get("baseRef"))
+        resolved_name = base_ref.get("name")
+        resolved_oid = _mapping(base_ref.get("target")).get("oid")
+        if resolved_name != requested or not isinstance(resolved_oid, str):
+            raise ProviderError(
+                f"GitHub repository does not contain base branch: {requested}"
+            )
+        return requested, resolved_oid
+
+    def resolve_base_branch(self, repository: str, requested: str | None) -> str:
+        owner, name = self._repository_parts(repository)
+        if requested:
+            resolved_name, _ = self._resolve_custom_base_branch(owner, name, requested)
+            return resolved_name
         data = self._client.execute(
             DEFAULT_BRANCH_QUERY,
             {"owner": owner, "name": name},
         )
-        repository_data = _mapping(_mapping(data.get("repository")))
+        repository_data = _mapping(data.get("repository"))
         default_branch = _mapping(repository_data.get("defaultBranchRef"))
         name_value = default_branch.get("name")
         if not isinstance(name_value, str) or not name_value:
             raise ProviderError("GitHub repository did not include a default branch")
         return name_value
 
+    def validate_handoff(
+        self, repository: str, branch: str, requested_base: str | None
+    ) -> str:
+        _validate_branch_name(branch)
+        return self.resolve_base_branch(repository, requested_base)
+
     def create_handoff(self, request: HandoffRequest) -> HandoffResult:
-        owner, separator, name = request.repository.partition("/")
-        if not separator or not owner or not name:
-            raise ProviderError(
-                f"Repository must use owner/name format: {request.repository}"
-            )
+        owner, name = self._repository_parts(request.repository)
+        _validate_branch_name(request.branch)
+        identity_marker = _handoff_marker(request)
         qualified_branch = f"refs/heads/{request.branch}"
-        pull_request_cursor: str | None = None
-        repository_id = ""
-        base_branch = ""
-        base_oid = ""
-        while True:
-            data = self._client.execute(
-                REPOSITORY_QUERY,
-                {
-                    "owner": owner,
-                    "name": name,
-                    "qualifiedBranch": qualified_branch,
-                    "pullRequestCursor": pull_request_cursor,
-                },
+        data = self._client.execute(
+            REPOSITORY_QUERY,
+            {
+                "owner": owner,
+                "name": name,
+                "qualifiedBranch": qualified_branch,
+                "pullRequestCursor": None,
+            },
+        )
+        repository = _mapping(data.get("repository"))
+        raw_repository_id = repository.get("id")
+        default_branch = _mapping(repository.get("defaultBranchRef"))
+        default_branch_name = default_branch.get("name")
+        default_oid = _mapping(default_branch.get("target")).get("oid")
+        if (
+            not isinstance(raw_repository_id, str)
+            or not isinstance(default_branch_name, str)
+            or not isinstance(default_oid, str)
+        ):
+            raise ProviderError(
+                "GitHub repository did not include branch creation metadata"
             )
-            repository = _mapping(_mapping(data.get("repository")))
-            if not repository_id:
-                raw_repository_id = repository.get("id")
-                default_branch = _mapping(repository.get("defaultBranchRef"))
-                default_branch_name = default_branch.get("name")
-                default_oid = _mapping(default_branch.get("target")).get("oid")
-                if (
-                    not isinstance(raw_repository_id, str)
-                    or not isinstance(default_branch_name, str)
-                    or not isinstance(default_oid, str)
-                ):
-                    raise ProviderError(
-                        "GitHub repository did not include branch creation metadata"
-                    )
-                repository_id = raw_repository_id
-                base_branch = request.base_branch or default_branch_name
-                base_oid = default_oid
-                if base_branch != default_branch_name:
-                    base_data = self._client.execute(
-                        BASE_BRANCH_QUERY,
+        repository_id = raw_repository_id
+        base_branch = request.base_branch or default_branch_name
+        base_oid = default_oid
+        if base_branch != default_branch_name:
+            _, base_oid = self._resolve_custom_base_branch(owner, name, base_branch)
+
+        if repository.get("ref") is None:
+            try:
+                create_data = self._client.execute(
+                    CREATE_REF_MUTATION,
+                    {
+                        "input": {
+                            "repositoryId": repository_id,
+                            "name": qualified_branch,
+                            "oid": base_oid,
+                        }
+                    },
+                )
+            except ProviderError as create_error:
+                try:
+                    retry_data = self._client.execute(
+                        REPOSITORY_QUERY,
                         {
                             "owner": owner,
                             "name": name,
-                            "qualifiedBranch": f"refs/heads/{base_branch}",
+                            "qualifiedBranch": qualified_branch,
+                            "pullRequestCursor": None,
                         },
                     )
-                    base_ref = _mapping(
-                        _mapping(base_data.get("repository")).get("baseRef")
+                    retry_repository = _mapping(_mapping(retry_data.get("repository")))
+                except ProviderError:
+                    raise create_error from None
+                if retry_repository.get("ref") is None:
+                    raise create_error from None
+                repository = retry_repository
+            else:
+                created_ref = _mapping(
+                    _mapping(create_data.get("createRef")).get("ref")
+                )
+                if created_ref.get("name") != qualified_branch:
+                    raise ProviderError(
+                        f"GitHub did not confirm branch creation: {qualified_branch}"
                     )
-                    resolved_base_name = base_ref.get("name")
-                    resolved_base_oid = _mapping(base_ref.get("target")).get("oid")
-                    if resolved_base_name != base_branch or not isinstance(
-                        resolved_base_oid, str
-                    ):
-                        raise ProviderError(
-                            "GitHub repository does not contain base branch: "
-                            f"{base_branch}"
-                        )
-                    base_oid = resolved_base_oid
 
-                if repository.get("ref") is None:
-                    try:
-                        create_data = self._client.execute(
-                            CREATE_REF_MUTATION,
-                            {
-                                "input": {
-                                    "repositoryId": repository_id,
-                                    "name": qualified_branch,
-                                    "oid": base_oid,
-                                }
-                            },
-                        )
-                    except ProviderError as create_error:
-                        try:
-                            retry_data = self._client.execute(
-                                REPOSITORY_QUERY,
-                                {
-                                    "owner": owner,
-                                    "name": name,
-                                    "qualifiedBranch": qualified_branch,
-                                    "pullRequestCursor": None,
-                                },
-                            )
-                            retry_repository = _mapping(
-                                _mapping(retry_data.get("repository"))
-                            )
-                        except ProviderError:
-                            raise create_error from None
-                        if retry_repository.get("ref") is None:
-                            raise create_error from None
-                        repository = retry_repository
-                    else:
-                        created_ref = _mapping(
-                            _mapping(create_data.get("createRef")).get("ref")
-                        )
-                        if created_ref.get("name") != qualified_branch:
-                            raise ProviderError(
-                                "GitHub did not confirm branch creation: "
-                                f"{qualified_branch}"
-                            )
-
-            for pull_request in _nodes(repository.get("pullRequests", {})):
-                if (
-                    pull_request.get("headRefName") == request.branch
-                    and pull_request.get("baseRefName") == base_branch
-                ):
-                    url = pull_request.get("url")
-                    number = pull_request.get("number")
-                    if isinstance(url, str) and isinstance(number, int):
-                        return HandoffResult(request.branch, url, number)
-
-            has_next, pull_request_cursor = _next_cursor(
-                _mapping(repository.get("pullRequests", {}))
-            )
-            if not has_next:
-                break
+        existing = self._find_existing_pull_request(
+            owner,
+            name,
+            qualified_branch,
+            request.branch,
+            base_branch,
+            identity_marker,
+            initial_repository=repository,
+        )
+        if existing is not None:
+            return existing
 
         try:
             pull_request_data = self._client.execute(
@@ -518,7 +594,7 @@ class GitHubProjectProvider:
                         "baseRefName": base_branch,
                         "headRefName": request.branch,
                         "title": request.title,
-                        "body": request.body,
+                        "body": _handoff_body(request.body, identity_marker),
                     }
                 },
             )
@@ -530,6 +606,7 @@ class GitHubProjectProvider:
                     qualified_branch,
                     request.branch,
                     base_branch,
+                    identity_marker,
                 )
             except ProviderError:
                 raise create_error from None
@@ -552,23 +629,26 @@ class GitHubProjectProvider:
         qualified_branch: str,
         branch: str,
         base_branch: str,
+        identity_marker: str,
+        initial_repository: Mapping[str, Any] | None = None,
     ) -> HandoffResult | None:
         cursor: str | None = None
+        repository = initial_repository
         while True:
-            data = self._client.execute(
-                REPOSITORY_QUERY,
-                {
-                    "owner": owner,
-                    "name": name,
-                    "qualifiedBranch": qualified_branch,
-                    "pullRequestCursor": cursor,
-                },
-            )
-            repository = _mapping(_mapping(data.get("repository")))
+            if repository is None:
+                data = self._client.execute(
+                    REPOSITORY_QUERY,
+                    {
+                        "owner": owner,
+                        "name": name,
+                        "qualifiedBranch": qualified_branch,
+                        "pullRequestCursor": cursor,
+                    },
+                )
+                repository = _mapping(_mapping(data.get("repository")))
             for pull_request in _nodes(repository.get("pullRequests", {})):
-                if (
-                    pull_request.get("headRefName") == branch
-                    and pull_request.get("baseRefName") == base_branch
+                if _pull_request_matches(
+                    pull_request, branch, base_branch, identity_marker
                 ):
                     url = pull_request.get("url")
                     number = pull_request.get("number")
@@ -579,6 +659,7 @@ class GitHubProjectProvider:
             )
             if not has_next:
                 return None
+            repository = None
 
 
 class EnvironmentGitHubProvider:
@@ -593,4 +674,11 @@ class EnvironmentGitHubProvider:
     def resolve_base_branch(self, repository: str, requested: str | None) -> str:
         return GitHubProjectProvider.from_environment().resolve_base_branch(
             repository, requested
+        )
+
+    def validate_handoff(
+        self, repository: str, branch: str, requested_base: str | None
+    ) -> str:
+        return GitHubProjectProvider.from_environment().validate_handoff(
+            repository, branch, requested_base
         )

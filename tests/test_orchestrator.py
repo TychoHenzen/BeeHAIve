@@ -15,7 +15,12 @@ from beehaiive.models import (
     Stage,
 )
 from beehaiive.orchestrator import Orchestrator
-from beehaiive.provider import GitHubProjectProvider, GraphQLClient, ProviderError
+from beehaiive.provider import (
+    GitHubProjectProvider,
+    GraphQLClient,
+    ProviderError,
+    _handoff_marker,
+)
 from beehaiive.storage import OrchestratorStore, StoreError
 
 
@@ -38,6 +43,18 @@ class FakeProvider:
 
     def resolve_base_branch(self, repository: str, requested: str | None) -> str:
         return requested or "master"
+
+    def validate_handoff(
+        self, repository: str, branch: str, requested_base: str | None
+    ) -> str:
+        return self.resolve_base_branch(repository, requested_base)
+
+
+class InvalidHandoffProvider(FakeProvider):
+    def validate_handoff(
+        self, repository: str, branch: str, requested_base: str | None
+    ) -> str:
+        raise ProviderError("invalid handoff metadata")
 
 
 class ConcurrentHandoffProvider(FakeProvider):
@@ -162,17 +179,56 @@ def test_repositories_have_independent_writer_claims() -> None:
         "owner/web",
     ]
 
-    api_run = service.claim("project-1", "owner/api")
+    api_run = service.claim("project-1", "owner/api", "worker-1")
     assert api_run is not None
     assert api_run.stage is Stage.REFINE
-    assert service.claim("project-1", "owner/api") == api_run
+    renewed = service.claim("project-1", "owner/api", "worker-1", api_run.lease_token)
+    assert renewed is not None
+    assert renewed.run_id == api_run.run_id
+    assert renewed.lease_token == api_run.lease_token
 
-    web_run = service.claim("project-1", "owner/web")
+    web_run = service.claim("project-1", "owner/web", "worker-1")
     assert web_run is not None
     assert web_run.run_id != api_run.run_id
 
     api_state = service.store.project_state("project-1")["repositories"][0]
     assert api_state["writer"]["run_id"] == api_run.run_id  # type: ignore[index]
+
+
+def test_durable_lease_blocks_duplicate_workers_and_fences_takeover(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "lease.sqlite3"
+    provider = FakeProvider(snapshot())
+    first_store = OrchestratorStore(database)
+    first_service = Orchestrator(first_store, provider)
+    first_service.synchronize("project-1")
+    first_run = first_service.claim("project-1", "owner/api", "worker-1")
+    assert first_run is not None
+    first_token = first_run.lease_token or ""
+
+    second_store = OrchestratorStore(database)
+    second_service = Orchestrator(second_store, provider)
+    assert second_service.claim("project-1", "owner/api", "worker-2") is None
+
+    first_store._connection.execute(
+        "UPDATE runs SET lease_expires_at = ? WHERE run_id = ?",
+        ("2000-01-01T00:00:00+00:00", first_run.run_id),
+    )
+    reclaimed = second_service.claim("project-1", "owner/api", "worker-2")
+
+    assert reclaimed is not None
+    assert reclaimed.owner_id == "worker-2"
+    assert reclaimed.lease_token != first_token
+    with pytest.raises(StoreError, match="lease token"):
+        first_service.advance(first_run.run_id, Stage.IMPLEMENT, first_token)
+
+    advanced = second_service.advance(
+        reclaimed.run_id, Stage.IMPLEMENT, reclaimed.lease_token or ""
+    )
+    assert advanced.stage is Stage.IMPLEMENT
+    first_store.close()
+    second_store.close()
 
 
 def test_github_api_double_drives_two_repository_queues() -> None:
@@ -251,30 +307,58 @@ def test_github_api_double_drives_two_repository_queues() -> None:
     service = Orchestrator(OrchestratorStore(), provider)
 
     service.synchronize("owner:7")
-    api_run = service.claim("owner:7", "owner/api")
-    web_run = service.claim("owner:7", "owner/web")
+    api_run = service.claim("owner:7", "owner/api", "worker-1")
+    web_run = service.claim("owner:7", "owner/web", "worker-1")
 
     assert api_run is not None
     assert web_run is not None
     assert api_run.run_id != web_run.run_id
-    assert service.claim("owner:7", "owner/api") == api_run
+    renewed = service.claim("owner:7", "owner/api", "worker-1", api_run.lease_token)
+    assert renewed is not None
+    assert renewed.run_id == api_run.run_id
+    assert renewed.lease_token == api_run.lease_token
 
 
 def test_failure_releases_only_the_failed_repository_writer() -> None:
     provider = FakeProvider(snapshot())
     service = Orchestrator(OrchestratorStore(), provider)
     service.synchronize("project-1")
-    api_run = service.claim("project-1", "owner/api")
-    web_run = service.claim("project-1", "owner/web")
+    api_run = service.claim("project-1", "owner/api", "worker-1")
+    web_run = service.claim("project-1", "owner/web", "worker-1")
     assert api_run is not None and web_run is not None
 
-    failed = service.fail(api_run.run_id, "provider unavailable")
+    api_token = api_run.lease_token or ""
+    failed = service.fail(api_run.run_id, "provider unavailable", api_token)
     assert failed.status.value == "failed"
-    assert service.claim("project-1", "owner/web") == web_run
-    retried = service.claim("project-1", "owner/api")
+    renewed = service.claim("project-1", "owner/web", "worker-1", web_run.lease_token)
+    assert renewed is not None
+    assert renewed.run_id == web_run.run_id
+    assert renewed.lease_token == web_run.lease_token
+    retried = service.claim("project-1", "owner/api", "worker-1")
     assert retried is not None
     assert retried.run_id == api_run.run_id
     assert retried.attempt == 2
+
+
+def test_project_state_limits_event_history() -> None:
+    provider = FakeProvider(snapshot())
+    store = OrchestratorStore()
+    service = Orchestrator(store, provider)
+    service.synchronize("project-1")
+    run = service.claim("project-1", "owner/api", "worker-1")
+    assert run is not None
+    token = run.lease_token or ""
+    service.advance(run.run_id, Stage.IMPLEMENT, token)
+
+    state = store.project_state("project-1", event_limit=1)
+    events = state["repositories"][0]["pbis"][0]["events"]  # type: ignore[index]
+
+    assert state["event_limit"] == 1
+    assert len(events) == 1  # type: ignore[arg-type]
+    assert events[0]["to_stage"] == Stage.IMPLEMENT.value  # type: ignore[index]
+    with pytest.raises(StoreError, match="event_limit"):
+        store.project_state("project-1", event_limit=0)
+    store.close()
 
 
 def test_sync_reconciles_removed_repositories_without_deleting_history() -> None:
@@ -298,16 +382,17 @@ def test_sync_reconciles_removed_repositories_without_deleting_history() -> None
     )
     assert removed["active"] is False
     assert removed["pbis"][0]["title"] == "Web one"  # type: ignore[index]
-    assert service.claim("project-1", "owner/web") is None
+    assert service.claim("project-1", "owner/web", "worker-1") is None
 
 
-def test_sync_reconciles_completed_and_removed_pbis() -> None:
+def test_sync_keeps_external_done_from_completing_a_local_run() -> None:
     provider = FakeProvider(snapshot())
     service = Orchestrator(OrchestratorStore(), provider)
     service.synchronize("project-1")
-    run = service.claim("project-1", "owner/api")
+    run = service.claim("project-1", "owner/api", "worker-1")
     assert run is not None
-    service.advance(run.run_id, Stage.IMPLEMENT)
+    lease_token = run.lease_token or ""
+    service.advance(run.run_id, Stage.IMPLEMENT, lease_token)
 
     provider.snapshot = ProjectSnapshot(
         project_id="project-1",
@@ -315,7 +400,16 @@ def test_sync_reconciles_completed_and_removed_pbis() -> None:
         repositories=(
             RepositorySnapshot(
                 "owner/api",
-                (PbiSnapshot("owner/api", 1, "API one", Stage.PULL_REQUEST),),
+                (
+                    PbiSnapshot(
+                        "owner/api",
+                        1,
+                        "API one",
+                        None,
+                        "Done",
+                        False,
+                    ),
+                ),
             ),
         ),
     )
@@ -323,10 +417,12 @@ def test_sync_reconciles_completed_and_removed_pbis() -> None:
 
     api_repository = service.store.project_state("project-1")["repositories"][0]
     pbi_rows = {pbi["number"]: pbi for pbi in api_repository["pbis"]}  # type: ignore[index]
-    assert pbi_rows[1]["stage"] == Stage.PULL_REQUEST.value
-    assert pbi_rows[1]["status"] == "completed"
+    assert pbi_rows[1]["stage"] == Stage.IMPLEMENT.value
+    assert pbi_rows[1]["status"] == "active"
     assert pbi_rows[1]["active"] is True
-    assert service.claim("project-1", "owner/api") is None
+    assert pbi_rows[1]["planning_status"] == "Done"
+    assert pbi_rows[1]["claimable"] is False
+    assert service.claim("project-1", "owner/api", "worker-1", lease_token) is not None
 
     web_repository = next(
         repository
@@ -340,13 +436,31 @@ def test_invalid_handoff_does_not_call_provider() -> None:
     provider = FakeProvider(snapshot())
     service = Orchestrator(OrchestratorStore(), provider)
     service.synchronize("project-1")
-    run = service.claim("project-1", "owner/api")
+    run = service.claim("project-1", "owner/api", "worker-1")
     assert run is not None
+    lease_token = run.lease_token or ""
 
     with pytest.raises(StoreError, match="Only an active implementation run"):
-        service.handoff(run.run_id, "codex/refine", "master", "Closes #1")
+        service.handoff(run.run_id, "codex/refine", "master", "Closes #1", lease_token)
 
     assert provider.handoffs == []
+
+
+def test_invalid_handoff_metadata_is_not_persisted() -> None:
+    provider = InvalidHandoffProvider(snapshot())
+    store = OrchestratorStore()
+    service = Orchestrator(store, provider)
+    service.synchronize("project-1")
+    run = service.claim("project-1", "owner/api", "worker-1")
+    assert run is not None
+    token = run.lease_token or ""
+    service.advance(run.run_id, Stage.IMPLEMENT, token)
+
+    with pytest.raises(ProviderError, match="invalid handoff metadata"):
+        service.handoff(run.run_id, "codex/api-1", "master", "Closes #1", token)
+
+    assert store.pending_handoff(run.run_id, token) is None
+    store.close()
 
 
 def test_handoff_intent_survives_external_crash_and_reuses_artifact(
@@ -357,28 +471,32 @@ def test_handoff_intent_survives_external_crash_and_reuses_artifact(
     first_store = OrchestratorStore(database)
     first_service = Orchestrator(first_store, provider)
     first_service.synchronize("project-1")
-    run = first_service.claim("project-1", "owner/api")
+    run = first_service.claim("project-1", "owner/api", "worker-1")
     assert run is not None
-    first_service.advance(run.run_id, Stage.IMPLEMENT)
+    lease_token = run.lease_token or ""
+    first_service.advance(run.run_id, Stage.IMPLEMENT, lease_token)
 
     with pytest.raises(RuntimeError, match="crashed after external handoff"):
-        first_service.handoff(run.run_id, "codex/api-1", None, "Closes #1")
+        first_service.handoff(run.run_id, "codex/api-1", None, "Closes #1", lease_token)
     first_store.close()
 
     second_store = OrchestratorStore(database)
     second_service = Orchestrator(second_store, provider)
-    resumed = second_service.claim("project-1", "owner/api")
+    resumed = second_service.claim("project-1", "owner/api", "worker-1", lease_token)
     assert resumed is not None
     assert resumed.stage is Stage.IMPLEMENT
     assert resumed.branch == "codex/api-1"
 
     with pytest.raises(StoreError, match="does not match the persisted intent"):
-        second_service.handoff(run.run_id, "codex/api-2", None, "Closes #1")
+        second_service.handoff(
+            run.run_id, "codex/api-2", None, "Closes #1", lease_token
+        )
     completed = second_service.handoff(
         run.run_id,
         "codex/api-1",
         None,
         "Closes #1",
+        lease_token,
     )
 
     assert completed.status.value == "completed"
@@ -397,13 +515,14 @@ def test_two_service_instances_share_idempotent_handoff_artifact(
     first_store = OrchestratorStore(database)
     first_service = Orchestrator(first_store, provider)
     first_service.synchronize("project-1")
-    run = first_service.claim("project-1", "owner/api")
+    run = first_service.claim("project-1", "owner/api", "worker-1")
     assert run is not None
-    first_service.advance(run.run_id, Stage.IMPLEMENT)
+    lease_token = run.lease_token or ""
+    first_service.advance(run.run_id, Stage.IMPLEMENT, lease_token)
 
     second_store = OrchestratorStore(database)
     second_service = Orchestrator(second_store, provider)
-    resumed = second_service.claim("project-1", "owner/api")
+    resumed = second_service.claim("project-1", "owner/api", "worker-1", lease_token)
     assert resumed is not None
     assert resumed.run_id == run.run_id
 
@@ -414,6 +533,7 @@ def test_two_service_instances_share_idempotent_handoff_artifact(
             "codex/api-1",
             None,
             "Closes #1",
+            lease_token,
         )
         assert provider.first_started.wait(timeout=2)
         second_future = executor.submit(
@@ -422,6 +542,7 @@ def test_two_service_instances_share_idempotent_handoff_artifact(
             "codex/api-1",
             None,
             "Closes #1",
+            lease_token,
         )
         assert provider.second_started.wait(timeout=2)
         provider.release_first.set()
@@ -438,9 +559,10 @@ def test_concurrent_handoffs_create_one_external_artifact() -> None:
     provider = ConcurrentHandoffProvider(snapshot())
     service = Orchestrator(OrchestratorStore(), provider)
     service.synchronize("project-1")
-    run = service.claim("project-1", "owner/api")
+    run = service.claim("project-1", "owner/api", "worker-1")
     assert run is not None
-    service.advance(run.run_id, Stage.IMPLEMENT)
+    lease_token = run.lease_token or ""
+    service.advance(run.run_id, Stage.IMPLEMENT, lease_token)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         first = executor.submit(
@@ -449,6 +571,7 @@ def test_concurrent_handoffs_create_one_external_artifact() -> None:
             "codex/api-1",
             "master",
             "Closes #1",
+            lease_token,
         )
         assert provider.started.wait(timeout=2)
         second = executor.submit(
@@ -457,12 +580,14 @@ def test_concurrent_handoffs_create_one_external_artifact() -> None:
             "codex/api-1",
             "master",
             "Closes #1",
+            lease_token,
         )
         provider.release.set()
-        assert first.result().status.value == "completed"
-        assert second.result().status.value == "completed"
+    assert first.result().status.value == "completed"
+    assert second.result().status.value == "completed"
 
     assert len(provider.handoffs) == 1
+    assert service._handoff_locks._entries == {}
 
 
 def test_handoff_records_branch_and_pull_request_in_disposable_repository(
@@ -504,15 +629,17 @@ def test_handoff_records_branch_and_pull_request_in_disposable_repository(
     provider = DisposableRepositoryProvider(repository_path, snapshot())
     service = Orchestrator(OrchestratorStore(), provider)
     service.synchronize("project-1")
-    run = service.claim("project-1", "owner/api")
+    run = service.claim("project-1", "owner/api", "worker-1")
     assert run is not None
-    service.advance(run.run_id, Stage.IMPLEMENT)
+    lease_token = run.lease_token or ""
+    service.advance(run.run_id, Stage.IMPLEMENT, lease_token)
 
     completed = service.handoff(
         run.run_id,
         "codex/api-1",
         "master",
         "Closes #1",
+        lease_token,
     )
     branches = subprocess.run(
         ["git", "-C", str(repository_path), "branch", "--format=%(refname:short)"],
@@ -537,37 +664,44 @@ def test_restart_resumes_run_and_records_idempotent_handoff(tmp_path: Path) -> N
     first_store = OrchestratorStore(database)
     first_service = Orchestrator(first_store, provider)
     first_service.synchronize("project-1")
-    run = first_service.claim("project-1", "owner/api")
+    run = first_service.claim("project-1", "owner/api", "worker-1")
     assert run is not None
+    lease_token = run.lease_token or ""
     first_store.close()
 
     second_store = OrchestratorStore(database)
     second_service = Orchestrator(second_store, provider)
-    resumed = second_service.claim("project-1", "owner/api")
-    assert resumed == run
-    second_service.advance(run.run_id, Stage.IMPLEMENT)
+    resumed = second_service.claim("project-1", "owner/api", "worker-1", lease_token)
+    assert resumed is not None
+    assert resumed.run_id == run.run_id
+    assert resumed.lease_token == run.lease_token
+    second_service.advance(run.run_id, Stage.IMPLEMENT, lease_token)
     second_store.close()
 
     third_store = OrchestratorStore(database)
     third_service = Orchestrator(third_store, provider)
-    resumed_again = third_service.claim("project-1", "owner/api")
+    resumed_again = third_service.claim(
+        "project-1", "owner/api", "worker-1", lease_token
+    )
     assert resumed_again is not None
     assert resumed_again.run_id == run.run_id
     assert resumed_again.stage is Stage.IMPLEMENT
     with pytest.raises(StoreError, match="Cannot advance"):
-        third_service.advance(run.run_id, Stage.PULL_REQUEST)
+        third_service.advance(run.run_id, Stage.PULL_REQUEST, lease_token)
 
     completed = third_service.handoff(
         run.run_id,
         "codex/api-1",
         "master",
         "Closes #1",
+        lease_token,
     )
     repeated = third_service.handoff(
         run.run_id,
         "codex/api-1",
         "master",
         "Closes #1",
+        lease_token,
     )
     assert completed == repeated
     assert completed.stage is Stage.PULL_REQUEST
@@ -684,6 +818,7 @@ class HandoffGraphQLClient:
                 "url": "https://example.test/owner/api/pull/8",
                 "headRefName": variables["input"]["headRefName"],
                 "baseRefName": variables["input"]["baseRefName"],
+                "body": variables["input"]["body"],
             }
             self.pull_requests.append(pull_request)
             return {"createPullRequest": {"pullRequest": pull_request}}
@@ -772,6 +907,7 @@ def test_github_provider_reuses_existing_branch_and_pull_request() -> None:
         branch="codex/api-1",
         base_branch=None,
         body="Closes #1",
+        run_id="run-1",
     )
 
     first = provider.create_handoff(request)
@@ -781,6 +917,38 @@ def test_github_provider_reuses_existing_branch_and_pull_request() -> None:
     assert client.ref_creations == 1
     assert client.pull_request_creations == 1
     assert client.pull_request_bases == ["main"]
+
+
+def test_github_provider_does_not_reuse_pull_request_for_another_run() -> None:
+    client = HandoffGraphQLClient()
+    provider = GitHubProjectProvider("owner", 7, "token", client=client)
+    first_request = HandoffRequest(
+        project_id="owner:7",
+        repository="owner/api",
+        pbi_number=1,
+        title="API one",
+        branch="codex/api-1",
+        base_branch=None,
+        body="Closes #1",
+        run_id="run-1",
+    )
+    second_request = HandoffRequest(
+        project_id="owner:7",
+        repository="owner/api",
+        pbi_number=2,
+        title="API two",
+        branch="codex/api-1",
+        base_branch=None,
+        body="Closes #2",
+        run_id="run-2",
+    )
+
+    first = provider.create_handoff(first_request)
+    second = provider.create_handoff(second_request)
+
+    assert first.pull_request_number == 8
+    assert second.pull_request_number == 8
+    assert client.pull_request_creations == 2
 
 
 def test_github_provider_uses_custom_base_branch_commit_and_target() -> None:
@@ -795,6 +963,7 @@ def test_github_provider_uses_custom_base_branch_commit_and_target() -> None:
         branch="codex/api-1",
         base_branch="release",
         body="Closes #1",
+        run_id="run-1",
     )
 
     provider.create_handoff(request)
@@ -868,6 +1037,7 @@ class RacingHandoffGraphQLClient(HandoffGraphQLClient):
                     "url": "https://example.test/owner/api/pull/8",
                     "headRefName": variables["input"]["headRefName"],
                     "baseRefName": variables["input"]["baseRefName"],
+                    "body": variables["input"]["body"],
                 }
             )
             raise ProviderError("pull request already exists")
@@ -885,7 +1055,9 @@ def test_github_provider_paginates_pull_requests_when_reusing_one() -> None:
         branch="codex/api-1",
         base_branch=None,
         body="Closes #1",
+        run_id="run-1",
     )
+    client.pull_requests[-1]["body"] = _handoff_marker(request)
 
     result = provider.create_handoff(request)
 
@@ -904,6 +1076,7 @@ def test_github_provider_recovers_from_create_races() -> None:
         branch="codex/api-1",
         base_branch=None,
         body="Closes #1",
+        run_id="run-1",
     )
 
     result = provider.create_handoff(request)

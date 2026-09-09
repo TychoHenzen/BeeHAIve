@@ -28,9 +28,10 @@ from beehaiive.provider import (
     _mapping,
     _next_cursor,
     _nodes,
+    _owner_query,
     _stage_from_status,
 )
-from beehaiive.storage import OrchestratorStore, StoreError
+from beehaiive.storage import OrchestratorStore, StoreError, _lease_is_active
 
 
 class StaticClient:
@@ -88,6 +89,7 @@ def _handoff_request(*, base_branch: str | None = None) -> HandoffRequest:
         branch="codex/api-1",
         base_branch=base_branch,
         body="Closes #1",
+        run_id="run-1",
     )
 
 
@@ -158,16 +160,33 @@ def test_provider_helpers_and_environment_configuration(
         _nodes({"nodes": "bad"})
     with pytest.raises(ProviderError, match="end cursor"):
         _next_cursor({"pageInfo": {"hasNextPage": True}})
+    with pytest.raises(ProviderError, match="owner type"):
+        _owner_query("query", "team")
     assert _stage_from_status("Todo") is Stage.REFINE
     assert _stage_from_status("In Progress") is Stage.IMPLEMENT
-    assert _stage_from_status("Done") is Stage.PULL_REQUEST
-    assert _stage_from_status("unknown") is Stage.BACKLOG
+    assert _stage_from_status("Done") is None
+    assert _stage_from_status("unknown") is None
+
+    marker = provider_module._handoff_marker(_handoff_request())
+    assert provider_module._handoff_body(marker, marker) == marker
+    with pytest.raises(ProviderError, match="identity"):
+        provider_module._handoff_marker(
+            HandoffRequest(
+                "owner:7", "owner/api", 1, "API one", "branch", None, "", " "
+            )
+        )
+
+    with pytest.raises(ValueError, match="lease_seconds"):
+        OrchestratorStore(lease_seconds=0)
+    assert not _lease_is_active(None)
+    assert not _lease_is_active("not-a-timestamp")
 
     for variable in (
         "GITHUB_TOKEN",
         "GH_TOKEN",
         "GITHUB_PROJECT_OWNER",
         "GITHUB_PROJECT_NUMBER",
+        "GITHUB_PROJECT_OWNER_TYPE",
     ):
         monkeypatch.delenv(variable, raising=False)
     with pytest.raises(ProviderError, match="Set GITHUB_TOKEN"):
@@ -180,6 +199,13 @@ def test_provider_helpers_and_environment_configuration(
     monkeypatch.setenv("GITHUB_PROJECT_NUMBER", "7")
     configured = GitHubProjectProvider.from_environment()
     assert configured.project_id == "owner:7"
+    monkeypatch.setenv("GITHUB_PROJECT_OWNER_TYPE", "organization")
+    organization_configured = GitHubProjectProvider.from_environment()
+    assert organization_configured.owner_type == "organization"
+
+    monkeypatch.setenv("GITHUB_PROJECT_OWNER_TYPE", "team")
+    with pytest.raises(ProviderError, match="owner type"):
+        GitHubProjectProvider.from_environment()
 
 
 def test_provider_discovery_and_base_branch_validation() -> None:
@@ -210,10 +236,24 @@ def test_provider_discovery_and_base_branch_validation() -> None:
     with pytest.raises(ProviderError, match="title"):
         missing_title.discover_project("owner:7")
 
-    branch_client = StaticClient({"repository": {"defaultBranchRef": {"name": "main"}}})
+    branch_client = StaticClient(
+        {
+            "repository": {
+                "defaultBranchRef": {"name": "main"},
+                "baseRef": {
+                    "name": "release",
+                    "target": {"oid": "release-oid"},
+                },
+            }
+        }
+    )
     branch_provider = GitHubProjectProvider("owner", 7, "token", client=branch_client)
     assert branch_provider.resolve_base_branch("owner/api", None) == "main"
     assert branch_provider.resolve_base_branch("owner/api", "release") == "release"
+    assert (
+        branch_provider.validate_handoff("owner/api", "codex/api-1", "release")
+        == "release"
+    )
     with pytest.raises(ProviderError, match="owner/name"):
         branch_provider.resolve_base_branch("invalid", None)
 
@@ -225,6 +265,48 @@ def test_provider_discovery_and_base_branch_validation() -> None:
     )
     with pytest.raises(ProviderError, match="default branch"):
         missing_branch.resolve_base_branch("owner/api", None)
+
+
+def test_provider_supports_organization_projects_and_holds_unmanaged_statuses() -> None:
+    project_data = _project_data(
+        items=[
+            {
+                "content": {
+                    "__typename": "Issue",
+                    "repository": {"nameWithOwner": "owner/api"},
+                    "number": 1,
+                    "title": "Done item",
+                },
+                "fieldValues": {
+                    "nodes": [{"name": "Done", "field": {"name": "Status"}}]
+                },
+            },
+            {
+                "content": {
+                    "__typename": "Issue",
+                    "repository": {"nameWithOwner": "owner/api"},
+                    "number": 2,
+                    "title": "Blocked item",
+                },
+                "fieldValues": {
+                    "nodes": [{"name": "Blocked", "field": {"name": "Status"}}]
+                },
+            },
+        ]
+    )
+    organization_data = {"organization": project_data["user"]}
+    client = StaticClient(organization_data)
+    provider = GitHubProjectProvider(
+        "owner", 7, "token", client=client, owner_type="organization"
+    )
+
+    discovered = provider.discover_project("owner:7")
+    pbis = discovered.repositories[0].pbis
+
+    assert [pbi.stage for pbi in pbis] == [None, None]
+    assert [pbi.planning_status for pbi in pbis] == ["Done", "Blocked"]
+    assert all(not pbi.claimable for pbi in pbis)
+    assert all("organization(login:" in query for query in client.calls)
 
 
 class ErrorHandoffClient:
@@ -306,8 +388,10 @@ def test_provider_rejects_invalid_handoff_metadata() -> None:
 
     with pytest.raises(ProviderError, match="owner/name"):
         malformed.create_handoff(
-            HandoffRequest("owner:7", "invalid", 1, "bad", "branch", None, "")
+            HandoffRequest("owner:7", "invalid", 1, "bad", "branch", None, "", "run-1")
         )
+    with pytest.raises(ProviderError, match="branch name"):
+        malformed.validate_handoff("owner/api", "bad branch", None)
 
 
 class RaceClient(ErrorHandoffClient):
@@ -373,6 +457,11 @@ class StubProvider:
     def resolve_base_branch(self, repository: str, requested: str | None) -> str:
         return requested or "main"
 
+    def validate_handoff(
+        self, repository: str, branch: str, requested_base: str | None
+    ) -> str:
+        return self.resolve_base_branch(repository, requested_base)
+
 
 def test_environment_provider_delegates(monkeypatch: pytest.MonkeyPatch) -> None:
     stub = StubProvider()
@@ -386,6 +475,7 @@ def test_environment_provider_delegates(monkeypatch: pytest.MonkeyPatch) -> None
     assert provider.discover_project("owner:7").project_id == "owner:7"
     assert provider.create_handoff(request).pull_request_number == 1
     assert provider.resolve_base_branch("owner/api", None) == "main"
+    assert provider.validate_handoff("owner/api", "codex/api-1", None) == "main"
 
 
 class StorageProvider(StubProvider):
@@ -408,37 +498,57 @@ def test_storage_rejects_invalid_state_operations() -> None:
     store = OrchestratorStore()
     service = Orchestrator(store, StorageProvider(_storage_snapshot()))
     service.synchronize("project-1")
-    run = service.claim("project-1", "owner/api")
+    with pytest.raises(StoreError, match="worker owner"):
+        store.claim_next("project-1", "owner/api", " ")
+    run = service.claim("project-1", "owner/api", "worker-1")
     assert run is not None
+    lease_token = run.lease_token or ""
 
     with pytest.raises(StoreError, match="Unknown run"):
-        store.advance("missing", Stage.IMPLEMENT)
+        store.advance("missing", Stage.IMPLEMENT, lease_token)
     with pytest.raises(StoreError, match="Unknown run"):
-        store.record_handoff("missing", "branch", "url", None)
+        store.record_handoff("missing", "branch", "url", None, lease_token)
     with pytest.raises(StoreError, match="Unknown run"):
-        store.prepare_handoff("missing", "branch", "main", "body")
+        store.prepare_handoff("missing", "branch", "main", "body", lease_token)
     with pytest.raises(StoreError, match="Unknown run"):
-        store.fail("missing", "error")
-    assert store.pending_handoff("missing") is None
+        store.fail("missing", "error", lease_token)
+    with pytest.raises(StoreError, match="Unknown run"):
+        store.pending_handoff("missing", lease_token)
+    with pytest.raises(StoreError, match="Unknown run"):
+        store.renew_lease("missing", lease_token)
     assert store.get_run("missing") is None
 
-    assert store.advance(run.run_id, Stage.REFINE) == run
+    renewed = service.renew_lease(run.run_id, lease_token)
+    assert renewed.run_id == run.run_id
+    store._connection.execute(
+        "UPDATE runs SET lease_expires_at = ? WHERE run_id = ?",
+        ("2000-01-01T00:00:00+00:00", run.run_id),
+    )
+    with pytest.raises(StoreError, match="expired"):
+        store.advance(run.run_id, Stage.IMPLEMENT, lease_token)
+    store._connection.execute(
+        "UPDATE runs SET lease_expires_at = ? WHERE run_id = ?",
+        (renewed.lease_expires_at, run.run_id),
+    )
+
+    advanced = store.advance(run.run_id, Stage.REFINE, lease_token)
+    assert advanced.stage is Stage.REFINE
     with pytest.raises(StoreError, match="Cannot advance"):
-        store.advance(run.run_id, Stage.PULL_REQUEST)
+        store.advance(run.run_id, Stage.PULL_REQUEST, lease_token)
     with pytest.raises(StoreError, match="failure reason"):
-        store.fail(run.run_id, "")
-    failed = store.fail(run.run_id, "failed")
+        store.fail(run.run_id, "", lease_token)
+    failed = store.fail(run.run_id, "failed", lease_token)
     assert failed.status is RunStatus.FAILED
-    assert store.fail(run.run_id, "again") == failed
-    assert store.advance(run.run_id, Stage.REFINE) == failed
+    assert store.fail(run.run_id, "again", lease_token) == failed
+    assert store.advance(run.run_id, Stage.REFINE, lease_token) == failed
     with pytest.raises(StoreError, match="not active"):
-        store.advance(run.run_id, Stage.IMPLEMENT)
+        store.advance(run.run_id, Stage.IMPLEMENT, lease_token)
     with pytest.raises(StoreError, match="branch and pull-request"):
-        store.record_handoff(run.run_id, "", "url", None)
+        store.record_handoff(run.run_id, "", "url", None, lease_token)
     with pytest.raises(StoreError, match="active implementation"):
-        store.record_handoff(run.run_id, "branch", "url", None)
+        store.record_handoff(run.run_id, "branch", "url", None, lease_token)
     with pytest.raises(StoreError, match="active implementation"):
-        store.prepare_handoff(run.run_id, "branch", "main", "body")
+        store.prepare_handoff(run.run_id, "branch", "main", "body", lease_token)
     store.close()
 
 
@@ -446,24 +556,29 @@ def test_storage_handoff_intent_edge_cases() -> None:
     store = OrchestratorStore()
     service = Orchestrator(store, StorageProvider(_storage_snapshot()))
     service.synchronize("project-1")
-    run = service.claim("project-1", "owner/api")
+    run = service.claim("project-1", "owner/api", "worker-1")
     assert run is not None
-    run = service.advance(run.run_id, Stage.IMPLEMENT)
+    lease_token = run.lease_token or ""
+    run = service.advance(run.run_id, Stage.IMPLEMENT, lease_token)
 
     with pytest.raises(StoreError, match="branch is required"):
-        store.prepare_handoff(run.run_id, "", "main", "body")
+        store.prepare_handoff(run.run_id, "", "main", "body", lease_token)
     with pytest.raises(StoreError, match="persisted intent"):
-        store.record_handoff(run.run_id, "branch", "url", None)
-    intent = store.prepare_handoff(run.run_id, "branch", "main", "body")
+        store.record_handoff(run.run_id, "branch", "url", None, lease_token)
+    intent = store.prepare_handoff(run.run_id, "branch", "main", "body", lease_token)
     with pytest.raises(StoreError, match="persisted intent"):
-        store.prepare_handoff(run.run_id, "other", "main", "body")
-    completed = store.record_handoff(run.run_id, "branch", "url", 1)
-    assert store.record_handoff(run.run_id, "branch", "url", 1) == completed
-    finished_intent = store.prepare_handoff(run.run_id, "branch", "main", "body")
+        store.prepare_handoff(run.run_id, "other", "main", "body", lease_token)
+    completed = store.record_handoff(run.run_id, "branch", "url", 1, lease_token)
+    assert (
+        store.record_handoff(run.run_id, "branch", "url", 1, lease_token) == completed
+    )
+    finished_intent = store.prepare_handoff(
+        run.run_id, "branch", "main", "body", lease_token
+    )
     assert finished_intent.run.status is RunStatus.COMPLETED
     assert intent.branch == finished_intent.branch
     with pytest.raises(StoreError, match="completed"):
-        store.fail(run.run_id, "late failure")
+        store.fail(run.run_id, "late failure", lease_token)
     store._connection.execute(
         """
         UPDATE pbis SET stage = 'implement', handoff_status = 'completed'
@@ -475,7 +590,7 @@ def test_storage_handoff_intent_edge_cases() -> None:
         "UPDATE runs SET status = 'active' WHERE run_id = ?", (run.run_id,)
     )
     with pytest.raises(StoreError, match="already completed"):
-        store.prepare_handoff(run.run_id, "branch", "main", "body")
+        store.prepare_handoff(run.run_id, "branch", "main", "body", lease_token)
     store.close()
 
 
@@ -483,11 +598,40 @@ def test_storage_reconciles_an_active_removed_pbi() -> None:
     store = OrchestratorStore()
     service = Orchestrator(store, StorageProvider(_storage_snapshot()))
     service.synchronize("project-1")
-    run = service.claim("project-1", "owner/api")
+    run = service.claim("project-1", "owner/api", "worker-1")
     assert run is not None
     store.sync_project(ProjectSnapshot("project-1", "Planning", ()))
     assert store.get_run(run.run_id) is not None
     assert store.get_run(run.run_id).status is RunStatus.FAILED  # type: ignore[union-attr]
+    store.close()
+
+
+def test_storage_external_sync_records_existing_run_id() -> None:
+    store = OrchestratorStore()
+    service = Orchestrator(store, StorageProvider(_storage_snapshot()))
+    service.synchronize("project-1")
+    run = service.claim("project-1", "owner/api", "worker-1")
+    assert run is not None
+
+    store.sync_project(
+        ProjectSnapshot(
+            "project-1",
+            "Planning",
+            (
+                RepositorySnapshot(
+                    "owner/api",
+                    (
+                        PbiSnapshot(
+                            "owner/api", 1, "one", Stage.IMPLEMENT, "In Progress"
+                        ),
+                    ),
+                ),
+            ),
+        )
+    )
+
+    pbi = store.project_state("project-1")["repositories"][0]["pbis"][0]  # type: ignore[index]
+    assert pbi["events"][-1]["run_id"] == run.run_id  # type: ignore[index]
     store.close()
 
 
@@ -512,9 +656,10 @@ def test_storage_defensive_handoff_branches(monkeypatch: pytest.MonkeyPatch) -> 
     store = OrchestratorStore()
     service = Orchestrator(store, StorageProvider(_storage_snapshot()))
     service.synchronize("project-1")
-    run = service.claim("project-1", "owner/api")
+    run = service.claim("project-1", "owner/api", "worker-1")
     assert run is not None
-    run = service.advance(run.run_id, Stage.IMPLEMENT)
+    lease_token = run.lease_token or ""
+    run = service.advance(run.run_id, Stage.IMPLEMENT, lease_token)
 
     orphan = RunState(
         "orphan",
@@ -525,10 +670,35 @@ def test_storage_defensive_handoff_branches(monkeypatch: pytest.MonkeyPatch) -> 
         Stage.IMPLEMENT,
         RunStatus.ACTIVE,
         1,
+        owner_id="worker-1",
+        lease_token=lease_token,
+        lease_expires_at=run.lease_expires_at,
     )
     monkeypatch.setattr(store, "_run_for_id", lambda connection, run_id: orphan)
     with pytest.raises(StoreError, match="Unknown PBI"):
-        store.prepare_handoff("orphan", "branch", "main", "body")
+        store.prepare_handoff("orphan", "branch", "main", "body", lease_token)
+    monkeypatch.undo()
+
+    store.prepare_handoff(run.run_id, "branch", "main", "body", lease_token)
+    pending_calls = 0
+
+    def return_pending_once(connection: object, run_id: str) -> RunState | None:
+        nonlocal pending_calls
+        pending_calls += 1
+        return run if pending_calls == 1 else None
+
+    monkeypatch.setattr(store, "_run_for_id", return_pending_once)
+    with pytest.raises(StoreError, match="Unknown run"):
+        store.prepare_handoff(run.run_id, "branch", "main", "body", lease_token)
+    store._connection.execute(
+        """
+        UPDATE pbis
+        SET branch = NULL, handoff_base_branch = NULL, handoff_body = NULL,
+            handoff_status = 'none'
+        WHERE project_id = ? AND repository_name = ? AND number = ?
+        """,
+        (run.project_id, run.repository, run.pbi_number),
+    )
 
     calls = 0
 
@@ -539,7 +709,7 @@ def test_storage_defensive_handoff_branches(monkeypatch: pytest.MonkeyPatch) -> 
 
     monkeypatch.setattr(store, "_run_for_id", return_once)
     with pytest.raises(StoreError, match="Unknown run"):
-        store.prepare_handoff(run.run_id, "branch", "main", "body")
+        store.prepare_handoff(run.run_id, "branch", "main", "body", lease_token)
     store.close()
 
 
@@ -550,11 +720,12 @@ def test_orchestrator_handoff_rejects_unknown_and_handles_completed_race(
     service = Orchestrator(store, StorageProvider(_storage_snapshot()))
     service.synchronize("project-1")
     with pytest.raises(StoreError, match="Unknown run"):
-        service.handoff("missing", "branch", None, "body")
+        service.handoff("missing", "branch", None, "body", "missing-token")
 
-    run = service.claim("project-1", "owner/api")
+    run = service.claim("project-1", "owner/api", "worker-1")
     assert run is not None
-    service.advance(run.run_id, Stage.IMPLEMENT)
+    lease_token = run.lease_token or ""
+    service.advance(run.run_id, Stage.IMPLEMENT, lease_token)
     completed = RunState(
         run.run_id,
         run.project_id,
@@ -566,13 +737,16 @@ def test_orchestrator_handoff_rejects_unknown_and_handles_completed_race(
         run.attempt,
         "branch",
         "https://example.test/pull/1",
+        owner_id=run.owner_id,
+        lease_token=run.lease_token,
+        lease_expires_at=run.lease_expires_at,
     )
     monkeypatch.setattr(
         store,
         "prepare_handoff",
         lambda *args: HandoffIntent(completed, "branch", "main", "body"),
     )
-    assert service.handoff(run.run_id, "branch", None, "body") == completed
+    assert service.handoff(run.run_id, "branch", None, "body", lease_token) == completed
     store.close()
 
 
@@ -618,5 +792,11 @@ def test_storage_migrates_legacy_columns(tmp_path: Path) -> None:
         "handoff_base_branch",
         "handoff_body",
         "handoff_status",
+        "planning_status",
+        "claimable",
     } <= columns
+    run_columns = {
+        str(row[1]) for row in store._connection.execute("PRAGMA table_info(runs)")
+    }
+    assert {"owner_id", "lease_token", "lease_expires_at"} <= run_columns
     store.close()

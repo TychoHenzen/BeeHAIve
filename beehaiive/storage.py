@@ -6,7 +6,7 @@ import json
 import sqlite3
 from collections.abc import Generator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import RLock
 from uuid import uuid4
@@ -31,15 +31,32 @@ _STAGE_ORDER = {
     Stage.PULL_REQUEST: 3,
 }
 
+DEFAULT_EVENT_LIMIT = 100
+MAX_EVENT_LIMIT = 500
+
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _lease_is_active(expires_at: str | None) -> bool:
+    if not expires_at:
+        return False
+    try:
+        return datetime.fromisoformat(expires_at) > datetime.now(UTC)
+    except ValueError:
+        return False
+
+
 class OrchestratorStore:
     """Thread-safe SQLite store with one active writer index per repository."""
 
-    def __init__(self, database: str | Path = ":memory:") -> None:
+    def __init__(
+        self, database: str | Path = ":memory:", lease_seconds: int = 300
+    ) -> None:
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        self._lease_seconds = lease_seconds
         if database != ":memory:":
             Path(database).parent.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(
@@ -91,6 +108,8 @@ class OrchestratorStore:
                     handoff_base_branch TEXT,
                     handoff_body TEXT,
                     handoff_status TEXT,
+                    planning_status TEXT,
+                    claimable INTEGER NOT NULL DEFAULT 1,
                     PRIMARY KEY (project_id, repository_name, number),
                     FOREIGN KEY (project_id, repository_name)
                         REFERENCES repositories(project_id, name) ON DELETE CASCADE
@@ -103,6 +122,9 @@ class OrchestratorStore:
                     pbi_number INTEGER NOT NULL,
                     status TEXT NOT NULL,
                     attempt INTEGER NOT NULL,
+                    owner_id TEXT,
+                    lease_token TEXT,
+                    lease_expires_at TEXT,
                     last_error TEXT,
                     updated_at TEXT NOT NULL,
                     UNIQUE (project_id, repository_name, pbi_number),
@@ -167,14 +189,32 @@ class OrchestratorStore:
                 self._connection.execute(
                     "ALTER TABLE pbis ADD COLUMN active INTEGER NOT NULL DEFAULT 1"
                 )
+            run_columns = {
+                str(row["name"])
+                for row in self._connection.execute(
+                    "PRAGMA table_info(runs)"
+                ).fetchall()
+            }
+            for column in ("owner_id", "lease_token", "lease_expires_at"):
+                if column not in run_columns:
+                    self._connection.execute(
+                        f"ALTER TABLE runs ADD COLUMN {column} TEXT"
+                    )
             for column in (
                 "handoff_base_branch",
                 "handoff_body",
                 "handoff_status",
+                "planning_status",
+                "claimable",
             ):
                 if column not in pbi_columns:
+                    definition = (
+                        "INTEGER NOT NULL DEFAULT 1"
+                        if column == "claimable"
+                        else "TEXT"
+                    )
                     self._connection.execute(
-                        f"ALTER TABLE pbis ADD COLUMN {column} TEXT"
+                        f"ALTER TABLE pbis ADD COLUMN {column} {definition}"
                     )
 
     @contextmanager
@@ -188,6 +228,31 @@ class OrchestratorStore:
                 raise
             else:
                 self._connection.commit()
+
+    def _lease_deadline(self) -> str:
+        return (datetime.now(UTC) + timedelta(seconds=self._lease_seconds)).isoformat()
+
+    @staticmethod
+    def _require_lease(run: RunState, lease_token: str) -> None:
+        if not lease_token or run.lease_token != lease_token:
+            raise StoreError("Invalid or missing run lease token")
+        if not _lease_is_active(run.lease_expires_at):
+            raise StoreError(f"Run {run.run_id} lease has expired")
+
+    def _renew_lease(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str,
+        lease_token: str,
+    ) -> None:
+        connection.execute(
+            """
+            UPDATE runs
+            SET lease_expires_at = ?, updated_at = ?
+            WHERE run_id = ? AND status = 'active' AND lease_token = ?
+            """,
+            (self._lease_deadline(), _now(), run_id, lease_token),
+        )
 
     def sync_project(self, snapshot: ProjectSnapshot) -> None:
         with self._transaction() as connection:
@@ -223,6 +288,17 @@ class OrchestratorStore:
                         raise StoreError(
                             "PBI repository does not match its repository snapshot"
                         )
+                    incoming_stage = (
+                        pbi.stage
+                        if pbi.claimable
+                        and pbi.stage
+                        in {
+                            Stage.BACKLOG,
+                            Stage.REFINE,
+                            Stage.IMPLEMENT,
+                        }
+                        else None
+                    )
                     existing = connection.execute(
                         """
                         SELECT stage, run_id
@@ -236,29 +312,36 @@ class OrchestratorStore:
                             """
                             INSERT INTO pbis(
                                 project_id, repository_name, number, title,
-                                stage, active
+                                stage, active, planning_status, claimable
                             )
-                            VALUES (?, ?, ?, ?, ?, 1)
+                            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
                             """,
                             (
                                 snapshot.project_id,
                                 pbi.repository,
                                 pbi.number,
                                 pbi.title,
-                                pbi.stage.value,
+                                (incoming_stage or Stage.BACKLOG).value,
+                                pbi.planning_status,
+                                int(incoming_stage is not None),
                             ),
                         )
                         continue
 
                     current_stage = Stage(str(existing["stage"]))
-                    merged_stage = max(
-                        (current_stage, pbi.stage),
-                        key=lambda stage: _STAGE_ORDER[stage],
+                    merged_stage = (
+                        max(
+                            (current_stage, incoming_stage),
+                            key=lambda stage: _STAGE_ORDER[stage],
+                        )
+                        if incoming_stage is not None
+                        else current_stage
                     )
                     connection.execute(
                         """
                         UPDATE pbis
                         SET title = ?, stage = ?, active = 1,
+                            planning_status = ?, claimable = ?,
                             last_error = CASE
                                 WHEN ? = ? THEN last_error
                                 ELSE NULL
@@ -268,6 +351,11 @@ class OrchestratorStore:
                         (
                             pbi.title,
                             merged_stage.value,
+                            pbi.planning_status,
+                            int(
+                                incoming_stage is not None
+                                and merged_stage is not Stage.PULL_REQUEST
+                            ),
                             current_stage.value,
                             merged_stage.value,
                             snapshot.project_id,
@@ -275,21 +363,6 @@ class OrchestratorStore:
                             pbi.number,
                         ),
                     )
-                    if merged_stage is Stage.PULL_REQUEST:
-                        connection.execute(
-                            """
-                            UPDATE runs
-                            SET status = 'completed', last_error = NULL, updated_at = ?
-                            WHERE project_id = ? AND repository_name = ?
-                              AND pbi_number = ? AND status != 'completed'
-                            """,
-                            (
-                                _now(),
-                                snapshot.project_id,
-                                pbi.repository,
-                                pbi.number,
-                            ),
-                        )
                     if merged_stage is not current_stage:
                         run_id = existing["run_id"]
                         if run_id is not None:
@@ -303,7 +376,14 @@ class OrchestratorStore:
                             "external_sync",
                             current_stage,
                             merged_stage,
-                            {"source_stage": pbi.stage.value},
+                            {
+                                "source_stage": pbi.planning_status
+                                or (
+                                    pbi.stage.value
+                                    if pbi.stage is not None
+                                    else "unknown"
+                                )
+                            },
                         )
             removed_runs = connection.execute(
                 """
@@ -354,11 +434,21 @@ class OrchestratorStore:
                     {"reason": "pbi no longer linked to selected project"},
                 )
 
-    def claim_next(self, project_id: str, repository: str) -> RunState | None:
+    def claim_next(
+        self,
+        project_id: str,
+        repository: str,
+        owner_id: str,
+        lease_token: str | None = None,
+    ) -> RunState | None:
+        if not owner_id.strip():
+            raise StoreError("A worker owner is required")
         with self._transaction() as connection:
             active = connection.execute(
                 """
-                SELECT p.*, r.run_id, r.status, r.attempt, r.last_error AS run_error
+                SELECT p.*, r.run_id, r.status, r.attempt,
+                       r.owner_id, r.lease_token, r.lease_expires_at,
+                       r.last_error AS run_error
                 FROM pbis AS p
                 JOIN repositories AS repository
                   ON repository.project_id = p.project_id
@@ -369,13 +459,53 @@ class OrchestratorStore:
                   ON r.project_id = p.project_id
                  AND r.repository_name = p.repository_name
                  AND r.pbi_number = p.number
-                WHERE p.project_id = ? AND p.repository_name = ? AND r.status = 'active'
+                WHERE p.project_id = ? AND p.repository_name = ?
+                  AND r.status = 'active'
                 LIMIT 1
                 """,
                 (project_id, repository),
             ).fetchone()
             if active is not None:
-                return self._run_from_row(active)
+                active_run = self._run_from_row(active)
+                if (
+                    active_run.owner_id == owner_id
+                    and lease_token is not None
+                    and active_run.lease_token == lease_token
+                    and _lease_is_active(active_run.lease_expires_at)
+                ):
+                    self._renew_lease(connection, active_run.run_id, lease_token)
+                    return self._run_for_id(connection, active_run.run_id)
+                if _lease_is_active(active_run.lease_expires_at):
+                    return None
+                run_id = active_run.run_id
+                new_lease_token = str(uuid4())
+                connection.execute(
+                    """
+                    UPDATE runs
+                    SET owner_id = ?, lease_token = ?, lease_expires_at = ?,
+                        last_error = NULL, updated_at = ?
+                    WHERE run_id = ? AND status = 'active'
+                    """,
+                    (
+                        owner_id,
+                        new_lease_token,
+                        self._lease_deadline(),
+                        _now(),
+                        run_id,
+                    ),
+                )
+                self._record_event(
+                    connection,
+                    project_id,
+                    repository,
+                    int(active["number"]),
+                    run_id,
+                    "lease_reclaimed",
+                    Stage(str(active["stage"])),
+                    Stage(str(active["stage"])),
+                    {"owner_id": owner_id},
+                )
+                return self._run_for_id(connection, run_id)
 
             candidate = connection.execute(
                 """
@@ -393,6 +523,7 @@ class OrchestratorStore:
                  AND r.pbi_number = p.number
                 WHERE p.project_id = ?
                   AND p.repository_name = ?
+                  AND p.claimable = 1
                   AND p.stage != ?
                   AND (r.status IS NULL OR r.status = 'failed')
                 ORDER BY p.number
@@ -404,15 +535,23 @@ class OrchestratorStore:
                 return None
 
             run_id = candidate["existing_run_id"]
+            new_lease_token = str(uuid4())
             if isinstance(run_id, str):
                 connection.execute(
                     """
                     UPDATE runs
                     SET status = 'active', attempt = attempt + 1,
+                        owner_id = ?, lease_token = ?, lease_expires_at = ?,
                         last_error = NULL, updated_at = ?
                     WHERE run_id = ?
                     """,
-                    (_now(), run_id),
+                    (
+                        owner_id,
+                        new_lease_token,
+                        self._lease_deadline(),
+                        _now(),
+                        run_id,
+                    ),
                 )
                 event_type = "resumed"
             else:
@@ -421,10 +560,20 @@ class OrchestratorStore:
                     """
                     INSERT INTO runs(
                         run_id, project_id, repository_name, pbi_number,
-                        status, attempt, updated_at
-                    ) VALUES (?, ?, ?, ?, 'active', 1, ?)
+                        status, attempt, owner_id, lease_token,
+                        lease_expires_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'active', 1, ?, ?, ?, ?)
                     """,
-                    (run_id, project_id, repository, candidate["number"], _now()),
+                    (
+                        run_id,
+                        project_id,
+                        repository,
+                        candidate["number"],
+                        owner_id,
+                        new_lease_token,
+                        self._lease_deadline(),
+                        _now(),
+                    ),
                 )
                 event_type = "claimed"
 
@@ -475,11 +624,12 @@ class OrchestratorStore:
                 )
             return self._run_for_id(connection, run_id)
 
-    def advance(self, run_id: str, target: Stage) -> RunState:
+    def advance(self, run_id: str, target: Stage, lease_token: str) -> RunState:
         with self._transaction() as connection:
             row = self._run_for_id(connection, run_id)
             if row is None:
                 raise StoreError(f"Unknown run: {run_id}")
+            self._require_lease(row, lease_token)
             if row.status is not RunStatus.ACTIVE:
                 if row.stage is target:
                     return row
@@ -500,9 +650,7 @@ class OrchestratorStore:
                 """,
                 (target.value, row.project_id, row.repository, row.pbi_number),
             )
-            connection.execute(
-                "UPDATE runs SET updated_at = ? WHERE run_id = ?", (_now(), run_id)
-            )
+            self._renew_lease(connection, run_id, lease_token)
             self._record_event(
                 connection,
                 row.project_id,
@@ -522,6 +670,7 @@ class OrchestratorStore:
         branch: str,
         pull_request_url: str,
         pull_request_number: int | None,
+        lease_token: str,
     ) -> RunState:
         if not branch.strip() or not pull_request_url.strip():
             raise StoreError("A branch and pull-request URL are required")
@@ -529,6 +678,7 @@ class OrchestratorStore:
             row = self._run_for_id(connection, run_id)
             if row is None:
                 raise StoreError(f"Unknown run: {run_id}")
+            self._require_lease(row, lease_token)
             if row.status is RunStatus.COMPLETED and row.stage is Stage.PULL_REQUEST:
                 return row
             if row.status is not RunStatus.ACTIVE or row.stage is not Stage.IMPLEMENT:
@@ -553,7 +703,7 @@ class OrchestratorStore:
                 """
                 UPDATE pbis
                 SET stage = ?, branch = ?, pull_request_url = ?,
-                    handoff_status = 'completed', last_error = NULL
+                    handoff_status = 'completed', claimable = 0, last_error = NULL
                 WHERE project_id = ? AND repository_name = ? AND number = ?
                 """,
                 (
@@ -609,6 +759,7 @@ class OrchestratorStore:
         branch: str,
         base_branch: str | None,
         body: str,
+        lease_token: str,
     ) -> HandoffIntent:
         if not branch.strip():
             raise StoreError("A branch is required")
@@ -616,6 +767,7 @@ class OrchestratorStore:
             row = self._run_for_id(connection, run_id)
             if row is None:
                 raise StoreError(f"Unknown run: {run_id}")
+            self._require_lease(row, lease_token)
             persisted = connection.execute(
                 """
                 SELECT branch, handoff_base_branch, handoff_body, handoff_status
@@ -646,8 +798,12 @@ class OrchestratorStore:
                     raise StoreError(
                         "Handoff request does not match the persisted intent"
                     )
+                self._renew_lease(connection, run_id, lease_token)
+                renewed_row = self._run_for_id(connection, run_id)
+                if renewed_row is None:
+                    raise StoreError(f"Unknown run: {run_id}")
                 return HandoffIntent(
-                    row,
+                    renewed_row,
                     str(persisted["branch"]),
                     persisted["handoff_base_branch"],
                     str(persisted["handoff_body"]),
@@ -670,16 +826,18 @@ class OrchestratorStore:
                     row.pbi_number,
                 ),
             )
+            self._renew_lease(connection, run_id, lease_token)
             persisted_row = self._run_for_id(connection, run_id)
             if persisted_row is None:
                 raise StoreError(f"Unknown run: {run_id}")
             return HandoffIntent(persisted_row, branch, base_branch, body)
 
-    def pending_handoff(self, run_id: str) -> HandoffIntent | None:
+    def pending_handoff(self, run_id: str, lease_token: str) -> HandoffIntent | None:
         with self._lock:
             run = self._run_for_id(self._connection, run_id)
             if run is None:
-                return None
+                raise StoreError(f"Unknown run: {run_id}")
+            self._require_lease(run, lease_token)
             row = self._connection.execute(
                 """
                 SELECT branch, handoff_base_branch, handoff_body, handoff_status
@@ -697,13 +855,25 @@ class OrchestratorStore:
                 str(row["handoff_body"] or ""),
             )
 
-    def fail(self, run_id: str, error: str) -> RunState:
+    def renew_lease(self, run_id: str, lease_token: str) -> RunState:
+        with self._transaction() as connection:
+            row = self._run_for_id(connection, run_id)
+            if row is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            self._require_lease(row, lease_token)
+            if row.status is not RunStatus.ACTIVE:
+                return row
+            self._renew_lease(connection, run_id, lease_token)
+            return self._run_for_id(connection, run_id) or row
+
+    def fail(self, run_id: str, error: str, lease_token: str) -> RunState:
         if not error.strip():
             raise StoreError("A failure reason is required")
         with self._transaction() as connection:
             row = self._run_for_id(connection, run_id)
             if row is None:
                 raise StoreError(f"Unknown run: {run_id}")
+            self._require_lease(row, lease_token)
             if row.status is RunStatus.COMPLETED:
                 raise StoreError("A completed run cannot fail")
             if row.status is RunStatus.FAILED:
@@ -740,7 +910,25 @@ class OrchestratorStore:
         with self._lock:
             return self._run_for_id(self._connection, run_id)
 
-    def project_state(self, project_id: str) -> dict[str, object]:
+    def is_active_repository(self, project_id: str, repository: str) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT 1
+                FROM repositories
+                WHERE project_id = ? AND name = ? AND active = 1
+                """,
+                (project_id, repository),
+            ).fetchone()
+            return row is not None
+
+    def project_state(
+        self,
+        project_id: str,
+        event_limit: int = DEFAULT_EVENT_LIMIT,
+    ) -> dict[str, object]:
+        if not 1 <= event_limit <= MAX_EVENT_LIMIT:
+            raise StoreError(f"event_limit must be between 1 and {MAX_EVENT_LIMIT}")
         with self._lock:
             project = self._connection.execute(
                 """
@@ -752,6 +940,7 @@ class OrchestratorStore:
             ).fetchone()
             if project is None:
                 raise StoreError(f"Unknown project: {project_id}")
+            events_by_pbi = self._events_for_project(project_id, event_limit)
             repositories: list[dict[str, object]] = []
             repository_rows = self._connection.execute(
                 """
@@ -767,7 +956,8 @@ class OrchestratorStore:
                 writer_row = (
                     self._connection.execute(
                         """
-                        SELECT run_id, pbi_number, updated_at
+                        SELECT run_id, pbi_number, owner_id, lease_expires_at,
+                               updated_at
                         FROM runs
                         WHERE project_id = ?
                           AND repository_name = ?
@@ -783,6 +973,8 @@ class OrchestratorStore:
                     writer = {
                         "run_id": writer_row["run_id"],
                         "pbi_number": writer_row["pbi_number"],
+                        "owner_id": writer_row["owner_id"],
+                        "lease_expires_at": writer_row["lease_expires_at"],
                         "updated_at": writer_row["updated_at"],
                     }
                 pbis: list[dict[str, object]] = []
@@ -800,11 +992,7 @@ class OrchestratorStore:
                     (project_id, repository),
                 ).fetchall()
                 for pbi_row in pbi_rows:
-                    events = self._events_for_pbi(
-                        project_id,
-                        repository,
-                        int(pbi_row["number"]),
-                    )
+                    events = events_by_pbi.get((repository, int(pbi_row["number"])), [])
                     pbis.append(
                         {
                             "id": f"{repository}#{pbi_row['number']}",
@@ -817,6 +1005,8 @@ class OrchestratorStore:
                             "pull_request_url": pbi_row["pull_request_url"],
                             "last_error": pbi_row["last_error"],
                             "active": bool(pbi_row["active"]),
+                            "planning_status": pbi_row["planning_status"],
+                            "claimable": bool(pbi_row["claimable"]),
                             "events": events,
                         }
                     )
@@ -832,6 +1022,7 @@ class OrchestratorStore:
                 "project_id": project["project_id"],
                 "name": project["name"],
                 "updated_at": project["updated_at"],
+                "event_limit": event_limit,
                 "repositories": repositories,
             }
 
@@ -842,7 +1033,8 @@ class OrchestratorStore:
             """
             SELECT p.project_id, p.repository_name, p.number, p.title, p.stage,
                    p.branch, p.pull_request_url, p.last_error,
-                   r.run_id, r.status, r.attempt, r.last_error AS run_error
+                   r.run_id, r.status, r.attempt, r.owner_id, r.lease_token,
+                   r.lease_expires_at, r.last_error AS run_error
             FROM runs AS r
             JOIN pbis AS p
               ON p.project_id = r.project_id
@@ -870,33 +1062,50 @@ class OrchestratorStore:
             branch=row["branch"],
             pull_request_url=row["pull_request_url"],
             last_error=row["run_error"] or row["last_error"],
+            owner_id=row["owner_id"],
+            lease_token=row["lease_token"],
+            lease_expires_at=row["lease_expires_at"],
         )
 
-    def _events_for_pbi(
-        self, project_id: str, repository: str, number: int
-    ) -> list[dict[str, object]]:
+    def _events_for_project(
+        self, project_id: str, event_limit: int
+    ) -> dict[tuple[str, int], list[dict[str, object]]]:
         rows = self._connection.execute(
             """
-            SELECT event_id, run_id, event_type, from_stage, to_stage,
-                   details_json, created_at
-            FROM events
-            WHERE project_id = ? AND repository_name = ? AND pbi_number = ?
-            ORDER BY event_id
+            SELECT event_id, repository_name, pbi_number, run_id, event_type,
+                   from_stage, to_stage, details_json, created_at
+            FROM (
+                SELECT event_id, repository_name, pbi_number, run_id,
+                       event_type, from_stage, to_stage, details_json,
+                       created_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY repository_name, pbi_number
+                           ORDER BY event_id DESC
+                       ) AS event_rank
+                FROM events
+                WHERE project_id = ?
+            )
+            WHERE event_rank <= ?
+            ORDER BY repository_name, pbi_number, event_id
             """,
-            (project_id, repository, number),
+            (project_id, event_limit),
         ).fetchall()
-        return [
-            {
-                "id": row["event_id"],
-                "run_id": row["run_id"],
-                "type": row["event_type"],
-                "from_stage": row["from_stage"],
-                "to_stage": row["to_stage"],
-                "details": json.loads(row["details_json"]),
-                "created_at": row["created_at"],
-            }
-            for row in rows
-        ]
+        events_by_pbi: dict[tuple[str, int], list[dict[str, object]]] = {}
+        for row in rows:
+            events_by_pbi.setdefault(
+                (str(row["repository_name"]), int(row["pbi_number"])), []
+            ).append(
+                {
+                    "id": row["event_id"],
+                    "run_id": row["run_id"],
+                    "type": row["event_type"],
+                    "from_stage": row["from_stage"],
+                    "to_stage": row["to_stage"],
+                    "details": json.loads(row["details_json"]),
+                    "created_at": row["created_at"],
+                }
+            )
+        return events_by_pbi
 
     @staticmethod
     def _record_event(

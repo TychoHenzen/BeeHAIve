@@ -30,7 +30,9 @@ class PbiSnapshot:
     repository: str
     number: int
     title: str
-    stage: Stage = Stage.BACKLOG
+    stage: Stage | None = Stage.BACKLOG
+    planning_status: str | None = None
+    claimable: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +63,7 @@ class HandoffRequest:
     branch: str
     base_branch: str | None
     body: str
+    run_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,3 +100,6 @@ class RunState:
     branch: str | None = None
     pull_request_url: str | None = None
     last_error: str | None = None
+    owner_id: str | None = None
+    lease_token: str | None = None
+    lease_expires_at: str | None = None
