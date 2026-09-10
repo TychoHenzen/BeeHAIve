@@ -509,6 +509,8 @@ def test_executor_builds_model_command_and_covers_process_helpers(
     assert captured["creationflags"] == 0x200
     assert "start_new_session" not in captured
     monkeypatch.setattr(agent_module.os, "name", "posix")
+    monkeypatch.setattr(agent_module.os, "getpgid", lambda pid: pid, raising=False)
+    monkeypatch.setattr(agent_module.os, "killpg", lambda *_args: None, raising=False)
 
     class FinishedProcess:
         pid = 1
