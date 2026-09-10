@@ -16,6 +16,7 @@ export function createDashboardView({
   function render(state) {
     renderSummary(state.counts || {});
     dashboardOutput.replaceChildren();
+    dashboardOutput.append(renderProject(state));
     const repositories = state.repositories || [];
     if (repositories.length === 0) {
       dashboardOutput.append(
@@ -29,6 +30,15 @@ export function createDashboardView({
     renderActions(state.actions || []);
   }
 
+  function renderProject(state) {
+    const section = element("section", undefined, "project-meta");
+    section.append(element("h2", state.name || state.project_id || "Project"));
+    if (state.updated_at) {
+      section.append(element("div", `Updated: ${state.updated_at}`, "muted"));
+    }
+    return section;
+  }
+
   function renderSummary(counts) {
     summaryOutput.replaceChildren();
     const fields = [
@@ -40,6 +50,7 @@ export function createDashboardView({
       ["Readers", counts.readers],
       ["Active runs", counts.active_runs],
       ["Failed runs", counts.failed_runs],
+      ["Completed runs", counts.completed_runs],
     ];
     fields.forEach(([label, value]) => {
       const card = element("div", undefined, "card");
@@ -78,6 +89,11 @@ export function createDashboardView({
 
   function renderPbi(repository, pbi) {
     const card = element("article", undefined, "pbi");
+    if (!card.dataset) card.dataset = {};
+    card.dataset.repository = String(repository || "");
+    card.dataset.pbiNumber = String(pbi.number ?? "");
+    card.dataset.runId = String(pbi.run_id ?? "");
+    card.dataset.attempt = String(pbi.attempt ?? "");
     const header = element("div", undefined, "pbi-header");
     const title = element("div");
     title.append(element("div", `${pbi.id || "PBI"} · #${pbi.number}`, "mono"));
@@ -97,6 +113,7 @@ export function createDashboardView({
     details.append(renderActivity(pbi.activity || []));
     card.append(details);
     if (pbi.last_error) card.append(element("p", `Failure: ${pbi.last_error}`, "status failure"));
+    if (pbi.result) card.append(element("p", `Result: ${pbi.result}`, "status success"));
     if (pbi.status !== "active" || !pbi.run_id) return card;
     const controls = element("div", undefined, "actions");
     const stop = element("button", "Stop", "danger");

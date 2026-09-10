@@ -22,6 +22,7 @@ from beehaiive.provider import (
     ProviderError,
     _handoff_marker,
 )
+from beehaiive.routing import ModelRouter, RoutingStore
 from beehaiive.storage import OrchestratorStore, StoreError
 
 
@@ -518,6 +519,44 @@ def test_sync_reconciles_removed_repositories_without_deleting_history() -> None
     assert removed["active"] is False
     assert removed["pbis"][0]["title"] == "Web one"  # type: ignore[index]
     assert service.claim("project-1", "owner/web", "worker-1") is None
+
+
+def test_sync_cancels_worker_for_removed_pbi() -> None:
+    provider = FakeProvider(snapshot())
+    store = OrchestratorStore()
+    service = Orchestrator(store, provider)
+    service.synchronize("project-1")
+    run = service.claim("project-1", "owner/web", "worker-1")
+    assert run is not None
+    cancelled: list[str] = []
+    service.register_worker_canceller(cancelled.append)
+    provider.snapshot = ProjectSnapshot(
+        project_id="project-1",
+        name="Planning",
+        repositories=(snapshot().repositories[0],),
+    )
+
+    service.synchronize("project-1")
+
+    assert cancelled == [run.run_id]
+    removed_run = store.get_run(run.run_id)
+    assert removed_run is not None
+    assert removed_run.status.value == "failed"
+    assert removed_run.lease_token is None
+    store.close()
+
+
+def test_routing_recovery_errors_are_mapped() -> None:
+    store = OrchestratorStore()
+    service = Orchestrator(store, FakeProvider(snapshot()))
+    service.recover_routing_problem("missing", "result persistence failed")
+    routing_store = RoutingStore()
+    routed = Orchestrator(store, FakeProvider(snapshot()), ModelRouter(routing_store))
+
+    with pytest.raises(StoreError, match="Unknown routing problem"):
+        routed.recover_routing_problem("missing", "result persistence failed")
+    routing_store.close()
+    store.close()
 
 
 def test_sync_replaces_removed_dashboard_metadata() -> None:
