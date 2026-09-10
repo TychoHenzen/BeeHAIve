@@ -68,6 +68,8 @@ test("rendering live state exposes current stages and active actions", () => {
   });
 
   view.render({
+    name: "Planning",
+    updated_at: "2026-09-09T20:00:00Z",
     counts: {
       projects: 1,
       active_repositories: 1,
@@ -127,6 +129,8 @@ test("rendering live state exposes current stages and active actions", () => {
   });
 
   assert.match(summaryOutput.textContent, /Projects1/);
+  assert.match(dashboardOutput.textContent, /Planning/);
+  assert.match(dashboardOutput.textContent, /Updated: 2026-09-09T20:00:00Z/);
   assert.match(dashboardOutput.textContent, /Live API/);
   assert.match(dashboardOutput.textContent, /Pull request/);
   assert.match(dashboardOutput.textContent, /Tier terra/);

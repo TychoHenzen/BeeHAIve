@@ -1211,8 +1211,12 @@ def _production_workflow_service() -> WorkflowService:
     )
 
 
-app = create_app(
-    workflow_service=_production_workflow_service(),
-    workflow_actor=os.environ.get("BEEHAIIVE_WORKFLOW_ACTOR"),
-    require_review_adapters=True,
+app = (
+    None
+    if os.environ.get("BEEHAIIVE_SKIP_PRODUCTION_APP") == "1"
+    else create_app(
+        workflow_service=_production_workflow_service(),
+        workflow_actor=os.environ.get("BEEHAIIVE_WORKFLOW_ACTOR"),
+        require_review_adapters=True,
+    )
 )

@@ -29,3 +29,45 @@ The GitHub provider supplies optional live details during project sync. GitHub
 sub-issues become subtasks, linked pull-request review requests and latest
 reviews become readers and reviewer results, issue comments become activity,
 and `bounces/N` or `escalation/<tier>` labels become escalation state.
+
+## Reproducible smoke proof
+
+`scripts/dashboard_smoke.py` starts a fresh service, opens the dashboard in
+Edge or Chrome through the DevTools protocol, and writes a redacted JSON proof
+report. It uses only the repository's existing Python dependencies and an
+installed Chromium-compatible browser. The report contains the service URL,
+redacted project identity, HTTP statuses, visible UI outcomes, credential
+safety checks, and the documented Python and JavaScript gate results.
+
+Run the deterministic local proof from the repository root:
+
+```text
+uv run python scripts/dashboard_smoke.py --mode fixture --report .beehaiive/dashboard-smoke.json
+```
+
+The fixture has project and repository metadata, a PBI with subtasks, readers,
+reviewers, escalation, and activity, one claimable repository, and one empty
+repository. The browser path verifies the no-key read, allowlist rejection,
+sync, start, approval, clarification, stop, and a visible failed action. The
+service databases, browser profile, and credentials stay outside source
+control.
+
+Run the live proof with credentials supplied only through the environment:
+
+```powershell
+$env:GITHUB_TOKEN = (gh auth token)
+$env:GITHUB_PROJECT_OWNER = "<owner>"
+$env:GITHUB_PROJECT_NUMBER = "<number>"
+$env:GITHUB_PROJECT_OWNER_TYPE = "user"
+$env:BEEHAIIVE_API_KEY = "<operator-key>"
+uv run python scripts/dashboard_smoke.py --mode live --project "<owner>:<number>" --allow-mutations --report .beehaiive/dashboard-live-smoke.json
+```
+
+Omit `--allow-mutations` for the read-only live proof. The flag is required to
+exercise sync, start, approval, clarification, and stop through the browser.
+The live refresh and action wait defaults to two provider request deadlines
+plus five seconds. Pass `--live-timeout <seconds>` to set a larger deadline for
+projects that require more paginated provider requests.
+The live harness uses an isolated local database. Project discovery uses the
+configured GitHub provider, while the dashboard actions remain local state
+changes. Pass `--browser` when Edge or Chrome is not discoverable.
