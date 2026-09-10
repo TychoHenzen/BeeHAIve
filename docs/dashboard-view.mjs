@@ -16,6 +16,7 @@ export function createDashboardView({
   function render(state) {
     renderSummary(state.counts || {});
     dashboardOutput.replaceChildren();
+    dashboardOutput.append(renderProject(state));
     const repositories = state.repositories || [];
     if (repositories.length === 0) {
       dashboardOutput.append(
@@ -27,6 +28,15 @@ export function createDashboardView({
       });
     }
     renderActions(state.actions || []);
+  }
+
+  function renderProject(state) {
+    const section = element("section", undefined, "project-meta");
+    section.append(element("h2", state.name || state.project_id || "Project"));
+    if (state.updated_at) {
+      section.append(element("div", `Updated: ${state.updated_at}`, "muted"));
+    }
+    return section;
   }
 
   function renderSummary(counts) {

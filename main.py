@@ -252,6 +252,12 @@ def create_app(
         )
 
     app = FastAPI(title="BeeHAIve")
+    app.state.beehaiive_stores = (
+        orchestrator.store,
+        routing_service.store,
+        review_service.store,
+        workflow_service.store if workflow_service is not None else None,
+    )
 
     if require_review_adapters:
 

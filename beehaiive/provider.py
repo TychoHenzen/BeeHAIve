@@ -139,23 +139,25 @@ query($owner: String!, $number: Int!, $cursor: String) {
               number
               title
               repository { nameWithOwner }
-              labels(first: 100) {
+              # Keep the project-wide query below GitHub's node limit. The
+              # provider completes these connections with repository queries.
+              labels(first: 20) {
                 nodes { name }
                 pageInfo { hasNextPage endCursor }
               }
-              subIssues(first: 100) {
+              subIssues(first: 20) {
                 nodes {
                   number
                   title
                   state
-                  labels(first: 100) {
+                  labels(first: 20) {
                     nodes { name }
                     pageInfo { hasNextPage endCursor }
                   }
                 }
                 pageInfo { hasNextPage endCursor }
               }
-              comments(first: 50) {
+              comments(first: 20) {
                 nodes {
                   author { ... on User { login } ... on Bot { login } }
                   body
@@ -164,12 +166,12 @@ query($owner: String!, $number: Int!, $cursor: String) {
                 }
                 pageInfo { hasNextPage endCursor }
               }
-              closedByPullRequestsReferences(includeClosedPrs: true, first: 100) {
+              closedByPullRequestsReferences(includeClosedPrs: true, first: 20) {
                 nodes {
                   number
                   url
                   reviewDecision
-                  reviewRequests(first: 100) {
+                  reviewRequests(first: 20) {
                     nodes {
                       requestedReviewer {
                         ... on User { login }
@@ -178,7 +180,7 @@ query($owner: String!, $number: Int!, $cursor: String) {
                     }
                     pageInfo { hasNextPage endCursor }
                   }
-                  latestReviews(first: 100) {
+                  latestReviews(first: 20) {
                     nodes {
                       author { ... on User { login } ... on Bot { login } }
                       state
