@@ -322,6 +322,8 @@ class CodexExecModelExecutor:
             "--ephemeral",
             "--skip-git-repo-check",
             "--ignore-user-config",
+            "--ask-for-approval",
+            "never",
             "--sandbox",
             "read-only",
             "--cd",

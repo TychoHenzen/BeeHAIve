@@ -445,6 +445,7 @@ def test_executor_builds_model_command_and_covers_process_helpers(
     assert "--sandbox" in command
     assert "--skip-git-repo-check" in command
     assert "--ignore-user-config" in command
+    assert command[command.index("--ask-for-approval") + 1] == "never"
     assert executor._command("prompt")[-1] == "prompt"
 
     captured: dict[str, object] = {}
