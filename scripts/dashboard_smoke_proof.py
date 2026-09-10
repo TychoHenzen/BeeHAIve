@@ -313,8 +313,10 @@ def record_action(
     expected: str | None = None,
     before_action_count: int = 0,
     timeout: float = 15.0,
+    *,
+    action_name: str | None = None,
 ) -> dict[str, Any]:
-    action = name.split("_", 1)[0]
+    action = action_name or name.split("_", 1)[0]
     pending = status_snapshot(devtools)
     if not pending["message"].startswith(f"{action} pending"):
         raise SmokeFailure(
@@ -535,6 +537,7 @@ def run_live_actions(
         "completion_writer",
         before_action_count=before,
         timeout=timeout,
+        action_name="start",
     )
     completion_repository, completion_pbi, completion_run = action_run_target(
         completion_response, "completion_writer"
