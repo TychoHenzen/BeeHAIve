@@ -22,7 +22,6 @@ from .dashboard_smoke_browser import (
     click_selector,
     credential_surface_snapshot,
     dashboard_fetch_count,
-    has_button,
     page_strings,
     set_input,
     status_snapshot,
@@ -102,6 +101,7 @@ def required_dashboard_fields(snapshot: Mapping[str, Any]) -> dict[str, bool]:
         "Readers",
         "Active runs",
         "Failed runs",
+        "Completed runs",
     )
     return {
         "project_name": bool(str(snapshot.get("project_name", "")).strip()),
@@ -251,6 +251,9 @@ def response_backed_dashboard_fields(
         "Failed runs": (
             counts.get("failed_runs") if isinstance(counts, Mapping) else None
         ),
+        "Completed runs": (
+            counts.get("completed_runs") if isinstance(counts, Mapping) else None
+        ),
     }
     count_values = rendered_counts if isinstance(rendered_counts, Mapping) else {}
     count_match = all(
@@ -310,8 +313,10 @@ def record_action(
     expected: str | None = None,
     before_action_count: int = 0,
     timeout: float = 15.0,
+    *,
+    action_name: str | None = None,
 ) -> dict[str, Any]:
-    action = name.split("_", 1)[0]
+    action = action_name or name.split("_", 1)[0]
     pending = status_snapshot(devtools)
     if not pending["message"].startswith(f"{action} pending"):
         raise SmokeFailure(
@@ -418,20 +423,62 @@ def run_fixture_actions(devtools: DevTools) -> dict[str, dict[str, Any]]:
     return outcomes
 
 
-def action_run_target(response: Mapping[str, Any], name: str) -> tuple[str, int, str]:
+def action_run_target(
+    response: Mapping[str, Any], name: str
+) -> tuple[str, int, str, int]:
     payload = response.get("payload")
     result = payload.get("result") if isinstance(payload, Mapping) else None
     run = result.get("run") if isinstance(result, Mapping) else None
     repository = run.get("repository") if isinstance(run, Mapping) else None
     pbi_number = run.get("pbi_number") if isinstance(run, Mapping) else None
     run_id = run.get("run_id") if isinstance(run, Mapping) else None
+    attempt = run.get("attempt") if isinstance(run, Mapping) else None
     if (
         not isinstance(repository, str)
         or not isinstance(pbi_number, int)
         or not isinstance(run_id, str)
+        or not isinstance(attempt, int)
     ):
         raise SmokeFailure(f"The {name} response omitted its run identity")
-    return repository, pbi_number, run_id
+    return repository, pbi_number, run_id, attempt
+
+
+def wait_for_demo_outcome(
+    devtools: DevTools,
+    repository: str,
+    pbi_number: int,
+    run_id: str,
+    attempt: int,
+    timeout: float,
+) -> dict[str, str]:
+    value = wait_until(
+        devtools,
+        f"""
+(() => {{
+  const pbi = [...document.querySelectorAll('.pbi')].find((node) =>
+    node.dataset.repository === {json.dumps(repository)}
+    && node.dataset.pbiNumber === {json.dumps(str(pbi_number))}
+    && node.dataset.runId === {json.dumps(run_id)}
+    && node.dataset.attempt === {json.dumps(str(attempt))}
+  );
+  const text = pbi?.textContent?.trim() || '';
+  if (text.includes('Result:')) return {{ status: 'completed', text }};
+  if (text.includes('Failure:')) return {{ status: 'failed', text }};
+  return null;
+}})()
+""",
+        "bounded demo result",
+        timeout=timeout,
+    )
+    if not isinstance(value, Mapping):
+        raise SmokeFailure("The live dashboard returned no bounded demo outcome")
+    status = value.get("status")
+    text = value.get("text")
+    if not isinstance(status, str) or not isinstance(text, str):
+        raise SmokeFailure(
+            "The live dashboard returned an invalid bounded demo outcome"
+        )
+    return {"status": status, "text": text}
 
 
 def run_live_actions(
@@ -447,33 +494,36 @@ def run_live_actions(
     )
 
     before = len(action_log_snapshot(devtools)["rows"])
-    if not has_button(devtools, "Start writer") or not click_button(
-        devtools, "Start writer"
-    ):
+    repository_hint = os.environ.get("BEEHAIIVE_AGENT_REPOSITORY_NAME", "").strip()
+    if not repository_hint:
+        raise SmokeFailure("Live mutation proof needs BEEHAIIVE_AGENT_REPOSITORY_NAME")
+    if not click_repository_button(devtools, repository_hint, "Start writer"):
         raise SmokeFailure("The live dashboard did not render the start-writer action")
     start_response = record_action(
         devtools, outcomes, "start_writer", before_action_count=before, timeout=timeout
     )
-    repository, pbi_number, run_id = action_run_target(start_response, "start_writer")
+    repository, pbi_number, run_id, _ = action_run_target(
+        start_response, "start_writer"
+    )
 
     before = len(action_log_snapshot(devtools)["rows"])
     if not click_pbi_button(
         devtools, repository, pbi_number, run_id, "Record approval"
     ):
         raise SmokeFailure(
-            "The live dashboard did not render the targeted approval action"
+            "The live approval action was not rendered for the targeted run"
         )
     record_action(
         devtools, outcomes, "approve", before_action_count=before, timeout=timeout
     )
 
-    devtools.evaluate("window.prompt = () => 'Live smoke clarification';")
+    devtools.evaluate("window.prompt = () => 'Use the live bounded demo';")
     before = len(action_log_snapshot(devtools)["rows"])
     if not click_pbi_button(
         devtools, repository, pbi_number, run_id, "Request clarification"
     ):
         raise SmokeFailure(
-            "The live dashboard did not render the targeted clarification action"
+            "The live clarification action was not rendered for the targeted run"
         )
     record_action(
         devtools, outcomes, "clarify", before_action_count=before, timeout=timeout
@@ -481,10 +531,40 @@ def run_live_actions(
 
     before = len(action_log_snapshot(devtools)["rows"])
     if not click_pbi_button(devtools, repository, pbi_number, run_id, "Stop"):
-        raise SmokeFailure("The live dashboard did not render the targeted stop action")
+        raise SmokeFailure("The live stop action was not rendered for the targeted run")
     record_action(
         devtools, outcomes, "stop", before_action_count=before, timeout=timeout
     )
+
+    before = len(action_log_snapshot(devtools)["rows"])
+    if not click_repository_button(devtools, repository_hint, "Start writer"):
+        raise SmokeFailure("The live completion run was not rendered")
+    completion_response = record_action(
+        devtools,
+        outcomes,
+        "completion_writer",
+        before_action_count=before,
+        timeout=timeout,
+        action_name="start",
+    )
+    completion_repository, completion_pbi, completion_run, completion_attempt = (
+        action_run_target(completion_response, "completion_writer")
+    )
+    demo_outcome = wait_for_demo_outcome(
+        devtools,
+        completion_repository,
+        completion_pbi,
+        completion_run,
+        completion_attempt,
+        timeout,
+    )
+    if demo_outcome["status"] != "completed":
+        raise SmokeFailure("The live bounded demo reported a failure")
+    outcomes["demo_result"] = {
+        "status": demo_outcome["status"],
+        "visible_result": "Result:" in demo_outcome["text"],
+        "targeted_run": True,
+    }
     return outcomes
 
 
@@ -549,6 +629,7 @@ def run_browser_smoke(
         "Subtasks",
         "Writers",
         "Readers",
+        "Completed runs",
     ):
         if expected not in visible_text:
             raise SmokeFailure(f"The dashboard summary omitted {expected}")

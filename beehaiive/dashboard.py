@@ -156,6 +156,7 @@ def _pbi_view(
         "branch": raw_pbi.get("branch"),
         "pull_request_url": raw_pbi.get("pull_request_url"),
         "last_error": raw_pbi.get("last_error"),
+        "result": raw_pbi.get("result"),
         "active": bool(raw_pbi.get("active")),
         "planning_status": raw_pbi.get("planning_status"),
         "claimable": bool(raw_pbi.get("claimable")),

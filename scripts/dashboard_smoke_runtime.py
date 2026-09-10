@@ -65,6 +65,19 @@ class FixtureProvider:
         return self.resolve_base_branch(repository, requested_base)
 
 
+class FixtureWorker:
+    """Keep fixture runs active so the browser can exercise each control."""
+
+    def start(self, run: Any) -> None:
+        del run
+
+    def cancel(self, run_id: str) -> None:
+        del run_id
+
+    def shutdown(self) -> None:
+        return None
+
+
 class DiscoveryCountingProvider:
     """Count provider discovery calls while delegating the live provider."""
 
@@ -234,6 +247,13 @@ def build_app(mode: str, project_id: str, directory: Path) -> ApplicationResourc
         runtime_stores.append(review_store)
         model_router = ModelRouter(routing_store)
         orchestrator = Orchestrator(state_store, provider, model_router)
+        agent_worker: Any = FixtureWorker() if mode == "fixture" else None
+        if mode == "live":
+            from beehaiive.agent import AgentWorkerManager, CodexExecModelExecutor
+
+            executor = CodexExecModelExecutor.from_environment()
+            orchestrator.model_executor = executor
+            agent_worker = AgentWorkerManager(orchestrator, executor)
         with isolated_module_environment(directory):
             import main
 
@@ -244,6 +264,7 @@ def build_app(mode: str, project_id: str, directory: Path) -> ApplicationResourc
                 review_store=review_store,
                 routing_store=routing_store,
                 model_router=model_router,
+                agent_worker=agent_worker,
             )
     except Exception as error:
         cleanup_errors = close_stores(runtime_stores)
