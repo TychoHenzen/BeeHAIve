@@ -317,6 +317,7 @@ class CodexExecModelExecutor:
             "--color",
             "never",
             "--ephemeral",
+            "--skip-git-repo-check",
             "--sandbox",
             "read-only",
             "--cd",

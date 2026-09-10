@@ -438,6 +438,7 @@ def test_executor_builds_model_command_and_covers_process_helpers(
     command = executor._command("prompt")
     assert command[-3:] == ["--model", "model-x", "prompt"]
     assert "--sandbox" in command
+    assert "--skip-git-repo-check" in command
     assert executor._command("prompt")[-1] == "prompt"
 
     captured: dict[str, object] = {}
