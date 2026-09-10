@@ -214,6 +214,27 @@ def test_executor_binds_repository_and_uses_selected_model(tmp_path: Path) -> No
     assert "--model" not in default_command
 
 
+def test_executor_prompt_contains_verified_repository_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executor = CodexExecModelExecutor(tmp_path, repository_name="owner/api")
+    monkeypatch.setattr(executor, "_discover_repository_branch", lambda: "feature/demo")
+    monkeypatch.setattr(
+        executor,
+        "_repository_files",
+        lambda: (Path("README.md"), Path("main.py")),
+    )
+
+    prompt = executor._prompt(
+        ModelRouter(RoutingStore()).config.spec_for(ModelTier.LUNA),
+        ModelRouter(RoutingStore()).begin("prompt-metadata").decision,
+    )
+
+    assert "Verified current branch: feature/demo" in prompt
+    assert "Verified tracked file count: 2" in prompt
+    assert ".git" in prompt
+
+
 def test_executor_safe_checkout_excludes_local_secret_files(tmp_path: Path) -> None:
     (tmp_path / "README.md").write_text("safe\n", encoding="utf-8")
     (tmp_path / ".env").write_text("TOKEN=secret\n", encoding="utf-8")
@@ -248,6 +269,12 @@ def test_executor_repository_discovery_handles_git_outputs(
 
     monkeypatch.setattr(agent_module.subprocess, "run", broken_run)
     assert CodexExecModelExecutor(tmp_path).repository_name is None
+    assert (
+        CodexExecModelExecutor(
+            tmp_path, repository_name="owner/api"
+        )._discover_repository_branch()
+        == "unknown"
+    )
 
 
 def test_executor_handles_communicate_timeout_exception(
@@ -445,7 +472,8 @@ def test_executor_builds_model_command_and_covers_process_helpers(
     assert "--sandbox" in command
     assert "--skip-git-repo-check" in command
     assert "--ignore-user-config" in command
-    assert command[command.index("--ask-for-approval") + 1] == "never"
+    assert "--ignore-rules" in command
+    assert "--approve-for-me" in command
     assert executor._command("prompt")[-1] == "prompt"
 
     captured: dict[str, object] = {}
