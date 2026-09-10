@@ -109,6 +109,7 @@ class RunState:
     owner_id: str | None = None
     lease_token: str | None = None
     lease_expires_at: str | None = None
+    last_result: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

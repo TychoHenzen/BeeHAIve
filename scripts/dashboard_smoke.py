@@ -131,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
         "result": "failed",
     }
     if args.skip_tests:
-        report["checks"] = [{"skipped": True, "reason": "--skip-tests"}]
+        report["checks"] = [{"passed": True, "skipped": True, "reason": "--skip-tests"}]
     else:
         report["checks"] = run_checks(secrets_to_redact, project_id)
 

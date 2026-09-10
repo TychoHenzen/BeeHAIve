@@ -187,6 +187,7 @@ def test_action_target_uses_the_run_returned_by_the_action() -> None:
                     "repository": "owner/api",
                     "pbi_number": 7,
                     "run_id": "run-7",
+                    "attempt": 2,
                 }
             }
         }
@@ -196,6 +197,7 @@ def test_action_target_uses_the_run_returned_by_the_action() -> None:
         "owner/api",
         7,
         "run-7",
+        2,
     )
 
 

@@ -23,6 +23,7 @@ from beehaiive.models import (
 from beehaiive.orchestrator import Orchestrator
 from beehaiive.provider import (
     GitHubProjectProvider,
+    GitHubRateLimitError,
     ProviderError,
     UrllibGraphQLClient,
     _mapping,
@@ -45,8 +46,9 @@ class StaticClient:
 
 
 class FakeResponse:
-    def __init__(self, payload: object) -> None:
+    def __init__(self, payload: object, headers: object | None = None) -> None:
         self.payload = payload
+        self.headers = headers or {}
 
     def __enter__(self) -> FakeResponse:
         return self
@@ -124,6 +126,7 @@ def test_urllib_graphql_client_validates_transport_and_payloads(
     for payload, message in (
         ([], "non-object"),
         ({"errors": ["bad"]}, "returned errors"),
+        ({"errors": [{"type": "OTHER"}]}, "returned errors"),
         ({"data": []}, "did not contain data"),
     ):
         monkeypatch.setattr(
@@ -149,6 +152,146 @@ def test_urllib_graphql_client_validates_transport_and_payloads(
     )
     with pytest.raises(ProviderError, match="invalid JSON"):
         client.execute("query", {})
+
+
+def test_urllib_graphql_client_honors_primary_and_secondary_rate_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary_client = UrllibGraphQLClient("token", "https://example.test/graphql")
+    primary_calls = 0
+
+    def primary_response(request: object, timeout: float) -> FakeResponse:
+        nonlocal primary_calls
+        primary_calls += 1
+        return FakeResponse(
+            {
+                "errors": [
+                    {
+                        "type": "RATE_LIMIT",
+                        "code": "graphql_rate_limit",
+                        "message": "API rate limit already exceeded",
+                    }
+                ]
+            },
+            {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "4000000000"},
+        )
+
+    monkeypatch.setattr(provider_module, "urlopen", primary_response)
+    with pytest.raises(GitHubRateLimitError) as primary_error:
+        primary_client.execute("query", {})
+    assert primary_error.value.primary
+    assert primary_error.value.reset_at == 4_000_000_000
+    with pytest.raises(GitHubRateLimitError, match="cooldown"):
+        primary_client.execute("query", {})
+    assert primary_calls == 1
+
+    secondary_client = UrllibGraphQLClient("token", "https://example.test/graphql")
+    secondary_calls = 0
+
+    def secondary_response(request: object, timeout: float) -> FakeResponse:
+        nonlocal secondary_calls
+        secondary_calls += 1
+        raise HTTPError(
+            "https://example.test/graphql",
+            429,
+            "too many requests",
+            {"retry-after": "60"},
+            None,
+        )
+
+    monkeypatch.setattr(provider_module, "urlopen", secondary_response)
+    with pytest.raises(GitHubRateLimitError) as secondary_error:
+        secondary_client.execute("query", {})
+    assert not secondary_error.value.primary
+    with pytest.raises(GitHubRateLimitError, match="cooldown"):
+        secondary_client.execute("query", {})
+    assert secondary_calls == 1
+
+    secondary_403_client = UrllibGraphQLClient("token", "https://example.test/graphql")
+
+    def secondary_403_response(request: object, timeout: float) -> object:
+        raise HTTPError(
+            "https://example.test/graphql",
+            403,
+            "secondary rate limit",
+            {"retry-after": "60"},
+            None,
+        )
+
+    monkeypatch.setattr(
+        provider_module,
+        "urlopen",
+        secondary_403_response,
+    )
+    with pytest.raises(GitHubRateLimitError) as secondary_403_error:
+        secondary_403_client.execute("query", {})
+    assert not secondary_403_error.value.primary
+
+    reset_only_client = UrllibGraphQLClient("token", "https://example.test/graphql")
+    monkeypatch.setattr(
+        provider_module,
+        "urlopen",
+        lambda request, timeout: FakeResponse(
+            {
+                "errors": [
+                    {
+                        "type": "RATE_LIMITED",
+                        "message": "secondary rate limit",
+                    }
+                ]
+            },
+            {"x-ratelimit-reset": "4000000000"},
+        ),
+    )
+    with pytest.raises(GitHubRateLimitError) as reset_only_error:
+        reset_only_client.execute("query", {})
+    assert not reset_only_error.value.primary
+
+    fallback_client = UrllibGraphQLClient("token", "https://example.test/graphql")
+    monkeypatch.setattr(
+        provider_module,
+        "urlopen",
+        lambda request, timeout: FakeResponse({"errors": [{"type": "RATE_LIMITED"}]}),
+    )
+    with pytest.raises(GitHubRateLimitError) as fallback_error:
+        fallback_client.execute("query", {})
+    assert not fallback_error.value.primary
+
+    exhausted_client = UrllibGraphQLClient("token", "https://example.test/graphql")
+    monkeypatch.setattr(
+        provider_module,
+        "urlopen",
+        lambda request, timeout: FakeResponse(
+            {"data": {"ok": True}},
+            {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "4000000000"},
+        ),
+    )
+    assert exhausted_client.execute("query", {}) == {"ok": True}
+    with pytest.raises(GitHubRateLimitError, match="cooldown"):
+        exhausted_client.execute("query", {})
+
+    invalid_header_client = UrllibGraphQLClient("token", "https://example.test/graphql")
+    monkeypatch.setattr(
+        provider_module,
+        "urlopen",
+        lambda request, timeout: FakeResponse(
+            {"data": {"ok": True}},
+            {"x-ratelimit-remaining": "unknown"},
+        ),
+    )
+    assert invalid_header_client.execute("query", {}) == {"ok": True}
+
+    class HeaderBag:
+        def items(self) -> list[tuple[str, str]]:
+            return [("X-RateLimit-Remaining", "10")]
+
+    object_header_client = UrllibGraphQLClient("token", "https://example.test/graphql")
+    monkeypatch.setattr(
+        provider_module,
+        "urlopen",
+        lambda request, timeout: FakeResponse({"data": {"ok": True}}, HeaderBag()),
+    )
+    assert object_header_client.execute("query", {}) == {"ok": True}
 
 
 def test_provider_helpers_and_environment_configuration(
@@ -187,6 +330,7 @@ def test_provider_helpers_and_environment_configuration(
         "GITHUB_PROJECT_OWNER",
         "GITHUB_PROJECT_NUMBER",
         "GITHUB_PROJECT_OWNER_TYPE",
+        provider_module.DISCOVERY_CACHE_SECONDS_ENV,
     ):
         monkeypatch.delenv(variable, raising=False)
     with pytest.raises(ProviderError, match="Set GITHUB_TOKEN"):
@@ -199,12 +343,21 @@ def test_provider_helpers_and_environment_configuration(
     monkeypatch.setenv("GITHUB_PROJECT_NUMBER", "7")
     configured = GitHubProjectProvider.from_environment()
     assert configured.project_id == "owner:7"
+    assert configured._discovery_cache_seconds == 600
+    monkeypatch.setenv(provider_module.DISCOVERY_CACHE_SECONDS_ENV, "0")
+    assert GitHubProjectProvider.from_environment()._discovery_cache_seconds == 0
     monkeypatch.setenv("GITHUB_PROJECT_OWNER_TYPE", "organization")
     organization_configured = GitHubProjectProvider.from_environment()
     assert organization_configured.owner_type == "organization"
 
     monkeypatch.setenv("GITHUB_PROJECT_OWNER_TYPE", "team")
     with pytest.raises(ProviderError, match="owner type"):
+        GitHubProjectProvider.from_environment()
+    monkeypatch.setenv(provider_module.DISCOVERY_CACHE_SECONDS_ENV, "not-a-number")
+    with pytest.raises(ProviderError, match="finite non-negative"):
+        GitHubProjectProvider.from_environment()
+    monkeypatch.setenv(provider_module.DISCOVERY_CACHE_SECONDS_ENV, "nan")
+    with pytest.raises(ProviderError, match="finite non-negative"):
         GitHubProjectProvider.from_environment()
 
 
@@ -265,6 +418,45 @@ def test_provider_discovery_and_base_branch_validation() -> None:
     )
     with pytest.raises(ProviderError, match="default branch"):
         missing_branch.resolve_base_branch("owner/api", None)
+
+
+class RateLimitedAfterDiscoveryClient(StaticClient):
+    def execute(self, query: str, variables: dict[str, object]) -> dict[str, Any]:
+        if len(self.calls) >= 3:
+            raise GitHubRateLimitError("limited")
+        return super().execute(query, variables)
+
+
+class AlwaysRateLimitedClient:
+    def execute(self, query: str, variables: dict[str, object]) -> dict[str, Any]:
+        raise GitHubRateLimitError("limited")
+
+
+def test_provider_caches_discovery_and_serves_stale_snapshot_on_limit() -> None:
+    with pytest.raises(ProviderError, match="cache seconds"):
+        GitHubProjectProvider("owner", 7, "token", discovery_cache_seconds=-1)
+
+    cached_client = StaticClient(_project_data())
+    cached_provider = GitHubProjectProvider(
+        "owner", 7, "token", client=cached_client, discovery_cache_seconds=60
+    )
+    first_snapshot = cached_provider.discover_project("owner:7")
+    assert cached_provider.discover_project("owner:7") == first_snapshot
+    assert len(cached_client.calls) == 3
+
+    limited_client = RateLimitedAfterDiscoveryClient(_project_data())
+    limited_provider = GitHubProjectProvider(
+        "owner", 7, "token", client=limited_client, discovery_cache_seconds=0
+    )
+    stale_snapshot = limited_provider.discover_project("owner:7")
+    assert limited_provider.discover_project("owner:7") == stale_snapshot
+    assert len(limited_client.calls) == 3
+
+    uncached_provider = GitHubProjectProvider(
+        "owner", 7, "token", client=AlwaysRateLimitedClient()
+    )
+    with pytest.raises(GitHubRateLimitError):
+        uncached_provider.discover_project("owner:7")
 
 
 def test_provider_supports_organization_projects_and_holds_unmanaged_statuses() -> None:
@@ -465,10 +657,17 @@ class StubProvider:
 
 def test_environment_provider_delegates(monkeypatch: pytest.MonkeyPatch) -> None:
     stub = StubProvider()
+    factory_calls = 0
+
+    def factory(cls: type[GitHubProjectProvider]) -> StubProvider:
+        nonlocal factory_calls
+        factory_calls += 1
+        return stub
+
     monkeypatch.setattr(
         provider_module.GitHubProjectProvider,
         "from_environment",
-        classmethod(lambda cls: stub),
+        classmethod(factory),
     )
     provider = provider_module.EnvironmentGitHubProvider()
     request = _handoff_request()
@@ -476,6 +675,7 @@ def test_environment_provider_delegates(monkeypatch: pytest.MonkeyPatch) -> None
     assert provider.create_handoff(request).pull_request_number == 1
     assert provider.resolve_base_branch("owner/api", None) == "main"
     assert provider.validate_handoff("owner/api", "codex/api-1", None) == "main"
+    assert factory_calls == 1
 
 
 class StorageProvider(StubProvider):

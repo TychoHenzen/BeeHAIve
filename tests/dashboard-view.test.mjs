@@ -102,6 +102,7 @@ test("rendering live state exposes current stages and active actions", () => {
             readers: [],
             reviewers: {},
             activity: [],
+            result: "inventory complete",
           },
         ],
       },
@@ -134,6 +135,7 @@ test("rendering live state exposes current stages and active actions", () => {
   assert.match(dashboardOutput.textContent, /Live API/);
   assert.match(dashboardOutput.textContent, /Pull request/);
   assert.match(dashboardOutput.textContent, /Tier terra/);
+  assert.match(dashboardOutput.textContent, /Result: inventory complete/);
   assert.equal(actionLog.hidden, false);
 
   const startButton = findNode(

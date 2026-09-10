@@ -1024,7 +1024,7 @@ def test_successful_handoff_resets_the_connected_routing_problem() -> None:
     orchestrator_store.close()
 
 
-def test_successful_handoff_resolves_a_human_routing_state() -> None:
+def test_human_handoff_stays_nonclaimable_until_explicit_reset() -> None:
     routing_store = RoutingStore()
     router = ModelRouter(routing_store, _config(max_rounds=1, max_bounces=10))
     orchestrator_store = OrchestratorStore()
@@ -1039,26 +1039,38 @@ def test_successful_handoff_resolves_a_human_routing_state() -> None:
     handoff = router.snapshot(run.run_id)
     assert handoff.state.status is RoutingStatus.HUMAN_HANDOFF
 
-    retried = service.claim("owner:7", "owner/api", "worker-1")
-    assert retried is not None
-    completed = service.handoff(
-        retried.run_id,
-        "codex/api-1",
-        "master",
-        "Closes #1",
-        retried.lease_token or "",
-    )
-    resolved = router.snapshot(run.run_id)
-
-    assert completed.status.value == "completed"
-    assert resolved.state.status is RoutingStatus.RESOLVED
-    assert resolved.state.consecutive_failures == 0
-    assert resolved.state.bounce_count == 0
-    assert resolved.attempts[-1].tier is ModelTier.HUMAN
-    assert resolved.attempts[-1].outcome is AttemptOutcome.SUCCESS
+    assert service.claim("owner:7", "owner/api", "worker-1") is None
+    pbi = orchestrator_store.project_state("owner:7")["repositories"][0]["pbis"][0]
+    assert pbi["claimable"] is False
+    assert handoff.state.required_action
 
     routing_store.close()
     orchestrator_store.close()
+
+
+def test_resolved_routing_problem_can_be_reopened_after_run_persistence_failure() -> (
+    None
+):
+    routing_store = RoutingStore()
+    router = ModelRouter(routing_store, _config())
+    resolved = router.begin("recover-me")
+    resolved = router.record("recover-me", AttemptOutcome.SUCCESS)
+
+    with pytest.raises(RoutingError, match="required"):
+        router.reopen_resolved("recover-me", " ")
+    with pytest.raises(RoutingError, match="Unknown routing problem"):
+        routing_store.reopen_problem("missing", 0, resolved.state)
+    with pytest.raises(RoutingError, match="changed during recovery"):
+        routing_store.reopen_problem("recover-me", 99, resolved.state)
+
+    reopened = router.reopen_resolved("recover-me", "result persistence failed")
+    assert reopened.state.status is RoutingStatus.ACTIVE
+    assert reopened.state.last_failure_context == "result persistence failed"
+    assert (
+        router.reopen_resolved("recover-me", "ignored").state.status
+        is RoutingStatus.ACTIVE
+    )
+    routing_store.close()
 
 
 def test_routing_api_requires_the_run_lease_scope() -> None:
