@@ -4,6 +4,11 @@ The service serves the operator dashboard at `/dashboard`. It reads the live
 state projection from `/projects/{project_id}/dashboard` and polls it every
 five seconds. It does not load the old static JSX sample.
 
+On Windows, copy `.env.example` to `.env`, fill in the required values, and run
+the tracked `start_dashboard.bat` launcher. The launcher reads `.env` before
+validating the configuration. Direct server commands still need environment
+variables supplied by the process.
+
 Start a local server from the repository root:
 
 ```text
@@ -15,10 +20,20 @@ must be present in `BEEHAIIVE_ALLOWED_PROJECTS`, or in the owner and number
 environment variables used by the service.
 
 Read-only state needs no API key. Operator actions require `BEEHAIIVE_API_KEY`
-and the dashboard API-key field. The first release exposes start or sync,
-stop, approval, and clarification actions. Every action is recorded as
-`pending`, `succeeded`, or `failed`; a response always includes the latest
-available run state.
+and the dashboard API-key field. The dashboard exposes sync, start writer, stop,
+approval, and clarification actions. In documented demo mode, start writer
+claims one PBI and runs the bounded repository-inventory worker. A completed
+result is shown on the PBI card. Every action is recorded as `pending`,
+`succeeded`, or `failed`; a response always includes the latest available run
+state.
+
+The demo worker runs `codex exec` with a read-only sandbox, an ephemeral
+session, and a finite timeout. It reads a temporary credential-free copy of the
+checkout configured by `BEEHAIIVE_AGENT_REPOSITORY`, and requires its exact
+`BEEHAIIVE_AGENT_REPOSITORY_NAME` identity to match the claimed repository.
+Stop, failure, project removal, and service shutdown terminate the process tree
+and clear the run lease. Demo review mode disables review operations. It is not
+a live pull-request review.
 
 A new local database is synchronized from GitHub when the dashboard first
 refreshes. Later refreshes synchronize again before reading the projection, so
@@ -29,6 +44,12 @@ The GitHub provider supplies optional live details during project sync. GitHub
 sub-issues become subtasks, linked pull-request review requests and latest
 reviews become readers and reviewer results, issue comments become activity,
 and `bounces/N` or `escalation/<tier>` labels become escalation state.
+The provider reuses one configured client, caches discovery for 10 minutes by
+default, and honors GitHub GraphQL rate-limit headers. It stops local retries
+until the reset window, and serves the last successful project snapshot when a
+later refresh is rate-limited. Set `BEEHAIIVE_GITHUB_DISCOVERY_CACHE_SECONDS`
+to change the cache interval. See [GitHub's GraphQL rate and query limits](https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api)
+for the upstream limit rules.
 
 ## Reproducible smoke proof
 

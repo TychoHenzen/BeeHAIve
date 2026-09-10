@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import re
-from collections.abc import Mapping
+import time
+from collections.abc import Iterable, Mapping
+from threading import Lock
 from typing import Any, Protocol, cast
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from .models import (
@@ -20,10 +24,98 @@ from .models import (
 )
 
 PROVIDER_REQUEST_TIMEOUT = 30.0
+DEFAULT_DISCOVERY_CACHE_SECONDS = 600.0
+DISCOVERY_CACHE_SECONDS_ENV = "BEEHAIIVE_GITHUB_DISCOVERY_CACHE_SECONDS"
 
 
 class ProviderError(RuntimeError):
     """Raised when a provider cannot discover or hand off work."""
+
+
+class GitHubRateLimitError(ProviderError):
+    """Raised when GitHub asks the client to stop GraphQL requests temporarily."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reset_at: float | None = None,
+        retry_after: float | None = None,
+        primary: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.reset_at = reset_at
+        self.retry_after = retry_after
+        self.primary = primary
+
+
+def _header_value(response: object, name: str) -> str | None:
+    """Read a response header from urllib responses and test doubles."""
+
+    wanted = name.lower()
+    headers: object = getattr(response, "headers", None)
+    if isinstance(headers, Mapping):
+        for key, value in cast(Mapping[object, object], headers).items():
+            if str(key).lower() == wanted:
+                return str(value)
+    elif headers is not None:
+        items = getattr(cast(Any, headers), "items", None)
+        if callable(items):
+            header_items = cast(Iterable[tuple[object, object]], items())
+            for key, value in header_items:
+                if str(key).lower() == wanted:
+                    return str(value)
+
+    return None
+
+
+def _header_float(response: object, name: str) -> float | None:
+    value = _header_value(response, name)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def _rate_error_details(errors: object) -> tuple[str, bool] | None:
+    if not isinstance(errors, list):
+        return None
+    for raw_error in cast(list[object], errors):
+        if not isinstance(raw_error, Mapping):
+            continue
+        error = cast(Mapping[str, object], raw_error)
+        error_type = str(error.get("type", "")).upper()
+        code = str(error.get("code", "")).lower()
+        message = str(error.get("message", ""))
+        normalized_message = message.lower()
+        if not (
+            error_type in {"RATE_LIMIT", "RATE_LIMITED"}
+            or code in {"graphql_rate_limit", "rate_limit", "rate_limited"}
+            or "rate limit" in normalized_message
+        ):
+            continue
+        primary = code == "graphql_rate_limit" or error_type == "RATE_LIMIT"
+        return message or "GitHub GraphQL rate limit exceeded", primary
+    return None
+
+
+def _discovery_cache_seconds_from_environment() -> float:
+    raw_value = os.environ.get(
+        DISCOVERY_CACHE_SECONDS_ENV, str(DEFAULT_DISCOVERY_CACHE_SECONDS)
+    )
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise ProviderError(
+            f"{DISCOVERY_CACHE_SECONDS_ENV} must be a finite non-negative number"
+        ) from exc
+    if not math.isfinite(value) or value < 0:
+        raise ProviderError(
+            f"{DISCOVERY_CACHE_SECONDS_ENV} must be a finite non-negative number"
+        )
+    return value
 
 
 class GraphQLClient(Protocol):
@@ -45,8 +137,103 @@ class UrllibGraphQLClient:
     ) -> None:
         self._token = token
         self._endpoint = endpoint
+        self._cooldown_lock = Lock()
+        self._cooldown_until = 0.0
+        self._cooldown_reset_at: float | None = None
+        self._cooldown_retry_after: float | None = None
+        self._cooldown_primary = False
+
+    def _raise_if_cooling_down(self) -> None:
+        now = time.time()
+        with self._cooldown_lock:
+            if self._cooldown_until <= now:
+                return
+            reset_at = self._cooldown_reset_at or self._cooldown_until
+            retry_after = self._cooldown_retry_after
+            primary = self._cooldown_primary
+        raise GitHubRateLimitError(
+            "GitHub GraphQL rate limit cooldown is active",
+            reset_at=reset_at,
+            retry_after=retry_after,
+            primary=primary,
+        )
+
+    def _set_cooldown(
+        self,
+        *,
+        reset_at: float | None,
+        retry_after: float | None,
+        primary: bool,
+    ) -> float:
+        now = time.time()
+        if primary and reset_at is not None and reset_at > now:
+            cooldown_until = reset_at
+        elif retry_after is not None:
+            cooldown_until = now + max(retry_after, 0.0)
+        elif reset_at is not None and reset_at > now:
+            cooldown_until = reset_at
+        else:
+            cooldown_until = now + 60.0
+
+        with self._cooldown_lock:
+            if cooldown_until > self._cooldown_until:
+                self._cooldown_until = cooldown_until
+                self._cooldown_reset_at = reset_at
+                self._cooldown_retry_after = retry_after
+                self._cooldown_primary = primary
+            return self._cooldown_until
+
+    def _rate_limit_error(
+        self,
+        response: object,
+        errors: object = None,
+        *,
+        status_code: int | None = None,
+    ) -> GitHubRateLimitError | None:
+        details = _rate_error_details(errors)
+        remaining = _header_float(response, "x-ratelimit-remaining")
+        reset_at = _header_float(response, "x-ratelimit-reset")
+        retry_after = _header_float(response, "retry-after")
+        status_is_rate_limited = status_code == 429 or (
+            status_code == 403
+            and (retry_after is not None or (remaining is not None and remaining <= 0))
+        )
+        has_rate_limit_header = (
+            remaining is not None and remaining <= 0 and errors is not None
+        )
+        if details is None and not has_rate_limit_header and not status_is_rate_limited:
+            return None
+
+        default_primary = status_code not in {403, 429}
+        message, primary = details or (
+            "GitHub GraphQL rate limit exceeded",
+            default_primary,
+        )
+        cooldown_until = self._set_cooldown(
+            reset_at=reset_at,
+            retry_after=retry_after,
+            primary=primary,
+        )
+        effective_reset_at = reset_at or cooldown_until
+        kind = "primary" if primary else "secondary"
+        return GitHubRateLimitError(
+            f"GitHub GraphQL {kind} rate limit exceeded: {message}",
+            reset_at=effective_reset_at,
+            retry_after=retry_after,
+            primary=primary,
+        )
+
+    def _record_exhausted_headers(self, response: object) -> None:
+        remaining = _header_float(response, "x-ratelimit-remaining")
+        if remaining is not None and remaining <= 0:
+            self._set_cooldown(
+                reset_at=_header_float(response, "x-ratelimit-reset"),
+                retry_after=_header_float(response, "retry-after"),
+                primary=True,
+            )
 
     def execute(self, query: str, variables: Mapping[str, object]) -> Mapping[str, Any]:
+        self._raise_if_cooling_down()
         request = Request(
             self._endpoint,
             data=json.dumps({"query": query, "variables": dict(variables)}).encode(
@@ -59,9 +246,16 @@ class UrllibGraphQLClient:
             },
             method="POST",
         )
+        response_headers: object | None = None
         try:
             with urlopen(request, timeout=PROVIDER_REQUEST_TIMEOUT) as response:
+                response_headers = response
                 raw_payload: object = json.loads(response.read())
+        except HTTPError as exc:
+            rate_error = self._rate_limit_error(exc, status_code=exc.code)
+            if rate_error is not None:
+                raise rate_error from exc
+            raise ProviderError(f"GitHub GraphQL request failed: {exc}") from exc
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise ProviderError(f"GitHub GraphQL returned invalid JSON: {exc}") from exc
         except OSError as exc:
@@ -71,6 +265,10 @@ class UrllibGraphQLClient:
             raise ProviderError("GitHub GraphQL returned a non-object response")
         payload = cast(dict[str, Any], raw_payload)
         errors = payload.get("errors")
+        rate_error = self._rate_limit_error(response_headers, errors)
+        if rate_error is not None:
+            raise rate_error
+        self._record_exhausted_headers(response_headers)
         if errors:
             raise ProviderError(f"GitHub GraphQL returned errors: {errors}")
         data = payload.get("data")
@@ -709,16 +907,24 @@ class GitHubProjectProvider:
         client: GraphQLClient | None = None,
         endpoint: str = "https://api.github.com/graphql",
         owner_type: str = "user",
+        discovery_cache_seconds: float = DEFAULT_DISCOVERY_CACHE_SECONDS,
     ) -> None:
         if owner_type not in {"user", "organization"}:
             raise ProviderError(
                 "GitHub Project owner type must be user or organization"
+            )
+        if not math.isfinite(discovery_cache_seconds) or discovery_cache_seconds < 0:
+            raise ProviderError(
+                "GitHub discovery cache seconds must be a finite non-negative number"
             )
         self.owner = owner
         self.project_number = project_number
         self.owner_type = owner_type
         self.project_id = f"{owner}:{project_number}"
         self._client = client or UrllibGraphQLClient(token, endpoint)
+        self._discovery_cache_seconds = discovery_cache_seconds
+        self._discovery_cache: tuple[float, ProjectSnapshot] | None = None
+        self._discovery_lock = Lock()
 
     def _complete_issue_metadata(self, issue: Mapping[str, Any]) -> Mapping[str, Any]:
         repository_name = _mapping(issue.get("repository")).get("nameWithOwner")
@@ -822,13 +1028,37 @@ class GitHubProjectProvider:
             number = int(number_text)
         except ValueError as exc:
             raise ProviderError("GITHUB_PROJECT_NUMBER must be an integer") from exc
-        return cls(owner, number, token, owner_type=owner_type)
+        return cls(
+            owner,
+            number,
+            token,
+            owner_type=owner_type,
+            discovery_cache_seconds=_discovery_cache_seconds_from_environment(),
+        )
 
     def discover_project(self, project_id: str) -> ProjectSnapshot:
         if project_id != self.project_id:
             raise ProviderError(
                 f"Provider is configured for {self.project_id}, not {project_id}"
             )
+
+        with self._discovery_lock:
+            cached = self._discovery_cache
+            if (
+                cached is not None
+                and time.monotonic() - cached[0] < self._discovery_cache_seconds
+            ):
+                return cached[1]
+            try:
+                snapshot = self._discover_project_uncached()
+            except GitHubRateLimitError:
+                if cached is None:
+                    raise
+                return cached[1]
+            self._discovery_cache = (time.monotonic(), snapshot)
+            return snapshot
+
+    def _discover_project_uncached(self) -> ProjectSnapshot:
 
         data = self._client.execute(
             _owner_query(PROJECT_QUERY, self.owner_type),
@@ -1142,20 +1372,41 @@ class GitHubProjectProvider:
 class EnvironmentGitHubProvider:
     """Lazy provider used by the default FastAPI app."""
 
+    def __init__(self) -> None:
+        self._provider: ProjectProvider | None = None
+        self._configuration: tuple[str | None, ...] | None = None
+        self._lock = Lock()
+
+    def _configured_provider(self) -> ProjectProvider:
+        configuration = tuple(
+            os.environ.get(name)
+            for name in (
+                "GITHUB_TOKEN",
+                "GH_TOKEN",
+                "GITHUB_PROJECT_OWNER",
+                "GITHUB_PROJECT_NUMBER",
+                "GITHUB_PROJECT_OWNER_TYPE",
+                DISCOVERY_CACHE_SECONDS_ENV,
+            )
+        )
+        with self._lock:
+            if self._provider is None or configuration != self._configuration:
+                self._provider = GitHubProjectProvider.from_environment()
+                self._configuration = configuration
+            return self._provider
+
     def discover_project(self, project_id: str) -> ProjectSnapshot:
-        return GitHubProjectProvider.from_environment().discover_project(project_id)
+        return self._configured_provider().discover_project(project_id)
 
     def create_handoff(self, request: HandoffRequest) -> HandoffResult:
-        return GitHubProjectProvider.from_environment().create_handoff(request)
+        return self._configured_provider().create_handoff(request)
 
     def resolve_base_branch(self, repository: str, requested: str | None) -> str:
-        return GitHubProjectProvider.from_environment().resolve_base_branch(
-            repository, requested
-        )
+        return self._configured_provider().resolve_base_branch(repository, requested)
 
     def validate_handoff(
         self, repository: str, branch: str, requested_base: str | None
     ) -> str:
-        return GitHubProjectProvider.from_environment().validate_handoff(
+        return self._configured_provider().validate_handoff(
             repository, branch, requested_base
         )
