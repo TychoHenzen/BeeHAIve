@@ -17,6 +17,7 @@ from beehaiive.agent import (
     CodexExecModelExecutor,
 )
 from beehaiive.dashboard import build_dashboard_state
+from beehaiive.meta_review import MetaReviewService
 from beehaiive.models import RunState, RunStatus
 from beehaiive.provider import ProviderError
 from beehaiive.review import (
@@ -42,6 +43,8 @@ from beehaiive.routing import (
 from beehaiive.storage import (
     DEFAULT_EVENT_LIMIT,
     MAX_EVENT_LIMIT,
+    MAX_META_REVIEW_INPUT_TOKENS,
+    MAX_META_REVIEW_RECORDS,
     StoreError,
 )
 from beehaiive.workflow import (
@@ -181,6 +184,22 @@ class DashboardClarifyRequest(DashboardActionBase):
     clarification: str = ""
 
 
+class MetaReviewRequest(BaseModel):
+    since: str | None = Field(default=None, max_length=40)
+    record_limit: int = Field(
+        default=MAX_META_REVIEW_RECORDS, ge=1, le=MAX_META_REVIEW_RECORDS
+    )
+    input_token_limit: int = Field(
+        default=MAX_META_REVIEW_INPUT_TOKENS,
+        ge=1,
+        le=MAX_META_REVIEW_INPUT_TOKENS,
+    )
+
+
+class MetaReviewDecisionRequest(BaseModel):
+    decision: Literal["accept", "reject"]
+
+
 DashboardActionRequest = Annotated[
     DashboardStartRequest
     | DashboardStopRequest
@@ -206,6 +225,7 @@ def create_app(
     model_router: ModelRouter | None = None,
     model_executor: ModelExecutor | None = None,
     agent_worker: AgentWorkerManager | None = None,
+    meta_review_service: MetaReviewService | None = None,
     workflow_service: WorkflowService | None = None,
     workflow_actor: WorkflowRole | str | None = None,
 ) -> FastAPI:
@@ -251,6 +271,15 @@ def create_app(
         orchestrator.model_router = routing_service
     if orchestrator.model_executor is None:
         orchestrator.model_executor = model_executor
+    if (
+        meta_review_service is not None
+        and meta_review_service.store is not orchestrator.store
+    ):
+        raise ValueError("The meta-review service and API must share one state store")
+    if meta_review_service is None:
+        meta_review_service = MetaReviewService(
+            orchestrator.store, routing_service.store
+        )
     effective_executor = orchestrator.model_executor
     if agent_worker is None and effective_executor is not None:
         required_worker_methods = (
@@ -876,6 +905,46 @@ def create_app(
     ) -> dict[str, object]:
         return _handle_store_error(
             lambda: {"actions": orchestrator.store.actions_for_project(project_id)}
+        )
+
+    @app.post("/projects/{project_id}/meta-review")
+    def run_meta_review(  # pyright: ignore[reportUnusedFunction]
+        project_id: str,
+        request: MetaReviewRequest,
+        _auth: None = Depends(require_mutation_access),
+    ) -> dict[str, object]:
+        return _handle_store_error(
+            lambda: meta_review_service.run(
+                project_id,
+                since=request.since,
+                record_limit=request.record_limit,
+                input_token_limit=request.input_token_limit,
+            )
+        )
+
+    @app.get("/projects/{project_id}/meta-review/suggestions")
+    def meta_review_suggestions(  # pyright: ignore[reportUnusedFunction]
+        project_id: str,
+        status: Literal["pending", "accepted", "rejected"] | None = None,
+        _access: None = Depends(require_project_access),
+    ) -> dict[str, object]:
+        return _handle_store_error(
+            lambda: {"suggestions": meta_review_service.suggestions(project_id, status)}
+        )
+
+    @app.post("/projects/{project_id}/meta-review/suggestions/{suggestion_id}")
+    def decide_meta_review_suggestion(  # pyright: ignore[reportUnusedFunction]
+        project_id: str,
+        suggestion_id: str,
+        request: MetaReviewDecisionRequest,
+        _auth: None = Depends(require_mutation_access),
+    ) -> dict[str, object]:
+        return _handle_store_error(
+            lambda: {
+                "suggestion": meta_review_service.decide(
+                    project_id, suggestion_id, request.decision
+                )
+            }
         )
 
     @app.post("/projects/{project_id}/actions")
