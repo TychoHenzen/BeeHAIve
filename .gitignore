@@ -30,10 +30,7 @@ dist/
 .agents/
 .claude/
 .serena/
-.idea/shelf/
-.idea/workspace.xml
-.idea/httpRequests/
-.idea/dataSources/
+.idea/
 
 # BeeHAIve runtime state
 .beehaiive/

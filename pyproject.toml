@@ -30,5 +30,5 @@ line-length = 88
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.pyright]
-include = ["main.py", "beehaiive"]
+include = ["main.py", "beehaiive", "scripts/dashboard_smoke.py"]
 typeCheckingMode = "strict"

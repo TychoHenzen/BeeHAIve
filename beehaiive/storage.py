@@ -15,6 +15,7 @@ from uuid import uuid4
 from .models import (
     HandoffIntent,
     ProjectSnapshot,
+    RoutingFailure,
     RunState,
     RunStatus,
     Stage,
@@ -36,6 +37,7 @@ DEFAULT_EVENT_LIMIT = 100
 MAX_EVENT_LIMIT = 500
 DEFAULT_ACTION_LIMIT = 50
 MAX_ACTION_LIMIT = 200
+MAX_AGENT_RESULT_LENGTH = 4_000
 
 
 def _now() -> str:
@@ -139,7 +141,9 @@ class OrchestratorStore:
                     owner_id TEXT,
                     lease_token TEXT,
                     lease_expires_at TEXT,
+                    execution_token TEXT,
                     last_error TEXT,
+                    last_result TEXT,
                     updated_at TEXT NOT NULL,
                     UNIQUE (project_id, repository_name, pbi_number),
                     FOREIGN KEY (project_id, repository_name, pbi_number)
@@ -194,6 +198,22 @@ class OrchestratorStore:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS routing_failure_outbox (
+                    transition_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    error TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL,
+                    output_tokens INTEGER NOT NULL,
+                    recursive_spawn_depth INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL,
+                    processed_at TEXT,
+                    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS routing_failure_outbox_pending
+                    ON routing_failure_outbox(run_id, status, created_at);
+
                 CREATE INDEX IF NOT EXISTS actions_by_project
                     ON actions(project_id, created_at DESC);
                 """
@@ -227,7 +247,13 @@ class OrchestratorStore:
                     "PRAGMA table_info(runs)"
                 ).fetchall()
             }
-            for column in ("owner_id", "lease_token", "lease_expires_at"):
+            for column in (
+                "owner_id",
+                "lease_token",
+                "lease_expires_at",
+                "execution_token",
+                "last_result",
+            ):
                 if column not in run_columns:
                     self._connection.execute(
                         f"ALTER TABLE runs ADD COLUMN {column} TEXT"
@@ -289,7 +315,8 @@ class OrchestratorStore:
             (self._lease_deadline(), _now(), run_id, lease_token),
         )
 
-    def sync_project(self, snapshot: ProjectSnapshot) -> None:
+    def sync_project(self, snapshot: ProjectSnapshot) -> tuple[str, ...]:
+        removed_run_ids: list[str] = []
         with self._transaction() as connection:
             connection.execute(
                 """
@@ -336,9 +363,14 @@ class OrchestratorStore:
                     )
                     existing = connection.execute(
                         """
-                        SELECT stage, run_id
-                        FROM pbis
-                        WHERE project_id = ? AND repository_name = ? AND number = ?
+                        SELECT p.stage, p.run_id, r.status AS run_status
+                        FROM pbis AS p
+                        LEFT JOIN runs AS r
+                          ON r.project_id = p.project_id
+                         AND r.repository_name = p.repository_name
+                         AND r.pbi_number = p.number
+                        WHERE p.project_id = ? AND p.repository_name = ?
+                          AND p.number = ?
                         """,
                         (snapshot.project_id, pbi.repository, pbi.number),
                     ).fetchone()
@@ -394,6 +426,7 @@ class OrchestratorStore:
                             int(
                                 incoming_stage is not None
                                 and merged_stage is not Stage.PULL_REQUEST
+                                and existing["run_status"] != RunStatus.COMPLETED.value
                             ),
                             current_stage.value,
                             merged_stage.value,
@@ -437,10 +470,13 @@ class OrchestratorStore:
                 (snapshot.project_id,),
             ).fetchall()
             for removed_run in removed_runs:
+                removed_run_ids.append(str(removed_run["run_id"]))
                 connection.execute(
                     """
                     UPDATE runs
-                    SET status = 'failed', last_error = ?, updated_at = ?
+                    SET status = 'failed', execution_token = NULL,
+                        last_error = ?, lease_token = NULL,
+                        lease_expires_at = NULL, updated_at = ?
                     WHERE run_id = ?
                     """,
                     (
@@ -472,6 +508,7 @@ class OrchestratorStore:
                     Stage(str(removed_run["stage"])),
                     {"reason": "pbi no longer linked to selected project"},
                 )
+        return tuple(removed_run_ids)
 
     def claim_next(
         self,
@@ -487,7 +524,7 @@ class OrchestratorStore:
                 """
                 SELECT p.*, r.run_id, r.status, r.attempt,
                        r.owner_id, r.lease_token, r.lease_expires_at,
-                       r.last_error AS run_error
+                       r.last_error AS run_error, r.last_result AS run_result
                 FROM pbis AS p
                 JOIN repositories AS repository
                   ON repository.project_id = p.project_id
@@ -522,7 +559,8 @@ class OrchestratorStore:
                     """
                     UPDATE runs
                     SET owner_id = ?, lease_token = ?, lease_expires_at = ?,
-                        last_error = NULL, updated_at = ?
+                        execution_token = NULL, last_error = NULL,
+                        last_result = NULL, updated_at = ?
                     WHERE run_id = ? AND status = 'active'
                     """,
                     (
@@ -581,7 +619,8 @@ class OrchestratorStore:
                     UPDATE runs
                     SET status = 'active', attempt = attempt + 1,
                         owner_id = ?, lease_token = ?, lease_expires_at = ?,
-                        last_error = NULL, updated_at = ?
+                        execution_token = NULL, last_error = NULL,
+                        last_result = NULL, updated_at = ?
                     WHERE run_id = ?
                     """,
                     (
@@ -756,7 +795,9 @@ class OrchestratorStore:
             )
             connection.execute(
                 """
-                UPDATE runs SET status = 'completed', last_error = NULL, updated_at = ?
+                UPDATE runs
+                SET status = 'completed', execution_token = NULL,
+                    last_error = NULL, updated_at = ?
                 WHERE run_id = ?
                 """,
                 (_now(), run_id),
@@ -905,9 +946,116 @@ class OrchestratorStore:
             self._renew_lease(connection, run_id, lease_token)
             return self._run_for_id(connection, run_id) or row
 
+    def validate_lease(self, run_id: str, lease_token: str) -> RunState:
+        with self._lock:
+            run = self._run_for_id(self._connection, run_id)
+            if run is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            self._require_lease(run, lease_token)
+            return run
+
+    def claim_execution(self, run_id: str, lease_token: str) -> str:
+        with self._transaction() as connection:
+            row = self._run_for_id(connection, run_id)
+            if row is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            self._require_lease(row, lease_token)
+            if row.status is not RunStatus.ACTIVE or row.stage is not Stage.IMPLEMENT:
+                raise StoreError(
+                    "Only an active implementation run can execute a model"
+                )
+            existing = connection.execute(
+                "SELECT execution_token FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if existing is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            if existing["execution_token"] is not None:
+                raise StoreError("A model execution is already active")
+            execution_token = str(uuid4())
+            connection.execute(
+                """
+                UPDATE runs
+                SET execution_token = ?, updated_at = ?
+                WHERE run_id = ? AND status = 'active' AND lease_token = ?
+                """,
+                (execution_token, _now(), run_id, lease_token),
+            )
+            self._renew_lease(connection, run_id, lease_token)
+            return execution_token
+
+    def validate_execution(
+        self, run_id: str, lease_token: str, execution_token: str
+    ) -> None:
+        with self._lock:
+            run = self._run_for_id(self._connection, run_id)
+            if run is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            self._require_lease(run, lease_token)
+            current = self._connection.execute(
+                "SELECT execution_token FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if current is None or current["execution_token"] != execution_token:
+                raise StoreError("Model execution claim is no longer valid")
+
+    def heartbeat_execution(
+        self, run_id: str, lease_token: str, execution_token: str
+    ) -> None:
+        with self._transaction() as connection:
+            current = connection.execute(
+                """
+                SELECT status, lease_token, execution_token
+                FROM runs WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            if current is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            if (
+                current["status"] != RunStatus.ACTIVE.value
+                or current["lease_token"] != lease_token
+                or current["execution_token"] != execution_token
+            ):
+                raise StoreError("Model execution claim is no longer valid")
+            self._renew_lease(connection, run_id, lease_token)
+
+    def release_execution(self, run_id: str, execution_token: str) -> None:
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                UPDATE runs
+                SET execution_token = NULL, updated_at = ?
+                WHERE run_id = ? AND execution_token = ?
+                """,
+                (_now(), run_id, execution_token),
+            )
+
+    @property
+    def lease_heartbeat_seconds(self) -> float:
+        return max(0.05, self._lease_seconds / 3)
+
     def fail(self, run_id: str, error: str, lease_token: str) -> RunState:
+        failed, _ = self.fail_with_transition(run_id, error, lease_token)
+        return failed
+
+    def fail_with_transition(
+        self,
+        run_id: str,
+        error: str,
+        lease_token: str,
+        *,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        recursive_spawn_depth: int = 0,
+        route_failure: bool = False,
+    ) -> tuple[RunState, bool]:
         if not error.strip():
             raise StoreError("A failure reason is required")
+        if input_tokens < 0 or output_tokens < 0:
+            raise StoreError("Token usage must not be negative")
+        if recursive_spawn_depth < 0:
+            raise StoreError("Recursive spawn depth must not be negative")
         with self._transaction() as connection:
             row = self._run_for_id(connection, run_id)
             if row is None:
@@ -916,11 +1064,12 @@ class OrchestratorStore:
             if row.status is RunStatus.COMPLETED:
                 raise StoreError("A completed run cannot fail")
             if row.status is RunStatus.FAILED:
-                return row
+                return row, False
             connection.execute(
                 """
                 UPDATE runs
-                SET status = 'failed', last_error = ?, updated_at = ?
+                SET status = 'failed', execution_token = NULL,
+                    last_error = ?, updated_at = ?
                 WHERE run_id = ?
                 """,
                 (error, _now(), run_id),
@@ -943,7 +1092,241 @@ class OrchestratorStore:
                 row.stage,
                 {"error": error},
             )
+            if route_failure and row.stage is Stage.IMPLEMENT:
+                connection.execute(
+                    """
+                    INSERT INTO routing_failure_outbox(
+                        transition_id, run_id, error, input_tokens, output_tokens,
+                        recursive_spawn_depth, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid4()),
+                        run_id,
+                        error,
+                        input_tokens,
+                        output_tokens,
+                        recursive_spawn_depth,
+                        _now(),
+                    ),
+                )
+            return self._run_for_id(connection, run_id) or row, True
+
+    def complete_agent_run(
+        self, run_id: str, result: str, lease_token: str
+    ) -> RunState:
+        """Persist a bounded worker result and release its lease."""
+
+        normalized_result = result.strip()
+        if not normalized_result:
+            raise StoreError("An agent result is required")
+        normalized_result = normalized_result[:MAX_AGENT_RESULT_LENGTH]
+        with self._transaction() as connection:
+            row = self._run_for_id(connection, run_id)
+            if row is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            if row.status is RunStatus.COMPLETED:
+                return row
+            self._require_lease(row, lease_token)
+            if row.status is not RunStatus.ACTIVE or row.stage is not Stage.IMPLEMENT:
+                raise StoreError("Only an active implementation run can complete")
+            now = _now()
+            connection.execute(
+                """
+                UPDATE runs
+                SET status = 'completed', execution_token = NULL,
+                    last_error = NULL, last_result = ?, lease_token = NULL,
+                    lease_expires_at = NULL, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (normalized_result, now, run_id),
+            )
+            connection.execute(
+                """
+                UPDATE pbis SET claimable = 0, last_error = NULL
+                WHERE project_id = ? AND repository_name = ? AND number = ?
+                """,
+                (row.project_id, row.repository, row.pbi_number),
+            )
+            self._record_event(
+                connection,
+                row.project_id,
+                row.repository,
+                row.pbi_number,
+                run_id,
+                "completed",
+                row.stage,
+                row.stage,
+                {"result": normalized_result},
+            )
             return self._run_for_id(connection, run_id) or row
+
+    def fail_agent_run(
+        self,
+        run_id: str,
+        error: str,
+        lease_token: str,
+        *,
+        claimable: bool | None = None,
+    ) -> RunState:
+        """Persist a worker failure and release its lease for a later retry."""
+
+        normalized_error = error.strip()
+        if not normalized_error:
+            raise StoreError("A failure reason is required")
+        normalized_error = normalized_error[:MAX_AGENT_RESULT_LENGTH]
+        with self._transaction() as connection:
+            row = self._run_for_id(connection, run_id)
+            if row is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            if row.status is RunStatus.COMPLETED:
+                raise StoreError("A completed run cannot fail")
+            if row.status is RunStatus.FAILED:
+                return row
+            self._require_lease(row, lease_token)
+            now = _now()
+            connection.execute(
+                """
+                UPDATE runs
+                SET status = 'failed', execution_token = NULL,
+                    last_error = ?, last_result = NULL, lease_token = NULL,
+                    lease_expires_at = NULL, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (normalized_error, now, run_id),
+            )
+            connection.execute(
+                """
+                UPDATE pbis SET claimable = ?, last_error = ?
+                WHERE project_id = ? AND repository_name = ? AND number = ?
+                """,
+                (
+                    int(
+                        row.stage is not Stage.PULL_REQUEST
+                        if claimable is None
+                        else claimable
+                    ),
+                    normalized_error,
+                    row.project_id,
+                    row.repository,
+                    row.pbi_number,
+                ),
+            )
+            self._record_event(
+                connection,
+                row.project_id,
+                row.repository,
+                row.pbi_number,
+                run_id,
+                "failure",
+                row.stage,
+                row.stage,
+                {"error": normalized_error},
+            )
+            return self._run_for_id(connection, run_id) or row
+
+    def fail_agent_run_after_lease_loss(self, run_id: str, error: str) -> RunState:
+        """Record a worker failure even when its lease can no longer be used."""
+
+        normalized_error = error.strip()
+        if not normalized_error:
+            raise StoreError("A failure reason is required")
+        normalized_error = normalized_error[:MAX_AGENT_RESULT_LENGTH]
+        with self._transaction() as connection:
+            row = self._run_for_id(connection, run_id)
+            if row is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            if row.status in {RunStatus.COMPLETED, RunStatus.FAILED}:
+                return row
+            now = _now()
+            connection.execute(
+                """
+                UPDATE runs
+                SET status = 'failed', execution_token = NULL,
+                    last_error = ?, last_result = NULL, lease_token = NULL,
+                    lease_expires_at = NULL, updated_at = ?
+                WHERE run_id = ? AND status = 'active'
+                """,
+                (normalized_error, now, run_id),
+            )
+            connection.execute(
+                """
+                UPDATE pbis SET claimable = ?, last_error = ?
+                WHERE project_id = ? AND repository_name = ? AND number = ?
+                """,
+                (
+                    int(row.stage is not Stage.PULL_REQUEST),
+                    normalized_error,
+                    row.project_id,
+                    row.repository,
+                    row.pbi_number,
+                ),
+            )
+            self._record_event(
+                connection,
+                row.project_id,
+                row.repository,
+                row.pbi_number,
+                run_id,
+                "failure",
+                row.stage,
+                row.stage,
+                {"error": normalized_error, "lease_lost": True},
+            )
+            return self._run_for_id(connection, run_id) or row
+
+    def set_run_claimable(self, run_id: str, claimable: bool) -> None:
+        with self._transaction() as connection:
+            row = self._run_for_id(connection, run_id)
+            if row is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            connection.execute(
+                """
+                UPDATE pbis SET claimable = ?
+                WHERE project_id = ? AND repository_name = ? AND number = ?
+                """,
+                (
+                    int(claimable),
+                    row.project_id,
+                    row.repository,
+                    row.pbi_number,
+                ),
+            )
+
+    def pending_routing_failures(self, run_id: str) -> tuple[RoutingFailure, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT transition_id, run_id, error, input_tokens, output_tokens,
+                       recursive_spawn_depth
+                FROM routing_failure_outbox
+                WHERE run_id = ? AND status = 'pending'
+                ORDER BY created_at, transition_id
+                """,
+                (run_id,),
+            ).fetchall()
+        return tuple(
+            RoutingFailure(
+                transition_id=str(row["transition_id"]),
+                run_id=str(row["run_id"]),
+                error=str(row["error"]),
+                input_tokens=int(row["input_tokens"]),
+                output_tokens=int(row["output_tokens"]),
+                recursive_spawn_depth=int(row["recursive_spawn_depth"]),
+            )
+            for row in rows
+        )
+
+    def mark_routing_failure_processed(self, transition_id: str) -> None:
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                UPDATE routing_failure_outbox
+                SET status = 'processed', processed_at = ?
+                WHERE transition_id = ? AND status = 'pending'
+                """,
+                (_now(), transition_id),
+            )
 
     def stop(self, run_id: str, reason: str = "Stopped by operator") -> RunState:
         """Stop a run from an authenticated operator action."""
@@ -959,7 +1342,8 @@ class OrchestratorStore:
             connection.execute(
                 """
                 UPDATE runs
-                SET status = 'failed', last_error = ?, lease_token = NULL,
+                SET status = 'failed', execution_token = NULL,
+                    last_error = ?, lease_token = NULL,
                     lease_expires_at = NULL, updated_at = ?
                 WHERE run_id = ?
                 """,
@@ -1083,6 +1467,19 @@ class OrchestratorStore:
         with self._lock:
             return self._run_for_id(self._connection, run_id)
 
+    def active_runs_for_project(self, project_id: str) -> tuple[RunState, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT run_id FROM runs WHERE project_id = ? AND status = 'active'",
+                (project_id,),
+            ).fetchall()
+            return tuple(
+                run
+                for row in rows
+                if (run := self._run_for_id(self._connection, str(row["run_id"])))
+                is not None
+            )
+
     def is_active_repository(self, project_id: str, repository: str) -> bool:
         with self._lock:
             row = self._connection.execute(
@@ -1153,7 +1550,7 @@ class OrchestratorStore:
                 pbis: list[dict[str, object]] = []
                 pbi_rows = self._connection.execute(
                     """
-                    SELECT p.*, r.status, r.attempt
+                    SELECT p.*, r.status, r.attempt, r.last_result AS run_result
                     FROM pbis AS p
                     LEFT JOIN runs AS r
                       ON r.project_id = p.project_id
@@ -1179,6 +1576,7 @@ class OrchestratorStore:
                             "branch": pbi_row["branch"],
                             "pull_request_url": pbi_row["pull_request_url"],
                             "last_error": pbi_row["last_error"],
+                            "result": pbi_row["run_result"],
                             "active": bool(pbi_row["active"]),
                             "planning_status": pbi_row["planning_status"],
                             "claimable": bool(pbi_row["claimable"]),
@@ -1232,7 +1630,8 @@ class OrchestratorStore:
             SELECT p.project_id, p.repository_name, p.number, p.title, p.stage,
                    p.branch, p.pull_request_url, p.last_error,
                    r.run_id, r.status, r.attempt, r.owner_id, r.lease_token,
-                   r.lease_expires_at, r.last_error AS run_error
+                   r.lease_expires_at, r.last_error AS run_error,
+                   r.last_result AS run_result
             FROM runs AS r
             JOIN pbis AS p
               ON p.project_id = r.project_id
@@ -1263,6 +1662,7 @@ class OrchestratorStore:
             owner_id=row["owner_id"],
             lease_token=row["lease_token"],
             lease_expires_at=row["lease_expires_at"],
+            last_result=row["run_result"],
         )
 
     def _events_for_project(
