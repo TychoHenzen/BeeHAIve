@@ -1,9 +1,11 @@
+import json
 import subprocess
 
 import pytest
 
 import beehaiive.routing as routing_module
 import beehaiive.storage as storage_module
+import scripts.dashboard_smoke as dashboard_smoke
 from beehaiive.provider import ITEMS_QUERY
 from scripts.dashboard_smoke import (
     SmokeFailure,
@@ -74,6 +76,35 @@ def test_report_sanitization_redacts_nested_dashboard_values() -> None:
         "project_name": "<redacted>",
         "repositories": ["o***:7"],
         "metadata": {"title": "<redacted>"},
+    }
+
+
+def test_write_report_fails_closed_when_sanitization_leaves_a_secret(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    monkeypatch.setattr(
+        dashboard_smoke,
+        "sanitize_report",
+        lambda *_args: {"value": "secret-token"},
+    )
+    report_path = tmp_path / "report.json"
+
+    assert not dashboard_smoke.write_report(
+        {"value": "ignored"},
+        report_path,
+        ("secret-token",),
+        "owner:7",
+    )
+
+    output = capsys.readouterr().out
+    assert "secret-token" not in output
+    assert json.loads(output) == {
+        "report_values_redacted": False,
+        "result": "failed",
+    }
+    assert json.loads(report_path.read_text(encoding="utf-8")) == {
+        "report_values_redacted": False,
+        "result": "failed",
     }
 
 

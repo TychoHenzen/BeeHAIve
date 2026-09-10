@@ -1475,11 +1475,9 @@ def run_browser_smoke(
         raise SmokeFailure("An API key appeared in rendered dashboard content")
     visible_text, page_html = page_strings(devtools)
     sensitive_values = tuple(value for value in secrets_to_redact if value)
-    page_secret_in_visible_text = any(
-        secret in visible_text for secret in sensitive_values
-    )
-    page_secret_in_markup = any(secret in page_html for secret in sensitive_values)
-    if page_secret_in_visible_text or page_secret_in_markup:
+    if any(secret in visible_text for secret in sensitive_values):
+        raise SmokeFailure("A credential appeared in the dashboard page")
+    if any(secret in page_html for secret in sensitive_values):
         raise SmokeFailure("A credential appeared in the dashboard page")
     service_output = server_output.getvalue()
     redacted_service_output = redact_text(service_output, sensitive_values, project_id)
@@ -1489,8 +1487,8 @@ def run_browser_smoke(
     if not storage_cleared:
         raise SmokeFailure("The browser did not clear the API key from local storage")
     report["credential_safety"] = {
-        "api_key_or_provider_token_in_visible_page": page_secret_in_visible_text,
-        "api_key_or_provider_token_in_page_markup": page_secret_in_markup,
+        "api_key_or_provider_token_in_visible_page": False,
+        "api_key_or_provider_token_in_page_markup": False,
         "service_output": {
             "captured": True,
             "redacted": True,
@@ -1691,20 +1689,30 @@ def write_report(
         project_id
         and (project_id in serialized or quote(project_id, safe="") in serialized)
     )
+    if not report_values_redacted:
+        serialized = json.dumps(
+            {"report_values_redacted": False, "result": "failed"},
+            ensure_ascii=True,
+            indent=2,
+            sort_keys=True,
+        )
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"{serialized}\n", encoding="utf-8")
+        print(serialized)
+        return False
     browser = safe_report.get("browser")
     credential_safety = (
         browser.get("credential_safety") if isinstance(browser, Mapping) else None
     )
     if isinstance(credential_safety, dict):
-        credential_safety["report_values_redacted"] = report_values_redacted
-    if not report_values_redacted:
-        safe_report["result"] = "failed"
+        credential_safety["report_values_redacted"] = True
     serialized = json.dumps(safe_report, ensure_ascii=True, indent=2, sort_keys=True)
     if path is not None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"{serialized}\n", encoding="utf-8")
     print(serialized)
-    return report_values_redacted
+    return True
 
 
 def main(argv: list[str] | None = None) -> int:
