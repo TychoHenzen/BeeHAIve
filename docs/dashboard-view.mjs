@@ -88,7 +88,7 @@ export function createDashboardView({
 
   function renderPbi(repository, pbi) {
     const card = element("article", undefined, "pbi");
-    card.dataset = card.dataset || {};
+    if (!card.dataset) card.dataset = {};
     card.dataset.repository = String(repository || "");
     card.dataset.pbiNumber = String(pbi.number ?? "");
     card.dataset.runId = String(pbi.run_id ?? "");
@@ -111,6 +111,7 @@ export function createDashboardView({
     details.append(renderActivity(pbi.activity || []));
     card.append(details);
     if (pbi.last_error) card.append(element("p", `Failure: ${pbi.last_error}`, "status failure"));
+    if (pbi.result) card.append(element("p", `Result: ${pbi.result}`, "status success"));
     if (pbi.status !== "active" || !pbi.run_id) return card;
     const controls = element("div", undefined, "actions");
     const stop = element("button", "Stop", "danger");

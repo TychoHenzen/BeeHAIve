@@ -44,6 +44,7 @@ class ModelExecution:
     output_tokens: int = 0
     failure_context: str = ""
     recursive_spawn_depth: int = 0
+    result: str = ""
 
     def __post_init__(self) -> None:
         if self.input_tokens < 0 or self.output_tokens < 0:
@@ -316,6 +317,7 @@ class RoutingResult:
     decision: RoutingDecision
     attempt: RoutingAttempt | None
     attempts: tuple[RoutingAttempt, ...]
+    execution_result: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -734,25 +736,31 @@ class ModelRouter:
                 bounded_output = min(
                     execution.output_tokens, remaining_tokens - bounded_input
                 )
-                return self.record(
-                    normalized_id,
-                    AttemptOutcome.FAILURE,
-                    input_tokens=bounded_input,
-                    output_tokens=bounded_output,
-                    failure_context=usage_violation,
-                    recursive_spawn_depth=min(
-                        execution.recursive_spawn_depth,
-                        self.config.limits.max_recursive_spawn_depth,
+                return replace(
+                    self.record(
+                        normalized_id,
+                        AttemptOutcome.FAILURE,
+                        input_tokens=bounded_input,
+                        output_tokens=bounded_output,
+                        failure_context=usage_violation,
+                        recursive_spawn_depth=min(
+                            execution.recursive_spawn_depth,
+                            self.config.limits.max_recursive_spawn_depth,
+                        ),
+                        force_human_reason=usage_violation,
                     ),
-                    force_human_reason=usage_violation,
+                    execution_result=execution.result or None,
                 )
-            return self.record(
-                normalized_id,
-                execution.outcome,
-                input_tokens=execution.input_tokens,
-                output_tokens=execution.output_tokens,
-                failure_context=execution.failure_context,
-                recursive_spawn_depth=execution.recursive_spawn_depth,
+            return replace(
+                self.record(
+                    normalized_id,
+                    execution.outcome,
+                    input_tokens=execution.input_tokens,
+                    output_tokens=execution.output_tokens,
+                    failure_context=execution.failure_context,
+                    recursive_spawn_depth=execution.recursive_spawn_depth,
+                ),
+                execution_result=execution.result or None,
             )
 
     def record(

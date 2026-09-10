@@ -15,10 +15,18 @@ must be present in `BEEHAIIVE_ALLOWED_PROJECTS`, or in the owner and number
 environment variables used by the service.
 
 Read-only state needs no API key. Operator actions require `BEEHAIIVE_API_KEY`
-and the dashboard API-key field. The first release exposes start or sync,
-stop, approval, and clarification actions. Every action is recorded as
-`pending`, `succeeded`, or `failed`; a response always includes the latest
-available run state.
+and the dashboard API-key field. The dashboard exposes sync, start writer, stop,
+approval, and clarification actions. In documented demo mode, start writer
+claims one PBI and runs the bounded repository-inventory worker. A completed
+result is shown on the PBI card. Every action is recorded as `pending`,
+`succeeded`, or `failed`; a response always includes the latest available run
+state.
+
+The demo worker runs `codex exec` with a read-only sandbox, an ephemeral
+session, and a fixed timeout. It reads only the checkout configured by
+`BEEHAIIVE_AGENT_REPOSITORY`. Stop and service shutdown terminate the process
+tree and clear the run lease. The demo mode uses deterministic review adapters
+only to let the production app start. It is not a live pull-request review.
 
 A new local database is synchronized from GitHub when the dashboard first
 refreshes. Later refreshes synchronize again before reading the projection, so

@@ -37,6 +37,7 @@ DEFAULT_EVENT_LIMIT = 100
 MAX_EVENT_LIMIT = 500
 DEFAULT_ACTION_LIMIT = 50
 MAX_ACTION_LIMIT = 200
+MAX_AGENT_RESULT_LENGTH = 4_000
 
 
 def _now() -> str:
@@ -142,6 +143,7 @@ class OrchestratorStore:
                     lease_expires_at TEXT,
                     execution_token TEXT,
                     last_error TEXT,
+                    last_result TEXT,
                     updated_at TEXT NOT NULL,
                     UNIQUE (project_id, repository_name, pbi_number),
                     FOREIGN KEY (project_id, repository_name, pbi_number)
@@ -250,6 +252,7 @@ class OrchestratorStore:
                 "lease_token",
                 "lease_expires_at",
                 "execution_token",
+                "last_result",
             ):
                 if column not in run_columns:
                     self._connection.execute(
@@ -359,9 +362,14 @@ class OrchestratorStore:
                     )
                     existing = connection.execute(
                         """
-                        SELECT stage, run_id
-                        FROM pbis
-                        WHERE project_id = ? AND repository_name = ? AND number = ?
+                        SELECT p.stage, p.run_id, r.status AS run_status
+                        FROM pbis AS p
+                        LEFT JOIN runs AS r
+                          ON r.project_id = p.project_id
+                         AND r.repository_name = p.repository_name
+                         AND r.pbi_number = p.number
+                        WHERE p.project_id = ? AND p.repository_name = ?
+                          AND p.number = ?
                         """,
                         (snapshot.project_id, pbi.repository, pbi.number),
                     ).fetchone()
@@ -417,6 +425,7 @@ class OrchestratorStore:
                             int(
                                 incoming_stage is not None
                                 and merged_stage is not Stage.PULL_REQUEST
+                                and existing["run_status"] != RunStatus.COMPLETED.value
                             ),
                             current_stage.value,
                             merged_stage.value,
@@ -511,7 +520,7 @@ class OrchestratorStore:
                 """
                 SELECT p.*, r.run_id, r.status, r.attempt,
                        r.owner_id, r.lease_token, r.lease_expires_at,
-                       r.last_error AS run_error
+                       r.last_error AS run_error, r.last_result AS run_result
                 FROM pbis AS p
                 JOIN repositories AS repository
                   ON repository.project_id = p.project_id
@@ -546,7 +555,8 @@ class OrchestratorStore:
                     """
                     UPDATE runs
                     SET owner_id = ?, lease_token = ?, lease_expires_at = ?,
-                        execution_token = NULL, last_error = NULL, updated_at = ?
+                        execution_token = NULL, last_error = NULL,
+                        last_result = NULL, updated_at = ?
                     WHERE run_id = ? AND status = 'active'
                     """,
                     (
@@ -605,7 +615,8 @@ class OrchestratorStore:
                     UPDATE runs
                     SET status = 'active', attempt = attempt + 1,
                         owner_id = ?, lease_token = ?, lease_expires_at = ?,
-                        execution_token = NULL, last_error = NULL, updated_at = ?
+                        execution_token = NULL, last_error = NULL,
+                        last_result = NULL, updated_at = ?
                     WHERE run_id = ?
                     """,
                     (
@@ -1097,6 +1108,108 @@ class OrchestratorStore:
                 )
             return self._run_for_id(connection, run_id) or row, True
 
+    def complete_agent_run(
+        self, run_id: str, result: str, lease_token: str
+    ) -> RunState:
+        """Persist a bounded worker result and release its lease."""
+
+        normalized_result = result.strip()
+        if not normalized_result:
+            raise StoreError("An agent result is required")
+        normalized_result = normalized_result[:MAX_AGENT_RESULT_LENGTH]
+        with self._transaction() as connection:
+            row = self._run_for_id(connection, run_id)
+            if row is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            if row.status is RunStatus.COMPLETED:
+                return row
+            self._require_lease(row, lease_token)
+            if row.status is not RunStatus.ACTIVE or row.stage is not Stage.IMPLEMENT:
+                raise StoreError("Only an active implementation run can complete")
+            now = _now()
+            connection.execute(
+                """
+                UPDATE runs
+                SET status = 'completed', execution_token = NULL,
+                    last_error = NULL, last_result = ?, lease_token = NULL,
+                    lease_expires_at = NULL, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (normalized_result, now, run_id),
+            )
+            connection.execute(
+                """
+                UPDATE pbis SET claimable = 0, last_error = NULL
+                WHERE project_id = ? AND repository_name = ? AND number = ?
+                """,
+                (row.project_id, row.repository, row.pbi_number),
+            )
+            self._record_event(
+                connection,
+                row.project_id,
+                row.repository,
+                row.pbi_number,
+                run_id,
+                "completed",
+                row.stage,
+                row.stage,
+                {"result": normalized_result},
+            )
+            return self._run_for_id(connection, run_id) or row
+
+    def fail_agent_run(self, run_id: str, error: str, lease_token: str) -> RunState:
+        """Persist a worker failure and release its lease for a later retry."""
+
+        normalized_error = error.strip()
+        if not normalized_error:
+            raise StoreError("A failure reason is required")
+        normalized_error = normalized_error[:MAX_AGENT_RESULT_LENGTH]
+        with self._transaction() as connection:
+            row = self._run_for_id(connection, run_id)
+            if row is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            if row.status is RunStatus.COMPLETED:
+                raise StoreError("A completed run cannot fail")
+            if row.status is RunStatus.FAILED:
+                return row
+            self._require_lease(row, lease_token)
+            now = _now()
+            connection.execute(
+                """
+                UPDATE runs
+                SET status = 'failed', execution_token = NULL,
+                    last_error = ?, last_result = NULL, lease_token = NULL,
+                    lease_expires_at = NULL, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (normalized_error, now, run_id),
+            )
+            connection.execute(
+                """
+                UPDATE pbis SET claimable = ?, last_error = ?
+                WHERE project_id = ? AND repository_name = ? AND number = ?
+                """,
+                (
+                    int(row.stage is not Stage.PULL_REQUEST),
+                    normalized_error,
+                    row.project_id,
+                    row.repository,
+                    row.pbi_number,
+                ),
+            )
+            self._record_event(
+                connection,
+                row.project_id,
+                row.repository,
+                row.pbi_number,
+                run_id,
+                "failure",
+                row.stage,
+                row.stage,
+                {"error": normalized_error},
+            )
+            return self._run_for_id(connection, run_id) or row
+
     def pending_routing_failures(self, run_id: str) -> tuple[RoutingFailure, ...]:
         with self._lock:
             rows = self._connection.execute(
@@ -1341,7 +1454,7 @@ class OrchestratorStore:
                 pbis: list[dict[str, object]] = []
                 pbi_rows = self._connection.execute(
                     """
-                    SELECT p.*, r.status, r.attempt
+                    SELECT p.*, r.status, r.attempt, r.last_result AS run_result
                     FROM pbis AS p
                     LEFT JOIN runs AS r
                       ON r.project_id = p.project_id
@@ -1367,6 +1480,7 @@ class OrchestratorStore:
                             "branch": pbi_row["branch"],
                             "pull_request_url": pbi_row["pull_request_url"],
                             "last_error": pbi_row["last_error"],
+                            "result": pbi_row["run_result"],
                             "active": bool(pbi_row["active"]),
                             "planning_status": pbi_row["planning_status"],
                             "claimable": bool(pbi_row["claimable"]),
@@ -1420,7 +1534,8 @@ class OrchestratorStore:
             SELECT p.project_id, p.repository_name, p.number, p.title, p.stage,
                    p.branch, p.pull_request_url, p.last_error,
                    r.run_id, r.status, r.attempt, r.owner_id, r.lease_token,
-                   r.lease_expires_at, r.last_error AS run_error
+                   r.lease_expires_at, r.last_error AS run_error,
+                   r.last_result AS run_result
             FROM runs AS r
             JOIN pbis AS p
               ON p.project_id = r.project_id
@@ -1451,6 +1566,7 @@ class OrchestratorStore:
             owner_id=row["owner_id"],
             lease_token=row["lease_token"],
             lease_expires_at=row["lease_expires_at"],
+            last_result=row["run_result"],
         )
 
     def _events_for_project(

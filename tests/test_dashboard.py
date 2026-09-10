@@ -1,7 +1,11 @@
+import time
+from pathlib import Path
+
 import pytest
 from conftest import FakeProvider
 from fastapi.testclient import TestClient
 
+from beehaiive.agent import AgentWorkerManager, CodexExecModelExecutor
 from beehaiive.dashboard import build_dashboard_state
 from beehaiive.models import (
     PbiSnapshot,
@@ -11,6 +15,7 @@ from beehaiive.models import (
 )
 from beehaiive.orchestrator import Orchestrator
 from beehaiive.provider import ProviderError
+from beehaiive.routing import AttemptOutcome, ModelExecution, ModelRouter, RoutingStore
 from beehaiive.storage import OrchestratorStore, StoreError, _json_mapping
 from main import (
     DashboardStopRequest,
@@ -18,6 +23,15 @@ from main import (
     _execute_dashboard_action,
     create_app,
 )
+
+
+class ImmediateDemoExecutor(CodexExecModelExecutor):
+    def __init__(self) -> None:
+        super().__init__(Path.cwd())
+
+    def execute(self, spec, decision) -> ModelExecution:
+        del spec, decision
+        return ModelExecution(AttemptOutcome.SUCCESS, result="demo result")
 
 
 def dashboard_snapshot(
@@ -594,3 +608,80 @@ def test_dashboard_runtime_assets_are_served_without_sample_data() -> None:
     assert script.status_code == 200
     assert client_script.status_code == 200
     assert view_script.status_code == 200
+
+
+def test_dashboard_worker_completes_bounded_demo_and_persists_result() -> None:
+    executor = ImmediateDemoExecutor()
+    service = Orchestrator(
+        OrchestratorStore(),
+        FakeProvider(dashboard_snapshot()),
+        ModelRouter(RoutingStore()),
+        executor,
+    )
+    worker = AgentWorkerManager(service, executor)
+
+    with TestClient(
+        create_app(
+            orchestrator=service,
+            api_key="test-key",
+            allowed_project_ids={"project-1"},
+            agent_worker=worker,
+        )
+    ) as client:
+        service.synchronize("project-1")
+        response = client.post(
+            "/projects/project-1/actions",
+            headers={"X-API-Key": "test-key"},
+            json={"action": "start", "approved": True, "repository": "owner/api"},
+        )
+
+        assert response.status_code == 200
+        run_id = response.json()["result"]["run"]["run_id"]
+        deadline = time.monotonic() + 3
+        run = service.store.get_run(run_id)
+        while run is not None and run.status.value == "active":
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
+            run = service.store.get_run(run_id)
+
+        assert run is not None
+        assert run.status.value == "completed"
+        assert run.last_result == "demo result"
+        assert run.lease_token is None
+        state = client.get("/projects/project-1/dashboard").json()
+        pbi = state["repositories"][0]["pbis"][0]
+        assert pbi["status"] == "completed"
+        assert pbi["result"] == "demo result"
+        assert pbi["claimable"] is False
+
+
+def test_dashboard_stop_cancels_worker_before_stopping_run() -> None:
+    service = Orchestrator(OrchestratorStore(), FakeProvider(dashboard_snapshot()))
+    service.synchronize("project-1")
+    run = service.claim("project-1", "owner/api", "worker-api")
+    assert run is not None
+
+    class RecordingWorker:
+        def __init__(self) -> None:
+            self.cancelled: str | None = None
+
+        def cancel(self, run_id: str) -> None:
+            self.cancelled = run_id
+
+    worker = RecordingWorker()
+    try:
+        result = _execute_dashboard_action(
+            service,
+            "project-1",
+            DashboardStopRequest(
+                action="stop",
+                run_id=run.run_id,
+                approved=True,
+            ),
+            worker,
+        )
+        assert worker.cancelled == run.run_id
+        assert result["run"]["status"] == "failed"
+    finally:
+        service.store.close()

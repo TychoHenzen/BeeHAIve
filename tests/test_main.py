@@ -230,3 +230,23 @@ def test_project_scope_configuration_uses_environment(
     monkeypatch.setenv("GITHUB_PROJECT_OWNER", "owner")
     monkeypatch.setenv("GITHUB_PROJECT_NUMBER", "7")
     assert _configured_project_ids(None) == {"owner:7"}
+
+
+def test_demo_mode_starts_production_app_with_bounded_adapters(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setenv("BEEHAIIVE_REVIEW_MODE", "demo")
+    monkeypatch.setenv("BEEHAIIVE_STATE_DB", str(tmp_path / "state.db"))
+    monkeypatch.setenv("BEEHAIIVE_ROUTING_DB", str(tmp_path / "routing.db"))
+    monkeypatch.setenv("BEEHAIIVE_REVIEW_DB", str(tmp_path / "review.db"))
+
+    with TestClient(
+        create_app(
+            api_key="test-key",
+            allowed_project_ids={"owner:1"},
+            require_review_adapters=True,
+        )
+    ) as demo_client:
+        response = demo_client.get("/")
+
+    assert response.status_code == 200

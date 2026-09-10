@@ -9,7 +9,9 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from beehaiive import EnvironmentGitHubProvider, Orchestrator, OrchestratorStore, Stage
+from beehaiive.agent import DEMO_TASK_NAME, AgentWorkerManager, CodexExecModelExecutor
 from beehaiive.dashboard import build_dashboard_state
+from beehaiive.demo import demo_review_adapters
 from beehaiive.models import RunState, RunStatus
 from beehaiive.provider import ProviderError
 from beehaiive.review import (
@@ -192,9 +194,11 @@ def create_app(
     routing_store: RoutingStore | None = None,
     model_router: ModelRouter | None = None,
     model_executor: ModelExecutor | None = None,
+    agent_worker: AgentWorkerManager | None = None,
     workflow_service: WorkflowService | None = None,
     workflow_actor: WorkflowRole | str | None = None,
 ) -> FastAPI:
+    owns_orchestrator = orchestrator is None
     if orchestrator is not None and orchestrator.model_router is not None:
         if model_router is not None and model_router is not orchestrator.model_router:
             raise ValueError("The orchestrator and API must share one model router")
@@ -224,6 +228,8 @@ def create_app(
             store = OrchestratorStore(
                 database if database == ":memory:" else Path(database)
             )
+        if model_executor is None:
+            model_executor = CodexExecModelExecutor.from_environment()
         orchestrator = Orchestrator(
             store, EnvironmentGitHubProvider(), routing_service, model_executor
         )
@@ -231,6 +237,12 @@ def create_app(
         orchestrator.model_router = routing_service
     if orchestrator.model_executor is None:
         orchestrator.model_executor = model_executor
+    if (
+        owns_orchestrator
+        and agent_worker is None
+        and isinstance(model_executor, CodexExecModelExecutor)
+    ):
+        agent_worker = AgentWorkerManager(orchestrator, model_executor)
     if (
         review_service is not None
         and review_store is not None
@@ -243,6 +255,13 @@ def create_app(
     ):
         raise ValueError("Review adapters must be configured on the review service")
     if review_service is None:
+        if (
+            require_review_adapters
+            and os.environ.get("BEEHAIIVE_REVIEW_MODE", "").strip().lower() == "demo"
+            and review_provider is None
+            and review_readers is None
+        ):
+            review_provider, review_readers = demo_review_adapters()
         review_database = os.environ.get("BEEHAIIVE_REVIEW_DB", ".beehaiive/reviews.db")
         review_service = ReviewService(
             review_store or ReviewStore(review_database),
@@ -252,6 +271,12 @@ def create_app(
         )
 
     app = FastAPI(title="BeeHAIve")
+
+    if agent_worker is not None:
+
+        @app.on_event("shutdown")  # pyright: ignore[reportDeprecated]
+        async def shutdown_agent_workers() -> None:  # pyright: ignore[reportUnusedFunction]
+            agent_worker.shutdown()
 
     if require_review_adapters:
 
@@ -890,7 +915,9 @@ def create_app(
             run_id,
         )
         try:
-            result = _execute_dashboard_action(orchestrator, project_id, request)
+            result = _execute_dashboard_action(
+                orchestrator, project_id, request, agent_worker
+            )
         except (ProviderError, StoreError) as exc:
             failed = orchestrator.store.finish_action(
                 str(action["id"]), "failed", error=str(exc)
@@ -1086,6 +1113,7 @@ def _run_dict(
         "branch": run.branch,
         "pull_request_url": run.pull_request_url,
         "last_error": run.last_error,
+        "result": run.last_result,
         "owner_id": run.owner_id,
         "lease_token": run.lease_token,
         "lease_expires_at": run.lease_expires_at,
@@ -1157,6 +1185,7 @@ def _execute_dashboard_action(
     orchestrator: Orchestrator,
     project_id: str,
     request: DashboardActionRequest,
+    agent_worker: AgentWorkerManager | None = None,
 ) -> dict[str, object]:
     if isinstance(request, DashboardStartRequest):
         if request.repository is None:
@@ -1168,8 +1197,16 @@ def _execute_dashboard_action(
         )
         if run is None:
             raise StoreError("No claimable PBI is available for this repository")
-        return {"run": _public_run_dict(run)}
+        if agent_worker is None:
+            return {"run": _public_run_dict(run)}
+        agent_worker.start(run)
+        return {
+            "run": _public_run_dict(run),
+            "worker": {"status": "started", "task": DEMO_TASK_NAME},
+        }
     if isinstance(request, DashboardStopRequest):
+        if agent_worker is not None:
+            agent_worker.cancel(request.run_id)
         return {
             "run": _public_run_dict(
                 orchestrator.stop(

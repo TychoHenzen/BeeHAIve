@@ -17,7 +17,6 @@ from .dashboard_smoke_browser import (
     browser_fetches,
     clear_credentials,
     click_button,
-    click_pbi_button,
     click_repository_button,
     click_selector,
     credential_surface_snapshot,
@@ -434,6 +433,42 @@ def action_run_target(response: Mapping[str, Any], name: str) -> tuple[str, int,
     return repository, pbi_number, run_id
 
 
+def wait_for_demo_outcome(
+    devtools: DevTools,
+    repository: str,
+    pbi_number: int,
+    run_id: str,
+    timeout: float,
+) -> dict[str, str]:
+    value = wait_until(
+        devtools,
+        f"""
+(() => {{
+  const pbi = [...document.querySelectorAll('.pbi')].find((node) =>
+    node.dataset.repository === {json.dumps(repository)}
+    && node.dataset.pbiNumber === {json.dumps(str(pbi_number))}
+    && node.dataset.runId === {json.dumps(run_id)}
+  );
+  const text = pbi?.textContent?.trim() || '';
+  if (text.includes('Result:')) return {{ status: 'completed', text }};
+  if (text.includes('Failure:')) return {{ status: 'failed', text }};
+  return null;
+}})()
+""",
+        "bounded demo result",
+        timeout=timeout,
+    )
+    if not isinstance(value, Mapping):
+        raise SmokeFailure("The live dashboard returned no bounded demo outcome")
+    status = value.get("status")
+    text = value.get("text")
+    if not isinstance(status, str) or not isinstance(text, str):
+        raise SmokeFailure(
+            "The live dashboard returned an invalid bounded demo outcome"
+        )
+    return {"status": status, "text": text}
+
+
 def run_live_actions(
     devtools: DevTools, api_key: str, timeout: float = 60.0
 ) -> dict[str, dict[str, Any]]:
@@ -447,44 +482,31 @@ def run_live_actions(
     )
 
     before = len(action_log_snapshot(devtools)["rows"])
-    if not has_button(devtools, "Start writer") or not click_button(
-        devtools, "Start writer"
-    ):
+    repository_hint = os.environ.get("BEEHAIIVE_AGENT_REPOSITORY_NAME", "").strip()
+    if not repository_hint:
+        configured_path = os.environ.get("BEEHAIIVE_AGENT_REPOSITORY", "")
+        repository_hint = os.path.basename(os.path.normpath(configured_path))
+    start_rendered = (
+        click_repository_button(devtools, repository_hint, "Start writer")
+        if repository_hint
+        else click_button(devtools, "Start writer")
+    )
+    if not has_button(devtools, "Start writer") or not start_rendered:
         raise SmokeFailure("The live dashboard did not render the start-writer action")
     start_response = record_action(
         devtools, outcomes, "start_writer", before_action_count=before, timeout=timeout
     )
     repository, pbi_number, run_id = action_run_target(start_response, "start_writer")
-
-    before = len(action_log_snapshot(devtools)["rows"])
-    if not click_pbi_button(
-        devtools, repository, pbi_number, run_id, "Record approval"
-    ):
-        raise SmokeFailure(
-            "The live dashboard did not render the targeted approval action"
-        )
-    record_action(
-        devtools, outcomes, "approve", before_action_count=before, timeout=timeout
+    demo_outcome = wait_for_demo_outcome(
+        devtools, repository, pbi_number, run_id, timeout
     )
-
-    devtools.evaluate("window.prompt = () => 'Live smoke clarification';")
-    before = len(action_log_snapshot(devtools)["rows"])
-    if not click_pbi_button(
-        devtools, repository, pbi_number, run_id, "Request clarification"
-    ):
-        raise SmokeFailure(
-            "The live dashboard did not render the targeted clarification action"
-        )
-    record_action(
-        devtools, outcomes, "clarify", before_action_count=before, timeout=timeout
-    )
-
-    before = len(action_log_snapshot(devtools)["rows"])
-    if not click_pbi_button(devtools, repository, pbi_number, run_id, "Stop"):
-        raise SmokeFailure("The live dashboard did not render the targeted stop action")
-    record_action(
-        devtools, outcomes, "stop", before_action_count=before, timeout=timeout
-    )
+    if demo_outcome["status"] != "completed":
+        raise SmokeFailure("The live bounded demo reported a failure")
+    outcomes["demo_result"] = {
+        "status": demo_outcome["status"],
+        "visible_result": "Result:" in demo_outcome["text"],
+        "targeted_run": True,
+    }
     return outcomes
 
 
