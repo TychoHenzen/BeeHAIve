@@ -36,7 +36,7 @@ GITHUB_TOKEN=<fine-grained-token>
 GITHUB_PROJECT_OWNER=<owner>
 GITHUB_PROJECT_NUMBER=<number>
 GITHUB_PROJECT_OWNER_TYPE=user
-# BEEHAIIVE_GITHUB_DISCOVERY_CACHE_SECONDS=30
+# BEEHAIIVE_GITHUB_DISCOVERY_CACHE_SECONDS=600
 BEEHAIIVE_ALLOWED_PROJECTS=<owner>:<number>
 BEEHAIIVE_API_KEY=<operator-key>
 BEEHAIIVE_REVIEW_MODE=demo
@@ -50,7 +50,7 @@ The project ID is exactly `<owner>:<number>`. The tracked launcher reads the
 gitignored `.env` file before checking these values. Existing process variables
 take precedence. `BEEHAIIVE_AGENT_REPOSITORY_NAME` must match the repository
 selected in the Project. The timeout must be finite and no greater than 900
-seconds. Project discovery is cached for 30 seconds by default, so the
+seconds. Project discovery is cached for 10 minutes by default, so the
 dashboard's five-second polling does not repeat the full GraphQL discovery.
 Set `BEEHAIIVE_GITHUB_DISCOVERY_CACHE_SECONDS` to a finite non-negative number
 to change that interval. Do not commit `.env` or place its values in screenshots.

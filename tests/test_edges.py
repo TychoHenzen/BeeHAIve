@@ -343,6 +343,7 @@ def test_provider_helpers_and_environment_configuration(
     monkeypatch.setenv("GITHUB_PROJECT_NUMBER", "7")
     configured = GitHubProjectProvider.from_environment()
     assert configured.project_id == "owner:7"
+    assert configured._discovery_cache_seconds == 600
     monkeypatch.setenv(provider_module.DISCOVERY_CACHE_SECONDS_ENV, "0")
     assert GitHubProjectProvider.from_environment()._discovery_cache_seconds == 0
     monkeypatch.setenv("GITHUB_PROJECT_OWNER_TYPE", "organization")
