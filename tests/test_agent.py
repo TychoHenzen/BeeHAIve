@@ -494,6 +494,22 @@ def test_executor_builds_model_command_and_covers_process_helpers(
     assert isinstance(started, StartedProcess)
     assert captured["start_new_session"] is True
 
+    monkeypatch.setattr(agent_module.os, "name", "nt")
+    monkeypatch.setattr(
+        agent_module.subprocess,
+        "CREATE_NEW_PROCESS_GROUP",
+        0x200,
+        raising=False,
+    )
+    captured.pop("start_new_session")
+    started = CodexExecModelExecutor._start_process(
+        [sys.executable, "-c", "pass", "--cd", str(tmp_path)], {}
+    )
+    assert isinstance(started, StartedProcess)
+    assert captured["creationflags"] == 0x200
+    assert "start_new_session" not in captured
+    monkeypatch.setattr(agent_module.os, "name", "posix")
+
     class FinishedProcess:
         pid = 1
 
