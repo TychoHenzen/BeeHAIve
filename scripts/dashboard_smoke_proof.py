@@ -423,20 +423,24 @@ def run_fixture_actions(devtools: DevTools) -> dict[str, dict[str, Any]]:
     return outcomes
 
 
-def action_run_target(response: Mapping[str, Any], name: str) -> tuple[str, int, str]:
+def action_run_target(
+    response: Mapping[str, Any], name: str
+) -> tuple[str, int, str, int]:
     payload = response.get("payload")
     result = payload.get("result") if isinstance(payload, Mapping) else None
     run = result.get("run") if isinstance(result, Mapping) else None
     repository = run.get("repository") if isinstance(run, Mapping) else None
     pbi_number = run.get("pbi_number") if isinstance(run, Mapping) else None
     run_id = run.get("run_id") if isinstance(run, Mapping) else None
+    attempt = run.get("attempt") if isinstance(run, Mapping) else None
     if (
         not isinstance(repository, str)
         or not isinstance(pbi_number, int)
         or not isinstance(run_id, str)
+        or not isinstance(attempt, int)
     ):
         raise SmokeFailure(f"The {name} response omitted its run identity")
-    return repository, pbi_number, run_id
+    return repository, pbi_number, run_id, attempt
 
 
 def wait_for_demo_outcome(
@@ -444,6 +448,7 @@ def wait_for_demo_outcome(
     repository: str,
     pbi_number: int,
     run_id: str,
+    attempt: int,
     timeout: float,
 ) -> dict[str, str]:
     value = wait_until(
@@ -454,6 +459,7 @@ def wait_for_demo_outcome(
     node.dataset.repository === {json.dumps(repository)}
     && node.dataset.pbiNumber === {json.dumps(str(pbi_number))}
     && node.dataset.runId === {json.dumps(run_id)}
+    && node.dataset.attempt === {json.dumps(str(attempt))}
   );
   const text = pbi?.textContent?.trim() || '';
   if (text.includes('Result:')) return {{ status: 'completed', text }};
@@ -496,7 +502,9 @@ def run_live_actions(
     start_response = record_action(
         devtools, outcomes, "start_writer", before_action_count=before, timeout=timeout
     )
-    repository, pbi_number, run_id = action_run_target(start_response, "start_writer")
+    repository, pbi_number, run_id, _ = action_run_target(
+        start_response, "start_writer"
+    )
 
     before = len(action_log_snapshot(devtools)["rows"])
     if not click_pbi_button(
@@ -539,11 +547,16 @@ def run_live_actions(
         timeout=timeout,
         action_name="start",
     )
-    completion_repository, completion_pbi, completion_run = action_run_target(
-        completion_response, "completion_writer"
+    completion_repository, completion_pbi, completion_run, completion_attempt = (
+        action_run_target(completion_response, "completion_writer")
     )
     demo_outcome = wait_for_demo_outcome(
-        devtools, completion_repository, completion_pbi, completion_run, timeout
+        devtools,
+        completion_repository,
+        completion_pbi,
+        completion_run,
+        completion_attempt,
+        timeout,
     )
     if demo_outcome["status"] != "completed":
         raise SmokeFailure("The live bounded demo reported a failure")

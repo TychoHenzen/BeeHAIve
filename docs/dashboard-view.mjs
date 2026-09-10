@@ -93,6 +93,7 @@ export function createDashboardView({
     card.dataset.repository = String(repository || "");
     card.dataset.pbiNumber = String(pbi.number ?? "");
     card.dataset.runId = String(pbi.run_id ?? "");
+    card.dataset.attempt = String(pbi.attempt ?? "");
     const header = element("div", undefined, "pbi-header");
     const title = element("div");
     title.append(element("div", `${pbi.id || "PBI"} · #${pbi.number}`, "mono"));
