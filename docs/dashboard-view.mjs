@@ -101,6 +101,10 @@ export function createDashboardView({
     const status = element("span", pbi.status || "pending", `pill ${pbi.status || ""}`);
     header.append(title, status);
     card.append(header);
+    if (pbi.archived) {
+      card.append(element("div", "Archived: completion evidence verified", "muted"));
+    }
+    if (pbi.source_url) card.append(element("div", `Source issue: ${pbi.source_url}`, "muted"));
     if (pbi.branch) card.append(element("div", `Branch: ${pbi.branch}`, "muted"));
     if (pbi.pull_request_url) card.append(element("div", `Pull request: ${pbi.pull_request_url}`, "muted"));
     card.append(renderProgress(pbi.stage_progress || []));
@@ -156,12 +160,19 @@ export function createDashboardView({
   }
 
   function pullRequestLabel(item) {
-    if (item.merged === true) return `#${item.number}: merged`;
+    const evidence = [
+      typeof item.url === "string" ? item.url : "",
+      item.source_branch
+        ? `branch ${item.source_branch} (${item.source_branch_state || "unknown"})`
+        : "",
+    ].filter(Boolean);
+    const suffix = evidence.length ? ` (${evidence.join(", ")})` : "";
+    if (item.merged === true) return `#${item.number}: merged${suffix}`;
     const state = typeof item.state === "string" ? item.state.toLowerCase() : "";
     const decision = item.review_decision || "";
-    if (state === "open" && !decision) return `#${item.number}: open, review pending`;
-    if (state && decision) return `#${item.number}: ${state}, ${decision}`;
-    return `#${item.number}: ${state || decision || "review pending"}`;
+    if (state === "open" && !decision) return `#${item.number}: open, review pending${suffix}`;
+    if (state && decision) return `#${item.number}: ${state}, ${decision}${suffix}`;
+    return `#${item.number}: ${state || decision || "review pending"}${suffix}`;
   }
 
   function renderReviewers(reviewers) {

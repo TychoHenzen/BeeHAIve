@@ -21,8 +21,10 @@
       h3 { font-size: .95rem; margin-bottom: 6px; }
       .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; padding: 12px; }
       label { display: grid; gap: 4px; color: #9ca3af; font-size: .78rem; }
+      label.check-label { display: flex; align-items: center; gap: 6px; }
       input, button { border: 1px solid #4b5563; border-radius: 6px; background: #111827; color: #e5e7eb; padding: 8px 10px; }
       input { min-width: 190px; }
+      label.check-label input { min-width: 0; }
       button { cursor: pointer; background: #1d4ed8; border-color: #2563eb; }
       button.secondary { background: #374151; border-color: #4b5563; }
       button.danger { background: #991b1b; border-color: #b91c1c; }
@@ -74,6 +76,7 @@
         <div class="toolbar">
           <label>Project ID <input id="project-id" autocomplete="off" placeholder="owner:project-number"></label>
           <label>API key for operator actions <input id="api-key" type="password" autocomplete="off"></label>
+          <label class="check-label"><input id="archived-view" type="checkbox" aria-controls="dashboard"> Show archived PBIs</label>
           <button id="refresh" class="secondary" type="button">Refresh</button>
           <button id="start" type="button">Sync project</button>
         </div>

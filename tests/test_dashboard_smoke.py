@@ -165,6 +165,8 @@ def test_project_query_bounds_nested_connections() -> None:
         "closedByPullRequestsReferences(includeClosedPrs: true, "
         "first: 20)" in ITEMS_QUERY
     )
+    assert "headRefName" in ITEMS_QUERY
+    assert "headRef { name }" in ITEMS_QUERY
     assert "reviewRequests(first: 20)" in ITEMS_QUERY
     assert "latestReviews(first: 20)" in ITEMS_QUERY
 

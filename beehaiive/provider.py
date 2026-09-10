@@ -338,6 +338,7 @@ query($owner: String!, $number: Int!, $cursor: String) {
             ... on Issue {
               number
               title
+              url
               repository { nameWithOwner }
               # Keep the project-wide query below GitHub's node limit. The
               # provider completes these connections with repository queries.
@@ -372,6 +373,8 @@ query($owner: String!, $number: Int!, $cursor: String) {
                   url
                   state
                   merged
+                  headRefName
+                  headRef { name }
                   reviewDecision
                   reviewRequests(first: 20) {
                     nodes {
@@ -479,6 +482,8 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
           url
           state
           merged
+          headRefName
+          headRef { name }
           reviewDecision
           reviewRequests(first: 100) {
             nodes {
@@ -708,6 +713,9 @@ def _dashboard_metadata(issue: Mapping[str, Any]) -> dict[str, object]:
     """Project issue metadata that the dashboard can show without fake state."""
 
     metadata: dict[str, object] = {}
+    source_url = issue.get("url")
+    if isinstance(source_url, str):
+        metadata["source_url"] = source_url
     labels = _label_names(issue.get("labels", {}))
 
     subtasks: list[dict[str, object]] = []
@@ -799,6 +807,19 @@ def _dashboard_metadata(issue: Mapping[str, Any]) -> dict[str, object]:
         merged = raw_pull_request.get("merged")
         if isinstance(merged, bool):
             pull_request["merged"] = merged
+        source_branch = raw_pull_request.get("headRefName")
+        if isinstance(source_branch, str) and source_branch.strip():
+            pull_request["source_branch"] = source_branch
+        head_ref = raw_pull_request.get("headRef")
+        pull_request["source_branch_state"] = (
+            "unknown"
+            if "headRef" not in raw_pull_request
+            else "deleted"
+            if head_ref is None
+            else "present"
+            if isinstance(head_ref, Mapping)
+            else "unknown"
+        )
         decision = raw_pull_request.get("reviewDecision")
         if isinstance(decision, str):
             pull_request["review_decision"] = decision.lower()

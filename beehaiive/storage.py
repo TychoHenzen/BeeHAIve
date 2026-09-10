@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Generator
+from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from .models import (
     HandoffIntent,
+    PbiSnapshot,
     ProjectSnapshot,
     RoutingFailure,
     RunState,
@@ -32,6 +33,7 @@ _STAGE_ORDER = {
     Stage.IMPLEMENT: 2,
     Stage.PULL_REQUEST: 3,
 }
+_TERMINAL_PROJECT_STATUSES = {"done", "completed", "closed", "merged"}
 
 DEFAULT_EVENT_LIMIT = 100
 MAX_EVENT_LIMIT = 500
@@ -61,6 +63,25 @@ def _json_mapping(value: object) -> dict[str, object]:
     except json.JSONDecodeError:
         return {}
     return cast(dict[str, object], decoded) if isinstance(decoded, dict) else {}
+
+
+def _archive_eligible(pbi: PbiSnapshot, run_status: str | None = None) -> bool:
+    if run_status in {RunStatus.ACTIVE.value, RunStatus.FAILED.value}:
+        return False
+    if (pbi.planning_status or "").strip().lower() not in _TERMINAL_PROJECT_STATUSES:
+        return False
+    pull_requests = pbi.metadata.get("pull_requests")
+    if not isinstance(pull_requests, Sequence) or isinstance(
+        pull_requests, (str, bytes, bytearray)
+    ):
+        return False
+    return any(
+        isinstance(raw_pull_request, Mapping)
+        and (pull_request := cast(Mapping[str, object], raw_pull_request)).get("merged")
+        is True
+        and pull_request.get("source_branch_state") == "deleted"
+        for raw_pull_request in cast(Sequence[object], pull_requests)
+    )
 
 
 class OrchestratorStore:
@@ -116,6 +137,7 @@ class OrchestratorStore:
                     title TEXT NOT NULL,
                     stage TEXT NOT NULL,
                     active INTEGER NOT NULL DEFAULT 1,
+                    archived INTEGER NOT NULL DEFAULT 0,
                     run_id TEXT,
                     branch TEXT,
                     pull_request_url TEXT,
@@ -265,11 +287,14 @@ class OrchestratorStore:
                 "planning_status",
                 "claimable",
                 "metadata_json",
+                "archived",
             ):
                 if column not in pbi_columns:
                     definition = (
                         "INTEGER NOT NULL DEFAULT 1"
                         if column == "claimable"
+                        else "INTEGER NOT NULL DEFAULT 0"
+                        if column == "archived"
                         else "TEXT NOT NULL DEFAULT '{}'"
                         if column == "metadata_json"
                         else "TEXT"
@@ -333,7 +358,7 @@ class OrchestratorStore:
                 (snapshot.project_id,),
             )
             connection.execute(
-                "UPDATE pbis SET active = 0 WHERE project_id = ?",
+                "UPDATE pbis SET active = 0, archived = 0 WHERE project_id = ?",
                 (snapshot.project_id,),
             )
             for repository in snapshot.repositories:
@@ -379,10 +404,10 @@ class OrchestratorStore:
                             """
                             INSERT INTO pbis(
                                 project_id, repository_name, number, title,
-                                stage, active, planning_status, claimable,
+                                stage, active, archived, planning_status, claimable,
                                 metadata_json
                             )
-                            VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
                             """,
                             (
                                 snapshot.project_id,
@@ -390,6 +415,7 @@ class OrchestratorStore:
                                 pbi.number,
                                 pbi.title,
                                 (incoming_stage or Stage.BACKLOG).value,
+                                int(_archive_eligible(pbi)),
                                 pbi.planning_status,
                                 int(incoming_stage is not None),
                                 json.dumps(dict(pbi.metadata), sort_keys=True),
@@ -409,7 +435,7 @@ class OrchestratorStore:
                     connection.execute(
                         """
                         UPDATE pbis
-                        SET title = ?, stage = ?, active = 1,
+                        SET title = ?, stage = ?, active = 1, archived = ?,
                             metadata_json = ?,
                             planning_status = ?, claimable = ?,
                             last_error = CASE
@@ -421,6 +447,14 @@ class OrchestratorStore:
                         (
                             pbi.title,
                             merged_stage.value,
+                            int(
+                                _archive_eligible(
+                                    pbi,
+                                    str(existing["run_status"])
+                                    if isinstance(existing["run_status"], str)
+                                    else None,
+                                )
+                            ),
                             json.dumps(dict(pbi.metadata), sort_keys=True),
                             pbi.planning_status,
                             int(
@@ -1578,6 +1612,7 @@ class OrchestratorStore:
                             "last_error": pbi_row["last_error"],
                             "result": pbi_row["run_result"],
                             "active": bool(pbi_row["active"]),
+                            "archived": bool(pbi_row["archived"]),
                             "planning_status": pbi_row["planning_status"],
                             "claimable": bool(pbi_row["claimable"]),
                             "events": events,

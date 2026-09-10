@@ -26,6 +26,7 @@ from beehaiive.provider import (
     GitHubRateLimitError,
     ProviderError,
     UrllibGraphQLClient,
+    _dashboard_metadata,
     _mapping,
     _next_cursor,
     _nodes,
@@ -418,6 +419,47 @@ def test_provider_discovery_and_base_branch_validation() -> None:
     )
     with pytest.raises(ProviderError, match="default branch"):
         missing_branch.resolve_base_branch("owner/api", None)
+
+
+def test_provider_preserves_archive_evidence() -> None:
+    metadata = _dashboard_metadata(
+        {
+            "url": "https://example.test/issues/1",
+            "closedByPullRequestsReferences": {
+                "nodes": [
+                    {
+                        "number": 1,
+                        "url": "https://example.test/pull/1",
+                        "state": "MERGED",
+                        "merged": True,
+                        "headRefName": "codex/done",
+                        "headRef": None,
+                    },
+                    {
+                        "number": 2,
+                        "headRefName": "codex/live",
+                        "headRef": {"name": "codex/live"},
+                    },
+                    {
+                        "number": 3,
+                        "headRefName": "codex/malformed",
+                        "headRef": "not-an-object",
+                    },
+                    {"number": 4, "headRefName": "codex/unknown"},
+                ]
+            },
+        }
+    )
+
+    pull_requests = metadata["pull_requests"]
+    assert metadata["source_url"] == "https://example.test/issues/1"
+    assert [pull_request["source_branch_state"] for pull_request in pull_requests] == [
+        "deleted",
+        "present",
+        "unknown",
+        "unknown",
+    ]  # type: ignore[index]
+    assert pull_requests[0]["source_branch"] == "codex/done"  # type: ignore[index]
 
 
 class RateLimitedAfterDiscoveryClient(StaticClient):
@@ -994,6 +1036,7 @@ def test_storage_migrates_legacy_columns(tmp_path: Path) -> None:
         "handoff_status",
         "planning_status",
         "claimable",
+        "archived",
     } <= columns
     run_columns = {
         str(row[1]) for row in store._connection.execute("PRAGMA table_info(runs)")

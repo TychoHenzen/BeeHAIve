@@ -32,13 +32,14 @@ _TERMINAL_PROJECT_STATUSES = {"done", "completed", "closed", "merged"}
 def build_dashboard_state(
     state: Mapping[str, object],
     actions: Sequence[Mapping[str, object]] = (),
+    include_archived: bool = False,
 ) -> dict[str, object]:
     """Build the dashboard contract without changing orchestration state."""
 
     repositories: list[dict[str, object]] = []
     all_pbis: list[dict[str, object]] = []
     for raw_repository in _mappings(state.get("repositories")):
-        repository = _repository_view(raw_repository, actions)
+        repository = _repository_view(raw_repository, actions, include_archived)
         repositories.append(repository)
         all_pbis.extend(_mappings(repository.get("pbis")))
 
@@ -91,6 +92,7 @@ def build_dashboard_state(
 def _repository_view(
     raw_repository: Mapping[str, object],
     actions: Sequence[Mapping[str, object]],
+    include_archived: bool,
 ) -> dict[str, object]:
     raw_writer = _mapping(raw_repository.get("writer"))
     if raw_writer:
@@ -105,6 +107,7 @@ def _repository_view(
     pbis = [
         _pbi_view(raw_pbi, raw_repository.get("name"), actions)
         for raw_pbi in _mappings(raw_repository.get("pbis"))
+        if bool(raw_pbi.get("archived")) is include_archived
     ]
     return {
         "name": raw_repository.get("name"),
@@ -146,6 +149,7 @@ def _pbi_view(
         ]
     escalation = _escalation_view(metadata, events)
     subtasks = _sequence(metadata.get("subtasks"))
+    source_url = metadata.get("source_url")
     matching_actions = [
         dict(action)
         for action in actions
@@ -166,7 +170,9 @@ def _pbi_view(
         "last_error": raw_pbi.get("last_error"),
         "result": raw_pbi.get("result"),
         "active": bool(raw_pbi.get("active")),
+        "archived": bool(raw_pbi.get("archived")),
         "planning_status": planning_status,
+        "source_url": source_url,
         "claimable": bool(raw_pbi.get("claimable")),
         "subtasks": subtasks,
         "pull_requests": pull_requests,

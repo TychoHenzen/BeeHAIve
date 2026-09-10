@@ -863,10 +863,11 @@ def create_app(
             ge=1,
             le=MAX_EVENT_LIMIT,
         ),
+        archived: bool = Query(default=False),
         _access: None = Depends(require_project_access),
     ) -> dict[str, object]:
         return _handle_store_error(
-            lambda: _dashboard_state(orchestrator, project_id, event_limit)
+            lambda: _dashboard_state(orchestrator, project_id, event_limit, archived)
         )
 
     @app.get("/projects/{project_id}/actions")
@@ -1165,12 +1166,15 @@ def _run_dict(
 
 
 def _dashboard_state(
-    orchestrator: Orchestrator, project_id: str, event_limit: int
+    orchestrator: Orchestrator,
+    project_id: str,
+    event_limit: int,
+    archived: bool = False,
 ) -> dict[str, object]:
     orchestrator.synchronize(project_id)
     state = orchestrator.store.project_state(project_id, event_limit)
     actions = orchestrator.store.actions_for_project(project_id)
-    return build_dashboard_state(state, actions)
+    return build_dashboard_state(state, actions, archived)
 
 
 def _dashboard_state_or_none(

@@ -782,6 +782,7 @@ def test_dashboard_runtime_assets_are_served_without_sample_data() -> None:
 
     assert page.status_code == 200
     assert "/dashboard.js" in page.text
+    assert 'id="archived-view"' in page.text
     assert script.status_code == 200
     assert client_script.status_code == 200
     assert view_script.status_code == 200

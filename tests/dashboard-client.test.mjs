@@ -18,6 +18,7 @@ function harness(fetcher, options = {}) {
   const client = createDashboardClient({
     fetcher,
     projectId: options.projectId || (() => "owner:7"),
+    archived: options.archived,
     apiKey: () => "test-key",
     saveApiKey: options.saveApiKey,
     onState: (state) => states.push(state),
@@ -61,6 +62,18 @@ test("refresh reports a failure without clearing the previous state", async () =
   assert.deepEqual(states, [{ updated_at: "known" }]);
   assert.equal(statuses.at(-1).kind, "failure");
   assert.match(statuses.at(-1).message, /fixture unavailable/);
+});
+
+test("refresh requests the archived dashboard view when enabled", async () => {
+  let requestedUrl;
+  const { client } = harness(async (url) => {
+    requestedUrl = url;
+    return response({ updated_at: "archived" });
+  }, { archived: () => true });
+
+  await client.refresh();
+
+  assert.equal(requestedUrl, "/projects/owner%3A7/dashboard?archived=true");
 });
 
 test("actions expose pending, success, and failure states", async () => {

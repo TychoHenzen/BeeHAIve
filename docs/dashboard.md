@@ -4,6 +4,14 @@ The service serves the operator dashboard at `/dashboard`. It reads the live
 state projection from `/projects/{project_id}/dashboard` and polls it every
 five seconds. It does not load the old static JSX sample.
 
+The default dashboard omits archived PBIs. Use
+`/projects/{project_id}/dashboard?archived=true`, or select **Show archived
+PBIs** in the dashboard, to view only PBIs whose Project status is terminal,
+whose linked pull request is merged, and whose pull-request source branch is
+deleted. The provider records an unknown branch state when GitHub does not
+return branch evidence, so unknown or present branches stay visible in the
+default view.
+
 On Windows, copy `.env.example` to `.env`, fill in the required values, and run
 the tracked `start_dashboard.bat` launcher. The launcher reads `.env` before
 validating the configuration. Direct server commands still need environment
@@ -37,8 +45,10 @@ a live pull-request review.
 
 A new local database is synchronized from GitHub when the dashboard first
 refreshes. Later refreshes synchronize again before reading the projection, so
-the dashboard does not depend on a manual sync action for current state. The
-project provider must be available, and the project must be allowlisted.
+the dashboard does not depend on a manual sync action for current state. Each
+sync reevaluates archive evidence and restores a PBI to the default view when
+any required fact changes. The project provider must be available, and the
+project must be allowlisted.
 
 The GitHub provider supplies optional live details during project sync. GitHub
 sub-issues become subtasks, linked pull-request review requests and latest
