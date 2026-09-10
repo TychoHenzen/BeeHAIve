@@ -16,6 +16,12 @@ from scripts.dashboard_smoke import (
     sanitize_report,
     terminate_process,
 )
+from scripts.dashboard_smoke_browser import set_input
+from scripts.dashboard_smoke_proof import (
+    action_run_target,
+    configured_live_timeout,
+    response_backed_dashboard_fields,
+)
 
 
 def test_project_identity_redaction_preserves_only_a_safe_number() -> None:
@@ -161,3 +167,47 @@ def test_project_query_bounds_nested_connections() -> None:
     )
     assert "reviewRequests(first: 20)" in ITEMS_QUERY
     assert "latestReviews(first: 20)" in ITEMS_QUERY
+
+
+def test_response_dashboard_fields_require_the_requested_project() -> None:
+    fields = response_backed_dashboard_fields(
+        {"project_id": "owner:8"},
+        {},
+        "owner:7",
+    )
+
+    assert fields["project_id"] is False
+
+
+def test_action_target_uses_the_run_returned_by_the_action() -> None:
+    response = {
+        "payload": {
+            "result": {
+                "run": {
+                    "repository": "owner/api",
+                    "pbi_number": 7,
+                    "run_id": "run-7",
+                }
+            }
+        }
+    }
+
+    assert action_run_target(response, "start_writer") == (
+        "owner/api",
+        7,
+        "run-7",
+    )
+
+
+def test_set_input_fails_at_a_missing_control() -> None:
+    class MissingInputDevTools:
+        def evaluate(self, expression: str):
+            return False
+
+    with pytest.raises(SmokeFailure, match="was not rendered"):
+        set_input(MissingInputDevTools(), "#project-id", "owner:7")
+
+
+def test_live_timeout_uses_provider_deadline_or_explicit_value() -> None:
+    assert configured_live_timeout(None) == 65.0
+    assert configured_live_timeout(90.0) == 90.0

@@ -65,6 +65,9 @@ uv run python scripts/dashboard_smoke.py --mode live --project "<owner>:<number>
 
 Omit `--allow-mutations` for the read-only live proof. The flag is required to
 exercise sync, start, approval, clarification, and stop through the browser.
+The live refresh and action wait defaults to two provider request deadlines
+plus five seconds. Pass `--live-timeout <seconds>` to set a larger deadline for
+projects that require more paginated provider requests.
 The live harness uses an isolated local database. Project discovery uses the
 configured GitHub provider, while the dashboard actions remain local state
 changes. Pass `--browser` when Edge or Chrome is not discoverable.

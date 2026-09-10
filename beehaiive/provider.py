@@ -19,6 +19,8 @@ from .models import (
     Stage,
 )
 
+PROVIDER_REQUEST_TIMEOUT = 30.0
+
 
 class ProviderError(RuntimeError):
     """Raised when a provider cannot discover or hand off work."""
@@ -58,7 +60,7 @@ class UrllibGraphQLClient:
             method="POST",
         )
         try:
-            with urlopen(request, timeout=30) as response:
+            with urlopen(request, timeout=PROVIDER_REQUEST_TIMEOUT) as response:
                 raw_payload: object = json.loads(response.read())
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise ProviderError(f"GitHub GraphQL returned invalid JSON: {exc}") from exc
