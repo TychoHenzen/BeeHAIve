@@ -208,6 +208,11 @@ def test_executor_binds_repository_and_uses_selected_model(tmp_path: Path) -> No
     command = executor._command_for_execution("prompt", "selected-model", tmp_path)
     assert command[-3:] == ["--model", "selected-model", "prompt"]
 
+    default_command = CodexExecModelExecutor(
+        tmp_path, repository_name="owner/api"
+    )._command_for_execution("prompt", "luna", tmp_path)
+    assert "--model" not in default_command
+
 
 def test_executor_safe_checkout_excludes_local_secret_files(tmp_path: Path) -> None:
     (tmp_path / "README.md").write_text("safe\n", encoding="utf-8")

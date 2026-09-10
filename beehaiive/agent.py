@@ -73,6 +73,7 @@ _SAFE_ENVIRONMENT_NAMES = frozenset(
         "WINDIR",
     }
 )
+_ROUTING_MODEL_ALIASES = frozenset({"luna", "terra", "sol", "astra", "human"})
 
 
 class CancellableModelExecutor(ModelExecutor, Protocol):
@@ -310,6 +311,8 @@ class CodexExecModelExecutor:
         repository: Path | None = None,
     ) -> list[str]:
         selected_model = model.strip() if model and model.strip() else self.model
+        if self.model is None and selected_model in _ROUTING_MODEL_ALIASES:
+            selected_model = None
         command = [
             self.executable,
             "exec",
