@@ -44,6 +44,12 @@ The GitHub provider supplies optional live details during project sync. GitHub
 sub-issues become subtasks, linked pull-request review requests and latest
 reviews become readers and reviewer results, issue comments become activity,
 and `bounces/N` or `escalation/<tier>` labels become escalation state.
+The provider reuses one configured client, caches discovery for 30 seconds by
+default, and honors GitHub GraphQL rate-limit headers. It stops local retries
+until the reset window, and serves the last successful project snapshot when a
+later refresh is rate-limited. Set `BEEHAIIVE_GITHUB_DISCOVERY_CACHE_SECONDS`
+to change the cache interval. See [GitHub's GraphQL rate and query limits](https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api)
+for the upstream limit rules.
 
 ## Reproducible smoke proof
 
