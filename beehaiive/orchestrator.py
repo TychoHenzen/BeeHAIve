@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from threading import Event, Lock, Thread
 
-from .models import HandoffRequest, RoutingFailure, RunState, RunStatus, Stage
+from .models import (
+    HandoffRequest,
+    ProjectSnapshot,
+    RoutingFailure,
+    RunState,
+    RunStatus,
+    Stage,
+)
 from .provider import ProjectProvider
 from .routing import (
     AttemptOutcome,
@@ -64,9 +71,14 @@ class Orchestrator:
         self.model_router = model_router
         self.model_executor = model_executor
         self._handoff_locks = _KeyedLockManager()
+        self._worker_canceller: Callable[[str], None] | None = None
+
+    def register_worker_canceller(self, canceller: Callable[[str], None]) -> None:
+        self._worker_canceller = canceller
 
     def synchronize(self, project_id: str) -> dict[str, object]:
         snapshot = self.provider.discover_project(project_id)
+        self._cancel_removed_workers(snapshot)
         self.store.sync_project(snapshot)
         return self.store.project_state(project_id)
 
@@ -219,6 +231,7 @@ class Orchestrator:
         output_tokens: int = 0,
         recursive_spawn_depth: int = 0,
     ) -> RunState:
+        self._cancel_worker(run_id)
         with self._routing_coordination(run_id), self._handoff_locks.acquire(run_id):
             return self._fail_with_routing(
                 run_id,
@@ -271,7 +284,31 @@ class Orchestrator:
     def stop(self, run_id: str, reason: str = "Stopped by operator") -> RunState:
         """Apply an authenticated operator stop without a worker lease."""
 
+        self._cancel_worker(run_id)
         return self.store.stop(run_id, reason)
+
+    def recover_routing_problem(self, run_id: str, reason: str) -> None:
+        if self.model_router is None:
+            return
+        try:
+            self.model_router.reopen_resolved(run_id, reason)
+        except RoutingError as exc:
+            raise StoreError(str(exc)) from exc
+
+    def _cancel_worker(self, run_id: str) -> None:
+        if self._worker_canceller is not None:
+            self._worker_canceller(run_id)
+
+    def _cancel_removed_workers(self, snapshot: ProjectSnapshot) -> None:
+        active_runs = self.store.active_runs_for_project(snapshot.project_id)
+        visible_pbis = {
+            (repository.name, pbi.number)
+            for repository in snapshot.repositories
+            for pbi in repository.pbis
+        }
+        for run in active_runs:
+            if (run.repository, run.pbi_number) not in visible_pbis:
+                self._cancel_worker(run.run_id)
 
     def _ensure_routing_problem(self, run_id: str) -> None:
         if self.model_router is None:
@@ -309,7 +346,7 @@ class Orchestrator:
         if self.model_router is None:  # pragma: no cover - guarded by callers
             return
         try:
-            self.model_router.record(
+            result = self.model_router.record(
                 failure.run_id,
                 AttemptOutcome.FAILURE,
                 input_tokens=failure.input_tokens,
@@ -318,6 +355,8 @@ class Orchestrator:
                 recursive_spawn_depth=failure.recursive_spawn_depth,
                 transition_id=failure.transition_id,
             )
+            if result.state.status is RoutingStatus.HUMAN_HANDOFF:
+                self.store.set_run_claimable(failure.run_id, False)
         except RoutingError as exc:
             if self.model_router.store.has_transition(failure.transition_id):
                 self.store.mark_routing_failure_processed(failure.transition_id)

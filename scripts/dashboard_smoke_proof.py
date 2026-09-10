@@ -17,11 +17,11 @@ from .dashboard_smoke_browser import (
     browser_fetches,
     clear_credentials,
     click_button,
+    click_pbi_button,
     click_repository_button,
     click_selector,
     credential_surface_snapshot,
     dashboard_fetch_count,
-    has_button,
     page_strings,
     set_input,
     status_snapshot,
@@ -101,6 +101,7 @@ def required_dashboard_fields(snapshot: Mapping[str, Any]) -> dict[str, bool]:
         "Readers",
         "Active runs",
         "Failed runs",
+        "Completed runs",
     )
     return {
         "project_name": bool(str(snapshot.get("project_name", "")).strip()),
@@ -249,6 +250,9 @@ def response_backed_dashboard_fields(
         ),
         "Failed runs": (
             counts.get("failed_runs") if isinstance(counts, Mapping) else None
+        ),
+        "Completed runs": (
+            counts.get("completed_runs") if isinstance(counts, Mapping) else None
         ),
     }
     count_values = rendered_counts if isinstance(rendered_counts, Mapping) else {}
@@ -484,21 +488,59 @@ def run_live_actions(
     before = len(action_log_snapshot(devtools)["rows"])
     repository_hint = os.environ.get("BEEHAIIVE_AGENT_REPOSITORY_NAME", "").strip()
     if not repository_hint:
-        configured_path = os.environ.get("BEEHAIIVE_AGENT_REPOSITORY", "")
-        repository_hint = os.path.basename(os.path.normpath(configured_path))
-    start_rendered = (
-        click_repository_button(devtools, repository_hint, "Start writer")
-        if repository_hint
-        else click_button(devtools, "Start writer")
-    )
-    if not has_button(devtools, "Start writer") or not start_rendered:
+        raise SmokeFailure("Live mutation proof needs BEEHAIIVE_AGENT_REPOSITORY_NAME")
+    if not click_repository_button(devtools, repository_hint, "Start writer"):
         raise SmokeFailure("The live dashboard did not render the start-writer action")
     start_response = record_action(
         devtools, outcomes, "start_writer", before_action_count=before, timeout=timeout
     )
     repository, pbi_number, run_id = action_run_target(start_response, "start_writer")
+
+    before = len(action_log_snapshot(devtools)["rows"])
+    if not click_pbi_button(
+        devtools, repository, pbi_number, run_id, "Record approval"
+    ):
+        raise SmokeFailure(
+            "The live approval action was not rendered for the targeted run"
+        )
+    record_action(
+        devtools, outcomes, "approve", before_action_count=before, timeout=timeout
+    )
+
+    devtools.evaluate("window.prompt = () => 'Use the live bounded demo';")
+    before = len(action_log_snapshot(devtools)["rows"])
+    if not click_pbi_button(
+        devtools, repository, pbi_number, run_id, "Request clarification"
+    ):
+        raise SmokeFailure(
+            "The live clarification action was not rendered for the targeted run"
+        )
+    record_action(
+        devtools, outcomes, "clarify", before_action_count=before, timeout=timeout
+    )
+
+    before = len(action_log_snapshot(devtools)["rows"])
+    if not click_pbi_button(devtools, repository, pbi_number, run_id, "Stop"):
+        raise SmokeFailure("The live stop action was not rendered for the targeted run")
+    record_action(
+        devtools, outcomes, "stop", before_action_count=before, timeout=timeout
+    )
+
+    before = len(action_log_snapshot(devtools)["rows"])
+    if not click_repository_button(devtools, repository_hint, "Start writer"):
+        raise SmokeFailure("The live completion run was not rendered")
+    completion_response = record_action(
+        devtools,
+        outcomes,
+        "completion_writer",
+        before_action_count=before,
+        timeout=timeout,
+    )
+    completion_repository, completion_pbi, completion_run = action_run_target(
+        completion_response, "completion_writer"
+    )
     demo_outcome = wait_for_demo_outcome(
-        devtools, repository, pbi_number, run_id, timeout
+        devtools, completion_repository, completion_pbi, completion_run, timeout
     )
     if demo_outcome["status"] != "completed":
         raise SmokeFailure("The live bounded demo reported a failure")
@@ -571,6 +613,7 @@ def run_browser_smoke(
         "Subtasks",
         "Writers",
         "Readers",
+        "Completed runs",
     ):
         if expected not in visible_text:
             raise SmokeFailure(f"The dashboard summary omitted {expected}")

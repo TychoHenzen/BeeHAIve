@@ -50,6 +50,7 @@ export function createDashboardView({
       ["Readers", counts.readers],
       ["Active runs", counts.active_runs],
       ["Failed runs", counts.failed_runs],
+      ["Completed runs", counts.completed_runs],
     ];
     fields.forEach(([label, value]) => {
       const card = element("div", undefined, "card");

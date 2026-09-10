@@ -18,6 +18,7 @@ from beehaiive.provider import ProviderError
 from beehaiive.routing import AttemptOutcome, ModelExecution, ModelRouter, RoutingStore
 from beehaiive.storage import OrchestratorStore, StoreError, _json_mapping
 from main import (
+    DashboardStartRequest,
     DashboardStopRequest,
     _dashboard_pbi,
     _execute_dashboard_action,
@@ -27,7 +28,7 @@ from main import (
 
 class ImmediateDemoExecutor(CodexExecModelExecutor):
     def __init__(self) -> None:
-        super().__init__(Path.cwd())
+        super().__init__(Path.cwd(), repository_name="owner/api")
 
     def execute(self, spec, decision) -> ModelExecution:
         del spec, decision
@@ -296,11 +297,20 @@ def test_dashboard_reads_require_project_allowlist_without_api_key() -> None:
 
 def test_dashboard_actions_preserve_state_and_report_results() -> None:
     service = Orchestrator(OrchestratorStore(), FakeProvider(dashboard_snapshot()))
+
+    class RecordingWorker:
+        def start(self, run) -> None:
+            del run
+
+        def cancel(self, run_id: str) -> None:
+            del run_id
+
     client = TestClient(
         create_app(
             orchestrator=service,
             api_key="test-key",
             allowed_project_ids={"project-1"},
+            agent_worker=RecordingWorker(),
         )
     )
     auth = {"X-API-Key": "test-key"}
@@ -684,4 +694,81 @@ def test_dashboard_stop_cancels_worker_before_stopping_run() -> None:
         assert worker.cancelled == run.run_id
         assert result["run"]["status"] == "failed"
     finally:
+        service.store.close()
+
+
+def test_dashboard_start_requires_a_worker_before_claiming() -> None:
+    service = Orchestrator(OrchestratorStore(), FakeProvider(dashboard_snapshot()))
+    service.synchronize("project-1")
+    try:
+        with pytest.raises(StoreError, match="worker is not configured"):
+            _execute_dashboard_action(
+                service,
+                "project-1",
+                DashboardStartRequest(
+                    action="start", approved=True, repository="owner/api"
+                ),
+            )
+        assert service.store.active_runs_for_project("project-1") == ()
+    finally:
+        service.store.close()
+
+
+def test_dashboard_start_failure_stops_claimed_run() -> None:
+    service = Orchestrator(OrchestratorStore(), FakeProvider(dashboard_snapshot()))
+    service.synchronize("project-1")
+
+    class FailingWorker:
+        def start(self, run) -> None:
+            del run
+            raise RuntimeError("thread start failed")
+
+    try:
+        with pytest.raises(StoreError, match="thread start failed"):
+            _execute_dashboard_action(
+                service,
+                "project-1",
+                DashboardStartRequest(
+                    action="start", approved=True, repository="owner/api"
+                ),
+                FailingWorker(),
+            )
+        run = service.store.active_runs_for_project("project-1")
+        assert run == ()
+        failed = service.store.project_state("project-1")["repositories"][0]["pbis"][0]
+        assert (
+            failed["last_error"] == "Agent worker failed to start: thread start failed"
+        )
+    finally:
+        service.store.close()
+
+
+def test_dashboard_start_cleanup_failure_is_reported() -> None:
+    service = Orchestrator(OrchestratorStore(), FakeProvider(dashboard_snapshot()))
+    service.synchronize("project-1")
+
+    class FailingWorker:
+        def start(self, run) -> None:
+            del run
+            raise RuntimeError("thread start failed")
+
+    original_stop = service.stop
+
+    def fail_stop(run_id: str, reason: str):
+        del run_id, reason
+        raise StoreError("cleanup unavailable")
+
+    service.stop = fail_stop  # type: ignore[method-assign]
+    try:
+        with pytest.raises(StoreError, match="cleanup failed: cleanup unavailable"):
+            _execute_dashboard_action(
+                service,
+                "project-1",
+                DashboardStartRequest(
+                    action="start", approved=True, repository="owner/api"
+                ),
+                FailingWorker(),
+            )
+    finally:
+        service.stop = original_stop  # type: ignore[method-assign]
         service.store.close()

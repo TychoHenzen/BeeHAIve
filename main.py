@@ -1,6 +1,7 @@
 import os
 import secrets
 from collections.abc import Callable, Collection, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Annotated, Literal, cast
 
@@ -9,9 +10,13 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from beehaiive import EnvironmentGitHubProvider, Orchestrator, OrchestratorStore, Stage
-from beehaiive.agent import DEMO_TASK_NAME, AgentWorkerManager, CodexExecModelExecutor
+from beehaiive.agent import (
+    DEMO_TASK_NAME,
+    AgentWorkerManager,
+    CancellableModelExecutor,
+    CodexExecModelExecutor,
+)
 from beehaiive.dashboard import build_dashboard_state
-from beehaiive.demo import demo_review_adapters
 from beehaiive.models import RunState, RunStatus
 from beehaiive.provider import ProviderError
 from beehaiive.review import (
@@ -27,7 +32,13 @@ from beehaiive.review import (
     ReviewService,
     ReviewStore,
 )
-from beehaiive.routing import ModelExecutor, ModelRouter, RoutingError, RoutingStore
+from beehaiive.routing import (
+    ModelExecutor,
+    ModelRouter,
+    RoutingConfig,
+    RoutingError,
+    RoutingStore,
+)
 from beehaiive.storage import (
     DEFAULT_EVENT_LIMIT,
     MAX_EVENT_LIMIT,
@@ -219,7 +230,10 @@ def create_app(
             routing_database = os.environ.get(
                 "BEEHAIIVE_ROUTING_DB", ".beehaiive/routing.db"
             )
-            model_router = ModelRouter(routing_store or RoutingStore(routing_database))
+            model_router = ModelRouter(
+                routing_store or RoutingStore(routing_database),
+                _routing_config_from_environment(),
+            )
         routing_service = model_router
 
     if orchestrator is None:
@@ -237,12 +251,26 @@ def create_app(
         orchestrator.model_router = routing_service
     if orchestrator.model_executor is None:
         orchestrator.model_executor = model_executor
-    if (
-        owns_orchestrator
-        and agent_worker is None
-        and isinstance(model_executor, CodexExecModelExecutor)
-    ):
-        agent_worker = AgentWorkerManager(orchestrator, model_executor)
+    effective_executor = orchestrator.model_executor
+    if agent_worker is None and effective_executor is not None:
+        required_worker_methods = (
+            "cancel",
+            "prepare_run",
+            "release_run",
+        )
+        if not all(
+            callable(getattr(effective_executor, name, None))
+            for name in required_worker_methods
+        ):
+            if owns_orchestrator:
+                raise ValueError(
+                    "The model executor must support cancellation and "
+                    "repository-bound worker preparation"
+                )
+        else:
+            agent_worker = AgentWorkerManager(
+                orchestrator, cast(CancellableModelExecutor, effective_executor)
+            )
     if (
         review_service is not None
         and review_store is not None
@@ -254,14 +282,10 @@ def create_app(
         for value in (review_provider, review_readers, review_authorizer)
     ):
         raise ValueError("Review adapters must be configured on the review service")
+    review_operations_enabled = (
+        os.environ.get("BEEHAIIVE_REVIEW_MODE", "").strip().lower() != "demo"
+    )
     if review_service is None:
-        if (
-            require_review_adapters
-            and os.environ.get("BEEHAIIVE_REVIEW_MODE", "").strip().lower() == "demo"
-            and review_provider is None
-            and review_readers is None
-        ):
-            review_provider, review_readers = demo_review_adapters()
         review_database = os.environ.get("BEEHAIIVE_REVIEW_DB", ".beehaiive/reviews.db")
         review_service = ReviewService(
             review_store or ReviewStore(review_database),
@@ -278,7 +302,7 @@ def create_app(
         async def shutdown_agent_workers() -> None:  # pyright: ignore[reportUnusedFunction]
             agent_worker.shutdown()
 
-    if require_review_adapters:
+    if require_review_adapters and review_operations_enabled:
 
         @app.on_event("startup")  # pyright: ignore[reportDeprecated]
         async def require_configured_review_adapters() -> None:  # pyright: ignore[reportUnusedFunction]
@@ -324,6 +348,10 @@ def create_app(
     def require_review_access(
         supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
     ) -> str:
+        if not review_operations_enabled:
+            raise HTTPException(
+                status_code=503, detail="Review operations are disabled in demo mode"
+            )
         require_api_key(supplied_api_key)
         if configured_review_actor is None or not configured_review_actor.strip():
             raise HTTPException(
@@ -360,14 +388,15 @@ def create_app(
             )
         ):
             raise HTTPException(status_code=403, detail="Run is not authorized")
-        try:
-            orchestrator.store.validate_lease(
-                run_id, _required_header(lease_token, "X-Lease-Token")
-            )
-        except StoreError as exc:
-            raise HTTPException(
-                status_code=403, detail="Run is not authorized"
-            ) from exc
+        if run.status is RunStatus.ACTIVE:
+            try:
+                orchestrator.store.validate_lease(
+                    run_id, _required_header(lease_token, "X-Lease-Token")
+                )
+            except StoreError as exc:
+                raise HTTPException(
+                    status_code=403, detail="Run is not authorized"
+                ) from exc
 
     def require_mutation_access(
         request: Request,
@@ -1067,6 +1096,18 @@ def _configured_project_ids(
     return frozenset()
 
 
+def _routing_config_from_environment() -> RoutingConfig:
+    config = RoutingConfig()
+    override = os.environ.get("BEEHAIIVE_CODEX_MODEL", "").strip()
+    if not override:
+        return config
+    return replace(
+        config,
+        writer=replace(config.writer, model=override),
+        triage=tuple(replace(spec, model=override) for spec in config.triage),
+    )
+
+
 def _required_header(value: str | None, name: str) -> str:
     if not value or not value.strip():
         raise HTTPException(status_code=401, detail=f"{name} is required")
@@ -1190,6 +1231,8 @@ def _execute_dashboard_action(
     if isinstance(request, DashboardStartRequest):
         if request.repository is None:
             return orchestrator.synchronize(project_id)
+        if agent_worker is None:
+            raise StoreError("Agent worker is not configured")
         run = orchestrator.claim(
             project_id,
             request.repository,
@@ -1197,9 +1240,16 @@ def _execute_dashboard_action(
         )
         if run is None:
             raise StoreError("No claimable PBI is available for this repository")
-        if agent_worker is None:
-            return {"run": _public_run_dict(run)}
-        agent_worker.start(run)
+        try:
+            agent_worker.start(run)
+        except Exception as exc:
+            try:
+                orchestrator.stop(run.run_id, f"Agent worker failed to start: {exc}")
+            except StoreError as stop_error:
+                raise StoreError(
+                    f"Agent worker failed to start and cleanup failed: {stop_error}"
+                ) from exc
+            raise StoreError(f"Agent worker failed to start: {exc}") from exc
         return {
             "run": _public_run_dict(run),
             "worker": {"status": "started", "task": DEMO_TASK_NAME},

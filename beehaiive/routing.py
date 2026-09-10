@@ -574,6 +574,53 @@ class RoutingStore:
             )
         return saved_state, replace(attempt, attempt_id=int(attempt_id))
 
+    def reopen_problem(
+        self, problem_id: str, expected_round: int, state: RoutingState
+    ) -> RoutingState:
+        with self._transaction() as connection:
+            current = connection.execute(
+                "SELECT round FROM routing_problems WHERE problem_id = ?",
+                (problem_id,),
+            ).fetchone()
+            if current is None:
+                raise RoutingError(f"Unknown routing problem: {problem_id}")
+            if int(current["round"]) != expected_round:
+                raise RoutingError("Routing problem changed during recovery")
+            connection.execute(
+                """
+                UPDATE routing_problems
+                SET status = ?, current_tier = ?, triage_index = ?,
+                    consecutive_failures = ?, bounce_count = ?, round = ?,
+                    total_tokens = ?, total_cost = ?, recursive_spawn_depth = ?,
+                    last_failure_context = ?, required_action = ?,
+                    next_reason = ?, updated_at = ?
+                WHERE problem_id = ?
+                """,
+                (
+                    state.status.value,
+                    state.current_tier.value,
+                    state.triage_index,
+                    state.consecutive_failures,
+                    state.bounce_count,
+                    state.round,
+                    state.total_tokens,
+                    state.total_cost,
+                    state.recursive_spawn_depth,
+                    state.last_failure_context,
+                    state.required_action,
+                    state.next_reason,
+                    state.updated_at,
+                    problem_id,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM routing_problems WHERE problem_id = ?",
+                (problem_id,),
+            ).fetchone()
+            if row is None:  # pragma: no cover - guarded by the update
+                raise RoutingError(f"Unknown routing problem: {problem_id}")
+            return _state_from_row(row)
+
 
 def _state_values(state: RoutingState) -> tuple[object, ...]:
     return (
@@ -681,6 +728,39 @@ class ModelRouter:
             None,
             self.store.get_attempts(normalized_id),
         )
+
+    def reopen_resolved(self, problem_id: str, reason: str) -> RoutingResult:
+        """Make a resolved route retryable after its run result was not durable."""
+
+        normalized_id = _problem_id(problem_id)
+        context = _compact_context(reason)
+        if not context:
+            raise RoutingError("A routing recovery reason is required")
+        with self.coordinate(normalized_id):
+            current = self.snapshot(normalized_id)
+            if current.state.status is not RoutingStatus.RESOLVED:
+                return current
+            state = self.store.reopen_problem(
+                normalized_id,
+                current.state.round,
+                replace(
+                    current.state,
+                    status=RoutingStatus.ACTIVE,
+                    current_tier=self.config.writer.tier,
+                    triage_index=0,
+                    consecutive_failures=0,
+                    required_action=None,
+                    last_failure_context=context,
+                    next_reason="retry after run persistence failure",
+                    updated_at=_now(),
+                ),
+            )
+            return RoutingResult(
+                state,
+                self._decision(state),
+                None,
+                self.store.get_attempts(normalized_id),
+            )
 
     @contextmanager
     def coordinate(self, problem_id: str) -> Generator[None]:

@@ -18,7 +18,12 @@ def test_readme_documents_the_clean_device_demo_path() -> None:
         "BEEHAIIVE_ALLOWED_PROJECTS",
         "BEEHAIIVE_API_KEY",
         "BEEHAIIVE_AGENT_REPOSITORY",
+        "BEEHAIIVE_AGENT_REPOSITORY_NAME",
         "/dashboard?project=<owner>:<number>",
+        "git clone",
+        "GitHub CLI",
+        "Node.js",
+        "Chromium",
         "Start writer",
         "Result",
         "Failure",
@@ -40,11 +45,12 @@ def test_batch_launcher_is_rooted_and_actionable() -> None:
     assert 'if exist ".env"' in launcher
     assert "eol=# tokens=1,* delims==" in launcher
     assert "where uv" in launcher
-    assert "where codex" in launcher
+    assert 'where "%BEEHAIIVE_CODEX_EXECUTABLE%"' in launcher
     assert "GITHUB_TOKEN or GH_TOKEN" in launcher
     assert "GITHUB_PROJECT_OWNER" in launcher
     assert "GITHUB_PROJECT_NUMBER" in launcher
     assert "BEEHAIIVE_API_KEY" in launcher
+    assert "BEEHAIIVE_AGENT_REPOSITORY_NAME" in launcher
     assert "uv run uvicorn main:app --reload" in launcher
 
 
@@ -59,6 +65,8 @@ def test_batch_launcher_loads_dotenv_values(tmp_path: Path) -> None:
                 "GITHUB_PROJECT_OWNER=dotenv-owner",
                 "GITHUB_PROJECT_NUMBER=42",
                 "BEEHAIIVE_API_KEY=dotenv-api-key",
+                "BEEHAIIVE_AGENT_REPOSITORY_NAME=dotenv-owner/api",
+                "BEEHAIIVE_CODEX_EXECUTABLE=custom-codex",
             )
         )
         + "\n",
@@ -74,7 +82,7 @@ def test_batch_launcher_loads_dotenv_values(tmp_path: Path) -> None:
         "echo api-key=%BEEHAIIVE_API_KEY%\n",
         encoding="utf-8",
     )
-    (command_dir / "codex.cmd").write_text("@echo off\n", encoding="utf-8")
+    (command_dir / "custom-codex.cmd").write_text("@echo off\n", encoding="utf-8")
     launcher = tmp_path / "start_dashboard.bat"
     shutil.copy2(ROOT / "start_dashboard.bat", launcher)
 
@@ -85,6 +93,8 @@ def test_batch_launcher_loads_dotenv_values(tmp_path: Path) -> None:
         "GITHUB_PROJECT_OWNER",
         "GITHUB_PROJECT_NUMBER",
         "BEEHAIIVE_API_KEY",
+        "BEEHAIIVE_AGENT_REPOSITORY_NAME",
+        "BEEHAIIVE_CODEX_EXECUTABLE",
     ):
         environment.pop(name, None)
     environment["PATH"] = f"{command_dir}{os.pathsep}{environment['PATH']}"

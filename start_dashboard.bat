@@ -20,6 +20,7 @@ if exist ".env" (
         if /i "%%~A"=="BEEHAIIVE_API_KEY" if not defined BEEHAIIVE_API_KEY set "BEEHAIIVE_API_KEY=%%~B"
         if /i "%%~A"=="BEEHAIIVE_REVIEW_MODE" if not defined BEEHAIIVE_REVIEW_MODE set "BEEHAIIVE_REVIEW_MODE=%%~B"
         if /i "%%~A"=="BEEHAIIVE_AGENT_REPOSITORY" if not defined BEEHAIIVE_AGENT_REPOSITORY set "BEEHAIIVE_AGENT_REPOSITORY=%%~B"
+        if /i "%%~A"=="BEEHAIIVE_AGENT_REPOSITORY_NAME" if not defined BEEHAIIVE_AGENT_REPOSITORY_NAME set "BEEHAIIVE_AGENT_REPOSITORY_NAME=%%~B"
         if /i "%%~A"=="BEEHAIIVE_AGENT_TIMEOUT_SECONDS" if not defined BEEHAIIVE_AGENT_TIMEOUT_SECONDS set "BEEHAIIVE_AGENT_TIMEOUT_SECONDS=%%~B"
         if /i "%%~A"=="BEEHAIIVE_CODEX_EXECUTABLE" if not defined BEEHAIIVE_CODEX_EXECUTABLE set "BEEHAIIVE_CODEX_EXECUTABLE=%%~B"
         if /i "%%~A"=="BEEHAIIVE_CODEX_MODEL" if not defined BEEHAIIVE_CODEX_MODEL set "BEEHAIIVE_CODEX_MODEL=%%~B"
@@ -33,9 +34,10 @@ if errorlevel 1 (
     exit /b 1
 )
 
-where codex >nul 2>&1
+if not defined BEEHAIIVE_CODEX_EXECUTABLE set "BEEHAIIVE_CODEX_EXECUTABLE=codex"
+where "%BEEHAIIVE_CODEX_EXECUTABLE%" >nul 2>&1
 if errorlevel 1 (
-    echo The Codex CLI is required for the bounded worker demo.
+    echo The configured Codex CLI executable was not found: %BEEHAIIVE_CODEX_EXECUTABLE%
     pause
     exit /b 1
 )
@@ -57,6 +59,11 @@ if not defined GITHUB_PROJECT_NUMBER (
 )
 if not defined BEEHAIIVE_API_KEY (
     echo Set BEEHAIIVE_API_KEY before starting the dashboard.
+    pause
+    exit /b 1
+)
+if not defined BEEHAIIVE_AGENT_REPOSITORY_NAME (
+    echo Set BEEHAIIVE_AGENT_REPOSITORY_NAME to the exact linked repository owner/name.
     pause
     exit /b 1
 )

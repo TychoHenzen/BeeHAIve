@@ -5,23 +5,25 @@ dashboard reads the live Project state, claims one repository writer run, and
 can execute one bounded local demo task.
 
 The demo task is named **bounded repository inventory**. It asks the Codex CLI
-to inspect the current checkout and report its repository name, current branch,
-and tracked-file count. It does not edit files, create files, access the
-network, read credentials, or start another agent. Its plain-text result is
-shown on the completed PBI card. It creates no file artifact.
+to inspect a temporary credential-free copy of the configured checkout and
+report its repository name, current branch, and tracked-file count. It does not
+edit files, create files, access the network, read credentials, or start
+another agent. Its plain-text result is shown on the completed PBI card.
 
 This delivery does not claim autonomous swarms, multi-device coordination,
 production pull-request review adapters, or automatic pull-request creation.
 
 ## Clean Windows setup
 
-Prerequisites are Windows, Python 3.13, `uv`, the Codex CLI, and a Chromium
-browser if you want to run the browser smoke proof. GitHub access must include
-the selected Project and its linked issue metadata.
+Prerequisites are Windows, Git, Python 3.13, `uv`, GitHub CLI, Node.js, the
+Codex CLI, and Chromium. GitHub access must include the selected Project and
+its linked issue metadata.
 
-From a clean checkout, run:
+Install Python 3.13 and `uv`, then check out the repository:
 
 ```powershell
+git clone https://github.com/TychoHenzen/BeeHAIve.git
+Set-Location BeeHAIve
 uv sync
 gh auth status
 Copy-Item .env.example .env
@@ -38,29 +40,32 @@ BEEHAIIVE_ALLOWED_PROJECTS=<owner>:<number>
 BEEHAIIVE_API_KEY=<operator-key>
 BEEHAIIVE_REVIEW_MODE=demo
 # BEEHAIIVE_AGENT_REPOSITORY=<path-to-BeeHAIve>
+BEEHAIIVE_AGENT_REPOSITORY_NAME=<owner>/<repository>
+# BEEHAIIVE_AGENT_TIMEOUT_SECONDS=120
+# BEEHAIIVE_CODEX_EXECUTABLE=codex
 ```
 
 The project ID is exactly `<owner>:<number>`. The tracked launcher reads the
 gitignored `.env` file before checking these values. Existing process variables
-take precedence. Direct `uv run uvicorn main:app --reload` still needs the
-variables in the process environment. Do not commit the `.env` file or place
-its values in screenshots.
+take precedence. `BEEHAIIVE_AGENT_REPOSITORY_NAME` must match the repository
+selected in the Project. The timeout must be finite and no greater than 900
+seconds. Do not commit `.env` or place its values in screenshots.
 
-Start the service from the repository root:
-
-```powershell
-uv run uvicorn main:app --reload
-```
-
-The tracked launcher performs the same checks and starts the same command:
+Start the service from the repository root so the launcher loads `.env`:
 
 ```powershell
 .\start_dashboard.bat
 ```
 
+The launcher checks `uv`, the configured Codex executable, GitHub configuration,
+and the API key. It starts `uv run uvicorn main:app --reload` and keeps the
+server output visible. Direct Uvicorn startup is supported only when the same
+variables are already present in the process environment.
+
 Open `http://127.0.0.1:8000/dashboard?project=<owner>:<number>` and
-`http://127.0.0.1:8000/docs`. Enter the API key in the dashboard only when you
-use an operator action. Read-only state does not require it.
+`http://127.0.0.1:8000/docs`. Viewing the dashboard does not need an API key.
+Before clicking an action such as **Start writer**, enter the value of
+`BEEHAIIVE_API_KEY` from `.env` in the dashboard API-key field.
 
 ## Run the live demo
 
@@ -72,10 +77,12 @@ use an operator action. Read-only state does not require it.
 5. Wait for the completed PBI card. Its **Result** field contains the agent's
    plain-text inventory result, and the completed-run count increases.
 
-The worker uses `codex exec --sandbox read-only --ephemeral --json` with a fixed
-timeout. The service renews the run lease while the process runs. **Stop**
-terminates the process tree, marks the run failed with a reason, and clears the
-lease. Service shutdown performs the same cleanup for active workers.
+The worker uses `codex exec --sandbox read-only --ephemeral --json` with a
+finite timeout. It receives an explicit model selected by the routing tier and
+a temporary copy that excludes local environment and credential files. The
+service renews the run lease while the process runs. **Stop**, failure, sync
+removal, and service shutdown terminate the process tree, mark the run failed
+with a reason, and clear the lease.
 
 If the demo fails, read the PBI **Failure** field and the action log. Check the
 GitHub token, exact project allowlist, `codex` availability, and the local
@@ -91,12 +98,16 @@ Redacted, versioned browser evidence is kept here:
 - [Completed result](docs/screenshots/completed-demo.png)
 - [Stopped or failed run](docs/screenshots/stopped-demo.png)
 
-These captures come from the deterministic browser proof and contain no live
-project identifiers or credentials. Regenerate them with:
+These captures come from the live browser proof and are redacted before they
+are written. They contain no project identifiers, repository names, or
+credentials. Regenerate them with the configured `.env`:
 
 ```powershell
 uv run python -m scripts.dashboard_screenshots
 ```
+
+Use `BEEHAIIVE_SCREENSHOT_MODE=fixture` only for local supplementary evidence.
+The committed captures must come from the live mode.
 
 Run the deterministic fixture proof without GitHub mutations:
 

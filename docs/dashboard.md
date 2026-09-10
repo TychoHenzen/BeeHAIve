@@ -28,10 +28,12 @@ result is shown on the PBI card. Every action is recorded as `pending`,
 state.
 
 The demo worker runs `codex exec` with a read-only sandbox, an ephemeral
-session, and a fixed timeout. It reads only the checkout configured by
-`BEEHAIIVE_AGENT_REPOSITORY`. Stop and service shutdown terminate the process
-tree and clear the run lease. The demo mode uses deterministic review adapters
-only to let the production app start. It is not a live pull-request review.
+session, and a finite timeout. It reads a temporary credential-free copy of the
+checkout configured by `BEEHAIIVE_AGENT_REPOSITORY`, and requires its exact
+`BEEHAIIVE_AGENT_REPOSITORY_NAME` identity to match the claimed repository.
+Stop, failure, project removal, and service shutdown terminate the process tree
+and clear the run lease. Demo review mode disables review operations. It is not
+a live pull-request review.
 
 A new local database is synchronized from GitHub when the dashboard first
 refreshes. Later refreshes synchronize again before reading the projection, so

@@ -1,3 +1,5 @@
+import importlib
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -10,9 +12,9 @@ from beehaiive.models import (
     Stage,
 )
 from beehaiive.orchestrator import Orchestrator
-from beehaiive.provider import ProviderError
+from beehaiive.provider import EnvironmentGitHubProvider, ProviderError
 from beehaiive.storage import OrchestratorStore
-from main import _configured_project_ids, create_app
+from main import _configured_project_ids, _routing_config_from_environment, create_app
 
 client = TestClient(create_app())
 
@@ -232,6 +234,36 @@ def test_project_scope_configuration_uses_environment(
     assert _configured_project_ids(None) == {"owner:7"}
 
 
+def test_routing_model_override_is_applied_before_worker_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BEEHAIIVE_CODEX_MODEL", "configured-model")
+    config = _routing_config_from_environment()
+
+    assert config.writer.model == "configured-model"
+    assert {spec.model for spec in config.triage} == {"configured-model"}
+
+
+def test_owned_app_rejects_an_executor_without_worker_capabilities(
+    tmp_path,
+) -> None:
+    class BareExecutor:
+        def execute(self, spec, decision):
+            del spec, decision
+            return None
+
+    store = OrchestratorStore(tmp_path / "state.db")
+    try:
+        with pytest.raises(ValueError, match="cancellation"):
+            create_app(
+                store=store,
+                model_executor=BareExecutor(),
+                allowed_project_ids={"owner:1"},
+            )
+    finally:
+        store.close()
+
+
 def test_demo_mode_starts_production_app_with_bounded_adapters(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
@@ -248,5 +280,50 @@ def test_demo_mode_starts_production_app_with_bounded_adapters(
         )
     ) as demo_client:
         response = demo_client.get("/")
+        review_response = demo_client.post(
+            "/reviews/ready",
+            headers={"X-API-Key": "test-key"},
+            json={"pull_request_id": "PR-1"},
+        )
 
     assert response.status_code == 200
+    assert review_response.status_code == 503
+    assert review_response.json()["detail"] == (
+        "Review operations are disabled in demo mode"
+    )
+
+
+def test_production_entrypoint_serves_live_project_routes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.delenv("BEEHAIIVE_SKIP_PRODUCTION_APP", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "test-github-token")
+    monkeypatch.setenv("GITHUB_PROJECT_OWNER", "owner")
+    monkeypatch.setenv("GITHUB_PROJECT_NUMBER", "7")
+    monkeypatch.setenv("GITHUB_PROJECT_OWNER_TYPE", "user")
+    monkeypatch.setenv("BEEHAIIVE_ALLOWED_PROJECTS", "owner:7")
+    monkeypatch.setenv("BEEHAIIVE_API_KEY", "test-api-key")
+    monkeypatch.setenv("BEEHAIIVE_REVIEW_MODE", "demo")
+    monkeypatch.setenv("BEEHAIIVE_AGENT_REPOSITORY", str(tmp_path))
+    monkeypatch.setenv("BEEHAIIVE_AGENT_REPOSITORY_NAME", "owner/api")
+    monkeypatch.setenv("BEEHAIIVE_STATE_DB", str(tmp_path / "state.db"))
+    monkeypatch.setenv("BEEHAIIVE_ROUTING_DB", str(tmp_path / "routing.db"))
+    monkeypatch.setenv("BEEHAIIVE_REVIEW_DB", str(tmp_path / "review.db"))
+    monkeypatch.setenv("BEEHAIIVE_WORKFLOW_DB", str(tmp_path / "workflow.db"))
+
+    def discover_project(_provider: EnvironmentGitHubProvider, project_id: str):
+        return ApiProvider().discover_project(project_id)
+
+    monkeypatch.setattr(EnvironmentGitHubProvider, "discover_project", discover_project)
+    import main as main_module
+
+    reloaded = importlib.reload(main_module)
+    assert reloaded.app is not None
+    with TestClient(reloaded.app) as production_client:
+        assert production_client.get("/dashboard").status_code == 200
+        assert production_client.get("/docs").status_code == 200
+        dashboard = production_client.get("/projects/owner:7/dashboard")
+
+    assert dashboard.status_code == 200
+    assert dashboard.json()["project_id"] == "owner:7"
+    assert dashboard.json()["repositories"][0]["name"] == "owner/api"

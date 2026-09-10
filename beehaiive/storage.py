@@ -315,7 +315,8 @@ class OrchestratorStore:
             (self._lease_deadline(), _now(), run_id, lease_token),
         )
 
-    def sync_project(self, snapshot: ProjectSnapshot) -> None:
+    def sync_project(self, snapshot: ProjectSnapshot) -> tuple[str, ...]:
+        removed_run_ids: list[str] = []
         with self._transaction() as connection:
             connection.execute(
                 """
@@ -469,11 +470,13 @@ class OrchestratorStore:
                 (snapshot.project_id,),
             ).fetchall()
             for removed_run in removed_runs:
+                removed_run_ids.append(str(removed_run["run_id"]))
                 connection.execute(
                     """
                     UPDATE runs
                     SET status = 'failed', execution_token = NULL,
-                        last_error = ?, updated_at = ?
+                        last_error = ?, lease_token = NULL,
+                        lease_expires_at = NULL, updated_at = ?
                     WHERE run_id = ?
                     """,
                     (
@@ -505,6 +508,7 @@ class OrchestratorStore:
                     Stage(str(removed_run["stage"])),
                     {"reason": "pbi no longer linked to selected project"},
                 )
+        return tuple(removed_run_ids)
 
     def claim_next(
         self,
@@ -1157,7 +1161,14 @@ class OrchestratorStore:
             )
             return self._run_for_id(connection, run_id) or row
 
-    def fail_agent_run(self, run_id: str, error: str, lease_token: str) -> RunState:
+    def fail_agent_run(
+        self,
+        run_id: str,
+        error: str,
+        lease_token: str,
+        *,
+        claimable: bool | None = None,
+    ) -> RunState:
         """Persist a worker failure and release its lease for a later retry."""
 
         normalized_error = error.strip()
@@ -1190,7 +1201,11 @@ class OrchestratorStore:
                 WHERE project_id = ? AND repository_name = ? AND number = ?
                 """,
                 (
-                    int(row.stage is not Stage.PULL_REQUEST),
+                    int(
+                        row.stage is not Stage.PULL_REQUEST
+                        if claimable is None
+                        else claimable
+                    ),
                     normalized_error,
                     row.project_id,
                     row.repository,
@@ -1209,6 +1224,74 @@ class OrchestratorStore:
                 {"error": normalized_error},
             )
             return self._run_for_id(connection, run_id) or row
+
+    def fail_agent_run_after_lease_loss(self, run_id: str, error: str) -> RunState:
+        """Record a worker failure even when its lease can no longer be used."""
+
+        normalized_error = error.strip()
+        if not normalized_error:
+            raise StoreError("A failure reason is required")
+        normalized_error = normalized_error[:MAX_AGENT_RESULT_LENGTH]
+        with self._transaction() as connection:
+            row = self._run_for_id(connection, run_id)
+            if row is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            if row.status in {RunStatus.COMPLETED, RunStatus.FAILED}:
+                return row
+            now = _now()
+            connection.execute(
+                """
+                UPDATE runs
+                SET status = 'failed', execution_token = NULL,
+                    last_error = ?, last_result = NULL, lease_token = NULL,
+                    lease_expires_at = NULL, updated_at = ?
+                WHERE run_id = ? AND status = 'active'
+                """,
+                (normalized_error, now, run_id),
+            )
+            connection.execute(
+                """
+                UPDATE pbis SET claimable = ?, last_error = ?
+                WHERE project_id = ? AND repository_name = ? AND number = ?
+                """,
+                (
+                    int(row.stage is not Stage.PULL_REQUEST),
+                    normalized_error,
+                    row.project_id,
+                    row.repository,
+                    row.pbi_number,
+                ),
+            )
+            self._record_event(
+                connection,
+                row.project_id,
+                row.repository,
+                row.pbi_number,
+                run_id,
+                "failure",
+                row.stage,
+                row.stage,
+                {"error": normalized_error, "lease_lost": True},
+            )
+            return self._run_for_id(connection, run_id) or row
+
+    def set_run_claimable(self, run_id: str, claimable: bool) -> None:
+        with self._transaction() as connection:
+            row = self._run_for_id(connection, run_id)
+            if row is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            connection.execute(
+                """
+                UPDATE pbis SET claimable = ?
+                WHERE project_id = ? AND repository_name = ? AND number = ?
+                """,
+                (
+                    int(claimable),
+                    row.project_id,
+                    row.repository,
+                    row.pbi_number,
+                ),
+            )
 
     def pending_routing_failures(self, run_id: str) -> tuple[RoutingFailure, ...]:
         with self._lock:
@@ -1383,6 +1466,19 @@ class OrchestratorStore:
     def get_run(self, run_id: str) -> RunState | None:
         with self._lock:
             return self._run_for_id(self._connection, run_id)
+
+    def active_runs_for_project(self, project_id: str) -> tuple[RunState, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT run_id FROM runs WHERE project_id = ? AND status = 'active'",
+                (project_id,),
+            ).fetchall()
+            return tuple(
+                run
+                for row in rows
+                if (run := self._run_for_id(self._connection, str(row["run_id"])))
+                is not None
+            )
 
     def is_active_repository(self, project_id: str, repository: str) -> bool:
         with self._lock:

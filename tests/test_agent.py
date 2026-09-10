@@ -5,6 +5,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 from threading import Thread
+from types import SimpleNamespace
 
 import pytest
 from conftest import FakeProvider
@@ -27,6 +28,7 @@ from beehaiive.routing import (
     ModelExecution,
     ModelRouter,
     ModelTier,
+    RoutingStatus,
     RoutingStore,
 )
 from beehaiive.storage import OrchestratorStore, StoreError
@@ -40,6 +42,7 @@ class ScriptExecutor(CodexExecModelExecutor):
             repository,
             executable=sys.executable,
             timeout_seconds=timeout_seconds,
+            repository_name="owner/api",
         )
         self.script = script
 
@@ -55,7 +58,7 @@ class ScriptExecutor(CodexExecModelExecutor):
 
 class ImmediateExecutor(CodexExecModelExecutor):
     def __init__(self, result: ModelExecution) -> None:
-        super().__init__(Path.cwd())
+        super().__init__(Path.cwd(), repository_name="owner/api")
         self.result = result
 
     def execute(self, spec, decision) -> ModelExecution:
@@ -179,6 +182,138 @@ def test_executor_validates_configuration_and_reads_environment(
     safe_environment = executor._safe_environment()
     assert "GITHUB_TOKEN" not in safe_environment
     assert "BEEHAIIVE_API_KEY" not in safe_environment
+    monkeypatch.setenv("DATABASE_URL", "postgres://secret")
+    monkeypatch.setenv("PIP_INDEX_URL", "https://secret.example")
+    safe_environment = executor._safe_environment()
+    assert "DATABASE_URL" not in safe_environment
+    assert "PIP_INDEX_URL" not in safe_environment
+    assert "PATH" in safe_environment
+
+    monkeypatch.setenv("BEEHAIIVE_AGENT_TIMEOUT_SECONDS", "nan")
+    with pytest.raises(ValueError, match="finite"):
+        CodexExecModelExecutor.from_environment()
+    monkeypatch.setenv("BEEHAIIVE_AGENT_TIMEOUT_SECONDS", "inf")
+    with pytest.raises(ValueError, match="finite"):
+        CodexExecModelExecutor.from_environment()
+
+
+def test_executor_binds_repository_and_uses_selected_model(tmp_path: Path) -> None:
+    executor = CodexExecModelExecutor(
+        tmp_path, model="configured-model", repository_name="owner/api"
+    )
+    with pytest.raises(StoreError, match="identity is not configured"):
+        CodexExecModelExecutor(tmp_path).validate_repository("owner/api")
+    with pytest.raises(StoreError, match="does not match"):
+        executor.validate_repository("owner/other")
+    command = executor._command_for_execution("prompt", "selected-model", tmp_path)
+    assert command[-3:] == ["--model", "selected-model", "prompt"]
+
+
+def test_executor_safe_checkout_excludes_local_secret_files(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("safe\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("TOKEN=secret\n", encoding="utf-8")
+    (tmp_path / ".env.production").write_text("TOKEN=secret\n", encoding="utf-8")
+    (tmp_path / "secret.txt").write_text("secret\n", encoding="utf-8")
+    executor = CodexExecModelExecutor(tmp_path, repository_name="owner/api")
+
+    with executor._safe_checkout() as checkout:
+        assert (checkout / "README.md").is_file()
+        assert not (checkout / ".env").exists()
+        assert not (checkout / ".env.production").exists()
+        assert not (checkout / "secret.txt").exists()
+
+
+def test_executor_repository_discovery_handles_git_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_run = agent_module.subprocess.run
+
+    def git_run(command, **kwargs):
+        if command[-3:] == ["config", "--get", "remote.origin.url"]:
+            return SimpleNamespace(stdout="git@github.com:owner/api.git", returncode=0)
+        return original_run(command, **kwargs)
+
+    monkeypatch.setattr(agent_module.subprocess, "run", git_run)
+    executor = CodexExecModelExecutor(tmp_path)
+    assert executor.repository_name == "owner/api"
+
+    def broken_run(*args, **kwargs):
+        del args, kwargs
+        raise OSError("git unavailable")
+
+    monkeypatch.setattr(agent_module.subprocess, "run", broken_run)
+    assert CodexExecModelExecutor(tmp_path).repository_name is None
+
+
+def test_executor_handles_communicate_timeout_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executor = ScriptExecutor(tmp_path, tmp_path / "unused.py")
+    router = ModelRouter(RoutingStore())
+
+    monkeypatch.setattr(
+        executor, "_start_process", lambda command, environment: object()
+    )
+
+    def raise_timeout(process, timeout):
+        del process, timeout
+        raise subprocess.TimeoutExpired("codex", 1)
+
+    monkeypatch.setattr(executor, "_communicate_bounded", raise_timeout)
+    monkeypatch.setattr(
+        CodexExecModelExecutor,
+        "_terminate_process",
+        staticmethod(lambda process: None),
+    )
+
+    result = executor.execute(
+        router.config.spec_for(ModelTier.LUNA),
+        router.begin("communicate-timeout").decision,
+    )
+
+    assert result.outcome is AttemptOutcome.FAILURE
+    assert "timed out" in result.failure_context
+
+
+def test_executor_safe_checkout_skips_unsafe_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outside = tmp_path.parent / "outside-agent-file.txt"
+    outside.write_text("outside\n", encoding="utf-8")
+    (tmp_path / "directory").mkdir()
+    executor = CodexExecModelExecutor(tmp_path, repository_name="owner/api")
+    monkeypatch.setattr(
+        executor,
+        "_repository_files",
+        lambda: (Path("../outside-agent-file.txt"), Path("directory")),
+    )
+
+    with executor._safe_checkout() as checkout:
+        assert not (checkout / "outside-agent-file.txt").exists()
+        assert not (checkout / "directory").exists()
+
+
+def test_executor_repository_file_discovery_uses_git_and_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executor = CodexExecModelExecutor(tmp_path, repository_name="owner/api")
+
+    def git_timeout(*args, **kwargs):
+        del args, kwargs
+        raise subprocess.TimeoutExpired("git", 5)
+
+    monkeypatch.setattr(agent_module.subprocess, "run", git_timeout)
+    (tmp_path / "fallback.py").write_text("pass\n", encoding="utf-8")
+    assert executor._repository_files() == (Path("fallback.py"),)
+
+    monkeypatch.setattr(
+        agent_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, stdout=b"one.py\0nested/two.py\0"
+        ),
+    )
+    assert executor._repository_files() == (Path("one.py"), Path("nested/two.py"))
 
 
 def test_executor_honors_cancellation_before_and_during_launch(
@@ -186,6 +321,7 @@ def test_executor_honors_cancellation_before_and_during_launch(
 ) -> None:
     router = ModelRouter(RoutingStore())
     executor = ScriptExecutor(tmp_path, tmp_path / "unused.py")
+    executor.prepare_run("cancel-before-launch", "owner/api")
     executor.cancel("cancel-before-launch")
     result = executor.execute(
         router.config.spec_for(ModelTier.LUNA),
@@ -400,6 +536,106 @@ def test_executor_builds_model_command_and_covers_process_helpers(
     CodexExecModelExecutor._terminate_process(windows_timed)
     assert windows_timed.killed
 
+    def raise_timeout(*args, **kwargs):
+        del args, kwargs
+        raise subprocess.TimeoutExpired("taskkill", 3)
+
+    monkeypatch.setattr(agent_module.subprocess, "run", raise_timeout)
+
+    class StuckProcess(Process):
+        def wait(self, timeout=None):
+            del timeout
+            self.waits += 1
+            raise subprocess.TimeoutExpired("process", 3)
+
+    CodexExecModelExecutor._terminate_process(StuckProcess())
+
+
+def test_executor_bounds_stdout_and_stderr_collection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Stream:
+        def __init__(self, chunks) -> None:
+            self.chunks = iter(chunks)
+            self.closed = False
+
+        def read(self, size):
+            del size
+            return next(self.chunks, b"")
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FailingStream(Stream):
+        def read(self, size):
+            del size
+            raise OSError("pipe closed")
+
+    class Process:
+        stdout = Stream(["x" * 100_000, ""])
+        stderr = FailingStream([])
+
+        def wait(self, timeout=None):
+            del timeout
+
+    stdout, stderr, timed_out = CodexExecModelExecutor._communicate_bounded(
+        Process(), 1
+    )
+    assert len(stdout) == agent_module.MAX_AGENT_OUTPUT_BYTES
+    assert stderr == ""
+    assert timed_out is False
+
+    class EmptyProcess:
+        stdout = None
+        stderr = None
+
+        def wait(self, timeout=None):
+            del timeout
+
+    assert CodexExecModelExecutor._communicate_bounded(EmptyProcess(), 1) == (
+        "",
+        "",
+        False,
+    )
+
+    class CloseTrackingStream:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def read(self, size):
+            del size
+            return b"ignored"
+
+        def close(self) -> None:
+            self.closed = True
+
+    stream = CloseTrackingStream()
+
+    class OneStuckReader:
+        def __init__(self, target, args, name, daemon) -> None:
+            del target, name, daemon
+            self.args = args
+
+        def start(self) -> None:
+            return None
+
+        def join(self, timeout=None) -> None:
+            del timeout
+
+        def is_alive(self) -> bool:
+            return True
+
+    class OneStreamProcess:
+        stdout = stream
+        stderr = None
+
+        def wait(self, timeout=None) -> None:
+            del timeout
+
+    monkeypatch.setattr(agent_module, "Thread", OneStuckReader)
+    CodexExecModelExecutor._communicate_bounded(OneStreamProcess(), 1)
+    assert stream.closed is True
+
 
 def test_executor_text_parser_rejects_unsupported_values() -> None:
     assert agent_module._text_value(3) == ""
@@ -433,6 +669,63 @@ def test_worker_manager_rejects_duplicates_and_shutdowns(
         with pytest.raises(StoreError, match="already active"):
             manager.start(run)
         manager.shutdown()
+        stopped = store.get_run(run.run_id)
+        assert stopped is not None
+        assert stopped.status is RunStatus.FAILED
+    finally:
+        store.close()
+        routing_store.close()
+
+
+def test_worker_manager_rolls_back_when_thread_start_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = ImmediateExecutor(
+        ModelExecution(AttemptOutcome.SUCCESS, result="unused")
+    )
+    service, store, routing_store, run = service_with_run(executor)
+
+    class FailingThread:
+        def __init__(self, target, args, name, daemon) -> None:
+            del target, args, name, daemon
+
+        def start(self) -> None:
+            raise RuntimeError("thread start failed")
+
+    monkeypatch.setattr(agent_module, "Thread", FailingThread)
+    manager = AgentWorkerManager(service, executor)
+    try:
+        with pytest.raises(RuntimeError, match="thread start failed"):
+            manager.start(run)
+        assert run.run_id not in manager._threads
+        assert run.run_id not in executor._active_attempts
+    finally:
+        store.close()
+        routing_store.close()
+
+
+def test_worker_manager_shutdown_uses_second_bounded_join() -> None:
+    executor = ImmediateExecutor(
+        ModelExecution(AttemptOutcome.SUCCESS, result="unused")
+    )
+    service, store, routing_store, run = service_with_run(executor)
+
+    class StuckThread:
+        def __init__(self) -> None:
+            self.joins: list[float | None] = []
+
+        def join(self, timeout=None) -> None:
+            self.joins.append(timeout)
+
+        def is_alive(self) -> bool:
+            return True
+
+    thread = StuckThread()
+    manager = AgentWorkerManager(service, executor)
+    manager._threads[run.run_id] = thread  # type: ignore[assignment]
+    try:
+        manager.shutdown()
+        assert thread.joins == [5, 1]
         stopped = store.get_run(run.run_id)
         assert stopped is not None
         assert stopped.status is RunStatus.FAILED
@@ -514,6 +807,187 @@ def test_worker_manager_records_unexpected_worker_exception() -> None:
     )
 
 
+def test_worker_manager_persists_human_handoff_without_claimability() -> None:
+    run = RunState(
+        "handoff-run",
+        "project-1",
+        "owner/api",
+        1,
+        "Demo PBI",
+        Stage.IMPLEMENT,
+        RunStatus.ACTIVE,
+        1,
+        owner_id="worker-1",
+        lease_token="lease-1",
+    )
+
+    class HandoffStore:
+        def __init__(self) -> None:
+            self.failure: tuple[str, str, str, bool | None] | None = None
+
+        def fail_agent_run(
+            self,
+            run_id: str,
+            error: str,
+            lease_token: str,
+            *,
+            claimable: bool | None = None,
+        ) -> None:
+            self.failure = (run_id, error, lease_token, claimable)
+
+    class HandoffOrchestrator:
+        def __init__(self) -> None:
+            self.store = HandoffStore()
+
+        def advance(self, run_id: str, target: Stage, lease_token: str) -> None:
+            del run_id, target, lease_token
+
+        def run_implementation_attempt(self, run_id: str, lease_token: str):
+            del run_id, lease_token
+            return SimpleNamespace(
+                state=SimpleNamespace(
+                    status=RoutingStatus.HUMAN_HANDOFF,
+                    required_action="Human approval is required",
+                ),
+                attempt=None,
+                decision=SimpleNamespace(failure_context=""),
+                execution_result=None,
+            )
+
+    executor = ImmediateExecutor(
+        ModelExecution(AttemptOutcome.SUCCESS, result="unused")
+    )
+    orchestrator = HandoffOrchestrator()
+    manager = AgentWorkerManager(orchestrator, executor)
+    manager._run(run.run_id, run.lease_token or "")
+
+    assert orchestrator.store.failure == (
+        run.run_id,
+        "Human approval is required",
+        "lease-1",
+        False,
+    )
+
+
+def test_worker_manager_reopens_routing_when_result_persistence_fails() -> None:
+    run = RunState(
+        "persist-run",
+        "project-1",
+        "owner/api",
+        1,
+        "Demo PBI",
+        Stage.IMPLEMENT,
+        RunStatus.ACTIVE,
+        1,
+        owner_id="worker-1",
+        lease_token="lease-1",
+    )
+
+    class PersistenceStore:
+        def __init__(self) -> None:
+            self.failure: tuple[str, str, str] | None = None
+
+        def complete_agent_run(self, run_id: str, result: str, lease_token: str):
+            del run_id, result, lease_token
+            raise RuntimeError("database unavailable")
+
+        def get_run(self, run_id: str) -> RunState:
+            assert run_id == run.run_id
+            return run
+
+        def fail_agent_run(self, run_id: str, error: str, lease_token: str) -> None:
+            self.failure = (run_id, error, lease_token)
+
+    class PersistenceOrchestrator:
+        def __init__(self) -> None:
+            self.store = PersistenceStore()
+            self.recovery: tuple[str, str] | None = None
+
+        def advance(self, run_id: str, target: Stage, lease_token: str) -> None:
+            del run_id, target, lease_token
+
+        def run_implementation_attempt(self, run_id: str, lease_token: str):
+            del run_id, lease_token
+            return SimpleNamespace(
+                state=SimpleNamespace(
+                    status=RoutingStatus.RESOLVED,
+                    required_action=None,
+                ),
+                attempt=SimpleNamespace(outcome=AttemptOutcome.SUCCESS),
+                decision=SimpleNamespace(failure_context=""),
+                execution_result="completed result",
+            )
+
+        def recover_routing_problem(self, run_id: str, reason: str) -> None:
+            self.recovery = (run_id, reason)
+
+    executor = ImmediateExecutor(
+        ModelExecution(AttemptOutcome.SUCCESS, result="unused")
+    )
+    orchestrator = PersistenceOrchestrator()
+    manager = AgentWorkerManager(orchestrator, executor)
+    manager._run(run.run_id, run.lease_token or "")
+
+    assert orchestrator.recovery is not None
+    assert orchestrator.recovery[0] == run.run_id
+    assert "database unavailable" in orchestrator.recovery[1]
+    assert orchestrator.store.failure == (
+        run.run_id,
+        "Agent worker failed: database unavailable",
+        "lease-1",
+    )
+
+
+def test_worker_manager_recovers_when_failure_lease_is_lost() -> None:
+    run = RunState(
+        "lease-loss-run",
+        "project-1",
+        "owner/api",
+        1,
+        "Demo PBI",
+        Stage.IMPLEMENT,
+        RunStatus.ACTIVE,
+        1,
+        owner_id="worker-1",
+        lease_token="lease-1",
+    )
+
+    class LeaseLossStore:
+        def __init__(self) -> None:
+            self.recovery: tuple[str, str] | None = None
+
+        def get_run(self, run_id: str) -> RunState:
+            assert run_id == run.run_id
+            return run
+
+        def fail_agent_run(self, run_id: str, error: str, lease_token: str) -> None:
+            del run_id, error, lease_token
+            raise StoreError("lease changed")
+
+        def fail_agent_run_after_lease_loss(self, run_id: str, error: str) -> None:
+            self.recovery = (run_id, error)
+
+    class LeaseLossOrchestrator:
+        def __init__(self) -> None:
+            self.store = LeaseLossStore()
+
+        def advance(self, run_id: str, target: Stage, lease_token: str) -> None:
+            del run_id, target, lease_token
+            raise RuntimeError("worker exploded")
+
+    executor = ImmediateExecutor(
+        ModelExecution(AttemptOutcome.SUCCESS, result="unused")
+    )
+    orchestrator = LeaseLossOrchestrator()
+    manager = AgentWorkerManager(orchestrator, executor)
+    manager._run(run.run_id, run.lease_token or "")
+
+    assert orchestrator.store.recovery == (
+        run.run_id,
+        "Agent worker failed: worker exploded",
+    )
+
+
 def test_demo_review_adapters_cover_all_required_concerns() -> None:
     provider, readers = demo_review_adapters()
     target = provider.get_pull_request("demo-pr")
@@ -581,3 +1055,28 @@ def test_agent_run_completion_and_failure_persist_bounded_state() -> None:
         assert pbi["claimable"] is True
     finally:
         failure_store.close()
+
+
+def test_lease_loss_failure_recovery_clears_active_worker_state() -> None:
+    store = OrchestratorStore()
+    service = Orchestrator(store, FakeProvider(agent_snapshot()))
+    service.synchronize("project-1")
+    run = service.claim("project-1", "owner/api", "worker-1")
+    assert run is not None
+    lease = run.lease_token or ""
+    implementation = store.advance(run.run_id, Stage.IMPLEMENT, lease)
+    try:
+        with pytest.raises(StoreError, match="Unknown run"):
+            store.set_run_claimable("missing", False)
+        with pytest.raises(StoreError, match="failure reason"):
+            store.fail_agent_run_after_lease_loss(run.run_id, " ")
+        with pytest.raises(StoreError, match="Unknown run"):
+            store.fail_agent_run_after_lease_loss("missing", "worker failed")
+        failed = store.fail_agent_run_after_lease_loss(
+            implementation.run_id, "lease expired while executing"
+        )
+        assert failed.status is RunStatus.FAILED
+        assert failed.lease_token is None
+        assert store.fail_agent_run_after_lease_loss(run.run_id, "ignored") == failed
+    finally:
+        store.close()
