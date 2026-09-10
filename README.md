@@ -24,19 +24,27 @@ From a clean checkout, run:
 ```powershell
 uv sync
 gh auth status
-$env:GITHUB_TOKEN = (gh auth token)
-$env:GITHUB_PROJECT_OWNER = "<owner>"
-$env:GITHUB_PROJECT_NUMBER = "<number>"
-$env:GITHUB_PROJECT_OWNER_TYPE = "user"
-$env:BEEHAIIVE_ALLOWED_PROJECTS = "$env:GITHUB_PROJECT_OWNER`:$env:GITHUB_PROJECT_NUMBER"
-$env:BEEHAIIVE_API_KEY = [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(24))
-$env:BEEHAIIVE_REVIEW_MODE = "demo"
-$env:BEEHAIIVE_AGENT_REPOSITORY = (Get-Location).Path
+Copy-Item .env.example .env
 ```
 
-The project ID is exactly `<owner>:<number>`. It must match the configured
-allowlist. Keep the GitHub token and API key in the process environment. Do not
-commit them or place them in screenshots.
+Edit `.env` with the selected project and credentials:
+
+```dotenv
+GITHUB_TOKEN=<fine-grained-token>
+GITHUB_PROJECT_OWNER=<owner>
+GITHUB_PROJECT_NUMBER=<number>
+GITHUB_PROJECT_OWNER_TYPE=user
+BEEHAIIVE_ALLOWED_PROJECTS=<owner>:<number>
+BEEHAIIVE_API_KEY=<operator-key>
+BEEHAIIVE_REVIEW_MODE=demo
+# BEEHAIIVE_AGENT_REPOSITORY=<path-to-BeeHAIve>
+```
+
+The project ID is exactly `<owner>:<number>`. The tracked launcher reads the
+gitignored `.env` file before checking these values. Existing process variables
+take precedence. Direct `uv run uvicorn main:app --reload` still needs the
+variables in the process environment. Do not commit the `.env` file or place
+its values in screenshots.
 
 Start the service from the repository root:
 

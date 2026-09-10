@@ -4,6 +4,11 @@ The service serves the operator dashboard at `/dashboard`. It reads the live
 state projection from `/projects/{project_id}/dashboard` and polls it every
 five seconds. It does not load the old static JSX sample.
 
+On Windows, copy `.env.example` to `.env`, fill in the required values, and run
+the tracked `start_dashboard.bat` launcher. The launcher reads `.env` before
+validating the configuration. Direct server commands still need environment
+variables supplied by the process.
+
 Start a local server from the repository root:
 
 ```text

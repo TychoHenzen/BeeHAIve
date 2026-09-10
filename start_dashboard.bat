@@ -8,6 +8,24 @@ if not exist "pyproject.toml" (
     exit /b 1
 )
 
+if exist ".env" (
+    echo Loading local configuration from .env.
+    for /f "usebackq eol=# tokens=1,* delims==" %%A in (".env") do (
+        if /i "%%~A"=="GITHUB_TOKEN" if not defined GITHUB_TOKEN if not defined GH_TOKEN set "GITHUB_TOKEN=%%~B"
+        if /i "%%~A"=="GH_TOKEN" if not defined GITHUB_TOKEN if not defined GH_TOKEN set "GH_TOKEN=%%~B"
+        if /i "%%~A"=="GITHUB_PROJECT_OWNER" if not defined GITHUB_PROJECT_OWNER set "GITHUB_PROJECT_OWNER=%%~B"
+        if /i "%%~A"=="GITHUB_PROJECT_NUMBER" if not defined GITHUB_PROJECT_NUMBER set "GITHUB_PROJECT_NUMBER=%%~B"
+        if /i "%%~A"=="GITHUB_PROJECT_OWNER_TYPE" if not defined GITHUB_PROJECT_OWNER_TYPE set "GITHUB_PROJECT_OWNER_TYPE=%%~B"
+        if /i "%%~A"=="BEEHAIIVE_ALLOWED_PROJECTS" if not defined BEEHAIIVE_ALLOWED_PROJECTS set "BEEHAIIVE_ALLOWED_PROJECTS=%%~B"
+        if /i "%%~A"=="BEEHAIIVE_API_KEY" if not defined BEEHAIIVE_API_KEY set "BEEHAIIVE_API_KEY=%%~B"
+        if /i "%%~A"=="BEEHAIIVE_REVIEW_MODE" if not defined BEEHAIIVE_REVIEW_MODE set "BEEHAIIVE_REVIEW_MODE=%%~B"
+        if /i "%%~A"=="BEEHAIIVE_AGENT_REPOSITORY" if not defined BEEHAIIVE_AGENT_REPOSITORY set "BEEHAIIVE_AGENT_REPOSITORY=%%~B"
+        if /i "%%~A"=="BEEHAIIVE_AGENT_TIMEOUT_SECONDS" if not defined BEEHAIIVE_AGENT_TIMEOUT_SECONDS set "BEEHAIIVE_AGENT_TIMEOUT_SECONDS=%%~B"
+        if /i "%%~A"=="BEEHAIIVE_CODEX_EXECUTABLE" if not defined BEEHAIIVE_CODEX_EXECUTABLE set "BEEHAIIVE_CODEX_EXECUTABLE=%%~B"
+        if /i "%%~A"=="BEEHAIIVE_CODEX_MODEL" if not defined BEEHAIIVE_CODEX_MODEL set "BEEHAIIVE_CODEX_MODEL=%%~B"
+    )
+)
+
 where uv >nul 2>&1
 if errorlevel 1 (
     echo uv is required. Install uv, then run this launcher again.
