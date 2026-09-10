@@ -159,3 +159,67 @@ test("rendering live state exposes current stages and active actions", () => {
     pbi_number: 3,
   });
 });
+
+test("rendering keeps project and pull-request terminal state visible", () => {
+  const summaryOutput = new FakeNode("section");
+  const dashboardOutput = new FakeNode("section");
+  const actionLog = new FakeNode("section");
+  const actionsOutput = new FakeNode("div");
+  const view = createDashboardView({
+    document: new FakeDocument(),
+    summaryOutput,
+    dashboardOutput,
+    actionLog,
+    actionsOutput,
+    runAction: () => {},
+  });
+
+  view.render({
+    name: "Planning",
+    counts: {},
+    repositories: [
+      {
+        name: "owner/api",
+        active: true,
+        writer: { status: "idle" },
+        pbis: [
+          {
+            id: "owner/api#1",
+            number: 1,
+            title: "Done PBI",
+            status: "idle",
+            planning_status: "Done",
+            stage_progress: [{ label: "Merged", status: "current" }],
+            pull_requests: [{ number: 9, state: "closed", merged: true }],
+            subtasks: [],
+            readers: [],
+            reviewers: {},
+            activity: [],
+          },
+          {
+            id: "owner/api#2",
+            number: 2,
+            title: "Open PBI",
+            status: "idle",
+            planning_status: "In Progress",
+            stage_progress: [{ label: "Implement", status: "current" }],
+            pull_requests: [
+              { number: 10, state: "open" },
+              { number: 11, state: "closed", review_decision: "changes_requested" },
+            ],
+            subtasks: [],
+            readers: [],
+            reviewers: {},
+            activity: [],
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.match(dashboardOutput.textContent, /Project status: Done/);
+  assert.match(dashboardOutput.textContent, /#9: merged/);
+  assert.match(dashboardOutput.textContent, /#10: open, review pending/);
+  assert.match(dashboardOutput.textContent, /#11: closed, changes_requested/);
+  assert.doesNotMatch(dashboardOutput.textContent, /#9: review pending/);
+});

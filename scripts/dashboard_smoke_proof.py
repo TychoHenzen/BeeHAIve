@@ -59,6 +59,11 @@ def dashboard_snapshot(devtools: DevTools) -> dict[str, Any]:
     pipeline_stages: [
       ...document.querySelectorAll(".pbi .progress li.current"),
     ].map(text),
+    pbi_cards: [...document.querySelectorAll(".pbi")].map((card) => ({
+      repository: card.dataset.repository || "",
+      number: card.dataset.pbiNumber || "",
+      text: text(card),
+    })),
     metadata_sections: [...document.querySelectorAll(".pbi .details h3")].map(text),
     metadata_values: [...document.querySelectorAll(".pbi .details section")]
       .flatMap((section) => {
@@ -82,6 +87,7 @@ def dashboard_snapshot(devtools: DevTools) -> dict[str, Any]:
             "repositories": [],
             "pbis": [],
             "pipeline_stages": [],
+            "pbi_cards": [],
             "metadata_sections": [],
             "metadata_values": [],
             "dashboard_text": "",
@@ -137,6 +143,23 @@ def response_mappings(value: Any) -> list[Mapping[str, Any]]:
     return [item for item in value if isinstance(item, Mapping)]
 
 
+def pull_request_line(item: Mapping[str, Any]) -> str:
+    if item.get("merged") is True:
+        state = "merged"
+    else:
+        raw_state = item.get("state")
+        state = raw_state.strip().lower() if isinstance(raw_state, str) else ""
+        decision = item.get("review_decision")
+        decision_text = decision if isinstance(decision, str) else ""
+        if state == "open" and not decision_text:
+            state = "open, review pending"
+        elif state and decision_text:
+            state = f"{state}, {decision_text}"
+        else:
+            state = state or decision_text or "review pending"
+    return f"#{item.get('number')}: {state}"
+
+
 def response_metadata_lines(payload: Mapping[str, Any]) -> list[str]:
     lines: list[str] = []
     for repository in response_mappings(payload.get("repositories")):
@@ -152,10 +175,7 @@ def response_metadata_lines(payload: Mapping[str, Any]) -> list[str]:
                 (
                     "Pull requests",
                     "pull_requests",
-                    lambda item: (
-                        f"#{item.get('number')}: "
-                        f"{item.get('review_decision') or 'review pending'}"
-                    ),
+                    pull_request_line,
                 ),
                 (
                     "Readers",
@@ -219,6 +239,68 @@ def response_metadata_lines(payload: Mapping[str, Any]) -> list[str]:
             else:
                 lines.append("Activity: None")
     return lines
+
+
+def live_terminal_pbi_proof(
+    payload: Mapping[str, Any], snapshot: Mapping[str, Any]
+) -> dict[str, Any]:
+    target_numbers = {7, 8, 9}
+    target_pbis: dict[int, Mapping[str, Any]] = {}
+    for repository in response_mappings(payload.get("repositories")):
+        if repository.get("name") != "TychoHenzen/BeeHAIve":
+            continue
+        for pbi in response_mappings(repository.get("pbis")):
+            number = pbi.get("number")
+            if isinstance(number, int) and number in target_numbers:
+                target_pbis[number] = pbi
+    if set(target_pbis) != target_numbers:
+        raise SmokeFailure("Live proof did not return BeeHAIve issues #7, #8, and #9")
+
+    cards = [
+        card
+        for card in response_mappings(snapshot.get("pbi_cards"))
+        if card.get("repository") == "TychoHenzen/BeeHAIve"
+    ]
+    evidence: dict[str, Any] = {}
+    for number in sorted(target_numbers):
+        pbi = target_pbis[number]
+        if pbi.get("planning_status") != "Done":
+            raise SmokeFailure(f"Live issue #{number} did not show Project status Done")
+        merged_pull_requests = [
+            pr
+            for pr in response_mappings(pbi.get("pull_requests"))
+            if pr.get("merged") is True
+        ]
+        if not merged_pull_requests:
+            raise SmokeFailure(
+                f"Live issue #{number} did not show a merged pull request"
+            )
+        progress = response_mappings(pbi.get("stage_progress"))
+        if not any(
+            item.get("id") == "merge" and item.get("status") == "current"
+            for item in progress
+        ):
+            raise SmokeFailure(f"Live issue #{number} did not show terminal progress")
+        card = next(
+            (item for item in cards if str(item.get("number")) == str(number)),
+            None,
+        )
+        card_text = str(card.get("text", "")) if card else ""
+        if "Project status: Done" not in card_text:
+            raise SmokeFailure(f"Live issue #{number} card omitted Project status Done")
+        if "review pending" in card_text.lower():
+            raise SmokeFailure(f"Live issue #{number} card still showed review pending")
+        evidence[str(number)] = {
+            "project_status": pbi.get("planning_status"),
+            "stage_label": pbi.get("stage_label"),
+            "merged_pull_requests": [
+                {"number": pr.get("number"), "merged": pr.get("merged")}
+                for pr in merged_pull_requests
+            ],
+            "card_project_status": "Done",
+            "card_review_pending": False,
+        }
+    return evidence
 
 
 def response_values(value: Any) -> list[Any]:
@@ -619,6 +701,11 @@ def run_browser_smoke(
             "The dashboard did not match response fields: "
             + ", ".join(missing_response_fields)
         )
+    live_terminal_evidence = (
+        live_terminal_pbi_proof(initial_payload, initial_view)
+        if mode == "live" and project_id == "TychoHenzen:2"
+        else None
+    )
     api_key_value = devtools.evaluate("document.querySelector('#api-key')?.value || ''")
     if api_key_value:
         raise SmokeFailure("The initial read-only dashboard requested an API key")
@@ -654,6 +741,8 @@ def run_browser_smoke(
         "pipeline_stages": initial_view["pipeline_stages"][:5],
         "metadata_sections": initial_view["metadata_sections"][:10],
     }
+    if live_terminal_evidence is not None:
+        report["live_terminal_project_state"] = live_terminal_evidence
 
     polling_baseline = dashboard_fetch_count(devtools)
     polling_delay = wait_until(

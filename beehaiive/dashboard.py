@@ -21,6 +21,12 @@ _DISPLAY_STAGE_LABELS = {
     "pull_request": "Pull request",
     "merge": "Merged",
 }
+_PROJECT_STAGE_BY_STATUS = {
+    "backlog": "backlog",
+    "todo": "refine",
+    "in progress": "implement",
+}
+_TERMINAL_PROJECT_STATUSES = {"done", "completed", "closed", "merged"}
 
 
 def build_dashboard_state(
@@ -127,8 +133,10 @@ def _pbi_view(
     metadata.update(_latest_metadata(events))
     raw_stage = str(raw_pbi.get("stage") or "backlog")
     raw_status = raw_pbi.get("status")
-    status = str(raw_status) if raw_status is not None else "pending"
-    display_stage = _display_stage(raw_stage, status)
+    status = str(raw_status) if raw_status is not None else "idle"
+    planning_status = raw_pbi.get("planning_status")
+    pull_requests = _sequence(metadata.get("pull_requests"))
+    display_stage = _display_stage(raw_stage, status, planning_status, pull_requests)
     readers = _sequence(metadata.get("readers"))
     reviewers = dict(_mapping(metadata.get("reviewers")))
     if not readers and reviewers:
@@ -148,8 +156,8 @@ def _pbi_view(
         "number": raw_pbi.get("number"),
         "title": raw_pbi.get("title"),
         "stage": raw_stage,
-        "stage_label": _DISPLAY_STAGE_LABELS[display_stage],
-        "stage_progress": _stage_progress(display_stage),
+        "stage_label": _display_stage_label(display_stage, planning_status),
+        "stage_progress": _stage_progress(display_stage, planning_status),
         "status": status,
         "attempt": raw_pbi.get("attempt"),
         "run_id": raw_pbi.get("run_id"),
@@ -158,10 +166,10 @@ def _pbi_view(
         "last_error": raw_pbi.get("last_error"),
         "result": raw_pbi.get("result"),
         "active": bool(raw_pbi.get("active")),
-        "planning_status": raw_pbi.get("planning_status"),
+        "planning_status": planning_status,
         "claimable": bool(raw_pbi.get("claimable")),
         "subtasks": subtasks,
-        "pull_requests": _sequence(metadata.get("pull_requests")),
+        "pull_requests": pull_requests,
         "readers": readers,
         "reviewers": reviewers,
         "escalation": escalation[0],
@@ -211,7 +219,9 @@ def _escalation_view(
     return escalation, raw_log
 
 
-def _stage_progress(stage: str) -> list[dict[str, str]]:
+def _stage_progress(stage: str, planning_status: object = None) -> list[dict[str, str]]:
+    if stage == "external":
+        return [{"id": stage, "label": str(planning_status), "status": "current"}]
     current_index = _DISPLAY_STAGES.index(stage)
     return [
         {
@@ -229,10 +239,33 @@ def _stage_progress(stage: str) -> list[dict[str, str]]:
     ]
 
 
-def _display_stage(stage: str, status: str) -> str:
+def _display_stage(
+    stage: str,
+    status: str,
+    planning_status: object = None,
+    pull_requests: Sequence[object] = (),
+) -> str:
+    normalized_planning_status = (
+        planning_status.strip().lower() if isinstance(planning_status, str) else ""
+    )
+    if status not in {"active", "failed", "completed"}:
+        if normalized_planning_status in _TERMINAL_PROJECT_STATUSES:
+            merged = any(
+                _mapping(pull_request).get("merged") is True
+                for pull_request in pull_requests
+            )
+            return "merge" if merged else "external"
+        if normalized_planning_status:
+            return _PROJECT_STAGE_BY_STATUS.get(normalized_planning_status, "external")
     if stage == "pull_request":
         return "pull_request" if status == "completed" else "review"
     return stage if stage in _DISPLAY_STAGES else "backlog"
+
+
+def _display_stage_label(stage: str, planning_status: object) -> str:
+    if stage == "external":
+        return str(planning_status)
+    return _DISPLAY_STAGE_LABELS[stage]
 
 
 def _action_matches(

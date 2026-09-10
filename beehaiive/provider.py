@@ -370,6 +370,8 @@ query($owner: String!, $number: Int!, $cursor: String) {
                 nodes {
                   number
                   url
+                  state
+                  merged
                   reviewDecision
                   reviewRequests(first: 20) {
                     nodes {
@@ -475,6 +477,8 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
         nodes {
           number
           url
+          state
+          merged
           reviewDecision
           reviewRequests(first: 100) {
             nodes {
@@ -789,6 +793,12 @@ def _dashboard_metadata(issue: Mapping[str, Any]) -> dict[str, object]:
         url = raw_pull_request.get("url")
         if isinstance(url, str):
             pull_request["url"] = url
+        state = raw_pull_request.get("state")
+        if isinstance(state, str) and state.strip():
+            pull_request["state"] = state.lower()
+        merged = raw_pull_request.get("merged")
+        if isinstance(merged, bool):
+            pull_request["merged"] = merged
         decision = raw_pull_request.get("reviewDecision")
         if isinstance(decision, str):
             pull_request["review_decision"] = decision.lower()
