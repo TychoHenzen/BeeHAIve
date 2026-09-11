@@ -23,6 +23,8 @@ _DISPLAY_STAGE_LABELS = {
     "pull_request": "Pull request",
     "merge": "Merged",
 }
+
+
 def build_dashboard_state(
     state: Mapping[str, object],
     actions: Sequence[Mapping[str, object]] = (),
