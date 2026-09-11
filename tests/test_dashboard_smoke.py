@@ -20,6 +20,8 @@ from scripts.dashboard_smoke_browser import set_input
 from scripts.dashboard_smoke_proof import (
     action_run_target,
     configured_live_timeout,
+    live_terminal_pbi_proof,
+    pull_request_line,
     response_backed_dashboard_fields,
 )
 
@@ -28,6 +30,60 @@ def test_project_identity_redaction_preserves_only_a_safe_number() -> None:
     assert redact_project_id("owner:7") == "o***:7"
     assert redact_project_id("owner:not-a-number") == "o***:<redacted-number>"
     assert redact_project_id("unknown") == "<redacted-project>"
+
+
+def test_smoke_archive_proof_separates_default_and_archived_views() -> None:
+    def archived_pbi(number: int) -> dict[str, object]:
+        return {
+            "number": number,
+            "planning_status": "Done",
+            "pull_requests": [{"number": number, "merged": True}],
+            "stage_progress": [{"id": "merge", "status": "current"}],
+        }
+
+    default_payload = {
+        "repositories": [{"name": "TychoHenzen/BeeHAIve", "pbis": [{"number": 1}]}]
+    }
+    default_snapshot = {
+        "pbi_cards": [{"repository": "TychoHenzen/BeeHAIve", "number": "1"}]
+    }
+    archived_payload = {
+        "repositories": [
+            {
+                "name": "TychoHenzen/BeeHAIve",
+                "pbis": [archived_pbi(7), archived_pbi(8), archived_pbi(9)],
+            }
+        ]
+    }
+    archived_snapshot = {
+        "pbi_cards": [
+            {
+                "repository": "TychoHenzen/BeeHAIve",
+                "number": str(number),
+                "text": "Project status: Done",
+            }
+            for number in (7, 8, 9)
+        ]
+    }
+
+    evidence = live_terminal_pbi_proof(
+        default_payload, default_snapshot, archived_payload, archived_snapshot
+    )
+
+    assert evidence["7"]["default_projection"] == "omitted"
+    assert evidence["7"]["archived_projection"] == "included"
+
+
+def test_smoke_pull_request_formatter_matches_dashboard_evidence() -> None:
+    assert pull_request_line(
+        {
+            "number": 9,
+            "merged": True,
+            "url": "https://example.test/pull/9",
+            "source_branch": "codex/done",
+            "source_branch_state": "deleted",
+        }
+    ) == ("#9: merged (https://example.test/pull/9, branch codex/done (deleted))")
 
 
 def test_redact_text_removes_secrets_and_project_identity() -> None:

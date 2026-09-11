@@ -252,6 +252,7 @@ test("rendering archived PBIs exposes completion and branch evidence", () => {
             title: "Archived PBI",
             archived: true,
             source_url: "https://example.test/issues/1",
+            pull_request_url: "https://example.test/pull/9",
             pull_requests: [
               {
                 number: 9,
@@ -275,4 +276,15 @@ test("rendering archived PBIs exposes completion and branch evidence", () => {
   assert.match(dashboardOutput.textContent, /Archived: completion evidence verified/);
   assert.match(dashboardOutput.textContent, /Source issue: https:\/\/example.test\/issues\/1/);
   assert.match(dashboardOutput.textContent, /branch codex\/done \(deleted\)/);
+
+  const links = [];
+  findNode(dashboardOutput, (node) => {
+    if (node.tag === "a") links.push(node);
+    return false;
+  });
+  assert.equal(links.length, 2);
+  assert.equal(links[0].target, "_blank");
+  assert.equal(links[0].rel, "noopener noreferrer");
+  assert.equal(links[0].href, "https://example.test/issues/1");
+  assert.equal(links[1].href, "https://example.test/pull/9");
 });

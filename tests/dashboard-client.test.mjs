@@ -76,6 +76,18 @@ test("refresh requests the archived dashboard view when enabled", async () => {
   assert.equal(requestedUrl, "/projects/owner%3A7/dashboard?archived=true");
 });
 
+test("actions preserve the archived dashboard view when enabled", async () => {
+  let requestedUrl;
+  const { client } = harness(async (url) => {
+    requestedUrl = url;
+    return response({ action: { status: "succeeded" }, state: { archived: true } });
+  }, { archived: () => true });
+
+  await client.runAction({ action: "approve" });
+
+  assert.equal(requestedUrl, "/projects/owner%3A7/actions?archived=true");
+});
+
 test("actions expose pending, success, and failure states", async () => {
   let resolveAction;
   const fetcher = () => new Promise((resolve) => {

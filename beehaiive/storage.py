@@ -13,6 +13,8 @@ from typing import cast
 from uuid import uuid4
 
 from .models import (
+    ARCHIVE_PROJECT_STATUS,
+    PROJECT_TERMINAL_STATUSES,
     HandoffIntent,
     PbiSnapshot,
     ProjectSnapshot,
@@ -33,8 +35,6 @@ _STAGE_ORDER = {
     Stage.IMPLEMENT: 2,
     Stage.PULL_REQUEST: 3,
 }
-_TERMINAL_PROJECT_STATUSES = {"done", "completed", "closed", "merged"}
-
 DEFAULT_EVENT_LIMIT = 100
 MAX_EVENT_LIMIT = 500
 DEFAULT_ACTION_LIMIT = 50
@@ -68,7 +68,9 @@ def _json_mapping(value: object) -> dict[str, object]:
 def _archive_eligible(pbi: PbiSnapshot, run_status: str | None = None) -> bool:
     if run_status in {RunStatus.ACTIVE.value, RunStatus.FAILED.value}:
         return False
-    if (pbi.planning_status or "").strip().lower() not in _TERMINAL_PROJECT_STATUSES:
+    if (pbi.planning_status or "").strip().lower() not in PROJECT_TERMINAL_STATUSES:
+        return False
+    if (pbi.planning_status or "").strip().lower() != ARCHIVE_PROJECT_STATUS:
         return False
     pull_requests = pbi.metadata.get("pull_requests")
     if not isinstance(pull_requests, Sequence) or isinstance(

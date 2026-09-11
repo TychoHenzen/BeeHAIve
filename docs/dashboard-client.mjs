@@ -60,8 +60,9 @@ export function createDashboardClient({
         headers["X-API-Key"] = configuredApiKey;
         saveApiKey(configuredApiKey);
       }
+      const archiveQuery = archived() ? "?archived=true" : "";
       const response = await fetcher(
-        `/projects/${encodeURIComponent(projectId().trim())}/actions`,
+        `/projects/${encodeURIComponent(projectId().trim())}/actions${archiveQuery}`,
         {
           method: "POST",
           headers,

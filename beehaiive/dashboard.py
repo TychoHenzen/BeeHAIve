@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import cast
 
+from .models import PROJECT_TERMINAL_STATUSES
+
 _DISPLAY_STAGES = (
     "backlog",
     "refine",
@@ -26,7 +28,6 @@ _PROJECT_STAGE_BY_STATUS = {
     "todo": "refine",
     "in progress": "implement",
 }
-_TERMINAL_PROJECT_STATUSES = {"done", "completed", "closed", "merged"}
 
 
 def build_dashboard_state(
@@ -255,7 +256,7 @@ def _display_stage(
         planning_status.strip().lower() if isinstance(planning_status, str) else ""
     )
     if status not in {"active", "failed", "completed"}:
-        if normalized_planning_status in _TERMINAL_PROJECT_STATUSES:
+        if normalized_planning_status in PROJECT_TERMINAL_STATUSES:
             merged = any(
                 _mapping(pull_request).get("merged") is True
                 for pull_request in pull_requests

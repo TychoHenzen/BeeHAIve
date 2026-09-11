@@ -122,7 +122,10 @@ def required_dashboard_fields(snapshot: Mapping[str, Any]) -> dict[str, bool]:
     }
 
 
-def dashboard_payload(devtools: DevTools) -> Mapping[str, Any]:
+def dashboard_payload(
+    devtools: DevTools, *, archived: bool = False
+) -> Mapping[str, Any]:
+    dashboard_path = "/dashboard?archived=true" if archived else "/dashboard"
     for item in browser_fetches(devtools):
         url = str(item.get("url", ""))
         payload = item.get("payload")
@@ -130,7 +133,7 @@ def dashboard_payload(devtools: DevTools) -> Mapping[str, Any]:
             item.get("method") == "GET"
             and item.get("status") == 200
             and "/projects/" in url
-            and url.endswith("/dashboard")
+            and url.endswith(dashboard_path)
             and isinstance(payload, Mapping)
         ):
             return payload
@@ -144,6 +147,15 @@ def response_mappings(value: Any) -> list[Mapping[str, Any]]:
 
 
 def pull_request_line(item: Mapping[str, Any]) -> str:
+    evidence: list[str] = []
+    url = item.get("url")
+    if isinstance(url, str) and url:
+        evidence.append(url)
+    source_branch = item.get("source_branch")
+    if source_branch:
+        branch_state = item.get("source_branch_state") or "unknown"
+        evidence.append(f"branch {source_branch} ({branch_state})")
+    suffix = f" ({', '.join(evidence)})" if evidence else ""
     if item.get("merged") is True:
         state = "merged"
     else:
@@ -157,7 +169,7 @@ def pull_request_line(item: Mapping[str, Any]) -> str:
             state = f"{state}, {decision_text}"
         else:
             state = state or decision_text or "review pending"
-    return f"#{item.get('number')}: {state}"
+    return f"#{item.get('number')}: {state}{suffix}"
 
 
 def response_metadata_lines(payload: Mapping[str, Any]) -> list[str]:
@@ -242,11 +254,14 @@ def response_metadata_lines(payload: Mapping[str, Any]) -> list[str]:
 
 
 def live_terminal_pbi_proof(
-    payload: Mapping[str, Any], snapshot: Mapping[str, Any]
+    default_payload: Mapping[str, Any],
+    default_snapshot: Mapping[str, Any],
+    archived_payload: Mapping[str, Any],
+    archived_snapshot: Mapping[str, Any],
 ) -> dict[str, Any]:
     target_numbers = {7, 8, 9}
     target_pbis: dict[int, Mapping[str, Any]] = {}
-    for repository in response_mappings(payload.get("repositories")):
+    for repository in response_mappings(archived_payload.get("repositories")):
         if repository.get("name") != "TychoHenzen/BeeHAIve":
             continue
         for pbi in response_mappings(repository.get("pbis")):
@@ -254,11 +269,28 @@ def live_terminal_pbi_proof(
             if isinstance(number, int) and number in target_numbers:
                 target_pbis[number] = pbi
     if set(target_pbis) != target_numbers:
-        raise SmokeFailure("Live proof did not return BeeHAIve issues #7, #8, and #9")
+        raise SmokeFailure(
+            "Archived live proof did not return BeeHAIve issues #7, #8, and #9"
+        )
 
+    default_pbi_numbers = {
+        pbi.get("number")
+        for repository in response_mappings(default_payload.get("repositories"))
+        if repository.get("name") == "TychoHenzen/BeeHAIve"
+        for pbi in response_mappings(repository.get("pbis"))
+    }
+    if default_pbi_numbers.intersection(target_numbers):
+        raise SmokeFailure("Default live proof still returned archived target PBIs")
+    default_cards = response_mappings(default_snapshot.get("pbi_cards"))
+    if any(
+        card.get("repository") == "TychoHenzen/BeeHAIve"
+        and str(card.get("number")) in {str(number) for number in target_numbers}
+        for card in default_cards
+    ):
+        raise SmokeFailure("Default live proof still rendered archived target PBIs")
     cards = [
         card
-        for card in response_mappings(snapshot.get("pbi_cards"))
+        for card in response_mappings(archived_snapshot.get("pbi_cards"))
         if card.get("repository") == "TychoHenzen/BeeHAIve"
     ]
     evidence: dict[str, Any] = {}
@@ -299,6 +331,8 @@ def live_terminal_pbi_proof(
             ],
             "card_project_status": "Done",
             "card_review_pending": False,
+            "default_projection": "omitted",
+            "archived_projection": "included",
         }
     return evidence
 
@@ -701,11 +735,29 @@ def run_browser_smoke(
             "The dashboard did not match response fields: "
             + ", ".join(missing_response_fields)
         )
-    live_terminal_evidence = (
-        live_terminal_pbi_proof(initial_payload, initial_view)
-        if mode == "live" and project_id == "TychoHenzen:2"
-        else None
-    )
+    live_terminal_evidence = None
+    if mode == "live" and project_id == "TychoHenzen:2":
+        if not devtools.evaluate("document.querySelector('#archived-view')"):
+            raise SmokeFailure("The live dashboard omitted the archived view control")
+        devtools.evaluate("document.querySelector('#archived-view').click()")
+        wait_for_status(
+            devtools,
+            "Updated ",
+            "archived dashboard refresh",
+            timeout=refresh_timeout,
+        )
+        archived_view = dashboard_snapshot(devtools)
+        archived_payload = dashboard_payload(devtools, archived=True)
+        live_terminal_evidence = live_terminal_pbi_proof(
+            initial_payload, initial_view, archived_payload, archived_view
+        )
+        devtools.evaluate("document.querySelector('#archived-view').click()")
+        wait_for_status(
+            devtools,
+            "Updated ",
+            "default dashboard refresh after archive proof",
+            timeout=refresh_timeout,
+        )
     api_key_value = devtools.evaluate("document.querySelector('#api-key')?.value || ''")
     if api_key_value:
         raise SmokeFailure("The initial read-only dashboard requested an API key")

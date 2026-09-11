@@ -808,12 +808,15 @@ def _dashboard_metadata(issue: Mapping[str, Any]) -> dict[str, object]:
         if isinstance(merged, bool):
             pull_request["merged"] = merged
         source_branch = raw_pull_request.get("headRefName")
-        if isinstance(source_branch, str) and source_branch.strip():
+        has_source_branch = isinstance(source_branch, str) and bool(
+            source_branch.strip()
+        )
+        if has_source_branch:
             pull_request["source_branch"] = source_branch
         head_ref = raw_pull_request.get("headRef")
         pull_request["source_branch_state"] = (
             "unknown"
-            if "headRef" not in raw_pull_request
+            if "headRef" not in raw_pull_request or not has_source_branch
             else "deleted"
             if head_ref is None
             else "present"
@@ -1088,6 +1091,10 @@ class GitHubProjectProvider:
                 return cached[1]
             self._discovery_cache = (time.monotonic(), snapshot)
             return snapshot
+
+    def invalidate_discovery_cache(self) -> None:
+        with self._discovery_lock:
+            self._discovery_cache = None
 
     def _discover_project_uncached(self) -> ProjectSnapshot:
 
@@ -1428,6 +1435,12 @@ class EnvironmentGitHubProvider:
 
     def discover_project(self, project_id: str) -> ProjectSnapshot:
         return self._configured_provider().discover_project(project_id)
+
+    def invalidate_discovery_cache(self) -> None:
+        provider = self._configured_provider()
+        invalidate = getattr(provider, "invalidate_discovery_cache", None)
+        if callable(invalidate):
+            invalidate()
 
     def create_handoff(self, request: HandoffRequest) -> HandoffResult:
         return self._configured_provider().create_handoff(request)

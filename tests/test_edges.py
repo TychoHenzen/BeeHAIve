@@ -446,6 +446,8 @@ def test_provider_preserves_archive_evidence() -> None:
                         "headRef": "not-an-object",
                     },
                     {"number": 4, "headRefName": "codex/unknown"},
+                    {"number": 5, "headRef": None},
+                    {"number": 6, "headRefName": "", "headRef": None},
                 ]
             },
         }
@@ -456,6 +458,8 @@ def test_provider_preserves_archive_evidence() -> None:
     assert [pull_request["source_branch_state"] for pull_request in pull_requests] == [
         "deleted",
         "present",
+        "unknown",
+        "unknown",
         "unknown",
         "unknown",
     ]  # type: ignore[index]
@@ -485,6 +489,12 @@ def test_provider_caches_discovery_and_serves_stale_snapshot_on_limit() -> None:
     first_snapshot = cached_provider.discover_project("owner:7")
     assert cached_provider.discover_project("owner:7") == first_snapshot
     assert len(cached_client.calls) == 3
+    sync_store = OrchestratorStore()
+    try:
+        Orchestrator(sync_store, cached_provider).synchronize("owner:7")
+        assert len(cached_client.calls) == 6
+    finally:
+        sync_store.close()
 
     limited_client = RateLimitedAfterDiscoveryClient(_project_data())
     limited_provider = GitHubProjectProvider(

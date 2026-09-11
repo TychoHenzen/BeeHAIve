@@ -883,6 +883,7 @@ def create_app(
     def dashboard_action(  # pyright: ignore[reportUnusedFunction]
         project_id: str,
         request: DashboardActionRequest,
+        archived: bool = Query(default=False),
         _auth: None = Depends(require_mutation_access),
     ) -> dict[str, object]:
         if not request.approved:
@@ -956,7 +957,7 @@ def create_app(
                 "action": failed,
                 "result": None,
                 "state": _dashboard_state_or_none(
-                    orchestrator, project_id, DEFAULT_EVENT_LIMIT
+                    orchestrator, project_id, DEFAULT_EVENT_LIMIT, archived
                 ),
             }
         completed = orchestrator.store.finish_action(
@@ -965,7 +966,9 @@ def create_app(
         return {
             "action": completed,
             "result": result,
-            "state": _dashboard_state(orchestrator, project_id, DEFAULT_EVENT_LIMIT),
+            "state": _dashboard_state(
+                orchestrator, project_id, DEFAULT_EVENT_LIMIT, archived
+            ),
         }
 
     @app.post("/projects/{project_id}/repositories/{repository:path}/claim")
@@ -1178,10 +1181,13 @@ def _dashboard_state(
 
 
 def _dashboard_state_or_none(
-    orchestrator: Orchestrator, project_id: str, event_limit: int
+    orchestrator: Orchestrator,
+    project_id: str,
+    event_limit: int,
+    archived: bool = False,
 ) -> dict[str, object] | None:
     try:
-        return _dashboard_state(orchestrator, project_id, event_limit)
+        return _dashboard_state(orchestrator, project_id, event_limit, archived)
     except (ProviderError, StoreError):
         return None
 

@@ -104,9 +104,9 @@ export function createDashboardView({
     if (pbi.archived) {
       card.append(element("div", "Archived: completion evidence verified", "muted"));
     }
-    if (pbi.source_url) card.append(element("div", `Source issue: ${pbi.source_url}`, "muted"));
+    if (pbi.source_url) card.append(renderEvidenceLink("Source issue", pbi.source_url));
     if (pbi.branch) card.append(element("div", `Branch: ${pbi.branch}`, "muted"));
-    if (pbi.pull_request_url) card.append(element("div", `Pull request: ${pbi.pull_request_url}`, "muted"));
+    if (pbi.pull_request_url) card.append(renderEvidenceLink("Pull request", pbi.pull_request_url));
     card.append(renderProgress(pbi.stage_progress || []));
     const details = element("div", undefined, "details");
     details.append(renderListSection("Subtasks", pbi.subtasks, (item) => `${item.id || "subtask"}: ${item.title || ""}`));
@@ -138,6 +138,20 @@ export function createDashboardView({
     controls.append(clarify);
     card.append(controls);
     return card;
+  }
+
+  function renderEvidenceLink(label, value) {
+    const raw = String(value);
+    if (!/^https?:\/\/[^\s]+$/i.test(raw)) {
+      return element("div", `${label}: ${raw}`, "muted");
+    }
+    const container = element("div", undefined, "muted");
+    const link = element("a", raw);
+    link.href = raw;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    container.append(element("span", `${label}: `), link);
+    return container;
   }
 
   function renderProgress(progress) {

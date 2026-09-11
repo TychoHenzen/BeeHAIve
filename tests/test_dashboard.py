@@ -665,7 +665,7 @@ def test_dashboard_actions_preserve_state_and_report_results() -> None:
     assert mismatched_repository.status_code == 403
 
     synced = client.post(
-        "/projects/project-1/actions",
+        "/projects/project-1/actions?archived=true",
         headers=auth,
         json={"action": "start", "approved": True},
     )
