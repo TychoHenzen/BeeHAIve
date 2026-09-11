@@ -76,10 +76,13 @@ class Orchestrator:
     def register_worker_canceller(self, canceller: Callable[[str], None]) -> None:
         self._worker_canceller = canceller
 
-    def synchronize(self, project_id: str) -> dict[str, object]:
-        invalidate = getattr(self.provider, "invalidate_discovery_cache", None)
-        if callable(invalidate):
-            invalidate()
+    def synchronize(
+        self, project_id: str, *, force_refresh: bool = True
+    ) -> dict[str, object]:
+        if force_refresh:
+            invalidate = getattr(self.provider, "invalidate_discovery_cache", None)
+            if callable(invalidate):
+                invalidate()
         snapshot = self.provider.discover_project(project_id)
         self._cancel_removed_workers(snapshot)
         self.store.sync_project(snapshot)
@@ -202,18 +205,23 @@ class Orchestrator:
         if intent.run.status is RunStatus.COMPLETED:
             return intent.run
         self._ensure_handoff_routing_allowed(run_id)
-        result = self.provider.create_handoff(
-            HandoffRequest(
-                project_id=intent.run.project_id,
-                repository=intent.run.repository,
-                pbi_number=intent.run.pbi_number,
-                title=intent.run.title,
-                branch=intent.branch,
-                base_branch=intent.base_branch,
-                body=intent.body,
-                run_id=intent.run.run_id,
+        try:
+            result = self.provider.create_handoff(
+                HandoffRequest(
+                    project_id=intent.run.project_id,
+                    repository=intent.run.repository,
+                    pbi_number=intent.run.pbi_number,
+                    title=intent.run.title,
+                    branch=intent.branch,
+                    base_branch=intent.base_branch,
+                    body=intent.body,
+                    run_id=intent.run.run_id,
+                )
             )
-        )
+        finally:
+            invalidate = getattr(self.provider, "invalidate_discovery_cache", None)
+            if callable(invalidate):
+                invalidate()
         self._complete_routing_problem(run_id)
         completed = self.store.record_handoff(
             run_id,

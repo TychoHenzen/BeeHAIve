@@ -1257,7 +1257,7 @@ def _dashboard_state(
     event_limit: int,
     archived: bool = False,
 ) -> dict[str, object]:
-    orchestrator.synchronize(project_id)
+    orchestrator.synchronize(project_id, force_refresh=False)
     state = orchestrator.store.project_state(project_id, event_limit)
     actions = orchestrator.store.actions_for_project(project_id)
     return build_dashboard_state(state, actions, archived)

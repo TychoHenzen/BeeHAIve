@@ -491,7 +491,10 @@ def test_provider_caches_discovery_and_serves_stale_snapshot_on_limit() -> None:
     assert len(cached_client.calls) == 3
     sync_store = OrchestratorStore()
     try:
-        Orchestrator(sync_store, cached_provider).synchronize("owner:7")
+        orchestrator = Orchestrator(sync_store, cached_provider)
+        orchestrator.synchronize("owner:7", force_refresh=False)
+        assert len(cached_client.calls) == 3
+        orchestrator.synchronize("owner:7")
         assert len(cached_client.calls) == 6
     finally:
         sync_store.close()

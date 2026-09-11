@@ -86,6 +86,22 @@ class FailingDashboardProvider(FakeProvider):
         raise ProviderError("dashboard provider unavailable")
 
 
+class CachedDashboardProvider(FakeProvider):
+    def __init__(self, snapshot: ProjectSnapshot) -> None:
+        super().__init__(snapshot)
+        self._cached_snapshot: ProjectSnapshot | None = None
+        self.invalidations = 0
+
+    def discover_project(self, project_id: str) -> ProjectSnapshot:
+        if self._cached_snapshot is None:
+            self._cached_snapshot = super().discover_project(project_id)
+        return self._cached_snapshot
+
+    def invalidate_discovery_cache(self) -> None:
+        self.invalidations += 1
+        self._cached_snapshot = None
+
+
 def test_dashboard_projection_exposes_optional_run_details() -> None:
     view = build_dashboard_state(
         {
@@ -442,6 +458,25 @@ def test_dashboard_refresh_synchronizes_current_state() -> None:
     assert second_refresh.status_code == 200
     assert second_refresh.json()["repositories"][0]["pbis"][0]["title"] == "API latest"
     assert provider.discoveries == 2
+    service.store.close()
+
+
+def test_dashboard_poll_uses_provider_cache() -> None:
+    provider = CachedDashboardProvider(dashboard_snapshot())
+    service = Orchestrator(OrchestratorStore(), provider)
+    client = TestClient(
+        create_app(orchestrator=service, allowed_project_ids={"project-1"})
+    )
+
+    first_refresh = client.get("/projects/project-1/dashboard")
+    provider.snapshot = dashboard_snapshot(api_title="API latest")
+    second_refresh = client.get("/projects/project-1/dashboard")
+
+    assert first_refresh.status_code == 200
+    assert second_refresh.status_code == 200
+    assert second_refresh.json()["repositories"][0]["pbis"][0]["title"] == "API one"
+    assert provider.discoveries == 1
+    assert provider.invalidations == 0
     service.store.close()
 
 
