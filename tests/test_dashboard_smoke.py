@@ -20,6 +20,7 @@ from scripts.dashboard_smoke_browser import set_input
 from scripts.dashboard_smoke_proof import (
     action_run_target,
     configured_live_timeout,
+    rendered_pull_request_states,
     response_backed_dashboard_fields,
 )
 
@@ -177,6 +178,63 @@ def test_response_dashboard_fields_require_the_requested_project() -> None:
     )
 
     assert fields["project_id"] is False
+
+
+@pytest.mark.parametrize(
+    ("pull_request", "rendered_line", "expected"),
+    (
+        pytest.param(
+            {"number": 9, "state": "closed", "merged": True},
+            "#9: merged",
+            True,
+            id="merged",
+        ),
+        pytest.param(
+            {"number": 10, "state": "open"},
+            "#10: open, review pending",
+            True,
+            id="open-review-pending",
+        ),
+        pytest.param(
+            {
+                "number": 11,
+                "state": "closed",
+                "review_decision": "changes_requested",
+            },
+            "#11: closed, changes_requested",
+            True,
+            id="closed-with-review-decision",
+        ),
+        pytest.param(
+            {"number": 9, "state": "closed", "merged": True},
+            "#9: review pending",
+            False,
+            id="wrong-state",
+        ),
+    ),
+)
+def test_pull_request_state_proof_uses_raw_state(
+    pull_request: dict[str, object], rendered_line: str, expected: bool
+) -> None:
+    payload = {
+        "repositories": [
+            {
+                "name": "owner/api",
+                "pbis": [{"number": 1, "pull_requests": [pull_request]}],
+            }
+        ]
+    }
+    snapshot = {
+        "pbi_cards": [
+            {
+                "repository": "owner/api",
+                "number": "1",
+                "pull_requests": [rendered_line],
+            }
+        ]
+    }
+
+    assert rendered_pull_request_states(payload, snapshot) is expected
 
 
 def test_action_target_uses_the_run_returned_by_the_action() -> None:

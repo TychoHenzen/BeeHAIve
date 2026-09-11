@@ -16,6 +16,15 @@ class Stage(StrEnum):
     PULL_REQUEST = "pull_request"
 
 
+def project_stage_from_status(status: str | None) -> Stage | None:
+    normalized = (status or "").strip().lower()
+    return {
+        "backlog": Stage.BACKLOG,
+        "todo": Stage.REFINE,
+        "in progress": Stage.IMPLEMENT,
+    }.get(normalized)
+
+
 class RunStatus(StrEnum):
     """Durable status of a repository writer run."""
 

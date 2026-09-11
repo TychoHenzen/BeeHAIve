@@ -106,7 +106,8 @@ export function createDashboardView({
     card.append(renderProgress(pbi.stage_progress || []));
     const details = element("div", undefined, "details");
     details.append(renderListSection("Subtasks", pbi.subtasks, (item) => `${item.id || "subtask"}: ${item.title || ""}`));
-    details.append(renderListSection("Pull requests", pbi.pull_requests, (item) => `#${item.number}: ${item.review_decision || "review pending"}`));
+    if (pbi.planning_status) card.append(element("div", `Project status: ${pbi.planning_status}`, "muted"));
+    details.append(renderListSection("Pull requests", pbi.pull_requests, (item) => pullRequestLabel(item)));
     details.append(renderListSection("Readers", pbi.readers, (item) => `${item.pull_request ? `PR #${item.pull_request} ` : ""}${item.id || item.name || "reader"}: ${item.status || "pending"}`));
     details.append(renderReviewers(pbi.reviewers || {}));
     details.append(renderEscalation(pbi.escalation, pbi.escalation_log));
@@ -152,6 +153,15 @@ export function createDashboardView({
       section.append(items);
     }
     return section;
+  }
+
+  function pullRequestLabel(item) {
+    if (item.merged === true) return `#${item.number}: merged`;
+    const state = typeof item.state === "string" ? item.state.toLowerCase() : "";
+    const decision = item.review_decision || "";
+    if (state === "open" && !decision) return `#${item.number}: open, review pending`;
+    if (state && decision) return `#${item.number}: ${state}, ${decision}`;
+    return `#${item.number}: ${state || decision || "review pending"}`;
   }
 
   function renderReviewers(reviewers) {
