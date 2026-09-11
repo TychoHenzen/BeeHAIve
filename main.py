@@ -1200,10 +1200,10 @@ def _handle_store_error[T](function: Callable[[], T]) -> T:
 def _handle_meta_review_error[T](function: Callable[[], T]) -> T:
     try:
         return function()
-    except (MetaReviewError, StoreError) as exc:
+    except (MetaReviewError, StoreError):
         raise HTTPException(
             status_code=409, detail="Meta-review request could not be completed"
-        ) from exc
+        ) from None
 
 
 def _handle_review_error[T](function: Callable[[], T]) -> T:
