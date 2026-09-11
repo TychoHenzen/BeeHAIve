@@ -21,6 +21,7 @@ from .models import (
     ProjectSnapshot,
     RepositorySnapshot,
     Stage,
+    project_stage_from_status,
 )
 
 PROVIDER_REQUEST_TIMEOUT = 30.0
@@ -665,14 +666,7 @@ def _complete_connection(
 
 
 def _stage_from_status(status: str | None) -> Stage | None:
-    normalized = (status or "").strip().lower()
-    if normalized == "backlog":
-        return Stage.BACKLOG
-    if normalized == "todo":
-        return Stage.REFINE
-    if normalized == "in progress":
-        return Stage.IMPLEMENT
-    return None
+    return project_stage_from_status(status)
 
 
 def _actor_name(value: object) -> str | None:

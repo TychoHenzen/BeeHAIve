@@ -63,6 +63,9 @@ def dashboard_snapshot(devtools: DevTools) -> dict[str, Any]:
       repository: card.dataset.repository || "",
       number: card.dataset.pbiNumber || "",
       text: text(card),
+      pull_requests: [...card.querySelectorAll(".details section")]
+        .filter((section) => text(section.querySelector("h3")) === "Pull requests")
+        .flatMap((section) => [...section.querySelectorAll("li")].map(text)),
     })),
     metadata_sections: [...document.querySelectorAll(".pbi .details h3")].map(text),
     metadata_values: [...document.querySelectorAll(".pbi .details section")]
@@ -143,23 +146,6 @@ def response_mappings(value: Any) -> list[Mapping[str, Any]]:
     return [item for item in value if isinstance(item, Mapping)]
 
 
-def pull_request_line(item: Mapping[str, Any]) -> str:
-    if item.get("merged") is True:
-        state = "merged"
-    else:
-        raw_state = item.get("state")
-        state = raw_state.strip().lower() if isinstance(raw_state, str) else ""
-        decision = item.get("review_decision")
-        decision_text = decision if isinstance(decision, str) else ""
-        if state == "open" and not decision_text:
-            state = "open, review pending"
-        elif state and decision_text:
-            state = f"{state}, {decision_text}"
-        else:
-            state = state or decision_text or "review pending"
-    return f"#{item.get('number')}: {state}"
-
-
 def response_metadata_lines(payload: Mapping[str, Any]) -> list[str]:
     lines: list[str] = []
     for repository in response_mappings(payload.get("repositories")):
@@ -171,11 +157,6 @@ def response_metadata_lines(payload: Mapping[str, Any]) -> list[str]:
                     lambda item: (
                         f"{item.get('id') or 'subtask'}: {item.get('title') or ''}"
                     ),
-                ),
-                (
-                    "Pull requests",
-                    "pull_requests",
-                    pull_request_line,
                 ),
                 (
                     "Readers",
@@ -288,8 +269,21 @@ def live_terminal_pbi_proof(
         card_text = str(card.get("text", "")) if card else ""
         if "Project status: Done" not in card_text:
             raise SmokeFailure(f"Live issue #{number} card omitted Project status Done")
-        if "review pending" in card_text.lower():
-            raise SmokeFailure(f"Live issue #{number} card still showed review pending")
+        card_pull_requests = (
+            card.get("pull_requests")
+            if isinstance(card, Mapping) and isinstance(card.get("pull_requests"), list)
+            else []
+        )
+        for pull_request in merged_pull_requests:
+            pull_request_number = pull_request.get("number")
+            if not any(
+                str(line).startswith(f"#{pull_request_number}: merged")
+                for line in card_pull_requests
+            ):
+                raise SmokeFailure(
+                    f"Live issue #{number} card omitted merged pull request "
+                    f"#{pull_request_number}"
+                )
         evidence[str(number)] = {
             "project_status": pbi.get("planning_status"),
             "stage_label": pbi.get("stage_label"),
@@ -298,7 +292,14 @@ def live_terminal_pbi_proof(
                 for pr in merged_pull_requests
             ],
             "card_project_status": "Done",
-            "card_review_pending": False,
+            "card_merged_pull_requests": [
+                pull_request
+                for pull_request in card_pull_requests
+                if any(
+                    str(pull_request).startswith(f"#{merged.get('number')}: merged")
+                    for merged in merged_pull_requests
+                )
+            ],
         }
     return evidence
 
@@ -307,6 +308,47 @@ def response_values(value: Any) -> list[Any]:
     if not isinstance(value, list):
         return []
     return value
+
+
+def rendered_pull_request_states(
+    payload: Mapping[str, Any], snapshot: Mapping[str, Any]
+) -> bool:
+    cards = response_mappings(snapshot.get("pbi_cards"))
+    for repository in response_mappings(payload.get("repositories")):
+        repository_name = repository.get("name")
+        for pbi in response_mappings(repository.get("pbis")):
+            pull_requests = response_mappings(pbi.get("pull_requests"))
+            if not pull_requests:
+                continue
+            card = next(
+                (
+                    item
+                    for item in cards
+                    if item.get("repository") == repository_name
+                    and str(item.get("number")) == str(pbi.get("number"))
+                ),
+                None,
+            )
+            if card is None:
+                return False
+            rendered_lines = card.get("pull_requests")
+            if not isinstance(rendered_lines, list):
+                return False
+            for pull_request in pull_requests:
+                number = pull_request.get("number")
+                if pull_request.get("merged") is True:
+                    expected_state = "merged"
+                else:
+                    raw_state = pull_request.get("state")
+                    expected_state = (
+                        raw_state.strip().lower() if isinstance(raw_state, str) else ""
+                    )
+                if expected_state and not any(
+                    str(line).startswith(f"#{number}: {expected_state}")
+                    for line in rendered_lines
+                ):
+                    return False
+    return True
 
 
 def response_backed_dashboard_fields(
@@ -364,7 +406,11 @@ def response_backed_dashboard_fields(
     rendered_stages = snapshot.get("pipeline_stages")
     metadata_values = snapshot.get("metadata_values")
     rendered_metadata = (
-        [str(value) for value in metadata_values]
+        [
+            str(value)
+            for value in metadata_values
+            if not str(value).startswith("Pull requests: ")
+        ]
         if isinstance(metadata_values, list)
         else []
     )
@@ -380,6 +426,7 @@ def response_backed_dashboard_fields(
         "pbis": rendered_pbis == expected_pbis,
         "pipeline_stage": rendered_stages == expected_stages,
         "metadata": rendered_metadata == expected_metadata,
+        "pull_requests": rendered_pull_request_states(payload, snapshot),
         "updated_at": (
             isinstance(updated_at, str)
             and updated == f"Updated: {updated_at}"

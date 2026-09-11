@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import cast
 
+from .models import project_stage_from_status
+
 _DISPLAY_STAGES = (
     "backlog",
     "refine",
@@ -20,11 +22,6 @@ _DISPLAY_STAGE_LABELS = {
     "review": "Review",
     "pull_request": "Pull request",
     "merge": "Merged",
-}
-_PROJECT_STAGE_BY_STATUS = {
-    "backlog": "backlog",
-    "todo": "refine",
-    "in progress": "implement",
 }
 _TERMINAL_PROJECT_STATUSES = {"done", "completed", "closed", "merged"}
 
@@ -256,7 +253,8 @@ def _display_stage(
             )
             return "merge" if merged else "external"
         if normalized_planning_status:
-            return _PROJECT_STAGE_BY_STATUS.get(normalized_planning_status, "external")
+            project_stage = project_stage_from_status(normalized_planning_status)
+            return project_stage.value if project_stage is not None else "external"
     if stage == "pull_request":
         return "pull_request" if status == "completed" else "review"
     return stage if stage in _DISPLAY_STAGES else "backlog"

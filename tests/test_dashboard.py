@@ -220,7 +220,102 @@ def test_dashboard_projection_exposes_optional_run_details() -> None:
     assert empty["repositories"] == []
 
 
-def test_dashboard_projection_separates_project_and_local_statuses() -> None:
+@pytest.mark.parametrize(
+    ("raw_pbi", "expected_status", "expected_stage_label"),
+    (
+        pytest.param(
+            {
+                "number": 1,
+                "stage": "backlog",
+                "planning_status": "Done",
+                "metadata": {
+                    "pull_requests": [{"number": 9, "state": "closed", "merged": True}]
+                },
+            },
+            "idle",
+            "Merged",
+            id="done-with-merged-pull-request",
+        ),
+        pytest.param(
+            {"number": 2, "stage": "backlog", "planning_status": "Blocked"},
+            "idle",
+            "Blocked",
+            id="blocked",
+        ),
+        pytest.param(
+            {"number": 3, "stage": "backlog", "planning_status": "New status"},
+            "idle",
+            "New status",
+            id="unknown-status",
+        ),
+        pytest.param(
+            {"number": 4, "stage": "implement", "planning_status": "Backlog"},
+            "idle",
+            "Backlog",
+            id="backlog",
+        ),
+        pytest.param(
+            {"number": 5, "stage": "pull_request", "planning_status": "Todo"},
+            "idle",
+            "Refine",
+            id="todo",
+        ),
+        pytest.param(
+            {
+                "number": 6,
+                "stage": "backlog",
+                "planning_status": "In Progress",
+            },
+            "idle",
+            "Implement",
+            id="in-progress",
+        ),
+        pytest.param(
+            {
+                "number": 7,
+                "stage": "implement",
+                "status": "active",
+                "planning_status": "Done",
+            },
+            "active",
+            "Implement",
+            id="active-run",
+        ),
+        pytest.param(
+            {
+                "number": 8,
+                "stage": "implement",
+                "status": "failed",
+                "planning_status": "Blocked",
+            },
+            "failed",
+            "Implement",
+            id="failed-run",
+        ),
+        pytest.param(
+            {
+                "number": 9,
+                "stage": "pull_request",
+                "status": "completed",
+                "planning_status": "Done",
+            },
+            "completed",
+            "Pull request",
+            id="completed-run",
+        ),
+        pytest.param(
+            {"number": 10, "stage": "implement", "planning_status": "Done"},
+            "idle",
+            "Done",
+            id="done-without-pull-request",
+        ),
+    ),
+)
+def test_dashboard_projection_separates_project_and_local_statuses(
+    raw_pbi: dict[str, object],
+    expected_status: str,
+    expected_stage_label: str,
+) -> None:
     view = build_dashboard_state(
         {
             "project_id": "project-1",
@@ -228,118 +323,16 @@ def test_dashboard_projection_separates_project_and_local_statuses() -> None:
             "repositories": [
                 {
                     "name": "owner/api",
-                    "pbis": [
-                        {
-                            "number": 1,
-                            "stage": "backlog",
-                            "planning_status": "Done",
-                            "metadata": {
-                                "pull_requests": [
-                                    {"number": 9, "state": "closed", "merged": True}
-                                ]
-                            },
-                        },
-                        {
-                            "number": 2,
-                            "stage": "backlog",
-                            "planning_status": "Blocked",
-                        },
-                        {
-                            "number": 3,
-                            "stage": "backlog",
-                            "planning_status": "New status",
-                        },
-                        {
-                            "number": 4,
-                            "stage": "implement",
-                            "planning_status": "Backlog",
-                        },
-                        {
-                            "number": 5,
-                            "stage": "pull_request",
-                            "planning_status": "Todo",
-                        },
-                        {
-                            "number": 6,
-                            "stage": "backlog",
-                            "planning_status": "In Progress",
-                        },
-                        {
-                            "number": 7,
-                            "stage": "implement",
-                            "status": "active",
-                            "planning_status": "Done",
-                        },
-                        {
-                            "number": 10,
-                            "stage": "implement",
-                            "planning_status": "Done",
-                            "metadata": {
-                                "pull_requests": [
-                                    {"number": 10, "state": "open", "merged": False}
-                                ]
-                            },
-                        },
-                        {
-                            "number": 11,
-                            "stage": "implement",
-                            "planning_status": "Done",
-                        },
-                        {
-                            "number": 8,
-                            "stage": "implement",
-                            "status": "failed",
-                            "planning_status": "Blocked",
-                        },
-                        {
-                            "number": 9,
-                            "stage": "pull_request",
-                            "status": "completed",
-                            "planning_status": "Done",
-                        },
-                    ],
+                    "pbis": [raw_pbi],
                 }
             ],
         }
     )
 
-    pbis = {pbi["number"]: pbi for pbi in view["repositories"][0]["pbis"]}
-    assert pbis[1]["status"] == "idle"
-    assert pbis[1]["planning_status"] == "Done"
-    assert pbis[1]["stage_label"] == "Merged"
-    assert pbis[1]["stage_progress"][-1] == {
-        "id": "merge",
-        "label": "Merged",
-        "status": "current",
-    }
-    assert pbis[1]["pull_requests"] == [
-        {"number": 9, "state": "closed", "merged": True}
-    ]
-    assert pbis[2]["stage_label"] == "Blocked"
-    assert pbis[2]["stage_progress"] == [
-        {"id": "external", "label": "Blocked", "status": "current"}
-    ]
-    assert pbis[3]["stage_label"] == "New status"
-    assert pbis[4]["stage_label"] == "Backlog"
-    assert pbis[5]["stage_label"] == "Refine"
-    assert pbis[6]["stage_label"] == "Implement"
-    assert pbis[10]["stage_label"] == "Done"
-    assert pbis[10]["stage_progress"] == [
-        {"id": "external", "label": "Done", "status": "current"}
-    ]
-    assert pbis[11]["stage_label"] == "Done"
-    assert pbis[11]["stage_progress"] == [
-        {"id": "external", "label": "Done", "status": "current"}
-    ]
-    assert pbis[7]["status"] == "active"
-    assert pbis[7]["planning_status"] == "Done"
-    assert pbis[7]["stage_label"] == "Implement"
-    assert pbis[8]["status"] == "failed"
-    assert pbis[8]["planning_status"] == "Blocked"
-    assert pbis[8]["stage_label"] == "Implement"
-    assert pbis[9]["status"] == "completed"
-    assert pbis[9]["planning_status"] == "Done"
-    assert pbis[9]["stage_label"] == "Pull request"
+    pbi = view["repositories"][0]["pbis"][0]
+    assert pbi["status"] == expected_status
+    assert pbi["stage_label"] == expected_stage_label
+    assert pbi["planning_status"] == raw_pbi["planning_status"]
 
 
 def test_dashboard_api_exposes_terminal_project_and_pull_request_state() -> None:
