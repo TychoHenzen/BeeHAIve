@@ -134,6 +134,7 @@ def _pbi_view(
     raw_status = raw_pbi.get("status")
     status = str(raw_status) if raw_status is not None else "idle"
     planning_status = raw_pbi.get("planning_status")
+    checks = dict(_mapping(metadata.get("checks")))
     pull_requests = _sequence(metadata.get("pull_requests"))
     display_stage = _display_stage(raw_stage, status, planning_status, pull_requests)
     readers = _sequence(metadata.get("readers"))
@@ -170,6 +171,7 @@ def _pbi_view(
         "planning_status": planning_status,
         "source_url": source_url,
         "claimable": bool(raw_pbi.get("claimable")),
+        "checks": checks,
         "subtasks": subtasks,
         "pull_requests": pull_requests,
         "readers": readers,
@@ -190,6 +192,7 @@ def _latest_metadata(events: Sequence[Mapping[str, object]]) -> dict[str, object
             "readers",
             "reviewers",
             "subtasks",
+            "checks",
             "escalation",
             "escalation_log",
         ):

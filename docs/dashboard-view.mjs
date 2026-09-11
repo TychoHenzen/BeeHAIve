@@ -112,6 +112,7 @@ export function createDashboardView({
     details.append(renderListSection("Subtasks", pbi.subtasks, (item) => `${item.id || "subtask"}: ${item.title || ""}`));
     if (pbi.planning_status) card.append(element("div", `Project status: ${pbi.planning_status}`, "muted"));
     details.append(renderListSection("Pull requests", pbi.pull_requests, (item) => pullRequestLabel(item)));
+    if (pbi.checks && typeof pbi.checks === "object") details.append(renderChecks(pbi.checks));
     details.append(renderListSection("Readers", pbi.readers, (item) => `${item.pull_request ? `PR #${item.pull_request} ` : ""}${item.id || item.name || "reader"}: ${item.status || "pending"}`));
     details.append(renderReviewers(pbi.reviewers || {}));
     details.append(renderEscalation(pbi.escalation, pbi.escalation_log));
@@ -187,6 +188,40 @@ export function createDashboardView({
     if (state === "open" && !decision) return `#${item.number}: open, review pending${suffix}`;
     if (state && decision) return `#${item.number}: ${state}, ${decision}${suffix}`;
     return `#${item.number}: ${state || decision || "review pending"}${suffix}`;
+  }
+
+  function renderChecks(checks) {
+    const section = element("section");
+    const verdict = checks.verdict || "unproven";
+    section.append(element("h3", "Checks"));
+    section.append(element("div", `Overall: ${verdict}`, checkStatusClass(verdict)));
+    (checks.pull_requests || []).forEach((pullRequest) => {
+      const head = pullRequest.head_sha || "unknown";
+      section.append(element("div", `PR #${pullRequest.number || "?"}: ${pullRequest.verdict || "unproven"}; head ${head}`, "muted"));
+      const contexts = pullRequest.contexts || [];
+      if (pullRequest.error) section.append(element("div", `Unproven: ${pullRequest.error}`, "status pending"));
+      if (contexts.length === 0) return;
+      const list = element("ul");
+      contexts.forEach((context) => {
+        const detail = [
+          context.name || "unknown",
+          context.verdict || "unproven",
+          context.required === true ? "required" : context.required === false ? "optional" : "requiredness unknown",
+          context.state || context.status || "state unknown",
+          context.conclusion || "",
+          context.url || "",
+        ].filter(Boolean).join("; ");
+        list.append(element("li", detail, checkStatusClass(context.verdict)));
+      });
+      section.append(list);
+    });
+    return section;
+  }
+
+  function checkStatusClass(verdict) {
+    if (verdict === "passing") return "status success";
+    if (verdict === "blocking") return "status failure";
+    return "status pending";
   }
 
   function renderReviewers(reviewers) {

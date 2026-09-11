@@ -357,7 +357,11 @@ def test_dashboard_api_exposes_terminal_project_and_pull_request_state() -> None
                                     "state": "closed",
                                     "merged": True,
                                 }
-                            ]
+                            ],
+                            "checks": {
+                                "verdict": "unproven",
+                                "pull_requests": [],
+                            },
                         },
                     ),
                 ),
@@ -377,6 +381,7 @@ def test_dashboard_api_exposes_terminal_project_and_pull_request_state() -> None
     assert pbi["planning_status"] == "Done"
     assert pbi["stage_label"] == "Merged"
     assert pbi["pull_requests"] == [{"number": 9, "state": "closed", "merged": True}]
+    assert pbi["checks"] == {"verdict": "unproven", "pull_requests": []}
     service.store.close()
 
 
