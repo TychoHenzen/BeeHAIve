@@ -17,7 +17,7 @@ from beehaiive.agent import (
     CodexExecModelExecutor,
 )
 from beehaiive.dashboard import build_dashboard_state
-from beehaiive.meta_review import MetaReviewService
+from beehaiive.meta_review import MetaReviewError, MetaReviewService
 from beehaiive.models import RunState, RunStatus
 from beehaiive.provider import ProviderError
 from beehaiive.review import (
@@ -276,6 +276,11 @@ def create_app(
         and meta_review_service.store is not orchestrator.store
     ):
         raise ValueError("The meta-review service and API must share one state store")
+    if (
+        meta_review_service is not None
+        and meta_review_service.routing_store is not routing_service.store
+    ):
+        raise ValueError("The meta-review service and API must share one routing store")
     if meta_review_service is None:
         meta_review_service = MetaReviewService(
             orchestrator.store, routing_service.store
@@ -913,7 +918,7 @@ def create_app(
         request: MetaReviewRequest,
         _auth: None = Depends(require_mutation_access),
     ) -> dict[str, object]:
-        return _handle_store_error(
+        return _handle_meta_review_error(
             lambda: meta_review_service.run(
                 project_id,
                 since=request.since,
@@ -928,7 +933,7 @@ def create_app(
         status: Literal["pending", "accepted", "rejected"] | None = None,
         _access: None = Depends(require_project_access),
     ) -> dict[str, object]:
-        return _handle_store_error(
+        return _handle_meta_review_error(
             lambda: {"suggestions": meta_review_service.suggestions(project_id, status)}
         )
 
@@ -939,7 +944,7 @@ def create_app(
         request: MetaReviewDecisionRequest,
         _auth: None = Depends(require_mutation_access),
     ) -> dict[str, object]:
-        return _handle_store_error(
+        return _handle_meta_review_error(
             lambda: {
                 "suggestion": meta_review_service.decide(
                     project_id, suggestion_id, request.decision
@@ -1190,6 +1195,15 @@ def _handle_store_error[T](function: Callable[[], T]) -> T:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ProviderError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+def _handle_meta_review_error[T](function: Callable[[], T]) -> T:
+    try:
+        return function()
+    except (MetaReviewError, StoreError) as exc:
+        raise HTTPException(
+            status_code=409, detail="Meta-review request could not be completed"
+        ) from exc
 
 
 def _handle_review_error[T](function: Callable[[], T]) -> T:

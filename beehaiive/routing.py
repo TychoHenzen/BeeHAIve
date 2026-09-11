@@ -453,16 +453,22 @@ class RoutingStore:
             ).fetchone()
         return None if row is None else _state_from_row(row)
 
-    def get_attempts(self, problem_id: str) -> tuple[RoutingAttempt, ...]:
+    def get_attempts(
+        self, problem_id: str, limit: int | None = None
+    ) -> tuple[RoutingAttempt, ...]:
+        if limit is not None and limit <= 0:
+            raise RoutingError("attempt limit must be positive")
+        query = """
+            SELECT * FROM routing_attempts
+            WHERE problem_id = ?
+            ORDER BY attempt_id
+        """
+        parameters: tuple[object, ...] = (problem_id,)
+        if limit is not None:
+            query += " LIMIT ?"
+            parameters += (limit,)
         with self._lock:
-            rows = self._connection.execute(
-                """
-                SELECT * FROM routing_attempts
-                WHERE problem_id = ?
-                ORDER BY attempt_id
-                """,
-                (problem_id,),
-            ).fetchall()
+            rows = self._connection.execute(query, parameters).fetchall()
         return tuple(_attempt_from_row(row) for row in rows)
 
     def has_transition(self, transition_id: str) -> bool:

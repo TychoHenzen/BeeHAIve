@@ -1,12 +1,16 @@
+import json
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from threading import Event, Thread
 
 import pytest
 from conftest import FakeProvider
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from beehaiive.meta_review import (
+    MAX_META_REVIEW_EVIDENCE_REFS,
     MetaReviewError,
     MetaReviewService,
     _estimate_tokens,
@@ -19,8 +23,9 @@ from beehaiive.meta_review import (
 )
 from beehaiive.models import PbiSnapshot, ProjectSnapshot, RepositorySnapshot, Stage
 from beehaiive.orchestrator import Orchestrator
-from beehaiive.routing import ModelRouter, RoutingStore
+from beehaiive.routing import ModelRouter, RoutingError, RoutingStore
 from beehaiive.storage import (
+    MAX_META_REVIEW_EVENT_DETAILS_LENGTH,
     MAX_META_REVIEW_INPUT_TOKENS,
     MAX_META_REVIEW_RECORDS,
     OrchestratorStore,
@@ -28,7 +33,7 @@ from beehaiive.storage import (
     _json_list,
     _json_mapping,
 )
-from main import create_app
+from main import _handle_meta_review_error, create_app
 
 
 @pytest.fixture
@@ -137,6 +142,9 @@ def test_review_uses_routing_failures_and_since_bounds_records(
     router.begin(first_run)
     router.record(first_run, "failure", failure_context="retry")
     assert routing.get_attempts(first_run)
+    assert len(routing.get_attempts(first_run, limit=1)) == 1
+    with pytest.raises(RoutingError, match="attempt limit"):
+        routing.get_attempts(first_run, limit=0)
     service = MetaReviewService(store, routing)
 
     result = service.run(
@@ -160,7 +168,7 @@ def test_review_uses_routing_failures_and_since_bounds_records(
     assert "Input token limit reached" in bounded["missing_evidence"]
 
 
-def test_review_reports_analyzer_failures_and_bad_evidence(
+def test_review_reports_analyzer_failures(
     stores: tuple[OrchestratorStore, RoutingStore],
 ) -> None:
     store, routing = stores
@@ -174,6 +182,13 @@ def test_review_reports_analyzer_failures_and_bad_evidence(
     assert failed["status"] == "failed"
     assert "hidden" not in str(failed["error"])
 
+
+def test_review_rejects_malformed_suggestions_and_evidence(
+    stores: tuple[OrchestratorStore, RoutingStore],
+) -> None:
+    store, routing = stores
+    _seed(store)
+    _complete(store)
     malformed = MetaReviewService(store, routing, lambda records: [object()]).run(
         "project-1"
     )
@@ -181,10 +196,6 @@ def test_review_reports_analyzer_failures_and_bad_evidence(
     assert "invalid suggestion" in str(malformed["error"])
 
     service = MetaReviewService(store, routing)
-    with pytest.raises(MetaReviewError, match="Unknown project"):
-        service.run("missing")
-    with pytest.raises(MetaReviewError, match="project id"):
-        service.run(" ")
     records, missing, tokens = service._bounded_evidence([object()], 100)
     assert records == []
     assert missing == ["Malformed completed session record"]
@@ -195,13 +206,58 @@ def test_review_reports_analyzer_failures_and_bad_evidence(
     assert "Malformed completed session record" in missing
     assert "run:x: run identifier unavailable" in missing
     records, missing, _ = MetaReviewService(store)._bounded_evidence(
-        [{"source_id": "run:x", "run_id": "x", "events": []}], 1_000
+        [
+            {
+                "source_id": "run:x",
+                "run_id": "x",
+                "result": "completed",
+                "events": [],
+            }
+        ],
+        1_000,
     )
     assert records
     assert "run:x: lifecycle events unavailable" in missing
     assert "run:x: routing attempts unavailable" in missing
+    records, missing, _ = service._bounded_evidence(
+        [
+            {
+                "source_id": "run:incomplete",
+                "run_id": "incomplete",
+                "result": "",
+                "error": None,
+                "events": [],
+            }
+        ],
+        1_000,
+    )
+    assert records == []
+    assert "run:incomplete: completion result or error unavailable" in missing
     with pytest.raises(MetaReviewError, match="incomplete suggestion"):
         _normalize_suggestions("project-1", [{}])
+
+
+def test_review_validates_project_and_request_inputs(
+    stores: tuple[OrchestratorStore, RoutingStore],
+) -> None:
+    store, routing = stores
+    _seed(store)
+    _complete(store)
+    service = MetaReviewService(store, routing)
+    with pytest.raises(MetaReviewError, match="Unknown project"):
+        service.run("missing")
+    with pytest.raises(MetaReviewError, match="project id"):
+        service.run(" ")
+    with pytest.raises(MetaReviewError, match="ISO-8601"):
+        service.run("project-1", since="not-a-date")
+    with pytest.raises(MetaReviewError, match="timezone"):
+        service.run("project-1", since="2026-01-01T00:00:00")
+    with pytest.raises(MetaReviewError, match="record_limit"):
+        service.run("project-1", record_limit=MAX_META_REVIEW_RECORDS + 1)
+    with pytest.raises(MetaReviewError, match="input_token_limit"):
+        service.run("project-1", input_token_limit=MAX_META_REVIEW_INPUT_TOKENS + 1)
+    with pytest.raises(MetaReviewError, match="Decision"):
+        service.decide("project-1", "missing", "hold")
 
 
 def test_review_rejects_overlap_and_invalid_inputs(
@@ -219,7 +275,15 @@ def test_review_rejects_overlap_and_invalid_inputs(
         return []
 
     service = MetaReviewService(store, routing, blocking_analyzer)
-    thread = Thread(target=lambda: service.run("project-1"), daemon=True)
+    thread_result: dict[str, object] = {}
+
+    def run_review() -> None:
+        try:
+            thread_result["result"] = service.run("project-1")
+        except BaseException as exc:  # pragma: no cover - diagnostic capture
+            thread_result["error"] = exc
+
+    thread = Thread(target=run_review, daemon=True)
     thread.start()
     assert started.wait(2)
     with pytest.raises(MetaReviewError, match="already running"):
@@ -227,17 +291,8 @@ def test_review_rejects_overlap_and_invalid_inputs(
     release.set()
     thread.join(timeout=2)
     assert not thread.is_alive()
-
-    with pytest.raises(MetaReviewError, match="ISO-8601"):
-        service.run("project-1", since="not-a-date")
-    with pytest.raises(MetaReviewError, match="timezone"):
-        service.run("project-1", since="2026-01-01T00:00:00")
-    with pytest.raises(MetaReviewError, match="record_limit"):
-        service.run("project-1", record_limit=MAX_META_REVIEW_RECORDS + 1)
-    with pytest.raises(MetaReviewError, match="input_token_limit"):
-        service.run("project-1", input_token_limit=MAX_META_REVIEW_INPUT_TOKENS + 1)
-    with pytest.raises(MetaReviewError, match="Decision"):
-        service.decide("project-1", "missing", "hold")
+    assert "error" not in thread_result
+    assert isinstance(thread_result.get("result"), dict)
 
 
 def test_meta_review_store_boundaries_and_decision(
@@ -245,6 +300,18 @@ def test_meta_review_store_boundaries_and_decision(
 ) -> None:
     store, _routing = stores
     _seed(store)
+    run_id = _complete(store)
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE events SET details_json = ? WHERE run_id = ?",
+            (
+                json.dumps({"value": "x" * (MAX_META_REVIEW_EVENT_DETAILS_LENGTH + 1)}),
+                run_id,
+            ),
+        )
+    records = store.completed_session_records("project-1", None, 1)
+    assert records[0]["events"]
+    assert records[0]["events"][0]["details"] == {}
     with pytest.raises(StoreError, match="project id"):
         store.completed_session_records("", None, 1)
     with pytest.raises(StoreError, match="record_limit"):
@@ -288,11 +355,56 @@ def test_meta_review_store_boundaries_and_decision(
         store.finish_meta_review("review-1", "completed", 0, 0, ["missing"])["status"]
         == "completed"
     )
+    with pytest.raises(StoreError, match="not running"):
+        store.complete_meta_review("review-1", 0, 0, [], [])
     decision = store.decide_meta_review_suggestion(
         "project-1", "suggestion-1", "rejected"
     )
     assert decision["status"] == "rejected"
     assert store.meta_review_suggestions("project-1", "rejected") == [decision]
+
+
+def test_meta_review_store_reclaims_stale_review_and_enforces_global_overlap(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "meta-review.db"
+    first = OrchestratorStore(database)
+    second = OrchestratorStore(database)
+    try:
+        _seed(first)
+        first.sync_project(
+            ProjectSnapshot(
+                "project-2",
+                "Planning 2",
+                (
+                    RepositorySnapshot(
+                        "owner/api", (PbiSnapshot("owner/api", 1, "PBI"),)
+                    ),
+                ),
+            )
+        )
+        first.begin_meta_review("stale", "project-1", 1, 1)
+        with first._transaction() as connection:
+            connection.execute(
+                "UPDATE meta_review_runs SET created_at = ? WHERE review_id = ?",
+                (
+                    (datetime.now(UTC) - timedelta(hours=1)).isoformat(),
+                    "stale",
+                ),
+            )
+        second.begin_meta_review("fresh", "project-2", 1, 1)
+        with first._lock:
+            stale = first._connection.execute(
+                "SELECT status, error FROM meta_review_runs WHERE review_id = ?",
+                ("stale",),
+            ).fetchone()
+        assert stale["status"] == "failed"
+        assert stale["error"] == "Meta-review lease expired"
+        with pytest.raises(StoreError, match="already running"):
+            first.begin_meta_review("blocked", "project-1", 1, 1)
+    finally:
+        first.close()
+        second.close()
 
 
 def test_meta_review_api_requires_key_and_never_calls_provider(
@@ -327,6 +439,26 @@ def test_meta_review_api_requires_key_and_never_calls_provider(
     finally:
         other_store.close()
 
+    other_routing = RoutingStore()
+    try:
+        with pytest.raises(ValueError, match="routing store"):
+            create_app(
+                orchestrator=orchestrator,
+                meta_review_service=MetaReviewService(store, other_routing),
+                api_key="test-key",
+                allowed_project_ids={"project-1"},
+            )
+    finally:
+        other_routing.close()
+
+    def fail_meta_review() -> dict[str, object]:
+        raise StoreError("token=hidden")
+
+    with pytest.raises(HTTPException) as error:
+        _handle_meta_review_error(fail_meta_review)
+    assert error.value.status_code == 409
+    assert error.value.detail == "Meta-review request could not be completed"
+
     with TestClient(app) as client:
         denied = client.post("/projects/project-1/meta-review")
         assert denied.status_code == 401
@@ -358,6 +490,20 @@ def test_meta_review_helpers_keep_json_and_time_bounds() -> None:
     assert _safe_text(None) == ""
     assert _safe_text(123) == "123"
     assert "secret" not in _safe_json({"value": "token=secret"})
+    redacted = _safe_text(
+        '{"access_token":"json-secret","client_secret":"client-secret"} '
+        "Authorization: Bearer bearer-secret https://user:url-secret@example.com "
+        "password=plain-secret",
+        2_000,
+    )
+    for secret in (
+        "json-secret",
+        "client-secret",
+        "bearer-secret",
+        "url-secret",
+        "plain-secret",
+    ):
+        assert secret not in redacted
     circular: list[object] = []
     circular.append(circular)
     assert _safe_json(circular)
@@ -375,6 +521,18 @@ def test_meta_review_helpers_keep_json_and_time_bounds() -> None:
         ]
     )
     assert success[0]["suggestion_key"] == "completed-handoff:run:1"
+    normalized = _normalize_suggestions(
+        "project-1",
+        [
+            {
+                "suggestion_key": "bounded",
+                "proposed_outcome": "Outcome",
+                "rationale": "Reason",
+                "evidence_refs": [f"ref-{index}" for index in range(100)],
+            }
+        ],
+    )
+    assert len(normalized[0]["evidence_refs"]) == MAX_META_REVIEW_EVIDENCE_REFS
     assert _normalize_since(None) is None
     assert (
         _normalize_since("2026-01-01T01:00:00+01:00")

@@ -42,6 +42,9 @@ MAX_META_REVIEW_RECORDS = 25
 MAX_META_REVIEW_INPUT_TOKENS = 8_000
 MAX_META_REVIEW_SUGGESTIONS = 25
 MAX_META_REVIEW_TEXT_LENGTH = 500
+MAX_META_REVIEW_ATTEMPTS = 20
+MAX_META_REVIEW_EVENT_DETAILS_LENGTH = 8_000
+META_REVIEW_LEASE_SECONDS = 900
 
 
 def _now() -> str:
@@ -65,6 +68,12 @@ def _json_mapping(value: object) -> dict[str, object]:
     except json.JSONDecodeError:
         return {}
     return cast(dict[str, object], decoded) if isinstance(decoded, dict) else {}
+
+
+def _bounded_event_details(value: object) -> dict[str, object]:
+    if not isinstance(value, str) or len(value) > MAX_META_REVIEW_EVENT_DETAILS_LENGTH:
+        return {}
+    return _json_mapping(value)
 
 
 def _json_list(value: object) -> list[object]:
@@ -249,6 +258,10 @@ class OrchestratorStore:
 
                 CREATE UNIQUE INDEX IF NOT EXISTS active_meta_review_project
                     ON meta_review_runs(project_id)
+                    WHERE status = 'running';
+
+                CREATE UNIQUE INDEX IF NOT EXISTS active_meta_review_global
+                    ON meta_review_runs(status)
                     WHERE status = 'running';
 
                 CREATE TABLE IF NOT EXISTS meta_review_suggestions (
@@ -1578,7 +1591,9 @@ class OrchestratorStore:
                                 "type": event["event_type"],
                                 "from_stage": event["from_stage"],
                                 "to_stage": event["to_stage"],
-                                "details": _json_mapping(event["details_json"]),
+                                "details": _bounded_event_details(
+                                    event["details_json"]
+                                ),
                                 "created_at": event["created_at"],
                             }
                             for event in reversed(event_rows)
@@ -1602,6 +1617,18 @@ class OrchestratorStore:
             ).fetchone()
             if project is None:
                 raise StoreError(f"Unknown project: {project_id}")
+            now = _now()
+            stale_before = (
+                datetime.now(UTC) - timedelta(seconds=META_REVIEW_LEASE_SECONDS)
+            ).isoformat()
+            connection.execute(
+                """
+                UPDATE meta_review_runs
+                SET status = 'failed', error = ?, completed_at = ?
+                WHERE status = 'running' AND created_at < ?
+                """,
+                ("Meta-review lease expired", now, stale_before),
+            )
             try:
                 connection.execute(
                     """
@@ -1610,7 +1637,7 @@ class OrchestratorStore:
                         input_token_limit, created_at
                     ) VALUES (?, ?, 'running', ?, ?, ?)
                     """,
-                    (review_id, project_id, record_limit, input_token_limit, _now()),
+                    (review_id, project_id, record_limit, input_token_limit, now),
                 )
             except sqlite3.IntegrityError as exc:
                 raise StoreError("A meta-review is already running") from exc
@@ -1651,54 +1678,101 @@ class OrchestratorStore:
                 raise StoreError(f"Unknown meta-review: {review_id}")
             return self._meta_review_run_from_row(row)
 
+    def complete_meta_review(
+        self,
+        review_id: str,
+        selected_records: int,
+        input_tokens: int,
+        missing_evidence: list[str],
+        suggestions: list[dict[str, object]],
+    ) -> tuple[dict[str, object], list[dict[str, object]]]:
+        with self._transaction() as connection:
+            saved = self._save_meta_review_suggestions(
+                connection, review_id, suggestions
+            )
+            now = _now()
+            updated = connection.execute(
+                """
+                UPDATE meta_review_runs
+                SET status = 'completed', selected_records = ?, input_tokens = ?,
+                    missing_evidence_json = ?, completed_at = ?
+                WHERE review_id = ? AND status = 'running'
+                """,
+                (
+                    selected_records,
+                    input_tokens,
+                    json.dumps(missing_evidence, sort_keys=True),
+                    now,
+                    review_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise StoreError("Meta-review is not running")
+            row = connection.execute(
+                "SELECT * FROM meta_review_runs WHERE review_id = ?", (review_id,)
+            ).fetchone()
+            if row is None:  # pragma: no cover - guarded by the update
+                raise StoreError(f"Unknown meta-review: {review_id}")
+            return self._meta_review_run_from_row(row), saved
+
     def save_meta_review_suggestions(
         self, review_id: str, suggestions: list[dict[str, object]]
     ) -> list[dict[str, object]]:
         with self._transaction() as connection:
-            review = connection.execute(
-                "SELECT project_id FROM meta_review_runs WHERE review_id = ?",
-                (review_id,),
-            ).fetchone()
-            if review is None:
-                raise StoreError(f"Unknown meta-review: {review_id}")
-            project_id = str(review["project_id"])
-            now = _now()
-            for suggestion in suggestions:
-                connection.execute(
-                    """
-                    INSERT INTO meta_review_suggestions(
-                        suggestion_id, project_id, suggestion_key,
-                        proposed_outcome, rationale, evidence_refs_json,
-                        status, created_at, updated_at, last_review_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
-                    ON CONFLICT(project_id, suggestion_key) DO UPDATE SET
-                        proposed_outcome = excluded.proposed_outcome,
-                        rationale = excluded.rationale,
-                        evidence_refs_json = excluded.evidence_refs_json,
-                        updated_at = excluded.updated_at,
-                        last_review_id = excluded.last_review_id
-                    """,
-                    (
-                        suggestion["suggestion_id"],
-                        project_id,
-                        suggestion["suggestion_key"],
-                        suggestion["proposed_outcome"],
-                        suggestion["rationale"],
-                        json.dumps(suggestion["evidence_refs"], sort_keys=True),
-                        now,
-                        now,
-                        review_id,
-                    ),
-                )
-            rows = connection.execute(
+            return self._save_meta_review_suggestions(
+                connection, review_id, suggestions
+            )
+
+    def _save_meta_review_suggestions(
+        self,
+        connection: sqlite3.Connection,
+        review_id: str,
+        suggestions: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        review = connection.execute(
+            "SELECT project_id FROM meta_review_runs WHERE review_id = ?",
+            (review_id,),
+        ).fetchone()
+        if review is None:
+            raise StoreError(f"Unknown meta-review: {review_id}")
+        project_id = str(review["project_id"])
+        now = _now()
+        for suggestion in suggestions:
+            connection.execute(
                 """
-                SELECT * FROM meta_review_suggestions
-                WHERE project_id = ? AND last_review_id = ?
-                ORDER BY created_at, suggestion_id
+                INSERT INTO meta_review_suggestions(
+                    suggestion_id, project_id, suggestion_key,
+                    proposed_outcome, rationale, evidence_refs_json,
+                    status, created_at, updated_at, last_review_id
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                ON CONFLICT(project_id, suggestion_key) DO UPDATE SET
+                    proposed_outcome = excluded.proposed_outcome,
+                    rationale = excluded.rationale,
+                    evidence_refs_json = excluded.evidence_refs_json,
+                    updated_at = excluded.updated_at,
+                    last_review_id = excluded.last_review_id
                 """,
-                (project_id, review_id),
-            ).fetchall()
-            return [self._meta_review_suggestion_from_row(row) for row in rows]
+                (
+                    suggestion["suggestion_id"],
+                    project_id,
+                    suggestion["suggestion_key"],
+                    suggestion["proposed_outcome"],
+                    suggestion["rationale"],
+                    json.dumps(suggestion["evidence_refs"], sort_keys=True),
+                    now,
+                    now,
+                    review_id,
+                ),
+            )
+        rows = connection.execute(
+            """
+            SELECT * FROM meta_review_suggestions
+            WHERE project_id = ? AND last_review_id = ?
+            ORDER BY created_at, suggestion_id
+            """,
+            (project_id, review_id),
+        ).fetchall()
+        return [self._meta_review_suggestion_from_row(row) for row in rows]
 
     def meta_review_suggestions(
         self, project_id: str, status: str | None = None
@@ -1713,7 +1787,8 @@ class OrchestratorStore:
             if status is not None:
                 query += " AND status = ?"
                 parameters.append(status)
-            query += " ORDER BY created_at, suggestion_id"
+            query += " ORDER BY created_at, suggestion_id LIMIT ?"
+            parameters.append(MAX_META_REVIEW_SUGGESTIONS)
             rows = self._connection.execute(query, parameters).fetchall()
             return [self._meta_review_suggestion_from_row(row) for row in rows]
 

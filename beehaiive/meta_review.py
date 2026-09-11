@@ -14,6 +14,7 @@ from uuid import uuid4
 from .agent import redact_worker_text
 from .routing import RoutingStore
 from .storage import (
+    MAX_META_REVIEW_ATTEMPTS,
     MAX_META_REVIEW_INPUT_TOKENS,
     MAX_META_REVIEW_RECORDS,
     MAX_META_REVIEW_SUGGESTIONS,
@@ -21,6 +22,8 @@ from .storage import (
     OrchestratorStore,
     StoreError,
 )
+
+MAX_META_REVIEW_EVIDENCE_REFS = 25
 
 
 class MetaReviewError(StoreError):
@@ -83,13 +86,12 @@ class MetaReviewService:
                 suggestions = _normalize_suggestions(
                     project_id, self._analyzer(records)
                 )
-                saved = self.store.save_meta_review_suggestions(review_id, suggestions)
-                run = self.store.finish_meta_review(
+                run, saved = self.store.complete_meta_review(
                     review_id,
-                    "completed",
                     selected_records,
                     input_tokens,
                     missing_evidence,
+                    suggestions,
                 )
                 return _review_result(run, saved)
             except Exception as exc:
@@ -169,6 +171,12 @@ class MetaReviewService:
             if not isinstance(run_id, str) or not run_id.strip():
                 missing.append(f"{source_id}: run identifier unavailable")
                 continue
+            if not any(
+                isinstance(value, str) and value.strip()
+                for value in (source_record.get("result"), source_record.get("error"))
+            ):
+                missing.append(f"{source_id}: completion result or error unavailable")
+                continue
             raw_events = source_record.get("events")
             if not _mappings(raw_events):
                 missing.append(f"{source_id}: lifecycle events unavailable")
@@ -178,7 +186,9 @@ class MetaReviewService:
             else:
                 attempts = [
                     attempt.as_dict()
-                    for attempt in self.routing_store.get_attempts(run_id)
+                    for attempt in self.routing_store.get_attempts(
+                        run_id, limit=MAX_META_REVIEW_ATTEMPTS
+                    )
                 ]
                 if not attempts:
                     missing.append(f"{source_id}: routing attempts unavailable")
@@ -262,7 +272,7 @@ def _normalize_suggestions(
         raw_refs = raw.get("evidence_refs")
         refs: list[str] = []
         if isinstance(raw_refs, Sequence) and not isinstance(raw_refs, str):
-            for ref in cast(Sequence[object], raw_refs):
+            for ref in cast(Sequence[object], raw_refs)[:MAX_META_REVIEW_EVIDENCE_REFS]:
                 safe_ref = _safe_text(ref, 160)
                 if safe_ref:
                     refs.append(safe_ref)
