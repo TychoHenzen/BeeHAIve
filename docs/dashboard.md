@@ -54,6 +54,13 @@ The GitHub provider supplies optional live details during project sync. GitHub
 sub-issues become subtasks, linked pull-request review requests and latest
 reviews become readers and reviewer results, issue comments become activity,
 and `bounces/N` or `escalation/<tier>` labels become escalation state.
+For each active linked pull request, the provider also records the observed head
+SHA and paginated `CheckRun` and `StatusContext` evidence. The dashboard shows
+requiredness, status or state, conclusion, source URL, and a verdict of
+`pending`, `passing`, `blocking`, or `unproven`. A missing rollup, provider or
+rate-limit error, unavailable requiredness, or head mismatch stays unproven.
+A blocking required check for the observed head fails the matching local
+implementation run through the existing durable failure and routing path.
 Each PBI card keeps the raw GitHub Project status separate from the local run
 status. A PBI without a local run is `idle`, terminal Project statuses appear
 as terminal progress, and pull requests show merged, open, or closed state

@@ -14,6 +14,7 @@ from typing import Any, Protocol, cast
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from .checks import aggregate_check_verdict, normalize_check_rollup
 from .models import (
     HandoffRequest,
     HandoffResult,
@@ -484,7 +485,7 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
           state
           merged
           headRefName
-          headRef { name }
+          headRef { name target { oid } }
           reviewDecision
           reviewRequests(first: 100) {
             nodes {
@@ -507,6 +508,44 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
           }
         }
         pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+
+PULL_REQUEST_CHECKS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      state
+      headRef { target { oid } }
+      statusCheckRollup {
+        commit { oid }
+        state
+        contexts(first: 100, after: $cursor) {
+          nodes {
+            __typename
+            ... on CheckRun {
+              name
+              status
+              conclusion
+              isRequired(pullRequestNumber: $number)
+              detailsUrl
+              startedAt
+              completedAt
+            }
+            ... on StatusContext {
+              context
+              state
+              isRequired(pullRequestNumber: $number)
+              targetUrl
+              createdAt
+              updatedAt
+            }
+          }
+          pageInfo { hasNextPage endCursor }
+        }
       }
     }
   }
@@ -694,6 +733,22 @@ def _label_names(value: object) -> list[str]:
     return names
 
 
+def _pull_request_head_sha(value: object) -> str | None:
+    if not isinstance(value, Mapping):
+        return None
+    head_ref = cast(Mapping[str, Any], value)
+    target_value = head_ref.get("target")
+    if not isinstance(target_value, Mapping):
+        return None
+    target = cast(Mapping[str, Any], target_value)
+    oid = target.get("oid")
+    return oid if isinstance(oid, str) and oid.strip() else None
+
+
+def _commit_oid(value: object) -> str | None:
+    return value if isinstance(value, str) and value.strip() else None
+
+
 def _review_status(state: object) -> str:
     normalized = str(state or "").strip().upper()
     if normalized == "APPROVED":
@@ -736,6 +791,7 @@ def _dashboard_metadata(issue: Mapping[str, Any]) -> dict[str, object]:
     readers: list[dict[str, object]] = []
     reviewers: dict[str, dict[str, object]] = {}
     pull_requests: list[dict[str, object]] = []
+    active_check_snapshots: list[Mapping[str, object]] = []
     for raw_pull_request in _nodes(issue.get("closedByPullRequestsReferences", {})):
         pull_request_number = raw_pull_request.get("number")
         if not isinstance(pull_request_number, int):
@@ -808,6 +864,9 @@ def _dashboard_metadata(issue: Mapping[str, Any]) -> dict[str, object]:
         if has_source_branch:
             pull_request["source_branch"] = source_branch
         head_ref = raw_pull_request.get("headRef")
+        head_sha = _pull_request_head_sha(head_ref)
+        if head_sha is not None:
+            pull_request["head_sha"] = head_sha
         pull_request["source_branch_state"] = (
             "unknown"
             if "headRef" not in raw_pull_request or not has_source_branch
@@ -820,6 +879,13 @@ def _dashboard_metadata(issue: Mapping[str, Any]) -> dict[str, object]:
         decision = raw_pull_request.get("reviewDecision")
         if isinstance(decision, str):
             pull_request["review_decision"] = decision.lower()
+        checks = raw_pull_request.get("checks")
+        if isinstance(checks, Mapping):
+            normalized_checks = dict(cast(Mapping[str, object], checks))
+            normalized_checks["number"] = pull_request_number
+            pull_request["checks"] = normalized_checks
+            if str(pull_request.get("state", "")).lower() == "open":
+                active_check_snapshots.append(normalized_checks)
         pull_requests.append(pull_request)
 
     if readers:
@@ -828,6 +894,10 @@ def _dashboard_metadata(issue: Mapping[str, Any]) -> dict[str, object]:
         metadata["reviewers"] = reviewers
     if pull_requests:
         metadata["pull_requests"] = pull_requests
+    metadata["checks"] = {
+        "verdict": aggregate_check_verdict(active_check_snapshots),
+        "pull_requests": [dict(check) for check in active_check_snapshots],
+    }
 
     activity: list[dict[str, object]] = []
     for comment in _nodes(issue.get("comments", {})):
@@ -1018,6 +1088,17 @@ class GitHubProjectProvider:
             pull_request = dict(raw_pull_request)
             pull_request_number = pull_request.get("number")
             if isinstance(pull_request_number, int):
+                if str(pull_request.get("state", "")).upper() == "OPEN":
+                    checks = self._complete_pull_request_checks(
+                        repository_owner,
+                        repository,
+                        pull_request_number,
+                        _pull_request_head_sha(pull_request.get("headRef")),
+                    )
+                    pull_request["checks"] = checks
+                    observed_head_sha = checks.get("head_sha")
+                    if isinstance(observed_head_sha, str) and observed_head_sha:
+                        pull_request["headRef"] = {"target": {"oid": observed_head_sha}}
                 review_variables = {
                     "owner": repository_owner,
                     "name": repository,
@@ -1041,6 +1122,58 @@ class GitHubProjectProvider:
         pull_requests["nodes"] = completed_pull_requests
         completed_issue["closedByPullRequestsReferences"] = pull_requests
         return completed_issue
+
+    def _complete_pull_request_checks(
+        self,
+        owner: str,
+        repository: str,
+        number: int,
+        head_sha: str | None,
+    ) -> dict[str, object]:
+        if head_sha is None:
+            return normalize_check_rollup(None, None)
+        variables = {"owner": owner, "name": repository, "number": number}
+        try:
+            data = self._client.execute(PULL_REQUEST_CHECKS_QUERY, variables)
+            pull_request = _mapping(_mapping(data.get("repository")).get("pullRequest"))
+            observed_head_sha = _pull_request_head_sha(pull_request.get("headRef"))
+            if str(pull_request.get("state", "")).upper() != "OPEN":
+                return normalize_check_rollup(observed_head_sha, None)
+            rollup = _mapping(pull_request.get("statusCheckRollup"))
+            initial_contexts = _mapping(rollup.get("contexts"))
+            context_nodes = list(_nodes(initial_contexts))
+            has_next, cursor = _next_cursor(initial_contexts)
+            rollup_sha = _commit_oid(_mapping(rollup.get("commit")).get("oid"))
+            while has_next:
+                page_data = self._client.execute(
+                    PULL_REQUEST_CHECKS_QUERY,
+                    {**variables, "cursor": cursor},
+                )
+                page_pull_request = _mapping(
+                    _mapping(page_data.get("repository")).get("pullRequest")
+                )
+                page_head_sha = _pull_request_head_sha(page_pull_request.get("headRef"))
+                page_rollup = _mapping(page_pull_request.get("statusCheckRollup"))
+                page_rollup_sha = _commit_oid(
+                    _mapping(page_rollup.get("commit")).get("oid")
+                )
+                if (
+                    str(page_pull_request.get("state", "")).upper() != "OPEN"
+                    or page_head_sha != observed_head_sha
+                    or page_rollup_sha != rollup_sha
+                ):
+                    return normalize_check_rollup(page_head_sha, None)
+                page_contexts = _mapping(page_rollup.get("contexts"))
+                context_nodes.extend(_nodes(page_contexts))
+                has_next, cursor = _next_cursor(page_contexts)
+            completed_rollup = dict(rollup)
+            completed_rollup["contexts"] = {
+                "nodes": context_nodes,
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            }
+            return normalize_check_rollup(observed_head_sha, completed_rollup)
+        except ProviderError as exc:
+            return normalize_check_rollup(None, None, error=str(exc))
 
     @classmethod
     def from_environment(cls) -> GitHubProjectProvider:

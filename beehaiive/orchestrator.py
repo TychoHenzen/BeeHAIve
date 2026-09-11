@@ -6,6 +6,7 @@ from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from threading import Event, Lock, Thread
 
+from .checks import blocking_check_failure
 from .models import (
     HandoffRequest,
     ProjectSnapshot,
@@ -83,6 +84,7 @@ class Orchestrator:
         snapshot = self.provider.discover_project(project_id)
         self._cancel_removed_workers(snapshot)
         self.store.sync_project(snapshot)
+        self._route_blocking_check_failures(snapshot)
         return self.store.project_state(project_id)
 
     def claim(
@@ -312,6 +314,20 @@ class Orchestrator:
         for run in active_runs:
             if (run.repository, run.pbi_number) not in visible_pbis:
                 self._cancel_worker(run.run_id)
+
+    def _route_blocking_check_failures(self, snapshot: ProjectSnapshot) -> None:
+        active_runs = {
+            (run.repository, run.pbi_number): run
+            for run in self.store.active_runs_for_project(snapshot.project_id)
+            if run.stage is Stage.IMPLEMENT and run.lease_token is not None
+        }
+        for repository in snapshot.repositories:
+            for pbi in repository.pbis:
+                failure = blocking_check_failure(pbi.metadata)
+                run = active_runs.get((repository.name, pbi.number))
+                if failure is None or run is None or run.lease_token is None:
+                    continue
+                self.fail(run.run_id, failure, run.lease_token)
 
     def _ensure_routing_problem(self, run_id: str) -> None:
         if self.model_router is None:

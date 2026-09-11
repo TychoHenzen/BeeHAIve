@@ -7,12 +7,14 @@ from typing import Any
 import pytest
 from conftest import FakeProvider
 
+import beehaiive.provider as provider_module
 from beehaiive.models import (
     HandoffRequest,
     HandoffResult,
     PbiSnapshot,
     ProjectSnapshot,
     RepositorySnapshot,
+    RunStatus,
     Stage,
 )
 from beehaiive.orchestrator import Orchestrator
@@ -169,6 +171,76 @@ def test_repositories_have_independent_writer_claims() -> None:
 
     api_state = service.store.project_state("project-1")["repositories"][0]
     assert api_state["writer"]["run_id"] == api_run.run_id  # type: ignore[index]
+
+
+def test_synchronize_routes_current_head_blocking_check_once() -> None:
+    provider = FakeProvider(snapshot())
+    routing_store = RoutingStore()
+    service = Orchestrator(
+        OrchestratorStore(), provider, model_router=ModelRouter(routing_store)
+    )
+    service.synchronize("project-1")
+    run = service.claim("project-1", "owner/api", "worker-1")
+    assert run is not None
+    active_run = service.advance(run.run_id, Stage.IMPLEMENT, run.lease_token or "")
+
+    provider.snapshot = ProjectSnapshot(
+        "project-1",
+        "Planning",
+        (
+            RepositorySnapshot(
+                "owner/api",
+                (
+                    PbiSnapshot(
+                        "owner/api",
+                        1,
+                        "API one",
+                        Stage.IMPLEMENT,
+                        "In Progress",
+                        True,
+                        {
+                            "pull_requests": [
+                                {
+                                    "number": 9,
+                                    "state": "open",
+                                    "checks": {
+                                        "head_sha": "abc",
+                                        "verdict": "blocking",
+                                        "blocking_contexts": [
+                                            {
+                                                "name": "codeql",
+                                                "state": "failure",
+                                                "required": True,
+                                                "verdict": "blocking",
+                                                "url": "https://example.test/codeql",
+                                            }
+                                        ],
+                                    },
+                                }
+                            ]
+                        },
+                    ),
+                    PbiSnapshot("owner/api", 2, "API two"),
+                ),
+            ),
+            RepositorySnapshot("owner/web", (PbiSnapshot("owner/web", 3, "Web one"),)),
+        ),
+    )
+
+    service.synchronize("project-1")
+    failed = service.store.get_run(active_run.run_id)
+    assert failed is not None
+    assert failed.status is RunStatus.FAILED
+    assert failed.last_error == (
+        "Pull request #9 check 'codeql' blocks head abc: failure "
+        "(https://example.test/codeql)"
+    )
+    assert len(routing_store.get_attempts(active_run.run_id)) == 1
+
+    service.synchronize("project-1")
+    assert len(routing_store.get_attempts(active_run.run_id)) == 1
+    service.store.close()
+    routing_store.close()
 
 
 def test_durable_lease_blocks_duplicate_workers_and_fences_takeover(
@@ -1212,6 +1284,122 @@ class NestedMetadataGraphQLClient:
         return {"user": {"projectV2": {"title": "Paged Planning"}}}
 
 
+class CheckGraphQLClient:
+    def __init__(
+        self,
+        *,
+        observed_head: str | None = "head-1",
+        rollup_oid: str | None = None,
+        page_observed_head: str | None = None,
+        page_rollup_oid: str | None = None,
+        observed_state: str = "OPEN",
+        error: str | None = None,
+    ) -> None:
+        self.cursors: list[object] = []
+        self.observed_head = observed_head
+        self.rollup_oid = rollup_oid
+        self.page_observed_head = page_observed_head
+        self.page_rollup_oid = page_rollup_oid
+        self.observed_state = observed_state
+        self.error = error
+
+    def execute(self, query: str, variables: dict[str, object]) -> dict[str, Any]:
+        if "statusCheckRollup" in query:
+            if self.error is not None:
+                raise ProviderError(self.error)
+            cursor = variables.get("cursor")
+            self.cursors.append(cursor)
+            page_head = (
+                self.page_observed_head
+                if cursor is not None and self.page_observed_head is not None
+                else self.observed_head
+            )
+            page_rollup_oid = (
+                self.page_rollup_oid
+                if cursor is not None and self.page_rollup_oid is not None
+                else self.rollup_oid
+            )
+            contexts = (
+                [
+                    {
+                        "__typename": "CheckRun",
+                        "name": "python-tests",
+                        "status": "COMPLETED",
+                        "conclusion": "SUCCESS",
+                        "isRequired": True,
+                        "detailsUrl": "https://example.test/python-tests",
+                        "completedAt": "2026-09-11T08:01:00Z",
+                    }
+                ]
+                if cursor is None
+                else [
+                    {
+                        "__typename": "StatusContext",
+                        "context": "legacy-status",
+                        "state": "SUCCESS",
+                        "isRequired": False,
+                        "targetUrl": "https://example.test/legacy-status",
+                        "updatedAt": "2026-09-11T08:02:00Z",
+                    }
+                ]
+            )
+            return {
+                "repository": {
+                    "pullRequest": {
+                        "state": self.observed_state,
+                        "headRef": (
+                            {"target": {"oid": page_head}}
+                            if page_head is not None
+                            else None
+                        ),
+                        "statusCheckRollup": {
+                            "commit": {"oid": page_rollup_oid or page_head},
+                            "state": "SUCCESS",
+                            "contexts": {
+                                "nodes": contexts,
+                                "pageInfo": {
+                                    "hasNextPage": cursor is None,
+                                    "endCursor": "checks-1" if cursor is None else None,
+                                },
+                            },
+                        },
+                    }
+                }
+            }
+        return {
+            "repository": {
+                "issue": {
+                    "labels": {
+                        "nodes": [],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    },
+                    "subIssues": {
+                        "nodes": [],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    },
+                    "comments": {
+                        "nodes": [],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    },
+                    "closedByPullRequestsReferences": {
+                        "nodes": [],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    },
+                },
+                "pullRequest": {
+                    "reviewRequests": {
+                        "nodes": [],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    },
+                    "latestReviews": {
+                        "nodes": [],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    },
+                },
+            }
+        }
+
+
 class HandoffGraphQLClient:
     def __init__(self) -> None:
         self.ref_exists = False
@@ -1340,6 +1528,153 @@ def test_github_provider_paginates_nested_dashboard_metadata() -> None:
         "consecutive": 2,
         "current_tier": "terra",
     }
+
+
+def test_github_provider_paginates_current_pull_request_checks() -> None:
+    client = CheckGraphQLClient()
+    provider = GitHubProjectProvider("owner", 7, "token", client=client)
+    issue = {
+        "repository": {"nameWithOwner": "owner/api"},
+        "number": 1,
+        "labels": {"nodes": [], "pageInfo": {"hasNextPage": False}},
+        "subIssues": {"nodes": [], "pageInfo": {"hasNextPage": False}},
+        "comments": {"nodes": [], "pageInfo": {"hasNextPage": False}},
+        "closedByPullRequestsReferences": {
+            "nodes": [
+                {
+                    "number": 9,
+                    "state": "OPEN",
+                    "headRef": {"target": {"oid": "head-1"}},
+                    "reviewRequests": {
+                        "nodes": [],
+                        "pageInfo": {"hasNextPage": False},
+                    },
+                    "latestReviews": {
+                        "nodes": [],
+                        "pageInfo": {"hasNextPage": False},
+                    },
+                }
+            ],
+            "pageInfo": {"hasNextPage": False},
+        },
+    }
+
+    completed = provider._complete_issue_metadata(issue)
+    metadata = provider_module._dashboard_metadata(completed)
+    checks = metadata["pull_requests"][0]["checks"]  # type: ignore[index]
+
+    assert client.cursors == [None, "checks-1"]
+    assert checks["head_sha"] == "head-1"  # type: ignore[index]
+    assert checks["verdict"] == "passing"  # type: ignore[index]
+    assert [context["kind"] for context in checks["contexts"]] == [  # type: ignore[index]
+        "check_run",
+        "status_context",
+    ]
+    assert metadata["checks"]["verdict"] == "passing"  # type: ignore[index]
+
+
+def test_github_provider_requires_current_head_evidence() -> None:
+    provider = GitHubProjectProvider(
+        "owner", 7, "token", client=CheckGraphQLClient(observed_head=None)
+    )
+
+    checks = provider._complete_pull_request_checks("owner", "api", 9, "head-1")
+    missing_head = provider._complete_pull_request_checks("owner", "api", 9, None)
+
+    assert checks["head_sha"] is None
+    assert checks["verdict"] == "unproven"
+    assert missing_head["verdict"] == "unproven"
+
+
+def test_github_provider_rejects_head_change_during_check_pagination() -> None:
+    provider = GitHubProjectProvider(
+        "owner",
+        7,
+        "token",
+        client=CheckGraphQLClient(page_observed_head="head-2"),
+    )
+
+    checks = provider._complete_pull_request_checks("owner", "api", 9, "head-1")
+
+    assert checks["head_sha"] == "head-2"
+    assert checks["verdict"] == "unproven"
+
+
+def test_github_provider_rejects_pull_request_closed_during_check_poll() -> None:
+    provider = GitHubProjectProvider(
+        "owner",
+        7,
+        "token",
+        client=CheckGraphQLClient(observed_state="MERGED"),
+    )
+
+    checks = provider._complete_pull_request_checks("owner", "api", 9, "head-1")
+
+    assert checks["verdict"] == "unproven"
+
+
+def test_github_provider_check_error_stays_unproven() -> None:
+    provider = GitHubProjectProvider(
+        "owner",
+        7,
+        "token",
+        client=CheckGraphQLClient(error="GitHub GraphQL rate limit exceeded"),
+    )
+
+    checks = provider._complete_pull_request_checks("owner", "api", 9, "head-1")
+
+    assert checks["verdict"] == "unproven"
+    assert checks["head_sha"] is None
+    assert checks["error"] == "GitHub GraphQL rate limit exceeded"
+
+
+def test_github_provider_does_not_merge_active_pull_request_check_verdicts() -> None:
+    metadata = provider_module._dashboard_metadata(
+        {
+            "closedByPullRequestsReferences": {
+                "nodes": [
+                    {
+                        "number": 9,
+                        "state": "OPEN",
+                        "checks": {
+                            "head_sha": "head-9",
+                            "verdict": "passing",
+                            "contexts": [],
+                        },
+                    },
+                    {
+                        "number": 10,
+                        "state": "OPEN",
+                        "checks": {
+                            "head_sha": "head-10",
+                            "verdict": "unproven",
+                            "contexts": [],
+                        },
+                    },
+                ],
+                "pageInfo": {"hasNextPage": False},
+            }
+        }
+    )
+
+    checks = metadata["checks"]
+    assert checks["verdict"] == "unproven"  # type: ignore[index]
+    assert [
+        check["head_sha"]
+        for check in checks["pull_requests"]  # type: ignore[index]
+    ] == ["head-9", "head-10"]
+    assert [
+        check["number"]
+        for check in checks["pull_requests"]  # type: ignore[index]
+    ] == [9, 10]
+
+
+def test_github_provider_marks_no_active_pull_request_unproven() -> None:
+    metadata = provider_module._dashboard_metadata(
+        {"closedByPullRequestsReferences": {"nodes": []}}
+    )
+
+    assert metadata["checks"] == {"verdict": "unproven", "pull_requests": []}
 
 
 def test_github_provider_ignores_incomplete_issue_metadata() -> None:

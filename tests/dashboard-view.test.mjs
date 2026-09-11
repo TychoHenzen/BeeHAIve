@@ -224,6 +224,83 @@ test("rendering keeps project and pull-request terminal state visible", () => {
   assert.doesNotMatch(dashboardOutput.textContent, /#9: review pending/);
 });
 
+test("rendering exposes current-head check verdicts and evidence", () => {
+  const summaryOutput = new FakeNode("section");
+  const dashboardOutput = new FakeNode("section");
+  const actionLog = new FakeNode("section");
+  const actionsOutput = new FakeNode("div");
+  const view = createDashboardView({
+    document: new FakeDocument(),
+    summaryOutput,
+    dashboardOutput,
+    actionLog,
+    actionsOutput,
+    runAction: () => {},
+  });
+
+  view.render({
+    name: "Planning",
+    counts: {},
+    repositories: [
+      {
+        name: "owner/api",
+        active: true,
+        writer: { status: "idle" },
+        pbis: [
+          {
+            number: 1,
+            title: "Checked PBI",
+            stage_progress: [],
+            pull_requests: [{ number: 9, state: "open" }],
+            checks: {
+              verdict: "blocking",
+              pull_requests: [
+                {
+                  number: 9,
+                  head_sha: "abc123",
+                  verdict: "blocking",
+                  contexts: [
+                    {
+                      name: "codeql",
+                      verdict: "blocking",
+                      required: true,
+                      state: "failure",
+                      url: "https://example.test/codeql",
+                    },
+                    {
+                      name: "legacy-status",
+                      verdict: "passing",
+                      required: false,
+                      state: "success",
+                    },
+                  ],
+                },
+              ],
+            },
+            subtasks: [],
+            readers: [],
+            reviewers: {},
+            activity: [],
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.match(dashboardOutput.textContent, /Checks/);
+  assert.match(dashboardOutput.textContent, /Overall: blocking/);
+  assert.match(dashboardOutput.textContent, /PR #9: blocking; head abc123/);
+  assert.match(dashboardOutput.textContent, /codeql; blocking; required; failure/);
+  assert.match(dashboardOutput.textContent, /https:\/\/example.test\/codeql/);
+  assert.match(dashboardOutput.textContent, /legacy-status; passing; optional; success/);
+
+  const blocking = findNode(
+    dashboardOutput,
+    (node) => node._textContent === "Overall: blocking",
+  );
+  assert.equal(blocking.className, "status failure");
+});
+
 test("rendering archived PBIs exposes completion and branch evidence", () => {
   const summaryOutput = new FakeNode("section");
   const dashboardOutput = new FakeNode("section");
