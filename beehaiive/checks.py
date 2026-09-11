@@ -119,21 +119,22 @@ def _context_nodes(rollup: Mapping[str, object]) -> list[Mapping[str, object]] |
     if not isinstance(raw_nodes, list):
         return None
     nodes = cast(list[object], raw_nodes)
-    return [
-        cast(Mapping[str, object], node) for node in nodes if isinstance(node, Mapping)
-    ]
+    if any(not isinstance(node, Mapping) for node in nodes):
+        return None
+    return [cast(Mapping[str, object], node) for node in nodes]
 
 
 def _verdict(contexts: Sequence[Mapping[str, object]]) -> CheckVerdict:
-    if not contexts or any(context.get("required") is None for context in contexts):
+    if not contexts or any(
+        context.get("required") is None or context.get("verdict") == "unproven"
+        for context in contexts
+    ):
         return "unproven"
     required = [context for context in contexts if context.get("required") is True]
     if any(context.get("verdict") == "blocking" for context in required):
         return "blocking"
     if any(context.get("verdict") == "pending" for context in required):
         return "pending"
-    if any(context.get("verdict") == "unproven" for context in required):
-        return "unproven"
     return "passing"
 
 

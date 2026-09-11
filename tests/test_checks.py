@@ -216,12 +216,37 @@ def test_normalize_unknown_context_and_malformed_nodes_are_unproven() -> None:
         "abc",
         {
             "commit": {"oid": "abc"},
-            "contexts": {"nodes": {"not": "a list"}},
+            "contexts": {
+                "nodes": [
+                    {
+                        "__typename": "CheckRun",
+                        "status": "COMPLETED",
+                        "conclusion": "SUCCESS",
+                        "isRequired": True,
+                    },
+                    "not a context",
+                ]
+            },
         },
+    )
+    missing_nodes = normalize_check_rollup(
+        "abc", {"commit": {"oid": "abc"}, "contexts": {"nodes": {}}}
+    )
+    optional_unknown = normalize_check_rollup(
+        "abc",
+        _rollup(
+            {
+                "__typename": "ThirdPartyContext",
+                "context": "unknown",
+                "isRequired": False,
+            }
+        ),
     )
 
     assert unknown["verdict"] == "unproven"
     assert malformed_nodes["verdict"] == "unproven"
+    assert missing_nodes["verdict"] == "unproven"
+    assert optional_unknown["verdict"] == "unproven"
 
 
 def test_aggregate_and_blocking_failure_use_current_required_evidence() -> None:
