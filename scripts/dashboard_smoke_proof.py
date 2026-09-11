@@ -59,6 +59,14 @@ def dashboard_snapshot(devtools: DevTools) -> dict[str, Any]:
     pipeline_stages: [
       ...document.querySelectorAll(".pbi .progress li.current"),
     ].map(text),
+    pbi_cards: [...document.querySelectorAll(".pbi")].map((card) => ({
+      repository: card.dataset.repository || "",
+      number: card.dataset.pbiNumber || "",
+      text: text(card),
+      pull_requests: [...card.querySelectorAll(".details section")]
+        .filter((section) => text(section.querySelector("h3")) === "Pull requests")
+        .flatMap((section) => [...section.querySelectorAll("li")].map(text)),
+    })),
     metadata_sections: [...document.querySelectorAll(".pbi .details h3")].map(text),
     metadata_values: [...document.querySelectorAll(".pbi .details section")]
       .flatMap((section) => {
@@ -82,6 +90,7 @@ def dashboard_snapshot(devtools: DevTools) -> dict[str, Any]:
             "repositories": [],
             "pbis": [],
             "pipeline_stages": [],
+            "pbi_cards": [],
             "metadata_sections": [],
             "metadata_values": [],
             "dashboard_text": "",
@@ -150,14 +159,6 @@ def response_metadata_lines(payload: Mapping[str, Any]) -> list[str]:
                     ),
                 ),
                 (
-                    "Pull requests",
-                    "pull_requests",
-                    lambda item: (
-                        f"#{item.get('number')}: "
-                        f"{item.get('review_decision') or 'review pending'}"
-                    ),
-                ),
-                (
                     "Readers",
                     "readers",
                     lambda item: (
@@ -221,10 +222,133 @@ def response_metadata_lines(payload: Mapping[str, Any]) -> list[str]:
     return lines
 
 
+def live_terminal_pbi_proof(
+    payload: Mapping[str, Any], snapshot: Mapping[str, Any]
+) -> dict[str, Any]:
+    target_numbers = {7, 8, 9}
+    target_pbis: dict[int, Mapping[str, Any]] = {}
+    for repository in response_mappings(payload.get("repositories")):
+        if repository.get("name") != "TychoHenzen/BeeHAIve":
+            continue
+        for pbi in response_mappings(repository.get("pbis")):
+            number = pbi.get("number")
+            if isinstance(number, int) and number in target_numbers:
+                target_pbis[number] = pbi
+    if set(target_pbis) != target_numbers:
+        raise SmokeFailure("Live proof did not return BeeHAIve issues #7, #8, and #9")
+
+    cards = [
+        card
+        for card in response_mappings(snapshot.get("pbi_cards"))
+        if card.get("repository") == "TychoHenzen/BeeHAIve"
+    ]
+    evidence: dict[str, Any] = {}
+    for number in sorted(target_numbers):
+        pbi = target_pbis[number]
+        if pbi.get("planning_status") != "Done":
+            raise SmokeFailure(f"Live issue #{number} did not show Project status Done")
+        merged_pull_requests = [
+            pr
+            for pr in response_mappings(pbi.get("pull_requests"))
+            if pr.get("merged") is True
+        ]
+        if not merged_pull_requests:
+            raise SmokeFailure(
+                f"Live issue #{number} did not show a merged pull request"
+            )
+        progress = response_mappings(pbi.get("stage_progress"))
+        if not any(
+            item.get("id") == "merge" and item.get("status") == "current"
+            for item in progress
+        ):
+            raise SmokeFailure(f"Live issue #{number} did not show terminal progress")
+        card = next(
+            (item for item in cards if str(item.get("number")) == str(number)),
+            None,
+        )
+        card_text = str(card.get("text", "")) if card else ""
+        if "Project status: Done" not in card_text:
+            raise SmokeFailure(f"Live issue #{number} card omitted Project status Done")
+        card_pull_requests = (
+            card.get("pull_requests")
+            if isinstance(card, Mapping) and isinstance(card.get("pull_requests"), list)
+            else []
+        )
+        for pull_request in merged_pull_requests:
+            pull_request_number = pull_request.get("number")
+            if not any(
+                str(line).startswith(f"#{pull_request_number}: merged")
+                for line in card_pull_requests
+            ):
+                raise SmokeFailure(
+                    f"Live issue #{number} card omitted merged pull request "
+                    f"#{pull_request_number}"
+                )
+        evidence[str(number)] = {
+            "project_status": pbi.get("planning_status"),
+            "stage_label": pbi.get("stage_label"),
+            "merged_pull_requests": [
+                {"number": pr.get("number"), "merged": pr.get("merged")}
+                for pr in merged_pull_requests
+            ],
+            "card_project_status": "Done",
+            "card_merged_pull_requests": [
+                pull_request
+                for pull_request in card_pull_requests
+                if any(
+                    str(pull_request).startswith(f"#{merged.get('number')}: merged")
+                    for merged in merged_pull_requests
+                )
+            ],
+        }
+    return evidence
+
+
 def response_values(value: Any) -> list[Any]:
     if not isinstance(value, list):
         return []
     return value
+
+
+def rendered_pull_request_states(
+    payload: Mapping[str, Any], snapshot: Mapping[str, Any]
+) -> bool:
+    cards = response_mappings(snapshot.get("pbi_cards"))
+    for repository in response_mappings(payload.get("repositories")):
+        repository_name = repository.get("name")
+        for pbi in response_mappings(repository.get("pbis")):
+            pull_requests = response_mappings(pbi.get("pull_requests"))
+            if not pull_requests:
+                continue
+            card = next(
+                (
+                    item
+                    for item in cards
+                    if item.get("repository") == repository_name
+                    and str(item.get("number")) == str(pbi.get("number"))
+                ),
+                None,
+            )
+            if card is None:
+                return False
+            rendered_lines = card.get("pull_requests")
+            if not isinstance(rendered_lines, list):
+                return False
+            for pull_request in pull_requests:
+                number = pull_request.get("number")
+                if pull_request.get("merged") is True:
+                    expected_state = "merged"
+                else:
+                    raw_state = pull_request.get("state")
+                    expected_state = (
+                        raw_state.strip().lower() if isinstance(raw_state, str) else ""
+                    )
+                if expected_state and not any(
+                    str(line).startswith(f"#{number}: {expected_state}")
+                    for line in rendered_lines
+                ):
+                    return False
+    return True
 
 
 def response_backed_dashboard_fields(
@@ -282,7 +406,11 @@ def response_backed_dashboard_fields(
     rendered_stages = snapshot.get("pipeline_stages")
     metadata_values = snapshot.get("metadata_values")
     rendered_metadata = (
-        [str(value) for value in metadata_values]
+        [
+            str(value)
+            for value in metadata_values
+            if not str(value).startswith("Pull requests: ")
+        ]
         if isinstance(metadata_values, list)
         else []
     )
@@ -298,6 +426,7 @@ def response_backed_dashboard_fields(
         "pbis": rendered_pbis == expected_pbis,
         "pipeline_stage": rendered_stages == expected_stages,
         "metadata": rendered_metadata == expected_metadata,
+        "pull_requests": rendered_pull_request_states(payload, snapshot),
         "updated_at": (
             isinstance(updated_at, str)
             and updated == f"Updated: {updated_at}"
@@ -619,6 +748,11 @@ def run_browser_smoke(
             "The dashboard did not match response fields: "
             + ", ".join(missing_response_fields)
         )
+    live_terminal_evidence = (
+        live_terminal_pbi_proof(initial_payload, initial_view)
+        if mode == "live" and project_id == "TychoHenzen:2"
+        else None
+    )
     api_key_value = devtools.evaluate("document.querySelector('#api-key')?.value || ''")
     if api_key_value:
         raise SmokeFailure("The initial read-only dashboard requested an API key")
@@ -654,6 +788,8 @@ def run_browser_smoke(
         "pipeline_stages": initial_view["pipeline_stages"][:5],
         "metadata_sections": initial_view["metadata_sections"][:10],
     }
+    if live_terminal_evidence is not None:
+        report["live_terminal_project_state"] = live_terminal_evidence
 
     polling_baseline = dashboard_fetch_count(devtools)
     polling_delay = wait_until(

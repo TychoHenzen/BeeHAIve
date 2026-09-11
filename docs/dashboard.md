@@ -44,6 +44,11 @@ The GitHub provider supplies optional live details during project sync. GitHub
 sub-issues become subtasks, linked pull-request review requests and latest
 reviews become readers and reviewer results, issue comments become activity,
 and `bounces/N` or `escalation/<tier>` labels become escalation state.
+Each PBI card keeps the raw GitHub Project status separate from the local run
+status. A PBI without a local run is `idle`, terminal Project statuses appear
+as terminal progress, and pull requests show merged, open, or closed state
+before review decisions. An empty review decision on a merged pull request is
+not rendered as `review pending`.
 The provider reuses one configured client, caches discovery for 10 minutes by
 default, and honors GitHub GraphQL rate-limit headers. It stops local retries
 until the reset window, and serves the last successful project snapshot when a

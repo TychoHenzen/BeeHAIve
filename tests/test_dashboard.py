@@ -220,6 +220,166 @@ def test_dashboard_projection_exposes_optional_run_details() -> None:
     assert empty["repositories"] == []
 
 
+@pytest.mark.parametrize(
+    ("raw_pbi", "expected_status", "expected_stage_label"),
+    (
+        pytest.param(
+            {
+                "number": 1,
+                "stage": "backlog",
+                "planning_status": "Done",
+                "metadata": {
+                    "pull_requests": [{"number": 9, "state": "closed", "merged": True}]
+                },
+            },
+            "idle",
+            "Merged",
+            id="done-with-merged-pull-request",
+        ),
+        pytest.param(
+            {"number": 2, "stage": "backlog", "planning_status": "Blocked"},
+            "idle",
+            "Blocked",
+            id="blocked",
+        ),
+        pytest.param(
+            {"number": 3, "stage": "backlog", "planning_status": "New status"},
+            "idle",
+            "New status",
+            id="unknown-status",
+        ),
+        pytest.param(
+            {"number": 4, "stage": "implement", "planning_status": "Backlog"},
+            "idle",
+            "Backlog",
+            id="backlog",
+        ),
+        pytest.param(
+            {"number": 5, "stage": "pull_request", "planning_status": "Todo"},
+            "idle",
+            "Refine",
+            id="todo",
+        ),
+        pytest.param(
+            {
+                "number": 6,
+                "stage": "backlog",
+                "planning_status": "In Progress",
+            },
+            "idle",
+            "Implement",
+            id="in-progress",
+        ),
+        pytest.param(
+            {
+                "number": 7,
+                "stage": "implement",
+                "status": "active",
+                "planning_status": "Done",
+            },
+            "active",
+            "Implement",
+            id="active-run",
+        ),
+        pytest.param(
+            {
+                "number": 8,
+                "stage": "implement",
+                "status": "failed",
+                "planning_status": "Blocked",
+            },
+            "failed",
+            "Implement",
+            id="failed-run",
+        ),
+        pytest.param(
+            {
+                "number": 9,
+                "stage": "pull_request",
+                "status": "completed",
+                "planning_status": "Done",
+            },
+            "completed",
+            "Pull request",
+            id="completed-run",
+        ),
+        pytest.param(
+            {"number": 10, "stage": "implement", "planning_status": "Done"},
+            "idle",
+            "Done",
+            id="done-without-pull-request",
+        ),
+    ),
+)
+def test_dashboard_projection_separates_project_and_local_statuses(
+    raw_pbi: dict[str, object],
+    expected_status: str,
+    expected_stage_label: str,
+) -> None:
+    view = build_dashboard_state(
+        {
+            "project_id": "project-1",
+            "name": "Planning",
+            "repositories": [
+                {
+                    "name": "owner/api",
+                    "pbis": [raw_pbi],
+                }
+            ],
+        }
+    )
+
+    pbi = view["repositories"][0]["pbis"][0]
+    assert pbi["status"] == expected_status
+    assert pbi["stage_label"] == expected_stage_label
+    assert pbi["planning_status"] == raw_pbi["planning_status"]
+
+
+def test_dashboard_api_exposes_terminal_project_and_pull_request_state() -> None:
+    snapshot = ProjectSnapshot(
+        "project-1",
+        "Planning",
+        (
+            RepositorySnapshot(
+                "owner/api",
+                (
+                    PbiSnapshot(
+                        "owner/api",
+                        1,
+                        "Done PBI",
+                        None,
+                        "Done",
+                        False,
+                        {
+                            "pull_requests": [
+                                {
+                                    "number": 9,
+                                    "state": "closed",
+                                    "merged": True,
+                                }
+                            ]
+                        },
+                    ),
+                ),
+            ),
+        ),
+    )
+    service = Orchestrator(OrchestratorStore(), FakeProvider(snapshot))
+    client = TestClient(
+        create_app(orchestrator=service, allowed_project_ids={"project-1"})
+    )
+
+    response = client.get("/projects/project-1/dashboard")
+
+    assert response.status_code == 200
+    pbi = response.json()["repositories"][0]["pbis"][0]
+    assert pbi["status"] == "idle"
+    assert pbi["planning_status"] == "Done"
+    assert pbi["stage_label"] == "Merged"
+    assert pbi["pull_requests"] == [{"number": 9, "state": "closed", "merged": True}]
+    service.store.close()
+
+
 def test_live_dashboard_route_reports_repositories_and_writers() -> None:
     service = Orchestrator(OrchestratorStore(), FakeProvider(dashboard_snapshot()))
     client = TestClient(

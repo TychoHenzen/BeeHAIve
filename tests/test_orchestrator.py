@@ -352,6 +352,8 @@ def test_github_provider_maps_live_dashboard_metadata() -> None:
                                                 {
                                                     "number": 9,
                                                     "url": "https://example.test/pull/9",
+                                                    "state": "CLOSED",
+                                                    "merged": True,
                                                     "reviewDecision": (
                                                         "CHANGES_REQUESTED"
                                                     ),
@@ -447,6 +449,9 @@ def test_github_provider_maps_live_dashboard_metadata() -> None:
     assert metadata["reviewers"]["#9:tests"]["status"] == "fail"  # type: ignore[index]
     assert metadata["reviewers"]["#9:security"]["status"] == "pass"  # type: ignore[index]
     assert metadata["reviewers"]["#9:bot"]["status"] == "pending"  # type: ignore[index]
+    pull_request = metadata["pull_requests"][0]  # type: ignore[index]
+    assert pull_request["state"] == "closed"  # type: ignore[index]
+    assert pull_request["merged"] is True  # type: ignore[index]
     assert metadata["escalation"] == {
         "current": 2,
         "consecutive": 2,
