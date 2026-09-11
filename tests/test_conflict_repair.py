@@ -124,6 +124,22 @@ class RepairAgent:
         return ModelExecution(AttemptOutcome.SUCCESS, result="resolved")
 
 
+class NonMergingRepairAgent(RepairAgent):
+    def execute_repair(
+        self,
+        problem_id: str,
+        worktree: Path,
+        source_branch: str,
+        target_branch: str,
+    ) -> ModelExecution:
+        del problem_id, source_branch, target_branch
+        _git(worktree, "merge", "--abort")
+        (worktree / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
+        _git(worktree, "add", "unrelated.txt")
+        _git(worktree, "commit", "-m", "unrelated repair")
+        return ModelExecution(AttemptOutcome.SUCCESS, result="resolved")
+
+
 class RaisingRepairAgent(RepairAgent):
     def execute_repair(
         self,
@@ -221,6 +237,30 @@ def test_conflict_repair_agent_failure_is_persisted_without_update(
     repeated = service.repair("owner/repo", 7)
     assert repeated.repair_id == failed.repair_id
     assert agent.calls == 1
+    store.close()
+
+
+def test_conflict_repair_requires_the_target_head_in_the_result(
+    tmp_path: Path,
+) -> None:
+    repository, source_head, target_head = _repository(tmp_path)
+    provider = FakeProvider(_snapshot(source_head, target_head))
+    store = WorkflowStore(tmp_path / "workflow.sqlite3")
+    workflow = WorkflowService(
+        store,
+        repository,
+        Constitution.load(CONSTITUTION_PATH),
+        [FixtureCheck()],
+    )
+    service = ConflictRepairService(
+        workflow, provider, NonMergingRepairAgent(), tmp_path / "repairs"
+    )
+
+    blocked = service.repair("owner/repo", 7)
+
+    assert blocked.status is RepairStatus.AWAITING_CLARIFICATION
+    assert blocked.required_action == "Repair commit does not include the target head"
+    assert provider.update_calls == 0
     store.close()
 
 
@@ -752,6 +792,8 @@ def test_worktree_manager_proves_exact_refs_and_merge_results(tmp_path: Path) ->
             manager.integrate_target(worktree, source_head, source_head).conflicted
             is False
         )
+        assert manager.contains_commit(worktree, source_head)
+        assert not manager.contains_commit(worktree, target_head)
         with pytest.raises(WorkflowError, match="expected head"):
             manager.integrate_target(worktree, "wrong-head", source_head)
         with pytest.raises(WorkflowError, match="missing-target"):
@@ -769,4 +811,22 @@ def test_worktree_manager_proves_exact_refs_and_merge_results(tmp_path: Path) ->
             workflow.discard_workspace("missing-lease", "test")
     finally:
         manager.remove_ref(source_ref)
+        store.close()
+
+
+def test_worktree_manager_fails_closed_when_remote_inventory_fails(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "not-a-repository"
+    repository.mkdir()
+    store = WorkflowStore(tmp_path / "workflow.sqlite3")
+    manager = GitWorktreeManager(repository, store)
+    try:
+        with pytest.raises(WorkflowError, match="not a git repository"):
+            manager.fetch_exact_branch(
+                "feature", "head", "refs/beehaiive/tests/missing"
+            )
+        with pytest.raises(WorkflowError, match="not a git repository"):
+            manager.contains_commit(repository, "head")
+    finally:
         store.close()

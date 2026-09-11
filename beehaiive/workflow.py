@@ -1364,11 +1364,13 @@ class GitWorktreeManager:
         branch = _required(branch, "remote branch")
         expected_head = _required(expected_head, "expected branch head", 200)
         destination_ref = _required(destination_ref, "destination ref", 400)
-        remote_exists = True
-        try:
-            self._git("remote", "get-url", "origin")
-        except WorkflowError:
-            remote_exists = False
+        remotes = self._run_git("remote")
+        if remotes.returncode != 0:
+            message = (remotes.stderr or remotes.stdout).strip()
+            raise WorkflowError(message or "Could not inspect repository remotes")
+        remote_exists = "origin" in {
+            line.strip() for line in remotes.stdout.splitlines()
+        }
         if remote_exists:
             result = self._run_git(
                 "fetch",
@@ -1389,6 +1391,22 @@ class GitWorktreeManager:
         if actual != expected_head:
             raise WorkflowError("Remote branch head changed before repair started")
         return destination_ref
+
+    def contains_commit(self, worktree: str | Path, commit: str) -> bool:
+        result = self._run_git(
+            "-C",
+            str(Path(worktree)),
+            "merge-base",
+            "--is-ancestor",
+            _required(commit, "commit", 200),
+            "HEAD",
+        )
+        if result.returncode == 0:
+            return True
+        if result.returncode == 1:
+            return False
+        message = (result.stderr or result.stdout).strip()
+        raise WorkflowError(message or "Could not verify commit ancestry")
 
     def remove_ref(self, ref: str) -> None:
         try:

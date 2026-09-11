@@ -197,6 +197,10 @@ class ConflictRepairService:
                     target_ref,
                 )
             repaired_head = self.workflow.worktrees.head(lease.worktree_path)
+            if not self.workflow.worktrees.contains_commit(
+                lease.worktree_path, before.target_head
+            ):
+                raise WorkflowError("Repair commit does not include the target head")
             gate = self.workflow.verify_repair(lease.lease_id, repaired_head)
             checks = gate.checks
             evidence["gates"] = gate.as_dict()
