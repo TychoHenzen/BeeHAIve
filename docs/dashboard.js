@@ -10,9 +10,11 @@ const actionLog = document.querySelector("#action-log");
 const actionsOutput = document.querySelector("#actions");
 const refreshButton = document.querySelector("#refresh");
 const startButton = document.querySelector("#start");
+const archivedInput = document.querySelector("#archived-view");
 
 const params = new URLSearchParams(window.location.search);
 projectInput.value = params.get("project") || "";
+archivedInput.checked = params.get("archived") === "true";
 apiKeyInput.value = window.localStorage.getItem("beehaiive-api-key") || "";
 
 function projectId() {
@@ -27,6 +29,7 @@ function setStatus(message, kind = "") {
 function toggleControls(disabled) {
   refreshButton.disabled = disabled;
   startButton.disabled = disabled;
+  archivedInput.disabled = disabled;
 }
 
 let client;
@@ -42,6 +45,7 @@ const view = createDashboardView({
 client = createDashboardClient({
   fetcher: window.fetch.bind(window),
   projectId,
+  archived: () => archivedInput.checked,
   apiKey: () => apiKeyInput.value.trim(),
   saveApiKey: (value) => window.localStorage.setItem("beehaiive-api-key", value),
   onState: view.render,
@@ -56,5 +60,6 @@ function refresh() {
 refreshButton.addEventListener("click", refresh);
 startButton.addEventListener("click", () => client.runAction({ action: "start" }));
 projectInput.addEventListener("change", refresh);
+archivedInput.addEventListener("change", refresh);
 window.setInterval(refresh, 5000);
 if (projectId()) refresh();

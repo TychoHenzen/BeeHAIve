@@ -26,6 +26,7 @@ from beehaiive.provider import (
     GitHubRateLimitError,
     ProviderError,
     UrllibGraphQLClient,
+    _dashboard_metadata,
     _mapping,
     _next_cursor,
     _nodes,
@@ -420,6 +421,51 @@ def test_provider_discovery_and_base_branch_validation() -> None:
         missing_branch.resolve_base_branch("owner/api", None)
 
 
+def test_provider_preserves_archive_evidence() -> None:
+    metadata = _dashboard_metadata(
+        {
+            "url": "https://example.test/issues/1",
+            "closedByPullRequestsReferences": {
+                "nodes": [
+                    {
+                        "number": 1,
+                        "url": "https://example.test/pull/1",
+                        "state": "MERGED",
+                        "merged": True,
+                        "headRefName": "codex/done",
+                        "headRef": None,
+                    },
+                    {
+                        "number": 2,
+                        "headRefName": "codex/live",
+                        "headRef": {"name": "codex/live"},
+                    },
+                    {
+                        "number": 3,
+                        "headRefName": "codex/malformed",
+                        "headRef": "not-an-object",
+                    },
+                    {"number": 4, "headRefName": "codex/unknown"},
+                    {"number": 5, "headRef": None},
+                    {"number": 6, "headRefName": "", "headRef": None},
+                ]
+            },
+        }
+    )
+
+    pull_requests = metadata["pull_requests"]
+    assert metadata["source_url"] == "https://example.test/issues/1"
+    assert [pull_request["source_branch_state"] for pull_request in pull_requests] == [
+        "deleted",
+        "present",
+        "unknown",
+        "unknown",
+        "unknown",
+        "unknown",
+    ]  # type: ignore[index]
+    assert pull_requests[0]["source_branch"] == "codex/done"  # type: ignore[index]
+
+
 class RateLimitedAfterDiscoveryClient(StaticClient):
     def execute(self, query: str, variables: dict[str, object]) -> dict[str, Any]:
         if len(self.calls) >= 3:
@@ -443,6 +489,12 @@ def test_provider_caches_discovery_and_serves_stale_snapshot_on_limit() -> None:
     first_snapshot = cached_provider.discover_project("owner:7")
     assert cached_provider.discover_project("owner:7") == first_snapshot
     assert len(cached_client.calls) == 3
+    sync_store = OrchestratorStore()
+    try:
+        Orchestrator(sync_store, cached_provider).synchronize("owner:7")
+        assert len(cached_client.calls) == 6
+    finally:
+        sync_store.close()
 
     limited_client = RateLimitedAfterDiscoveryClient(_project_data())
     limited_provider = GitHubProjectProvider(
@@ -994,6 +1046,7 @@ def test_storage_migrates_legacy_columns(tmp_path: Path) -> None:
         "handoff_status",
         "planning_status",
         "claimable",
+        "archived",
     } <= columns
     run_columns = {
         str(row[1]) for row in store._connection.execute("PRAGMA table_info(runs)")

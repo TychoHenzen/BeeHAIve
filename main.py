@@ -897,10 +897,11 @@ def create_app(
             ge=1,
             le=MAX_EVENT_LIMIT,
         ),
+        archived: bool = Query(default=False),
         _access: None = Depends(require_project_access),
     ) -> dict[str, object]:
         return _handle_store_error(
-            lambda: _dashboard_state(orchestrator, project_id, event_limit)
+            lambda: _dashboard_state(orchestrator, project_id, event_limit, archived)
         )
 
     @app.get("/projects/{project_id}/actions")
@@ -956,6 +957,7 @@ def create_app(
     def dashboard_action(  # pyright: ignore[reportUnusedFunction]
         project_id: str,
         request: DashboardActionRequest,
+        archived: bool = Query(default=False),
         _auth: None = Depends(require_mutation_access),
     ) -> dict[str, object]:
         if not request.approved:
@@ -1029,7 +1031,7 @@ def create_app(
                 "action": failed,
                 "result": None,
                 "state": _dashboard_state_or_none(
-                    orchestrator, project_id, DEFAULT_EVENT_LIMIT
+                    orchestrator, project_id, DEFAULT_EVENT_LIMIT, archived
                 ),
             }
         completed = orchestrator.store.finish_action(
@@ -1038,7 +1040,9 @@ def create_app(
         return {
             "action": completed,
             "result": result,
-            "state": _dashboard_state(orchestrator, project_id, DEFAULT_EVENT_LIMIT),
+            "state": _dashboard_state(
+                orchestrator, project_id, DEFAULT_EVENT_LIMIT, archived
+            ),
         }
 
     @app.post("/projects/{project_id}/repositories/{repository:path}/claim")
@@ -1248,19 +1252,25 @@ def _run_dict(
 
 
 def _dashboard_state(
-    orchestrator: Orchestrator, project_id: str, event_limit: int
+    orchestrator: Orchestrator,
+    project_id: str,
+    event_limit: int,
+    archived: bool = False,
 ) -> dict[str, object]:
     orchestrator.synchronize(project_id)
     state = orchestrator.store.project_state(project_id, event_limit)
     actions = orchestrator.store.actions_for_project(project_id)
-    return build_dashboard_state(state, actions)
+    return build_dashboard_state(state, actions, archived)
 
 
 def _dashboard_state_or_none(
-    orchestrator: Orchestrator, project_id: str, event_limit: int
+    orchestrator: Orchestrator,
+    project_id: str,
+    event_limit: int,
+    archived: bool = False,
 ) -> dict[str, object] | None:
     try:
-        return _dashboard_state(orchestrator, project_id, event_limit)
+        return _dashboard_state(orchestrator, project_id, event_limit, archived)
     except (ProviderError, StoreError):
         return None
 

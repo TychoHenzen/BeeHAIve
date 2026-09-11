@@ -101,8 +101,12 @@ export function createDashboardView({
     const status = element("span", pbi.status || "pending", `pill ${pbi.status || ""}`);
     header.append(title, status);
     card.append(header);
+    if (pbi.archived) {
+      card.append(element("div", "Archived: completion evidence verified", "muted"));
+    }
+    if (pbi.source_url) card.append(renderEvidenceLink("Source issue", pbi.source_url));
     if (pbi.branch) card.append(element("div", `Branch: ${pbi.branch}`, "muted"));
-    if (pbi.pull_request_url) card.append(element("div", `Pull request: ${pbi.pull_request_url}`, "muted"));
+    if (pbi.pull_request_url) card.append(renderEvidenceLink("Pull request", pbi.pull_request_url));
     card.append(renderProgress(pbi.stage_progress || []));
     const details = element("div", undefined, "details");
     details.append(renderListSection("Subtasks", pbi.subtasks, (item) => `${item.id || "subtask"}: ${item.title || ""}`));
@@ -136,6 +140,20 @@ export function createDashboardView({
     return card;
   }
 
+  function renderEvidenceLink(label, value) {
+    const raw = String(value);
+    if (!/^https?:\/\/[^\s]+$/i.test(raw)) {
+      return element("div", `${label}: ${raw}`, "muted");
+    }
+    const container = element("div", undefined, "muted");
+    const link = element("a", raw);
+    link.href = raw;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    container.append(element("span", `${label}: `), link);
+    return container;
+  }
+
   function renderProgress(progress) {
     const list = element("ol", undefined, "progress");
     progress.forEach((stage) => list.append(element("li", stage.label, stage.status)));
@@ -156,12 +174,19 @@ export function createDashboardView({
   }
 
   function pullRequestLabel(item) {
-    if (item.merged === true) return `#${item.number}: merged`;
+    const evidence = [
+      typeof item.url === "string" ? item.url : "",
+      item.source_branch
+        ? `branch ${item.source_branch} (${item.source_branch_state || "unknown"})`
+        : "",
+    ].filter(Boolean);
+    const suffix = evidence.length ? ` (${evidence.join(", ")})` : "";
+    if (item.merged === true) return `#${item.number}: merged${suffix}`;
     const state = typeof item.state === "string" ? item.state.toLowerCase() : "";
     const decision = item.review_decision || "";
-    if (state === "open" && !decision) return `#${item.number}: open, review pending`;
-    if (state && decision) return `#${item.number}: ${state}, ${decision}`;
-    return `#${item.number}: ${state || decision || "review pending"}`;
+    if (state === "open" && !decision) return `#${item.number}: open, review pending${suffix}`;
+    if (state && decision) return `#${item.number}: ${state}, ${decision}${suffix}`;
+    return `#${item.number}: ${state || decision || "review pending"}${suffix}`;
   }
 
   function renderReviewers(reviewers) {

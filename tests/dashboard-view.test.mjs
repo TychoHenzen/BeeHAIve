@@ -223,3 +223,68 @@ test("rendering keeps project and pull-request terminal state visible", () => {
   assert.match(dashboardOutput.textContent, /#11: closed, changes_requested/);
   assert.doesNotMatch(dashboardOutput.textContent, /#9: review pending/);
 });
+
+test("rendering archived PBIs exposes completion and branch evidence", () => {
+  const summaryOutput = new FakeNode("section");
+  const dashboardOutput = new FakeNode("section");
+  const actionLog = new FakeNode("section");
+  const actionsOutput = new FakeNode("div");
+  const view = createDashboardView({
+    document: new FakeDocument(),
+    summaryOutput,
+    dashboardOutput,
+    actionLog,
+    actionsOutput,
+    runAction: () => {},
+  });
+
+  view.render({
+    name: "Planning",
+    counts: { pbis: 1 },
+    repositories: [
+      {
+        name: "owner/api",
+        active: true,
+        writer: { status: "idle" },
+        pbis: [
+          {
+            number: 1,
+            title: "Archived PBI",
+            archived: true,
+            source_url: "https://example.test/issues/1",
+            pull_request_url: "https://example.test/pull/9",
+            pull_requests: [
+              {
+                number: 9,
+                merged: true,
+                url: "https://example.test/pull/9",
+                source_branch: "codex/done",
+                source_branch_state: "deleted",
+              },
+            ],
+            stage_progress: [],
+            subtasks: [],
+            readers: [],
+            reviewers: {},
+            activity: [],
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.match(dashboardOutput.textContent, /Archived: completion evidence verified/);
+  assert.match(dashboardOutput.textContent, /Source issue: https:\/\/example.test\/issues\/1/);
+  assert.match(dashboardOutput.textContent, /branch codex\/done \(deleted\)/);
+
+  const links = [];
+  findNode(dashboardOutput, (node) => {
+    if (node.tag === "a") links.push(node);
+    return false;
+  });
+  assert.equal(links.length, 2);
+  assert.equal(links[0].target, "_blank");
+  assert.equal(links[0].rel, "noopener noreferrer");
+  assert.equal(links[0].href, "https://example.test/issues/1");
+  assert.equal(links[1].href, "https://example.test/pull/9");
+});

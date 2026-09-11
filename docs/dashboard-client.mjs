@@ -1,6 +1,7 @@
 export function createDashboardClient({
   fetcher,
   projectId,
+  archived = () => false,
   apiKey,
   saveApiKey = () => {},
   onState = () => {},
@@ -25,8 +26,9 @@ export function createDashboardClient({
     refreshController = controller;
     onStatus("Loading live state...", "pending");
     try {
+      const archiveQuery = archived() ? "?archived=true" : "";
       const response = await fetcher(
-        `/projects/${encodeURIComponent(currentProject)}/dashboard`,
+        `/projects/${encodeURIComponent(currentProject)}/dashboard${archiveQuery}`,
         { cache: "no-store", signal: controller.signal },
       );
       const payload = await readJson(response);
@@ -58,8 +60,9 @@ export function createDashboardClient({
         headers["X-API-Key"] = configuredApiKey;
         saveApiKey(configuredApiKey);
       }
+      const archiveQuery = archived() ? "?archived=true" : "";
       const response = await fetcher(
-        `/projects/${encodeURIComponent(projectId().trim())}/actions`,
+        `/projects/${encodeURIComponent(projectId().trim())}/actions${archiveQuery}`,
         {
           method: "POST",
           headers,

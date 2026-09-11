@@ -33,6 +33,10 @@ class RunStatus(StrEnum):
     COMPLETED = "completed"
 
 
+PROJECT_TERMINAL_STATUSES = frozenset({"done", "completed", "closed", "merged"})
+ARCHIVE_PROJECT_STATUS = "done"
+
+
 def _empty_metadata() -> dict[str, object]:
     return {}
 
