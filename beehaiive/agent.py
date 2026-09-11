@@ -274,6 +274,97 @@ class CodexExecModelExecutor:
                 self._cancelled.discard(problem_id)
                 self._active_attempts.discard(problem_id)
 
+    def execute_repair(
+        self,
+        problem_id: str,
+        worktree: Path,
+        source_branch: str,
+        target_branch: str,
+    ) -> ModelExecution:
+        """Run one bounded write-enabled repair inside the leased worktree."""
+
+        if not worktree.is_dir():
+            return ModelExecution(
+                AttemptOutcome.FAILURE,
+                failure_context="Repair worktree does not exist",
+            )
+        prompt = (
+            "BeeHAIve conflict repair.\n"
+            f"Source branch: {source_branch}\n"
+            f"Target branch: {target_branch}\n"
+            "This is the exact leased repair worktree. Resolve every merge conflict "
+            "left by the target integration. Work only inside this worktree. Do not "
+            "push, force-push, access credentials, edit another checkout, or start "
+            "another agent. Run the configured checks only when useful. Stage the "
+            "resolved files and create one normal merge commit. Return a concise "
+            "plain-text result after the commit succeeds."
+        )
+        with self._lock:
+            self._active_attempts.add(problem_id)
+            if problem_id in self._cancelled:
+                self._cancelled.discard(problem_id)
+                self._active_attempts.discard(problem_id)
+                return ModelExecution(
+                    AttemptOutcome.FAILURE,
+                    failure_context="Agent stopped by operator",
+                )
+        process: subprocess.Popen[str] | None = None
+        try:
+            process = self._start_process(
+                self._repair_command(prompt, worktree), self._safe_environment()
+            )
+            with self._lock:
+                self._processes[problem_id] = process
+                cancelled = problem_id in self._cancelled
+            if cancelled:
+                self._terminate_process(process)
+            try:
+                stdout, stderr, timed_out = self._communicate_bounded(
+                    process, self.timeout_seconds
+                )
+            except subprocess.TimeoutExpired:
+                self._terminate_process(process)
+                stdout, stderr, timed_out = "", "", True
+            if timed_out:
+                return ModelExecution(
+                    AttemptOutcome.FAILURE,
+                    failure_context=(
+                        f"Repair agent timed out after {self.timeout_seconds:g} seconds"
+                    ),
+                )
+            with self._lock:
+                was_cancelled = problem_id in self._cancelled
+            if was_cancelled:
+                return ModelExecution(
+                    AttemptOutcome.FAILURE,
+                    failure_context="Agent stopped by operator",
+                )
+            result, input_tokens, output_tokens = self._parse_output(stdout)
+            result = redact_worker_text(result, self._secret_values).strip()
+            if process.returncode != 0:
+                detail = redact_worker_text(stderr or stdout, self._secret_values)
+                return ModelExecution(
+                    AttemptOutcome.FAILURE,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    failure_context=(
+                        "Bounded repair agent failed: "
+                        f"{detail.strip() or 'process failed'}"
+                    ),
+                )
+            return ModelExecution(
+                AttemptOutcome.SUCCESS,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                result=result or "Conflict repair agent completed",
+            )
+        finally:
+            with self._lock:
+                if process is not None:
+                    self._processes.pop(problem_id, None)
+                self._cancelled.discard(problem_id)
+                self._active_attempts.discard(problem_id)
+
     def cancel(self, problem_id: str) -> None:
         """Terminate the process for one run, including its child process tree."""
 
@@ -357,6 +448,29 @@ class CodexExecModelExecutor:
         if type(self)._command is not CodexExecModelExecutor._command:
             return self._command(prompt)
         return self._command(prompt, model, repository)
+
+    def _repair_command(self, prompt: str, repository: Path) -> list[str]:
+        selected_model = self.model
+        command = [
+            self.executable,
+            "--approve-for-me",
+            "exec",
+            "--json",
+            "--color",
+            "never",
+            "--ephemeral",
+            "--skip-git-repo-check",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--sandbox",
+            "workspace-write",
+            "--cd",
+            str(repository),
+        ]
+        if selected_model is not None:
+            command.extend(("--model", selected_model))
+        command.append(prompt)
+        return command
 
     def _safe_environment(self) -> dict[str, str]:
         return {

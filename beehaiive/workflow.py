@@ -48,6 +48,17 @@ class HandoffStatus(StrEnum):
     STOPPED = "stopped"
 
 
+class RepairStatus(StrEnum):
+    """Durable lifecycle state for one pull-request conflict repair."""
+
+    RUNNING = "running"
+    BLOCKED = "blocked"
+    AWAITING_APPROVAL = "awaiting_approval"
+    AWAITING_CLARIFICATION = "awaiting_clarification"
+    NOT_REQUIRED = "not_required"
+    SUCCEEDED = "succeeded"
+
+
 ALLOWED_ROLE_TRANSITIONS: Mapping[WorkflowRole, frozenset[WorkflowRole]] = {
     WorkflowRole.PLANNER: frozenset({WorkflowRole.WRITER}),
     WorkflowRole.WRITER: frozenset({WorkflowRole.REVIEWER, WorkflowRole.OPERATOR}),
@@ -196,6 +207,52 @@ class HandoffRecord:
             "required_action": self.required_action,
             "approval_actor": self.approval_actor,
             "approval_note": self.approval_note,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RepairRecord:
+    """Persisted conflict-repair identity, evidence, and operator state."""
+
+    repair_id: str
+    pull_request_id: str
+    repository: str
+    pull_request_number: int
+    source_branch: str
+    target_branch: str
+    expected_head: str
+    target_head: str
+    repair_branch: str
+    worktree_path: str
+    lease_id: str | None
+    status: RepairStatus
+    repaired_head: str | None
+    checks: tuple[CheckResult, ...]
+    evidence: Mapping[str, object]
+    required_action: str | None
+    created_at: str
+    updated_at: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "repair_id": self.repair_id,
+            "pull_request_id": self.pull_request_id,
+            "repository": self.repository,
+            "pull_request_number": self.pull_request_number,
+            "source_branch": self.source_branch,
+            "target_branch": self.target_branch,
+            "expected_head": self.expected_head,
+            "target_head": self.target_head,
+            "repair_branch": self.repair_branch,
+            "worktree_path": self.worktree_path,
+            "lease_id": self.lease_id,
+            "status": self.status.value,
+            "repaired_head": self.repaired_head,
+            "verification_evidence": [check.as_dict() for check in self.checks],
+            "evidence": dict(self.evidence),
+            "required_action": self.required_action,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -494,6 +551,28 @@ class WorkflowStore:
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(lease_id) REFERENCES workflow_leases(lease_id)
                 );
+                CREATE TABLE IF NOT EXISTS workflow_repairs (
+                    repair_id TEXT PRIMARY KEY,
+                    pull_request_id TEXT NOT NULL,
+                    repository TEXT NOT NULL,
+                    pull_request_number INTEGER NOT NULL,
+                    source_branch TEXT NOT NULL,
+                    target_branch TEXT NOT NULL,
+                    expected_head TEXT NOT NULL,
+                    target_head TEXT NOT NULL,
+                    repair_branch TEXT NOT NULL,
+                    worktree_path TEXT NOT NULL,
+                    lease_id TEXT,
+                    status TEXT NOT NULL,
+                    repaired_head TEXT,
+                    checks_json TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    required_action TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS workflow_repairs_identity
+                    ON workflow_repairs(pull_request_id, expected_head);
                 """
             )
             lease_columns = {
@@ -529,6 +608,23 @@ class WorkflowStore:
                             str(row["lease_id"]),
                         ),
                     )
+
+            self._connection.execute(
+                """
+                UPDATE workflow_repairs
+                SET status = ?, required_action = ?, updated_at = ?
+                WHERE lease_id IN (
+                    SELECT lease_id FROM workflow_leases WHERE status = ?
+                ) AND status = ?
+                """,
+                (
+                    RepairStatus.AWAITING_CLARIFICATION.value,
+                    "Lease expired and requires operator recovery",
+                    _now(),
+                    LeaseStatus.STOPPED.value,
+                    RepairStatus.RUNNING.value,
+                ),
+            )
 
     @staticmethod
     def _lease_from_row(row: sqlite3.Row) -> WorkspaceLease:
@@ -585,6 +681,20 @@ class WorkflowStore:
                     LeaseStatus.ACTIVE.value,
                 ),
             )
+            connection.execute(
+                """
+                UPDATE workflow_repairs
+                SET status = ?, required_action = ?, updated_at = ?
+                WHERE lease_id = ? AND status = ?
+                """,
+                (
+                    RepairStatus.AWAITING_CLARIFICATION.value,
+                    "Lease expired and requires operator recovery",
+                    timestamp,
+                    lease_id,
+                    RepairStatus.RUNNING.value,
+                ),
+            )
             expired_ids.append(lease_id)
         return tuple(expired_ids)
 
@@ -608,6 +718,198 @@ class WorkflowStore:
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
         )
+
+    @staticmethod
+    def _repair_from_row(row: sqlite3.Row) -> RepairRecord:
+        try:
+            evidence = json.loads(str(row["evidence_json"]))
+        except json.JSONDecodeError as exc:
+            raise WorkflowError("Stored repair evidence is invalid") from exc
+        if not isinstance(evidence, dict):
+            raise WorkflowError("Stored repair evidence is invalid")
+        try:
+            status = RepairStatus(str(row["status"]))
+        except ValueError as exc:
+            raise WorkflowError("Stored repair status is invalid") from exc
+        return RepairRecord(
+            repair_id=str(row["repair_id"]),
+            pull_request_id=str(row["pull_request_id"]),
+            repository=str(row["repository"]),
+            pull_request_number=int(row["pull_request_number"]),
+            source_branch=str(row["source_branch"]),
+            target_branch=str(row["target_branch"]),
+            expected_head=str(row["expected_head"]),
+            target_head=str(row["target_head"]),
+            repair_branch=str(row["repair_branch"]),
+            worktree_path=str(row["worktree_path"]),
+            lease_id=row["lease_id"],
+            status=status,
+            repaired_head=row["repaired_head"],
+            checks=_checks_from_json(row["checks_json"]),
+            evidence=cast(Mapping[str, object], evidence),
+            required_action=row["required_action"],
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def begin_repair(
+        self,
+        repair_id: str,
+        pull_request_id: str,
+        repository: str,
+        pull_request_number: int,
+        source_branch: str,
+        target_branch: str,
+        expected_head: str,
+        target_head: str,
+        repair_branch: str,
+        worktree_path: str,
+        evidence: Mapping[str, object],
+    ) -> RepairRecord:
+        values = (
+            _required(repair_id, "repair id", 200),
+            _required(pull_request_id, "pull-request id", 300),
+            _required(repository, "repository", 300),
+            pull_request_number,
+            _optional(source_branch),
+            _optional(target_branch),
+            _optional(expected_head, 200),
+            _optional(target_head, 200),
+            _required(repair_branch, "repair branch", 400),
+            _path_required(worktree_path, "repair worktree", 1_000),
+            RepairStatus.RUNNING.value,
+            _checks_to_json(()),
+            json.dumps(dict(evidence), sort_keys=True),
+            _now(),
+            _now(),
+        )
+        if pull_request_number <= 0:
+            raise WorkflowError("Pull-request number must be positive")
+        with self._transaction() as connection:
+            existing = connection.execute(
+                """
+                SELECT * FROM workflow_repairs
+                WHERE pull_request_id = ? AND expected_head = ?
+                """,
+                (values[1], values[6]),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO workflow_repairs(
+                        repair_id, pull_request_id, repository, pull_request_number,
+                        source_branch, target_branch, expected_head, target_head,
+                        repair_branch, worktree_path, lease_id, status, repaired_head,
+                        checks_json, evidence_json, required_action, created_at,
+                        updated_at
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, NULL,
+                        ?, ?
+                    )
+                    """,
+                    values,
+                )
+            else:
+                return self._repair_from_row(existing)
+            row = connection.execute(
+                "SELECT * FROM workflow_repairs WHERE repair_id = ?",
+                (values[0],),
+            ).fetchone()
+        if row is None:
+            raise WorkflowError("Repair record was not persisted")
+        return self._repair_from_row(row)
+
+    def attach_repair_workspace(
+        self, repair_id: str, lease_id: str, worktree_path: str
+    ) -> RepairRecord:
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM workflow_repairs WHERE repair_id = ?", (repair_id,)
+            ).fetchone()
+            if row is None:
+                raise WorkflowError(f"Unknown repair: {repair_id}")
+            current_lease = row["lease_id"]
+            if current_lease is not None and current_lease != lease_id:
+                raise WorkflowError("Repair already has a different workspace lease")
+            connection.execute(
+                """
+                UPDATE workflow_repairs
+                SET lease_id = ?, worktree_path = ?, updated_at = ?
+                WHERE repair_id = ? AND status = ?
+                """,
+                (
+                    lease_id,
+                    _path_required(worktree_path, "repair worktree", 1_000),
+                    _now(),
+                    repair_id,
+                    RepairStatus.RUNNING.value,
+                ),
+            )
+        record = self.get_repair(repair_id)
+        if record is None:
+            raise WorkflowError("Repair record disappeared")
+        return record
+
+    def finish_repair(
+        self,
+        repair_id: str,
+        status: RepairStatus,
+        required_action: str | None,
+        evidence: Mapping[str, object],
+        checks: Sequence[CheckResult] = (),
+        repaired_head: str | None = None,
+    ) -> RepairRecord:
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM workflow_repairs WHERE repair_id = ?", (repair_id,)
+            ).fetchone()
+            if row is None:
+                raise WorkflowError(f"Unknown repair: {repair_id}")
+            current = RepairStatus(str(row["status"]))
+            if current is not RepairStatus.RUNNING:
+                return self._repair_from_row(row)
+            connection.execute(
+                """
+                UPDATE workflow_repairs
+                SET status = ?, repaired_head = ?, checks_json = ?, evidence_json = ?,
+                    required_action = ?, updated_at = ?
+                WHERE repair_id = ? AND status = ?
+                """,
+                (
+                    status.value,
+                    repaired_head,
+                    _checks_to_json(checks),
+                    json.dumps(dict(evidence), sort_keys=True),
+                    required_action,
+                    _now(),
+                    repair_id,
+                    RepairStatus.RUNNING.value,
+                ),
+            )
+        record = self.get_repair(repair_id)
+        if record is None:
+            raise WorkflowError("Repair record disappeared")
+        return record
+
+    def get_repair(self, repair_id: str) -> RepairRecord | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM workflow_repairs WHERE repair_id = ?", (repair_id,)
+            ).fetchone()
+        return None if row is None else self._repair_from_row(row)
+
+    def get_repair_for_identity(
+        self, pull_request_id: str, expected_head: str
+    ) -> RepairRecord | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM workflow_repairs
+                WHERE pull_request_id = ? AND expected_head = ?
+                """,
+                (pull_request_id, expected_head),
+            ).fetchone()
+        return None if row is None else self._repair_from_row(row)
 
     def get_lease(self, lease_id: str) -> WorkspaceLease | None:
         with self._transaction() as connection:
@@ -987,6 +1289,14 @@ class WorkflowStore:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class MergeResult:
+    """Result of integrating the exact target commit into a repair worktree."""
+
+    conflicted: bool
+    evidence: str
+
+
 class GitWorktreeManager:
     """Create and remove real git worktrees behind durable lease claims."""
 
@@ -1046,7 +1356,109 @@ class GitWorktreeManager:
     def clean(self, worktree: str | Path) -> bool:
         return not self._git("-C", str(Path(worktree)), "status", "--porcelain")
 
+    def fetch_exact_branch(
+        self, branch: str, expected_head: str, destination_ref: str
+    ) -> str:
+        """Fetch one branch into an internal ref and prove its exact head."""
+
+        branch = _required(branch, "remote branch")
+        expected_head = _required(expected_head, "expected branch head", 200)
+        destination_ref = _required(destination_ref, "destination ref", 400)
+        remotes = self._run_git("remote")
+        if remotes.returncode != 0:
+            message = (remotes.stderr or remotes.stdout).strip()
+            raise WorkflowError(message or "Could not inspect repository remotes")
+        remote_exists = "origin" in {
+            line.strip() for line in remotes.stdout.splitlines()
+        }
+        if remote_exists:
+            result = self._run_git(
+                "fetch",
+                "--no-tags",
+                "origin",
+                f"refs/heads/{branch}:{destination_ref}",
+            )
+            if result.returncode != 0:
+                message = (result.stderr or result.stdout).strip()
+                raise WorkflowError(
+                    message or "Could not fetch the pull-request branch"
+                )
+        else:
+            if not self._commit_exists(expected_head):
+                raise WorkflowError("Expected branch head is not available locally")
+            self._git("update-ref", destination_ref, expected_head)
+        actual = self._git("rev-parse", destination_ref)
+        if actual != expected_head:
+            raise WorkflowError("Remote branch head changed before repair started")
+        return destination_ref
+
+    def contains_commit(self, worktree: str | Path, commit: str) -> bool:
+        result = self._run_git(
+            "-C",
+            str(Path(worktree)),
+            "merge-base",
+            "--is-ancestor",
+            _required(commit, "commit", 200),
+            "HEAD",
+        )
+        if result.returncode == 0:
+            return True
+        if result.returncode == 1:
+            return False
+        message = (result.stderr or result.stdout).strip()
+        raise WorkflowError(message or "Could not verify commit ancestry")
+
+    def remove_ref(self, ref: str) -> None:
+        try:
+            self._git("update-ref", "-d", _required(ref, "internal ref", 400))
+        except WorkflowError:
+            return
+
+    def integrate_target(
+        self, worktree: str | Path, expected_source_head: str, target_head: str
+    ) -> MergeResult:
+        workspace = Path(worktree)
+        actual_source_head = self.head(workspace)
+        if actual_source_head != expected_source_head:
+            raise WorkflowError(
+                "Repair worktree was not created from the expected head"
+            )
+        result = self._run_git(
+            "-C",
+            str(workspace),
+            "merge",
+            "--no-edit",
+            "--no-ff",
+            "--no-commit",
+            target_head,
+        )
+        evidence = "\n".join(
+            part.strip() for part in (result.stdout, result.stderr) if part.strip()
+        )[-4_000:]
+        if result.returncode == 0:
+            return MergeResult(False, evidence or "Target branch staged for merge")
+        conflicts = self._run_git(
+            "-C",
+            str(workspace),
+            "diff",
+            "--name-only",
+            "--diff-filter=U",
+        )
+        if conflicts.returncode == 0 and conflicts.stdout.strip():
+            return MergeResult(
+                True,
+                f"Merge conflicts: {conflicts.stdout.strip()}"[-4_000:],
+            )
+        raise WorkflowError(evidence or "Target branch integration failed")
+
     def _git(self, *arguments: str) -> str:
+        result = self._run_git(*arguments)
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout).strip()
+            raise WorkflowError(message or f"git command failed: {' '.join(arguments)}")
+        return result.stdout.strip()
+
+    def _run_git(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         try:
             result = subprocess.run(
                 ("git", *arguments),
@@ -1060,10 +1472,11 @@ class GitWorktreeManager:
             raise WorkflowError(
                 f"git command timed out after {self.git_timeout_seconds:g} seconds"
             ) from exc
-        if result.returncode != 0:
-            message = (result.stderr or result.stdout).strip()
-            raise WorkflowError(message or f"git command failed: {' '.join(arguments)}")
-        return result.stdout.strip()
+        return result
+
+    def _commit_exists(self, commit: str) -> bool:
+        result = self._run_git("cat-file", "-t", commit)
+        return result.returncode == 0 and result.stdout.strip() == "commit"
 
     def _cleanup_stopped_worktree(self, worktree_path: str) -> None:
         path = Path(worktree_path)
@@ -1105,6 +1518,16 @@ class WorkflowService:
     def release_workspace(self, lease_id: str) -> WorkspaceLease:
         return self.worktrees.release(lease_id)
 
+    def discard_workspace(self, lease_id: str, reason: str) -> WorkspaceLease:
+        """Stop and remove a repair workspace without releasing dirty files."""
+
+        lease = self.store.get_lease(lease_id)
+        if lease is None:
+            raise WorkflowError(f"Unknown workspace lease: {lease_id}")
+        if lease.status is LeaseStatus.ACTIVE:
+            self.stop(lease_id, reason)
+        return self.worktrees.release(lease_id)
+
     def before_model_call(self, lease_id: str) -> GateResult:
         lease = self._active_lease(lease_id)
         checks = self.checks.run(Path(lease.worktree_path))
@@ -1125,6 +1548,33 @@ class WorkflowService:
             not failed_checks and handoff_allowed,
             checks,
             required_action,
+        )
+        self.store.record_gate(lease_id, result)
+        return result
+
+    def verify_repair(
+        self,
+        lease_id: str,
+        commit_sha: str,
+        source_state: str = "conflict repair",
+    ) -> GateResult:
+        """Run and persist the full committed-tree evidence for a repair."""
+
+        lease = self._active_lease(lease_id)
+        rules = self.constitution.rules_for(WorkflowRole.WRITER)
+        checks = self._handoff_checks(
+            lease,
+            _optional(source_state, 1_000),
+            rules,
+            _optional(commit_sha, 200),
+        )
+        result = GateResult(
+            "conflict_repair",
+            all(check.passed for check in checks),
+            tuple(checks),
+            None
+            if all(check.passed for check in checks)
+            else self._failed_action(checks),
         )
         self.store.record_gate(lease_id, result)
         return result

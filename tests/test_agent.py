@@ -56,6 +56,22 @@ class ScriptExecutor(CodexExecModelExecutor):
         ]
 
 
+class RepairScriptExecutor(CodexExecModelExecutor):
+    def __init__(
+        self, repository: Path, script: Path, timeout_seconds: float = 5
+    ) -> None:
+        super().__init__(
+            repository,
+            executable=sys.executable,
+            timeout_seconds=timeout_seconds,
+            repository_name="owner/api",
+        )
+        self.script = script
+
+    def _repair_command(self, prompt: str, repository: Path) -> list[str]:
+        return [sys.executable, str(self.script), "--cd", str(repository), prompt]
+
+
 class ImmediateExecutor(CodexExecModelExecutor):
     def __init__(self, result: ModelExecution) -> None:
         super().__init__(Path.cwd(), repository_name="owner/api")
@@ -149,6 +165,115 @@ def test_codex_executor_terminates_timed_out_process_tree(tmp_path: Path) -> Non
     assert result.outcome is AttemptOutcome.FAILURE
     assert "timed out" in result.failure_context
     assert time.monotonic() - started < 5
+
+
+def test_codex_executor_repair_writes_only_the_leased_worktree(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "repair_runner.py"
+    script.write_text(
+        "import json, os\n"
+        "open('repair-output.txt', 'w').write('inside')\n"
+        "print(json.dumps({'type': 'agent_message', 'text': 'repair done; token=' + "
+        "str('GITHUB_TOKEN' in os.environ)}))\n",
+        encoding="utf-8",
+    )
+    worktree = tmp_path / "repair-worktree"
+    worktree.mkdir()
+    executor = RepairScriptExecutor(tmp_path, script)
+
+    result = executor.execute_repair("repair-1", worktree, "feature", "master")
+
+    assert result.outcome is AttemptOutcome.SUCCESS
+    assert result.result == "repair done; token=[redacted]"
+    assert (worktree / "repair-output.txt").read_text(encoding="utf-8") == "inside"
+    command = CodexExecModelExecutor(
+        tmp_path, model="repair-model", repository_name="owner/api"
+    )._repair_command("prompt", worktree)
+    assert "workspace-write" in command
+    assert str(worktree) in command
+
+
+def test_codex_executor_repair_handles_invalid_launch_failure_and_empty_result(
+    tmp_path: Path,
+) -> None:
+    executor = RepairScriptExecutor(tmp_path, tmp_path / "unused.py")
+    missing = executor.execute_repair(
+        "missing-worktree", tmp_path / "missing", "feature", "master"
+    )
+    assert missing.outcome is AttemptOutcome.FAILURE
+    assert "does not exist" in missing.failure_context
+
+    failed_script = tmp_path / "repair-failed.py"
+    failed_script.write_text("print('token=visible-secret')\nraise SystemExit(3)\n")
+    failed = RepairScriptExecutor(tmp_path, failed_script).execute_repair(
+        "repair-failed", tmp_path, "feature", "master"
+    )
+    assert failed.outcome is AttemptOutcome.FAILURE
+    assert "Bounded repair agent failed" in failed.failure_context
+
+    empty_script = tmp_path / "repair-empty.py"
+    empty_script.write_text("pass\n")
+    empty = RepairScriptExecutor(tmp_path, empty_script).execute_repair(
+        "repair-empty", tmp_path, "feature", "master"
+    )
+    assert empty.outcome is AttemptOutcome.SUCCESS
+    assert "completed" in empty.result
+
+
+def test_codex_executor_repair_honors_cancellation_and_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cancelled = RepairScriptExecutor(tmp_path, tmp_path / "unused.py")
+    cancelled.prepare_run("repair-cancel-before", "owner/api")
+    cancelled.cancel("repair-cancel-before")
+    result = cancelled.execute_repair(
+        "repair-cancel-before", tmp_path, "feature", "master"
+    )
+    assert result.outcome is AttemptOutcome.FAILURE
+    assert "stopped" in result.failure_context
+
+    slow_script = tmp_path / "repair-slow.py"
+    slow_script.write_text("import time\ntime.sleep(30)\n")
+    slow = RepairScriptExecutor(tmp_path, slow_script, timeout_seconds=0.1)
+    timed_out = slow.execute_repair("repair-timeout", tmp_path, "feature", "master")
+    assert timed_out.outcome is AttemptOutcome.FAILURE
+    assert "timed out" in timed_out.failure_context
+
+    class CancelOnStartExecutor(RepairScriptExecutor):
+        def _start_process(
+            self, command: list[str], environment: dict[str, str]
+        ) -> subprocess.Popen[str]:
+            process = super()._start_process(command, environment)
+            self.cancel("repair-cancel-launch")
+            return process
+
+    cancelled_after_start = CancelOnStartExecutor(tmp_path, slow_script)
+    stopped = cancelled_after_start.execute_repair(
+        "repair-cancel-launch", tmp_path, "feature", "master"
+    )
+    assert stopped.outcome is AttemptOutcome.FAILURE
+    assert "stopped" in stopped.failure_context
+
+    timeout_exception = RepairScriptExecutor(tmp_path, slow_script)
+    monkeypatch.setattr(
+        timeout_exception,
+        "_start_process",
+        lambda command, environment: SimpleNamespace(returncode=0),
+    )
+    monkeypatch.setattr(
+        timeout_exception,
+        "_communicate_bounded",
+        lambda process, timeout: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired("codex", timeout)
+        ),
+    )
+    monkeypatch.setattr(timeout_exception, "_terminate_process", lambda process: None)
+    raised_timeout = timeout_exception.execute_repair(
+        "repair-timeout-exception", tmp_path, "feature", "master"
+    )
+    assert raised_timeout.outcome is AttemptOutcome.FAILURE
+    assert "timed out" in raised_timeout.failure_context
 
 
 def test_executor_validates_configuration_and_reads_environment(

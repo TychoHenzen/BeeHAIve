@@ -7,8 +7,10 @@ import json
 import math
 import os
 import re
+import subprocess
 import time
 from collections.abc import Iterable, Mapping
+from pathlib import Path
 from threading import Lock
 from typing import Any, Protocol, cast
 from urllib.error import HTTPError
@@ -20,6 +22,7 @@ from .models import (
     HandoffResult,
     PbiSnapshot,
     ProjectSnapshot,
+    PullRequestSnapshot,
     RepositorySnapshot,
     Stage,
     project_stage_from_status,
@@ -304,6 +307,22 @@ class ProjectProvider(Protocol):
 
         ...
 
+    def get_pull_request(self, repository: str, number: int) -> PullRequestSnapshot:
+        """Return current pull-request identity and mergeability evidence."""
+
+        ...
+
+    def update_source_branch(
+        self,
+        snapshot: PullRequestSnapshot,
+        worktree: str | Path,
+        expected_head: str,
+        repaired_head: str,
+    ) -> None:
+        """Update only the existing source branch with an expected-head guard."""
+
+        ...
+
 
 PROJECT_QUERY = """
 query($owner: String!, $number: Int!) {
@@ -552,6 +571,26 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
 }
 """
 
+PULL_REQUEST_STATE_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      id
+      number
+      url
+      state
+      merged
+      headRefName
+      headRef { name target { oid } }
+      baseRefName
+      baseRef { name target { oid } }
+      mergeable
+      mergeStateStatus
+    }
+  }
+}
+"""
+
 PULL_REQUEST_REVIEW_REQUESTS_QUERY = """
 query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
   repository(owner: $owner, name: $name) {
@@ -641,6 +680,88 @@ mutation($input: CreatePullRequestInput!) {
   }
 }
 """
+
+
+def _required_text(value: object, label: str) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _pull_request_snapshot(
+    repository: str, requested_number: int, value: object
+) -> PullRequestSnapshot:
+    pull_request = _mapping(value)
+    number = pull_request.get("number")
+    if not isinstance(number, int) or number != requested_number:
+        raise ProviderError("GitHub returned the wrong pull-request number")
+    pull_request_id = _required_text(pull_request.get("id"), "pull-request id")
+    url = _required_text(pull_request.get("url"), "pull-request URL")
+    state = _required_text(pull_request.get("state"), "pull-request state")
+    merged = pull_request.get("merged")
+    if (
+        pull_request_id is None
+        or url is None
+        or state is None
+        or not isinstance(merged, bool)
+    ):
+        raise ProviderError("GitHub returned incomplete pull-request identity")
+
+    head_ref = pull_request.get("headRef")
+    base_ref = pull_request.get("baseRef")
+    source_ref = (
+        cast(Mapping[str, Any], head_ref)
+        if isinstance(head_ref, Mapping)
+        else cast(Mapping[str, Any], {})
+    )
+    target_ref = (
+        cast(Mapping[str, Any], base_ref)
+        if isinstance(base_ref, Mapping)
+        else cast(Mapping[str, Any], {})
+    )
+    source_branch = _required_text(pull_request.get("headRefName"), "source branch")
+    source_ref_name = _required_text(source_ref.get("name"), "source branch")
+    source_head = _pull_request_head_sha(cast(object, head_ref))
+    target_branch = _required_text(pull_request.get("baseRefName"), "target branch")
+    target_ref_name = _required_text(target_ref.get("name"), "target branch")
+    target_head = _pull_request_head_sha(cast(object, base_ref))
+    if (
+        source_branch is None
+        or source_ref_name != source_branch
+        or source_head is None
+        or target_branch is None
+        or target_ref_name != target_branch
+        or target_head is None
+    ):
+        return PullRequestSnapshot(
+            repository,
+            number,
+            pull_request_id,
+            url,
+            state.upper(),
+            merged,
+            source_branch,
+            source_head,
+            target_branch,
+            target_head,
+            _required_text(pull_request.get("mergeable"), "mergeability"),
+            _required_text(pull_request.get("mergeStateStatus"), "merge state"),
+            "GitHub returned contradictory pull-request branch identity",
+        )
+    mergeable = _required_text(pull_request.get("mergeable"), "mergeability")
+    merge_state = _required_text(pull_request.get("mergeStateStatus"), "merge state")
+    return PullRequestSnapshot(
+        repository,
+        number,
+        pull_request_id,
+        url,
+        state.upper(),
+        merged,
+        source_branch,
+        source_head,
+        target_branch,
+        target_head,
+        mergeable.upper() if mergeable else None,
+        merge_state.upper() if merge_state else None,
+    )
 
 
 def _mapping(value: object) -> Mapping[str, Any]:
@@ -1374,6 +1495,93 @@ class GitHubProjectProvider:
         _validate_branch_name(branch)
         return self.resolve_base_branch(repository, requested_base)
 
+    def get_pull_request(self, repository: str, number: int) -> PullRequestSnapshot:
+        if number <= 0:
+            raise ProviderError("Pull-request number must be positive")
+        owner, name = self._repository_parts(repository)
+        data = self._client.execute(
+            PULL_REQUEST_STATE_QUERY,
+            {"owner": owner, "name": name, "number": number},
+        )
+        repository_data = _mapping(data.get("repository"))
+        pull_request = repository_data.get("pullRequest")
+        if pull_request is None:
+            raise ProviderError(f"Pull request not found: {repository}#{number}")
+        return _pull_request_snapshot(repository, number, pull_request)
+
+    def update_source_branch(
+        self,
+        snapshot: PullRequestSnapshot,
+        worktree: str | Path,
+        expected_head: str,
+        repaired_head: str,
+    ) -> None:
+        if snapshot.source_head != expected_head:
+            raise ProviderError("Pull-request source head changed before update")
+        if (
+            snapshot.state != "OPEN"
+            or snapshot.merged
+            or not snapshot.source_branch
+            or not expected_head.strip()
+            or not repaired_head.strip()
+        ):
+            raise ProviderError("Pull request is not eligible for source-branch update")
+        _validate_branch_name(snapshot.source_branch)
+        workspace = Path(worktree).resolve()
+        try:
+            head_result = subprocess.run(
+                ["git", "-C", str(workspace), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=PROVIDER_REQUEST_TIMEOUT,
+                check=False,
+            )
+            if (
+                head_result.returncode != 0
+                or head_result.stdout.strip() != repaired_head
+            ):
+                raise ProviderError("Repair worktree head does not match repaired head")
+            ancestry = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(workspace),
+                    "merge-base",
+                    "--is-ancestor",
+                    expected_head,
+                    repaired_head,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=PROVIDER_REQUEST_TIMEOUT,
+                check=False,
+            )
+            if ancestry.returncode != 0:
+                raise ProviderError("Repair commit does not preserve source history")
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(workspace),
+                    "push",
+                    "--porcelain",
+                    f"--force-with-lease=refs/heads/{snapshot.source_branch}:{expected_head}",
+                    "origin",
+                    f"{repaired_head}:refs/heads/{snapshot.source_branch}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=PROVIDER_REQUEST_TIMEOUT,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ProviderError("Guarded source-branch update failed") from exc
+        if result.returncode != 0:
+            raise ProviderError(
+                "Guarded source-branch update rejected with exit code "
+                f"{result.returncode}"
+            )
+
     def create_handoff(self, request: HandoffRequest) -> HandoffResult:
         owner, name = self._repository_parts(request.repository)
         _validate_branch_name(request.branch)
@@ -1580,4 +1788,18 @@ class EnvironmentGitHubProvider:
     ) -> str:
         return self._configured_provider().validate_handoff(
             repository, branch, requested_base
+        )
+
+    def get_pull_request(self, repository: str, number: int) -> PullRequestSnapshot:
+        return self._configured_provider().get_pull_request(repository, number)
+
+    def update_source_branch(
+        self,
+        snapshot: PullRequestSnapshot,
+        worktree: str | Path,
+        expected_head: str,
+        repaired_head: str,
+    ) -> None:
+        self._configured_provider().update_source_branch(
+            snapshot, worktree, expected_head, repaired_head
         )
