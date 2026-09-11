@@ -92,6 +92,14 @@ _SECRET_ASSIGNMENT = re.compile(
     r"\b(token|api[_-]?key|secret|password)\b\s*[:=]\s*\S+",
     re.IGNORECASE,
 )
+_SECRET_JSON = re.compile(
+    r"([\"']?(?:access[_-]?token|refresh[_-]?token|token|api[_-]?key|"
+    r"client[_-]?secret|secret|password)[\"']?\s*:\s*)"
+    r"(?:\"[^\"]*\"|'[^']*'|[^,}\s]+)",
+    re.IGNORECASE,
+)
+_BEARER_TOKEN = re.compile(r"\bBearer\s+\S+", re.IGNORECASE)
+_URL_CREDENTIALS = re.compile(r"(https?://)[^/\s:@]+:[^@\s]+@", re.IGNORECASE)
 
 
 def redact_worker_text(text: str, secret_values: tuple[str, ...] = ()) -> str:
@@ -102,6 +110,9 @@ def redact_worker_text(text: str, secret_values: tuple[str, ...] = ()) -> str:
         (value for value in secret_values if value), key=len, reverse=True
     ):
         redacted = redacted.replace(secret, "[redacted]")
+    redacted = _SECRET_JSON.sub(r"\1[redacted]", redacted)
+    redacted = _BEARER_TOKEN.sub("Bearer [redacted]", redacted)
+    redacted = _URL_CREDENTIALS.sub(r"\1[redacted]@", redacted)
     return _SECRET_ASSIGNMENT.sub(
         lambda match: f"{match.group(1)}=[redacted]", redacted
     )[:MAX_AGENT_OUTPUT_LENGTH]

@@ -141,4 +141,5 @@ uv run pytest --cov=beehaiive --cov=main --cov-report=term-missing --cov-fail-un
 ```
 
 The dashboard details and security boundary are documented in
-[`docs/dashboard.md`](docs/dashboard.md) and [`docs/security.md`](docs/security.md).
+[`docs/dashboard.md`](docs/dashboard.md), [`docs/meta-review.md`](docs/meta-review.md),
+and [`docs/security.md`](docs/security.md).
