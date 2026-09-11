@@ -1,6 +1,13 @@
 """Durable orchestration primitives for BeeHAIve."""
 
-from .models import HandoffRequest, HandoffResult, ProjectSnapshot, Stage
+from .conflict_repair import ConflictRepairAgent, ConflictRepairService
+from .models import (
+    HandoffRequest,
+    HandoffResult,
+    ProjectSnapshot,
+    PullRequestSnapshot,
+    Stage,
+)
 from .orchestrator import Orchestrator
 from .provider import EnvironmentGitHubProvider, GitHubProjectProvider, ProjectProvider
 from .review import (
@@ -49,6 +56,8 @@ from .workflow import (
     HandoffRecord,
     HandoffStatus,
     LeaseStatus,
+    RepairRecord,
+    RepairStatus,
     WorkflowError,
     WorkflowRole,
     WorkflowService,
@@ -58,6 +67,8 @@ from .workflow import (
 
 __all__ = [
     "AllowListReviewAuthorizer",
+    "ConflictRepairAgent",
+    "ConflictRepairService",
     "CheckResult",
     "CommandCheck",
     "Constitution",
@@ -86,6 +97,9 @@ __all__ = [
     "PullRequestTarget",
     "ProjectProvider",
     "ProjectSnapshot",
+    "PullRequestSnapshot",
+    "RepairRecord",
+    "RepairStatus",
     "ReaderResult",
     "ReaderExecution",
     "ReaderStatus",

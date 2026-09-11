@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -15,6 +17,7 @@ from beehaiive.models import (
     HandoffResult,
     PbiSnapshot,
     ProjectSnapshot,
+    PullRequestSnapshot,
     RepositorySnapshot,
     RunState,
     RunStatus,
@@ -94,6 +97,18 @@ def _handoff_request(*, base_branch: str | None = None) -> HandoffRequest:
         body="Closes #1",
         run_id="run-1",
     )
+
+
+def _git(cwd: Path, *arguments: str) -> str:
+    result = subprocess.run(
+        ("git", *arguments),
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    return result.stdout.strip()
 
 
 def test_urllib_graphql_client_validates_transport_and_payloads(
@@ -421,6 +436,232 @@ def test_provider_discovery_and_base_branch_validation() -> None:
         missing_branch.resolve_base_branch("owner/api", None)
 
 
+def _pull_request_data(
+    *,
+    mergeable: object = "CONFLICTING",
+    merge_state: object = "DIRTY",
+    source_name: object = "feature",
+    source_ref_name: object = "feature",
+    source_head: object = "source-head",
+    target_name: object = "main",
+    target_ref_name: object = "main",
+    target_head: object = "target-head",
+    pull_request: object = "present",
+) -> dict[str, Any]:
+    if pull_request is None:
+        return {"repository": {"pullRequest": None}}
+    return {
+        "repository": {
+            "pullRequest": {
+                "id": "PR_1",
+                "number": 1,
+                "url": "https://example.test/pull/1",
+                "state": "OPEN",
+                "merged": False,
+                "headRefName": source_name,
+                "headRef": {
+                    "name": source_ref_name,
+                    "target": {"oid": source_head},
+                },
+                "baseRefName": target_name,
+                "baseRef": {
+                    "name": target_ref_name,
+                    "target": {"oid": target_head},
+                },
+                "mergeable": mergeable,
+                "mergeStateStatus": merge_state,
+            }
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    ("mergeable", "merge_state", "expected"),
+    [
+        ("CONFLICTING", "DIRTY", "conflicting"),
+        ("MERGEABLE", "CLEAN", "clean"),
+        ("UNKNOWN", "UNKNOWN", "unknown"),
+    ],
+)
+def test_provider_returns_pull_request_merge_evidence(
+    mergeable: str, merge_state: str, expected: str
+) -> None:
+    provider = GitHubProjectProvider(
+        "owner",
+        7,
+        "token",
+        client=StaticClient(
+            _pull_request_data(mergeable=mergeable, merge_state=merge_state)
+        ),
+    )
+
+    snapshot = provider.get_pull_request("owner/api", 1)
+
+    assert isinstance(snapshot, PullRequestSnapshot)
+    assert snapshot.source_head == "source-head"
+    assert snapshot.target_branch == "main"
+    assert snapshot.target_head == "target-head"
+    assert snapshot.conflict_state == expected
+
+
+def test_provider_pull_request_evidence_fails_closed() -> None:
+    contradictory = GitHubProjectProvider(
+        "owner",
+        7,
+        "token",
+        client=StaticClient(_pull_request_data(source_ref_name="different")),
+    ).get_pull_request("owner/api", 1)
+    assert contradictory.conflict_state == "unknown"
+    assert contradictory.evidence_error
+
+    missing_head = GitHubProjectProvider(
+        "owner",
+        7,
+        "token",
+        client=StaticClient(_pull_request_data(source_head=None)),
+    ).get_pull_request("owner/api", 1)
+    assert missing_head.conflict_state == "unknown"
+    assert missing_head.evidence_error
+
+    malformed = _pull_request_data()
+    malformed["repository"]["pullRequest"]["id"] = None  # type: ignore[index]
+    with pytest.raises(ProviderError, match="incomplete"):
+        GitHubProjectProvider(
+            "owner", 7, "token", client=StaticClient(malformed)
+        ).get_pull_request("owner/api", 1)
+
+    missing = GitHubProjectProvider(
+        "owner", 7, "token", client=StaticClient(_pull_request_data(pull_request=None))
+    )
+    with pytest.raises(ProviderError, match="not found"):
+        missing.get_pull_request("owner/api", 1)
+    with pytest.raises(ProviderError, match="positive"):
+        missing.get_pull_request("owner/api", 0)
+    with pytest.raises(ProviderError, match="wrong"):
+        GitHubProjectProvider(
+            "owner", 7, "token", client=StaticClient(_pull_request_data())
+        ).get_pull_request("owner/api", 2)
+
+
+def test_provider_updates_only_the_expected_source_branch(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-b", "master")
+    _git(repository, "config", "user.email", "tests@example.test")
+    _git(repository, "config", "user.name", "Provider Tests")
+    (repository / "README.md").write_text("base\n", encoding="utf-8")
+    _git(repository, "add", "README.md")
+    _git(repository, "commit", "-m", "base")
+    _git(repository, "switch", "-c", "feature")
+    (repository / "README.md").write_text("source\n", encoding="utf-8")
+    _git(repository, "add", "README.md")
+    _git(repository, "commit", "-m", "source")
+    expected_head = _git(repository, "rev-parse", "HEAD")
+    remote = tmp_path / "remote.git"
+    _git(tmp_path, "init", "--bare", str(remote))
+    _git(repository, "remote", "add", "origin", str(remote))
+    _git(repository, "push", "origin", "--all")
+
+    worktree = tmp_path / "repair"
+    _git(repository, "worktree", "add", "-b", "repair", str(worktree), expected_head)
+    (worktree / "repair.txt").write_text("repaired\n", encoding="utf-8")
+    _git(worktree, "add", "repair.txt")
+    _git(worktree, "commit", "-m", "repair")
+    repaired_head = _git(worktree, "rev-parse", "HEAD")
+    snapshot = PullRequestSnapshot(
+        "owner/api",
+        1,
+        "PR_1",
+        "https://example.test/pull/1",
+        "OPEN",
+        False,
+        "feature",
+        expected_head,
+        "master",
+        _git(repository, "rev-parse", "master"),
+        "CONFLICTING",
+        "DIRTY",
+    )
+    provider = GitHubProjectProvider("owner", 7, "token", client=StaticClient({}))
+
+    provider.update_source_branch(snapshot, worktree, expected_head, repaired_head)
+
+    assert _git(remote, "rev-parse", "refs/heads/feature") == repaired_head
+    _git(repository, "switch", "-c", "advance", repaired_head)
+    (repository / "advance.txt").write_text("advance\n", encoding="utf-8")
+    _git(repository, "add", "advance.txt")
+    _git(repository, "commit", "-m", "advance remote branch")
+    _git(repository, "push", "--force", "origin", "advance:feature")
+    _git(repository, "switch", "feature")
+    _git(repository, "branch", "-D", "advance")
+    with pytest.raises(ProviderError, match="exit code"):
+        provider.update_source_branch(snapshot, worktree, expected_head, repaired_head)
+    stale = replace(snapshot, source_head="different-head")
+    with pytest.raises(ProviderError, match="changed"):
+        provider.update_source_branch(stale, worktree, expected_head, repaired_head)
+    with pytest.raises(ProviderError, match="eligible"):
+        provider.update_source_branch(
+            replace(snapshot, state="CLOSED"), worktree, expected_head, repaired_head
+        )
+    with pytest.raises(ProviderError, match="worktree head"):
+        provider.update_source_branch(snapshot, worktree, expected_head, expected_head)
+
+    _git(repository, "worktree", "remove", "--force", str(worktree))
+    _git(repository, "branch", "-D", "repair")
+
+
+def test_provider_guarded_update_rejects_unrelated_history_and_git_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-b", "master")
+    _git(repository, "config", "user.email", "tests@example.test")
+    _git(repository, "config", "user.name", "Provider Tests")
+    (repository / "README.md").write_text("base\n", encoding="utf-8")
+    _git(repository, "add", "README.md")
+    _git(repository, "commit", "-m", "base")
+    base_head = _git(repository, "rev-parse", "HEAD")
+    worktree = tmp_path / "repair"
+    _git(repository, "worktree", "add", "-b", "repair", str(worktree), base_head)
+    (repository / "expected.txt").write_text("expected\n", encoding="utf-8")
+    _git(repository, "add", "expected.txt")
+    _git(repository, "commit", "-m", "expected")
+    expected_head = _git(repository, "rev-parse", "HEAD")
+    (worktree / "unrelated.txt").write_text("other\n", encoding="utf-8")
+    _git(worktree, "add", "unrelated.txt")
+    _git(worktree, "commit", "-m", "unrelated")
+    unrelated_head = _git(worktree, "rev-parse", "HEAD")
+    snapshot = PullRequestSnapshot(
+        "owner/api",
+        1,
+        "PR_1",
+        "https://example.test/pull/1",
+        "OPEN",
+        False,
+        "feature",
+        expected_head,
+        "master",
+        expected_head,
+        "CONFLICTING",
+        "DIRTY",
+    )
+    provider = GitHubProjectProvider("owner", 7, "token", client=StaticClient({}))
+    with pytest.raises(ProviderError, match="preserve source"):
+        provider.update_source_branch(snapshot, worktree, expected_head, unrelated_head)
+
+    _git(repository, "worktree", "remove", "--force", str(worktree))
+    _git(repository, "branch", "-D", "repair")
+
+    def broken_run(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise OSError("git unavailable")
+
+    monkeypatch.setattr(provider_module.subprocess, "run", broken_run)
+    with pytest.raises(ProviderError, match="Guarded source"):
+        provider.update_source_branch(snapshot, worktree, expected_head, unrelated_head)
+
+
 def test_provider_preserves_archive_evidence() -> None:
     metadata = _dashboard_metadata(
         {
@@ -706,6 +947,31 @@ class StubProvider:
     ) -> str:
         return self.resolve_base_branch(repository, requested_base)
 
+    def get_pull_request(self, repository: str, number: int) -> PullRequestSnapshot:
+        return PullRequestSnapshot(
+            repository,
+            number,
+            "PR_1",
+            "https://example.test/pull/1",
+            "OPEN",
+            False,
+            "feature",
+            "head",
+            "main",
+            "base",
+            "MERGEABLE",
+            "CLEAN",
+        )
+
+    def update_source_branch(
+        self,
+        snapshot: PullRequestSnapshot,
+        worktree: str | Path,
+        expected_head: str,
+        repaired_head: str,
+    ) -> None:
+        del snapshot, worktree, expected_head, repaired_head
+
 
 def test_environment_provider_delegates(monkeypatch: pytest.MonkeyPatch) -> None:
     stub = StubProvider()
@@ -727,6 +993,8 @@ def test_environment_provider_delegates(monkeypatch: pytest.MonkeyPatch) -> None
     assert provider.create_handoff(request).pull_request_number == 1
     assert provider.resolve_base_branch("owner/api", None) == "main"
     assert provider.validate_handoff("owner/api", "codex/api-1", None) == "main"
+    pull_request = provider.get_pull_request("owner/api", 1)
+    provider.update_source_branch(pull_request, "worktree", "head", "head")
     assert factory_calls == 1
 
 

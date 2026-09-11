@@ -16,6 +16,7 @@ from beehaiive.agent import (
     CancellableModelExecutor,
     CodexExecModelExecutor,
 )
+from beehaiive.conflict_repair import ConflictRepairAgent, ConflictRepairService
 from beehaiive.dashboard import build_dashboard_state
 from beehaiive.meta_review import MetaReviewError, MetaReviewService
 from beehaiive.models import RunState, RunStatus
@@ -117,6 +118,11 @@ class WorkflowModelCallRequest(BaseModel):
 
 class WorkflowStopRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=400)
+
+
+class ConflictRepairRequest(BaseModel):
+    repository: str = Field(min_length=1, max_length=300)
+    pull_request_number: int = Field(gt=0)
 
 
 class ReviewStartRequest(BaseModel):
@@ -228,6 +234,7 @@ def create_app(
     meta_review_service: MetaReviewService | None = None,
     workflow_service: WorkflowService | None = None,
     workflow_actor: WorkflowRole | str | None = None,
+    conflict_repair_service: ConflictRepairService | None = None,
 ) -> FastAPI:
     owns_orchestrator = orchestrator is None
     if orchestrator is not None and orchestrator.model_router is not None:
@@ -271,6 +278,19 @@ def create_app(
         orchestrator.model_router = routing_service
     if orchestrator.model_executor is None:
         orchestrator.model_executor = model_executor
+    if (
+        conflict_repair_service is None
+        and workflow_service is not None
+        and orchestrator.model_executor is not None
+        and callable(getattr(orchestrator.provider, "get_pull_request", None))
+        and callable(getattr(orchestrator.provider, "update_source_branch", None))
+        and callable(getattr(orchestrator.model_executor, "execute_repair", None))
+    ):
+        conflict_repair_service = ConflictRepairService(
+            workflow_service,
+            orchestrator.provider,
+            cast(ConflictRepairAgent, orchestrator.model_executor),
+        )
     if (
         meta_review_service is not None
         and meta_review_service.store is not orchestrator.store
@@ -698,6 +718,37 @@ def create_app(
             )
 
         return _handle_workflow_error(operation)
+
+    @app.post("/workflow/conflict-repairs")
+    def repair_conflict(  # pyright: ignore[reportUnusedFunction]
+        request: ConflictRepairRequest,
+        _auth: None = Depends(require_workflow_access),
+    ) -> dict[str, object]:
+        if conflict_repair_service is None:
+            raise HTTPException(
+                status_code=503, detail="Conflict repair is not configured"
+            )
+        service = conflict_repair_service
+        return _handle_workflow_error(
+            lambda: service.repair(
+                request.repository, request.pull_request_number
+            ).as_dict()
+        )
+
+    @app.get("/workflow/conflict-repairs/{repair_id}")
+    def get_conflict_repair(  # pyright: ignore[reportUnusedFunction]
+        repair_id: str,
+        _auth: None = Depends(require_workflow_access),
+    ) -> dict[str, object]:
+        service = require_workflow_service()
+        if conflict_repair_service is None:
+            raise HTTPException(
+                status_code=503, detail="Conflict repair is not configured"
+            )
+        record = service.store.get_repair(repair_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="Repair not found")
+        return record.as_dict()
 
     @app.post("/workflow/handoffs")
     def create_workflow_handoff(  # pyright: ignore[reportUnusedFunction]
