@@ -2054,6 +2054,29 @@ def test_github_provider_rejects_ambiguous_branch_with_unexpected_target() -> No
     assert client.pull_request_creations == 0
 
 
+def test_github_provider_rejects_unverified_branch_target_mismatch() -> None:
+    client = HandoffGraphQLClient()
+    client.ref_exists = True
+    client.branch_sha = "unexpected-oid"
+    provider = GitHubProjectProvider("owner", 7, "token", client=client)
+    request = HandoffRequest(
+        project_id="owner:7",
+        repository="owner/api",
+        pbi_number=1,
+        title="API one",
+        branch="codex/api-1",
+        base_branch=None,
+        body="Closes #1",
+        run_id="run-1",
+    )
+
+    with pytest.raises(ProviderError, match="intended base commit"):
+        provider.create_handoff(request)
+
+    assert client.ref_creations == 0
+    assert client.pull_request_creations == 0
+
+
 def test_github_provider_creates_and_updates_verified_draft() -> None:
     client = HandoffGraphQLClient()
     client.ref_exists = True
