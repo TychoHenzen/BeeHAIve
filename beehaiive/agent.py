@@ -86,6 +86,17 @@ _SAFE_ENVIRONMENT_NAMES = frozenset(
     }
 )
 _ROUTING_MODEL_ALIASES = frozenset({"luna", "terra", "sol", "astra", "human"})
+_SESSION_PROGRESS_EVENTS = frozenset(
+    {
+        "thread.started",
+        "turn.started",
+        "turn.completed",
+        "turn.failed",
+        "item.started",
+        "item.updated",
+        "item.completed",
+    }
+)
 
 
 class CancellableModelExecutor(ModelExecutor, Protocol):
@@ -118,7 +129,11 @@ _BEARER_TOKEN = re.compile(r"\bBearer\s+\S+", re.IGNORECASE)
 _URL_CREDENTIALS = re.compile(r"(https?://)[^/\s:@]+:[^@\s]+@", re.IGNORECASE)
 
 
-def redact_worker_text(text: str, secret_values: tuple[str, ...] = ()) -> str:
+def redact_worker_text(
+    text: str,
+    secret_values: tuple[str, ...] = (),
+    max_length: int | None = MAX_AGENT_OUTPUT_LENGTH,
+) -> str:
     """Remove common credential forms before worker text reaches durable state."""
 
     redacted = text
@@ -129,9 +144,10 @@ def redact_worker_text(text: str, secret_values: tuple[str, ...] = ()) -> str:
     redacted = _SECRET_JSON.sub(r"\1[redacted]", redacted)
     redacted = _BEARER_TOKEN.sub("Bearer [redacted]", redacted)
     redacted = _URL_CREDENTIALS.sub(r"\1[redacted]@", redacted)
-    return _SECRET_ASSIGNMENT.sub(
+    redacted = _SECRET_ASSIGNMENT.sub(
         lambda match: f"{match.group(1)}=[redacted]", redacted
-    )[:MAX_AGENT_OUTPUT_LENGTH]
+    )
+    return redacted if max_length is None else redacted[:max_length]
 
 
 class CodexExecModelExecutor:
@@ -176,6 +192,10 @@ class CodexExecModelExecutor:
         self._active_attempts: set[str] = set()
         self._cancelled: set[str] = set()
         self._task_contracts: dict[str, TaskContract] = {}
+        self._session_tasks: dict[str, str] = {}
+        self._session_event_handlers: dict[
+            str, Callable[[str, str, str | None, str], None]
+        ] = {}
         self._workspace_leases: dict[str, WorkspaceLease] = {}
         self._workspace_validators: dict[str, Callable[[], None]] = {}
         self._secret_values = tuple(
@@ -214,6 +234,7 @@ class CodexExecModelExecutor:
         problem_id = decision.problem_id
         with self._lock:
             contract = self._task_contracts.get(problem_id)
+            event_handler = self._session_event_handlers.get(problem_id)
             workspace_lease = self._workspace_leases.get(problem_id)
             validate_workspace_lease = self._workspace_validators.get(problem_id)
         execution_repository = (
@@ -274,9 +295,18 @@ class CodexExecModelExecutor:
                 if cancelled:
                     self._terminate_process(process)
                 try:
-                    stdout, stderr, timed_out = self._communicate_bounded(
-                        process, self.timeout_seconds
-                    )
+                    if event_handler is None:
+                        stdout, stderr, timed_out = self._communicate_bounded(
+                            process, self.timeout_seconds
+                        )
+                    else:
+
+                        def record_line(line: str) -> None:
+                            self._record_session_line(line, event_handler)
+
+                        stdout, stderr, timed_out = self._communicate_bounded(
+                            process, self.timeout_seconds, record_line
+                        )
                 except subprocess.TimeoutExpired:
                     self._terminate_process(process)
                     stdout, stderr = "", ""
@@ -513,11 +543,28 @@ class CodexExecModelExecutor:
         with self._lock:
             self._task_contracts[problem_id] = contract
 
+    def set_session_task(self, problem_id: str, task: str) -> None:
+        with self._lock:
+            self._session_tasks[problem_id] = task
+
+    def set_session_event_handler(
+        self,
+        problem_id: str,
+        handler: Callable[[str, str, str | None, str], None] | None,
+    ) -> None:
+        with self._lock:
+            if handler is None:
+                self._session_event_handlers.pop(problem_id, None)
+            else:
+                self._session_event_handlers[problem_id] = handler
+
     def release_run(self, problem_id: str) -> None:
         with self._lock:
             self._active_attempts.discard(problem_id)
             self._cancelled.discard(problem_id)
             self._task_contracts.pop(problem_id, None)
+            self._session_tasks.pop(problem_id, None)
+            self._session_event_handlers.pop(problem_id, None)
             self._workspace_leases.pop(problem_id, None)
             self._workspace_validators.pop(problem_id, None)
 
@@ -556,6 +603,8 @@ class CodexExecModelExecutor:
             if repository is None
             else self._repository_files(repository)
         )
+        with self._lock:
+            task = self._session_tasks.get(decision.problem_id, self.task)
         scope = (
             "The exact leased worktree is the only writable path. Work only inside "
             "it. Do not access the network or credentials, modify another checkout, "
@@ -567,7 +616,7 @@ class CodexExecModelExecutor:
         prompt = (
             "BeeHAIve dashboard demo.\n"
             f"Task name: {DEMO_TASK_NAME}\n"
-            f"Task: {self.task}\n"
+            f"Task: {task}\n"
             f"Repository identity: {self.repository_name or self.repository.name}\n"
             f"Verified current branch: {branch}\n"
             f"Verified tracked file count: {tracked_file_count}\n"
@@ -877,33 +926,85 @@ class CodexExecModelExecutor:
 
     @staticmethod
     def _communicate_bounded(
-        process: subprocess.Popen[Any], timeout: float
+        process: subprocess.Popen[Any],
+        timeout: float,
+        stdout_line_handler: Callable[[str], None] | None = None,
     ) -> tuple[str, str, bool]:
         buffers = [bytearray(), bytearray()]
         streams = [process.stdout, process.stderr]
+        handler_errors: list[Exception] = []
 
-        def collect(stream: Any, buffer: bytearray) -> None:
+        def collect(
+            stream: Any,
+            buffer: bytearray,
+            line_handler: Callable[[str], None] | None,
+        ) -> None:
+            line_buffer = bytearray()
+            dropping_line = False
+
+            def handle_lines(chunk: bytes) -> None:
+                nonlocal dropping_line
+                if dropping_line:
+                    newline = chunk.find(b"\n")
+                    if newline < 0:
+                        return
+                    chunk = chunk[newline + 1 :]
+                    dropping_line = False
+                line_buffer.extend(chunk)
+                while True:
+                    newline = line_buffer.find(b"\n")
+                    if newline < 0:
+                        if len(line_buffer) > MAX_AGENT_OUTPUT_BYTES:
+                            line_buffer.clear()
+                            dropping_line = True
+                        return
+                    line = bytes(line_buffer[:newline])
+                    del line_buffer[: newline + 1]
+                    if len(line) > MAX_AGENT_OUTPUT_BYTES or handler_errors:
+                        continue
+                    try:
+                        assert line_handler is not None
+                        line_handler(line.decode("utf-8", errors="replace"))
+                    except Exception as exc:
+                        handler_errors.append(exc)
+
             try:
                 while True:
-                    chunk = stream.read(4096)
+                    chunk = stream.read1(4096)
                     if not chunk:
-                        return
+                        break
                     if isinstance(chunk, str):
                         chunk = chunk.encode("utf-8", errors="replace")
                     remaining = MAX_AGENT_OUTPUT_BYTES - len(buffer)
                     if remaining > 0:
                         buffer.extend(chunk[:remaining])
+                    if line_handler is not None and not handler_errors:
+                        handle_lines(chunk)
+                if (
+                    line_handler is not None
+                    and line_buffer
+                    and not dropping_line
+                    and not handler_errors
+                ):
+                    try:
+                        line_handler(line_buffer.decode("utf-8", errors="replace"))
+                    except Exception as exc:
+                        handler_errors.append(exc)
             except (OSError, ValueError):
                 return
 
         readers = [
             Thread(
                 target=collect,
-                args=(stream, buffer),
+                args=(
+                    stream,
+                    buffer,
+                    stdout_line_handler if index == 0 else None,
+                ),
                 name="beehaiive-agent-output",
                 daemon=True,
             )
-            for stream, buffer in zip(streams, buffers, strict=True)
+            for index, (stream, buffer) in enumerate(zip(streams, buffers, strict=True))
             if stream is not None
         ]
         for reader in readers:
@@ -921,11 +1022,60 @@ class CodexExecModelExecutor:
             if reader.is_alive():
                 with suppress(OSError, ValueError):
                     stream.close()
+        if handler_errors:
+            raise handler_errors[0]
         return (
             buffers[0].decode("utf-8", errors="replace"),
             buffers[1].decode("utf-8", errors="replace"),
             timed_out,
         )
+
+    def _record_session_line(
+        self,
+        line: str,
+        handler: Callable[[str, str, str | None, str], None],
+    ) -> None:
+        event = self._session_event(line)
+        if event is None:
+            return
+        kind, source_type, role, text = event
+        handler(
+            kind,
+            source_type,
+            role,
+            redact_worker_text(text, self._secret_values),
+        )
+
+    @staticmethod
+    def _session_event(
+        line: str,
+    ) -> tuple[str, str, str | None, str] | None:
+        try:
+            raw_event: object = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(raw_event, dict):
+            return None
+        event = cast(dict[str, object], raw_event)
+        event_type = event.get("type")
+        item_value = event.get("item")
+        item = (
+            cast(dict[str, object], item_value) if isinstance(item_value, dict) else {}
+        )
+        if item.get("type") == "agent_message":
+            message = _text_value(item.get("text", item.get("content")))
+            if message:
+                source_type = (
+                    event_type if isinstance(event_type, str) else "agent_message"
+                )
+                return "message", source_type, "assistant", message
+        if event_type == "agent_message":
+            message = _text_value(event.get("text", event.get("content")))
+            if message:
+                return "message", "agent_message", "assistant", message
+        if isinstance(event_type, str) and event_type in _SESSION_PROGRESS_EVENTS:
+            return "progress", event_type, None, event_type
+        return None
 
     @staticmethod
     def _parse_output(output: str) -> tuple[str, int, int]:
@@ -993,11 +1143,85 @@ class AgentWorkerManager:
         self._workspace_leases: dict[str, WorkspaceLease] = {}
         self._workspace_validators: dict[str, Callable[[], None]] = {}
         self._delivery_lock = Lock()
-        if workflow_service is not None:
-            workflow_service.cleanup_dashboard_run_workspaces()
+        self._worker_id = f"{os.getpid()}:{uuid4().hex}"
         register = getattr(orchestrator, "register_worker_canceller", None)
         if callable(register):
             register(self.cancel)
+
+    def claim(
+        self,
+        project_id: str,
+        repository: str,
+        owner_id: str,
+        task: str,
+        *,
+        expected_run_id: str | None = None,
+    ) -> RunState | None:
+        if not task.strip():
+            raise StoreError("An agent task is required")
+        secret_values = tuple(
+            value
+            for value in getattr(self.executor, "_secret_values", ())
+            if isinstance(value, str)
+        )
+        return self.orchestrator.claim(
+            project_id,
+            repository,
+            owner_id,
+            expected_run_id=expected_run_id,
+            agent_session=(
+                self._worker_id,
+                redact_worker_text(task, secret_values, max_length=None),
+            ),
+        )
+
+    def recover(self) -> tuple[str, ...]:
+        service = self.workflow_service
+        if service is None:
+            return ()
+        store = self.orchestrator.store
+        recovered: list[str] = []
+        for previous_run in store.active_agent_sessions():
+            session = store.get_agent_session(previous_run.run_id)
+            task = None if session is None else session.get("task")
+            if not isinstance(task, str) or not task.strip():
+                task = getattr(self.executor, "task", previous_run.title)
+            if not isinstance(task, str) or not task.strip():
+                task = previous_run.title
+            run = self.claim(
+                previous_run.project_id,
+                previous_run.repository,
+                self._worker_id,
+                task,
+                expected_run_id=previous_run.run_id,
+            )
+            if run is None:
+                continue
+            lease_token = run.lease_token
+            if lease_token is None:
+                raise StoreError("Recovered agent run has no lease token")
+            try:
+                service.cleanup_dashboard_run_workspaces(run.run_id)
+                self.start(run)
+            except Exception as exc:
+                current = store.get_run(run.run_id)
+                if (
+                    current is not None
+                    and current.status is RunStatus.ACTIVE
+                    and current.lease_token == lease_token
+                ):
+                    failure = redact_worker_text(f"Agent recovery failed: {exc}")
+                    try:
+                        store.fail_agent_run(run.run_id, failure, lease_token)
+                    except StoreError:
+                        store.fail_agent_run_after_lease_loss(
+                            run.run_id,
+                            failure,
+                            expected_lease_token=lease_token,
+                        )
+                continue
+            recovered.append(run.run_id)
+        return tuple(recovered)
 
     def start(self, run: RunState) -> None:
         if run.status is not RunStatus.ACTIVE or run.lease_token is None:
@@ -1045,6 +1269,51 @@ class AgentWorkerManager:
                 workspace_lease,
                 validate_workspace_lease,
             )
+            store = self.orchestrator.store
+            previous_session = store.get_agent_session(run.run_id)
+            task = (
+                previous_session.get("task")
+                if previous_session is not None
+                else getattr(self.executor, "task", run.title)
+            )
+            if not isinstance(task, str) or not task.strip():
+                task = run.title
+            secret_values = tuple(
+                value
+                for value in getattr(self.executor, "_secret_values", ())
+                if isinstance(value, str)
+            )
+            session_task = redact_worker_text(task, secret_values, max_length=None)
+            store.start_agent_session(
+                run.run_id,
+                self._worker_id,
+                session_task,
+                run.lease_token,
+            )
+            set_session_task = getattr(self.executor, "set_session_task", None)
+            if callable(set_session_task):
+                set_session_task(run.run_id, session_task)
+            set_event_handler = getattr(
+                self.executor, "set_session_event_handler", None
+            )
+            if callable(set_event_handler):
+
+                def record_event(
+                    kind: str,
+                    source_type: str,
+                    role: str | None,
+                    text: str,
+                ) -> None:
+                    store.record_agent_session_event(
+                        run.run_id,
+                        run.lease_token or "",
+                        kind,
+                        source_type,
+                        role,
+                        redact_worker_text(text, secret_values),
+                    )
+
+                set_event_handler(run.run_id, record_event)
             with self._lock:
                 self._workspace_leases[run.run_id] = workspace_lease
                 self._workspace_validators[run.run_id] = validate_workspace_lease
@@ -1195,7 +1464,8 @@ class AgentWorkerManager:
                 with suppress(StoreError):
                     self.orchestrator.stop(run_id, "Agent worker shut down")
         if self.workflow_service is not None:
-            self.workflow_service.cleanup_dashboard_run_workspaces()
+            for run_id, _thread in items:
+                self.workflow_service.cleanup_dashboard_run_workspaces(run_id)
 
     def _run(self, run_id: str, lease_token: str) -> None:
         workflow_service = self.workflow_service
@@ -1311,7 +1581,7 @@ class AgentWorkerManager:
                         self.orchestrator.store, "fail_agent_run_after_lease_loss", None
                     )
                     if callable(recover):
-                        recover(run_id, failure)
+                        recover(run_id, failure, expected_lease_token=lease_token)
         finally:
             heartbeat_stop.set()
             cleanup_error: WorkflowError | None = None

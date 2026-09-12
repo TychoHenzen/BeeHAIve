@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from beehaiive import EnvironmentGitHubProvider, Orchestrator, OrchestratorStore, Stage
 from beehaiive.agent import (
+    DEFAULT_DEMO_TASK,
     DEMO_TASK_NAME,
     AgentWorkerManager,
     CancellableModelExecutor,
@@ -387,6 +388,12 @@ def create_app(
                 raise RuntimeError(
                     f"Production review adapters are not configured: {configured}"
                 )
+
+    if agent_worker is not None:
+
+        @app.on_event("startup")  # pyright: ignore[reportDeprecated]
+        async def recover_agent_workers() -> None:  # pyright: ignore[reportUnusedFunction]
+            agent_worker.recover()
 
     configured_api_key = (
         api_key if api_key is not None else os.environ.get("BEEHAIIVE_API_KEY")
@@ -1504,10 +1511,14 @@ def _execute_dashboard_action(
             return orchestrator.synchronize(project_id)
         if agent_worker is None:
             raise StoreError("Agent worker is not configured")
-        run = orchestrator.claim(
+        task = getattr(getattr(agent_worker, "executor", None), "task", None)
+        if not isinstance(task, str) or not task.strip():
+            task = DEFAULT_DEMO_TASK
+        run = agent_worker.claim(
             project_id,
             request.repository,
             request.worker_id or "dashboard-operator",
+            task=task,
         )
         if run is None:
             raise StoreError("No claimable PBI is available for this repository")

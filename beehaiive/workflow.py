@@ -2072,9 +2072,13 @@ class WorkflowService:
         run_id = _required(run_id, "run id")
         return self.store.get_lease_for_agent(f"dashboard-run:{run_id}")
 
-    def cleanup_dashboard_run_workspaces(self) -> tuple[WorkspaceLease, ...]:
+    def cleanup_dashboard_run_workspaces(
+        self, run_id: str | None = None
+    ) -> tuple[WorkspaceLease, ...]:
         cleaned: list[WorkspaceLease] = []
         for lease in self.store.dashboard_run_leases():
+            if run_id is not None and lease.agent_id != f"dashboard-run:{run_id}":
+                continue
             if lease.status is LeaseStatus.ACTIVE:
                 lease = self.store.stop_lease(
                     lease.lease_id, "Dashboard worker did not survive service restart"

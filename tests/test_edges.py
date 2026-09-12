@@ -1014,12 +1014,79 @@ def _storage_snapshot() -> ProjectSnapshot:
     )
 
 
+def test_claim_recovery_cannot_claim_a_different_run() -> None:
+    snapshot = ProjectSnapshot(
+        "project-1",
+        "Planning",
+        (
+            RepositorySnapshot(
+                "owner/api",
+                (
+                    PbiSnapshot("owner/api", 1, "first"),
+                    PbiSnapshot("owner/api", 2, "second"),
+                ),
+            ),
+        ),
+    )
+    store = OrchestratorStore()
+    store.sync_project(snapshot)
+    previous = store.claim_next("project-1", "owner/api", "worker-1")
+    assert previous is not None
+    store._connection.execute(
+        "UPDATE runs SET status = 'completed', owner_id = NULL, "
+        "lease_token = NULL, lease_expires_at = NULL WHERE run_id = ?",
+        (previous.run_id,),
+    )
+    store._connection.execute(
+        "UPDATE pbis SET claimable = 0 WHERE project_id = ? "
+        "AND repository_name = ? AND number = 1",
+        ("project-1", "owner/api"),
+    )
+
+    assert (
+        store.claim_next(
+            "project-1",
+            "owner/api",
+            "recovery-worker",
+            expected_run_id=previous.run_id,
+        )
+        is None
+    )
+    next_run = store.claim_next("project-1", "owner/api", "next-worker")
+    assert next_run is not None and next_run.pbi_number == 2
+    store.close()
+
+
+def test_claim_renews_same_lease_and_registers_agent_session() -> None:
+    store = OrchestratorStore()
+    store.sync_project(_storage_snapshot())
+    claimed = store.claim_next("project-1", "owner/api", "worker-1")
+    assert claimed is not None and claimed.lease_token is not None
+
+    renewed = store.claim_next(
+        "project-1",
+        "owner/api",
+        "worker-1",
+        claimed.lease_token,
+        agent_session=("agent-worker", "persisted task"),
+    )
+
+    assert renewed is not None and renewed.run_id == claimed.run_id
+    session = store.get_agent_session(claimed.run_id)
+    assert session is not None and session["task"] == "persisted task"
+    store.close()
+
+
 def test_storage_rejects_invalid_state_operations() -> None:
     store = OrchestratorStore()
     service = Orchestrator(store, StorageProvider(_storage_snapshot()))
     service.synchronize("project-1")
     with pytest.raises(StoreError, match="worker owner"):
         store.claim_next("project-1", "owner/api", " ")
+    with pytest.raises(StoreError, match="agent worker and task"):
+        store.claim_next(
+            "project-1", "owner/api", "worker-1", agent_session=("agent", " ")
+        )
     run = service.claim("project-1", "owner/api", "worker-1")
     assert run is not None
     lease_token = run.lease_token or ""
@@ -1320,4 +1387,11 @@ def test_storage_migrates_legacy_columns(tmp_path: Path) -> None:
         str(row[1]) for row in store._connection.execute("PRAGMA table_info(runs)")
     }
     assert {"owner_id", "lease_token", "lease_expires_at"} <= run_columns
+    tables = {
+        str(row[0])
+        for row in store._connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    assert {"agent_sessions", "agent_session_events"} <= tables
     store.close()
