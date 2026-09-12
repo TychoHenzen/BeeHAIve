@@ -824,7 +824,14 @@ class ErrorHandoffClient:
         if "CreateRefInput" in query and self.bad_ref_name:
             return {"createRef": {"ref": {"name": "wrong"}}}
         if "CreateRefInput" in query:
-            return {"createRef": {"ref": {"name": variables["input"]["name"]}}}
+            return {
+                "createRef": {
+                    "ref": {
+                        "name": variables["input"]["name"],
+                        "target": {"oid": variables["input"]["oid"]},
+                    }
+                }
+            }
         return {
             "repository": {
                 "id": "repo-id",
@@ -834,7 +841,10 @@ class ErrorHandoffClient:
                 },
                 "ref": None
                 if self.bad_ref or self.bad_ref_name
-                else {"name": variables["qualifiedBranch"]},
+                else {
+                    "name": variables["qualifiedBranch"],
+                    "target": {"oid": "oid"},
+                },
                 "pullRequests": {
                     "nodes": [],
                     "pageInfo": {"hasNextPage": False, "endCursor": None},
@@ -896,7 +906,14 @@ class RaceClient(ErrorHandoffClient):
                 "pr-query-error",
             }:
                 raise ProviderError("recheck failed")
-            ref = None if self.mode.startswith("ref-") else {"name": "branch"}
+            ref = (
+                None
+                if self.mode.startswith("ref-")
+                else {
+                    "name": variables["qualifiedBranch"],
+                    "target": {"oid": "oid"},
+                }
+            )
             return {
                 "repository": {
                     "id": "repo-id",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import math
 import os
@@ -672,7 +673,7 @@ query($owner: String!, $name: String!, $qualifiedBranch: String!) {
 
 CREATE_REF_MUTATION = """
 mutation($input: CreateRefInput!) {
-  createRef(input: $input) { ref { name } }
+  createRef(input: $input) { ref { name target { oid } } }
 }
 """
 
@@ -1095,9 +1096,31 @@ def _validate_branch_name(branch: str) -> None:
         raise ProviderError("GitHub branch name is invalid")
 
 
-def _handoff_marker(request: HandoffRequest) -> str:
+def _handoff_marker(request: HandoffRequest, base_branch: str | None = None) -> str:
     if not request.run_id.strip():
         raise ProviderError("Handoff run identity is required")
+    payload = json.dumps(
+        {
+            "base_branch": (
+                request.base_branch if base_branch is None else base_branch
+            ),
+            "body_intent_sha256": hashlib.sha256(
+                request.body.encode("utf-8")
+            ).hexdigest(),
+            "branch": request.branch,
+            "pbi_number": request.pbi_number,
+            "project_id": request.project_id,
+            "repository": request.repository,
+            "run_id": request.run_id,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    return f"<!-- beehaiive-handoff:{encoded} -->"
+
+
+def _legacy_handoff_marker(request: HandoffRequest) -> str:
     payload = json.dumps(
         {
             "pbi_number": request.pbi_number,
@@ -1140,13 +1163,36 @@ def _pull_request_matches(
     branch: str,
     base_branch: str,
     identity_marker: str,
+    legacy_marker: str | None = None,
+    legacy_body: str | None = None,
 ) -> bool:
+    body = pull_request.get("body")
     return (
         pull_request.get("headRefName") == branch
         and pull_request.get("baseRefName") == base_branch
-        and isinstance(pull_request.get("body"), str)
-        and identity_marker in pull_request["body"]
+        and isinstance(body, str)
+        and (
+            identity_marker in body
+            or (
+                legacy_marker is not None
+                and legacy_body is not None
+                and body == legacy_body
+                and legacy_marker in body
+            )
+        )
     )
+
+
+def _branch_ref_matches(
+    branch_ref: Mapping[str, Any], qualified_branch: str, expected_oid: str
+) -> bool:
+    if branch_ref.get("name") != qualified_branch:
+        return False
+    target = branch_ref.get("target")
+    if not isinstance(target, Mapping):
+        return False
+    branch_oid = cast(Mapping[str, Any], target).get("oid")
+    return isinstance(branch_oid, str) and branch_oid.lower() == expected_oid.lower()
 
 
 class GitHubProjectProvider:
@@ -1619,6 +1665,8 @@ class GitHubProjectProvider:
     def create_handoff(self, request: HandoffRequest) -> HandoffResult:
         owner, name = self._repository_parts(request.repository)
         _validate_branch_name(request.branch)
+        if not request.run_id.strip():
+            raise ProviderError("Handoff run identity is required")
         head_sha = request.head_sha
         if head_sha is not None:
             normalized_head = head_sha.strip().lower()
@@ -1628,8 +1676,6 @@ class GitHubProjectProvider:
                 raise ProviderError("Verified handoff head must be a Git object ID")
             if not request.verification_evidence.strip():
                 raise ProviderError("Verified handoff evidence is required")
-        identity_marker = _handoff_marker(request)
-        pull_request_body = _handoff_body(request.body, identity_marker, request)
         qualified_branch = f"refs/heads/{request.branch}"
         data = self._client.execute(
             REPOSITORY_QUERY,
@@ -1658,25 +1704,28 @@ class GitHubProjectProvider:
         base_oid = default_oid
         if base_branch != default_branch_name:
             _, base_oid = self._resolve_custom_base_branch(owner, name, base_branch)
+        identity_marker = _handoff_marker(request, base_branch)
+        pull_request_body = _handoff_body(request.body, identity_marker, request)
+        legacy_marker = _legacy_handoff_marker(request)
+        legacy_body = _handoff_body(request.body, legacy_marker, request)
 
         raw_branch_ref = repository.get("ref")
         branch_ref = _mapping(raw_branch_ref) if raw_branch_ref is not None else None
         if head_sha is not None:
-            branch_oid = (
-                _mapping(branch_ref.get("target")).get("oid")
-                if branch_ref is not None
-                else None
-            )
-            if (
-                branch_ref is None
-                or branch_ref.get("name") != qualified_branch
-                or not isinstance(branch_oid, str)
-                or branch_oid.lower() != head_sha.strip().lower()
+            if branch_ref is None or not _branch_ref_matches(
+                branch_ref, qualified_branch, head_sha.strip()
             ):
                 raise ProviderError(
                     "GitHub branch head does not match the verified pushed head"
                 )
-        elif branch_ref is None:
+        elif branch_ref is not None:
+            # ponytail: refs lack run metadata. Run-qualified branches or durable
+            # identity are needed to prove orphan ownership.
+            if not _branch_ref_matches(branch_ref, qualified_branch, base_oid):
+                raise ProviderError(
+                    "GitHub branch head does not match the intended base commit"
+                )
+        else:
             try:
                 create_data = self._client.execute(
                     CREATE_REF_MUTATION,
@@ -1702,14 +1751,20 @@ class GitHubProjectProvider:
                     retry_repository = _mapping(_mapping(retry_data.get("repository")))
                 except ProviderError:
                     raise create_error from None
-                if retry_repository.get("ref") is None:
+                raw_retry_ref = retry_repository.get("ref")
+                if raw_retry_ref is None:
                     raise create_error from None
+                retry_ref = _mapping(raw_retry_ref)
+                if not _branch_ref_matches(retry_ref, qualified_branch, base_oid):
+                    raise ProviderError(
+                        "GitHub branch head does not match the intended base commit"
+                    ) from create_error
                 repository = retry_repository
             else:
                 created_ref = _mapping(
                     _mapping(create_data.get("createRef")).get("ref")
                 )
-                if created_ref.get("name") != qualified_branch:
+                if not _branch_ref_matches(created_ref, qualified_branch, base_oid):
                     raise ProviderError(
                         f"GitHub did not confirm branch creation: {qualified_branch}"
                     )
@@ -1721,6 +1776,8 @@ class GitHubProjectProvider:
             request.branch,
             base_branch,
             identity_marker,
+            legacy_marker=legacy_marker,
+            legacy_body=legacy_body,
             initial_repository=repository,
         )
         if existing is not None:
@@ -1732,6 +1789,8 @@ class GitHubProjectProvider:
                 request,
                 base_branch,
                 identity_marker,
+                legacy_marker,
+                legacy_body,
                 pull_request_body,
             )
 
@@ -1758,6 +1817,8 @@ class GitHubProjectProvider:
                     request.branch,
                     base_branch,
                     identity_marker,
+                    legacy_marker=legacy_marker,
+                    legacy_body=legacy_body,
                 )
             except ProviderError:
                 raise create_error from None
@@ -1771,6 +1832,8 @@ class GitHubProjectProvider:
                 request,
                 base_branch,
                 identity_marker,
+                legacy_marker,
+                legacy_body,
                 pull_request_body,
             )
         pull_request = _mapping(
@@ -1837,10 +1900,17 @@ class GitHubProjectProvider:
         request: HandoffRequest,
         base_branch: str,
         identity_marker: str,
+        legacy_marker: str | None,
+        legacy_body: str | None,
         pull_request_body: str,
     ) -> HandoffResult:
         if not _pull_request_matches(
-            existing, request.branch, base_branch, identity_marker
+            existing,
+            request.branch,
+            base_branch,
+            identity_marker,
+            legacy_marker,
+            legacy_body,
         ):
             raise ProviderError(
                 "An existing pull request has a different handoff identity; "
@@ -1849,7 +1919,12 @@ class GitHubProjectProvider:
         current = existing
         for attempt in range(2):
             self._validated_handoff_identity(
-                current, request, base_branch, identity_marker
+                current,
+                request,
+                base_branch,
+                identity_marker,
+                legacy_marker,
+                legacy_body,
             )
             pull_request_id = _required_text(current.get("id"), "pull-request id")
             if pull_request_id is None:
@@ -1876,13 +1951,20 @@ class GitHubProjectProvider:
                         request.branch,
                         base_branch,
                         identity_marker,
+                        legacy_marker=legacy_marker,
+                        legacy_body=legacy_body,
                     )
                 except ProviderError:
                     raise update_error from None
                 if latest is None:
                     raise update_error from None
                 self._validated_handoff_identity(
-                    latest, request, base_branch, identity_marker
+                    latest,
+                    request,
+                    base_branch,
+                    identity_marker,
+                    legacy_marker,
+                    legacy_body,
                 )
                 if (
                     latest.get("title") == request.title
@@ -1911,9 +1993,16 @@ class GitHubProjectProvider:
         request: HandoffRequest,
         base_branch: str,
         identity_marker: str,
+        legacy_marker: str | None = None,
+        legacy_body: str | None = None,
     ) -> None:
         if not _pull_request_matches(
-            pull_request, request.branch, base_branch, identity_marker
+            pull_request,
+            request.branch,
+            base_branch,
+            identity_marker,
+            legacy_marker,
+            legacy_body,
         ):
             raise ProviderError(
                 "An existing pull request has a different handoff identity; "
@@ -1946,6 +2035,8 @@ class GitHubProjectProvider:
         branch: str,
         base_branch: str,
         identity_marker: str,
+        legacy_marker: str | None = None,
+        legacy_body: str | None = None,
         initial_repository: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any] | None:
         cursor: str | None = None
@@ -1972,7 +2063,12 @@ class GitHubProjectProvider:
                 ):
                     continue
                 if _pull_request_matches(
-                    pull_request, branch, base_branch, identity_marker
+                    pull_request,
+                    branch,
+                    base_branch,
+                    identity_marker,
+                    legacy_marker,
+                    legacy_body,
                 ):
                     if matching is not None:
                         raise ProviderError(
