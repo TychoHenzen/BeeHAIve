@@ -41,6 +41,8 @@ from beehaiive.storage import OrchestratorStore, StoreError
 from beehaiive.workflow import (
     CheckResult,
     Constitution,
+    GitDeliveryResult,
+    GitDeliveryStatus,
     LeaseStatus,
     WorkflowError,
     WorkflowService,
@@ -2481,6 +2483,16 @@ def test_dashboard_worker_writes_only_in_retained_worktree(
     workflow_service, workflow_store = workflow_service_for(tmp_path, repository)
     monkeypatch.setenv("GITHUB_TOKEN", "fixture-secret")
     monkeypatch.setenv("BEEHAIIVE_API_KEY", "fixture-api-key")
+    provider = orchestrator.provider
+    original_create_handoff = provider.create_handoff
+    handoff_run_states: list[RunStatus | None] = []
+
+    def record_handoff_state(request):
+        current_run = state_store.get_run(request.run_id)
+        handoff_run_states.append(None if current_run is None else current_run.status)
+        return original_create_handoff(request)
+
+    monkeypatch.setattr(provider, "create_handoff", record_handoff_state)
     manager = AgentWorkerManager(orchestrator, executor, workflow_service)
     try:
         manager.start(run)
@@ -2493,7 +2505,9 @@ def test_dashboard_worker_writes_only_in_retained_worktree(
             current = state_store.get_run(run.run_id)
 
         assert current is not None and current.status is RunStatus.COMPLETED
+        assert current.stage.value == "pull_request"
         assert "Git delivery: pushed" in (current.last_result or "")
+        assert handoff_run_states == [RunStatus.ACTIVE]
         lease = workflow_service.workspace_for_run(run.run_id)
         assert lease is not None
         assert lease.status is LeaseStatus.RETAINED
@@ -2533,6 +2547,29 @@ def test_dashboard_worker_writes_only_in_retained_worktree(
             text=True,
         ).stdout.split()[0]
         assert delivered_sha == remote_head
+        assert f"Pushed head: {remote_head}" in (current.last_result or "")
+        assert '"outcome":"pass"' in (current.last_result or "")
+        handoff_record = state_store._connection.execute(
+            """
+            SELECT branch, pull_request_url, pull_request_number
+            FROM handoffs WHERE run_id = ?
+            """,
+            (run.run_id,),
+        ).fetchone()
+        assert handoff_record is not None
+        assert handoff_record["branch"] == lease.branch
+        assert handoff_record["pull_request_url"].endswith("/pull/1")
+        assert handoff_record["pull_request_number"] == 1
+        handoff_evidence = state_store._connection.execute(
+            """
+            SELECT handoff_head_sha, handoff_verification_evidence
+            FROM pbis WHERE project_id = ? AND repository_name = ? AND number = ?
+            """,
+            (run.project_id, run.repository, run.pbi_number),
+        ).fetchone()
+        assert handoff_evidence is not None
+        assert handoff_evidence["handoff_head_sha"] == remote_head
+        assert '"outcome":"pass"' in handoff_evidence["handoff_verification_evidence"]
         assert (
             subprocess.run(
                 ("git", "status", "--porcelain"),
@@ -2737,8 +2774,8 @@ def test_worker_manager_persists_human_handoff_without_claimability() -> None:
     )
 
 
-def test_worker_manager_reopens_routing_when_result_persistence_fails(
-    tmp_path: Path,
+def test_worker_manager_reopens_routing_when_handoff_persistence_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repository = make_git_repository(tmp_path / "repository")
     run = RunState(
@@ -2757,10 +2794,6 @@ def test_worker_manager_reopens_routing_when_result_persistence_fails(
     class PersistenceStore:
         def __init__(self) -> None:
             self.failure: tuple[str, str, str] | None = None
-
-        def complete_agent_run(self, run_id: str, result: str, lease_token: str):
-            del run_id, result, lease_token
-            raise RuntimeError("database unavailable")
 
         def get_run(self, run_id: str) -> RunState:
             assert run_id == run.run_id
@@ -2790,7 +2823,12 @@ def test_worker_manager_reopens_routing_when_result_persistence_fails(
                 attempt=SimpleNamespace(outcome=AttemptOutcome.SUCCESS),
                 decision=SimpleNamespace(failure_context=""),
                 execution_result="completed result",
+                task_result=TaskResult(TaskOutcome.PASS, {}),
             )
+
+        def handoff(self, *args, **kwargs) -> None:
+            del args, kwargs
+            raise RuntimeError("database unavailable")
 
         def recover_routing_problem(self, run_id: str, reason: str) -> None:
             self.recovery = (run_id, reason)
@@ -2808,6 +2846,17 @@ def test_worker_manager_reopens_routing_when_result_persistence_fails(
     )
     worktree = Path(lease.worktree_path)
     manager._workspace_leases[run.run_id] = lease
+    monkeypatch.setattr(
+        manager,
+        "commit_and_push",
+        lambda _run_id: GitDeliveryResult(
+            GitDeliveryStatus.PUSHED,
+            lease.lease_id,
+            lease.branch,
+            "a" * 40,
+            "push verified",
+        ),
+    )
 
     try:
         manager._run(run.run_id, run.lease_token or "")

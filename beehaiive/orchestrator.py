@@ -230,9 +230,20 @@ class Orchestrator:
         base_branch: str | None,
         body: str,
         lease_token: str,
+        *,
+        head_sha: str | None = None,
+        verification_evidence: str = "",
     ) -> RunState:
         with self._routing_coordination(run_id), self._handoff_locks.acquire(run_id):
-            return self._handoff_locked(run_id, branch, base_branch, body, lease_token)
+            return self._handoff_locked(
+                run_id,
+                branch,
+                base_branch,
+                body,
+                lease_token,
+                head_sha=head_sha,
+                verification_evidence=verification_evidence,
+            )
 
     def _handoff_locked(
         self,
@@ -241,6 +252,9 @@ class Orchestrator:
         base_branch: str | None,
         body: str,
         lease_token: str,
+        *,
+        head_sha: str | None,
+        verification_evidence: str,
     ) -> RunState:
         run = self.store.get_run(run_id)
         if run is None:
@@ -252,10 +266,18 @@ class Orchestrator:
             raise StoreError("Only an active implementation run can create a handoff")
         pending = self.store.pending_handoff(run_id, lease_token)
         if pending is not None:
+            requested_head = pending.head_sha if head_sha is None else head_sha
+            requested_evidence = (
+                verification_evidence
+                if verification_evidence
+                else pending.verification_evidence
+            )
             if (
                 pending.branch != branch
                 or pending.body != body
                 or (base_branch is not None and pending.base_branch != base_branch)
+                or pending.head_sha != requested_head
+                or pending.verification_evidence != requested_evidence
             ):
                 raise StoreError("Handoff request does not match the persisted intent")
             intent = self.store.prepare_handoff(
@@ -264,13 +286,30 @@ class Orchestrator:
                 pending.base_branch,
                 pending.body,
                 lease_token,
+                pending.head_sha,
+                pending.verification_evidence,
             )
         else:
+            if head_sha is not None:
+                normalized_head = head_sha.strip().lower()
+                if len(normalized_head) not in {40, 64} or any(
+                    char not in "0123456789abcdef" for char in normalized_head
+                ):
+                    raise StoreError("Verified handoff head must be a Git object ID")
+                if not verification_evidence.strip():
+                    raise StoreError("Verified handoff evidence is required")
+                head_sha = normalized_head
             resolved_base_branch = self.provider.validate_handoff(
                 run.repository, branch, base_branch
             )
             intent = self.store.prepare_handoff(
-                run_id, branch, resolved_base_branch, body, lease_token
+                run_id,
+                branch,
+                resolved_base_branch,
+                body,
+                lease_token,
+                head_sha,
+                verification_evidence,
             )
         if intent.run.status is RunStatus.COMPLETED:
             return intent.run
@@ -285,6 +324,8 @@ class Orchestrator:
                 base_branch=intent.base_branch,
                 body=intent.body,
                 run_id=intent.run.run_id,
+                head_sha=intent.head_sha,
+                verification_evidence=intent.verification_evidence,
             )
         )
         self._complete_routing_problem(run_id)
@@ -294,6 +335,12 @@ class Orchestrator:
             result.pull_request_url,
             result.pull_request_number,
             lease_token,
+            result=(
+                f"{intent.body}\n\nPushed head: {intent.head_sha}\n\n"
+                f"Verification evidence:\n{intent.verification_evidence}"
+                if intent.head_sha is not None
+                else intent.body
+            ),
         )
         return completed
 

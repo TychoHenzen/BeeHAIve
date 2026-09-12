@@ -237,6 +237,8 @@ class OrchestratorStore:
                     last_error TEXT,
                     handoff_base_branch TEXT,
                     handoff_body TEXT,
+                    handoff_head_sha TEXT,
+                    handoff_verification_evidence TEXT,
                     handoff_status TEXT,
                     planning_status TEXT,
                     claimable INTEGER NOT NULL DEFAULT 1,
@@ -453,6 +455,8 @@ class OrchestratorStore:
             for column in (
                 "handoff_base_branch",
                 "handoff_body",
+                "handoff_head_sha",
+                "handoff_verification_evidence",
                 "handoff_status",
                 "planning_status",
                 "claimable",
@@ -982,9 +986,11 @@ class OrchestratorStore:
         pull_request_url: str,
         pull_request_number: int | None,
         lease_token: str,
+        result: str | None = None,
     ) -> RunState:
         if not branch.strip() or not pull_request_url.strip():
             raise StoreError("A branch and pull-request URL are required")
+        normalized_result = result.strip()[:MAX_AGENT_RESULT_LENGTH] if result else None
         with self._transaction() as connection:
             row = self._run_for_id(connection, run_id)
             if row is None:
@@ -1030,10 +1036,11 @@ class OrchestratorStore:
                 """
                 UPDATE runs
                 SET status = 'completed', execution_token = NULL,
-                    last_error = NULL, updated_at = ?
+                    last_error = NULL, last_result = COALESCE(?, last_result),
+                    updated_at = ?
                 WHERE run_id = ?
                 """,
-                (_now(), run_id),
+                (normalized_result, _now(), run_id),
             )
             connection.execute(
                 """
@@ -1073,6 +1080,8 @@ class OrchestratorStore:
         base_branch: str | None,
         body: str,
         lease_token: str,
+        head_sha: str | None = None,
+        verification_evidence: str = "",
     ) -> HandoffIntent:
         if not branch.strip():
             raise StoreError("A branch is required")
@@ -1083,7 +1092,9 @@ class OrchestratorStore:
             self._require_lease(row, lease_token)
             persisted = connection.execute(
                 """
-                SELECT branch, handoff_base_branch, handoff_body, handoff_status
+                SELECT branch, handoff_base_branch, handoff_body,
+                       handoff_head_sha, handoff_verification_evidence,
+                       handoff_status
                 FROM pbis
                 WHERE project_id = ? AND repository_name = ? AND number = ?
                 """,
@@ -1097,6 +1108,8 @@ class OrchestratorStore:
                     str(persisted["branch"]),
                     persisted["handoff_base_branch"],
                     str(persisted["handoff_body"] or ""),
+                    persisted["handoff_head_sha"],
+                    str(persisted["handoff_verification_evidence"] or ""),
                 )
             if row.status is not RunStatus.ACTIVE or row.stage is not Stage.IMPLEMENT:
                 raise StoreError(
@@ -1107,6 +1120,9 @@ class OrchestratorStore:
                     persisted["branch"] != branch
                     or persisted["handoff_base_branch"] != base_branch
                     or persisted["handoff_body"] != body
+                    or persisted["handoff_head_sha"] != head_sha
+                    or str(persisted["handoff_verification_evidence"] or "")
+                    != verification_evidence
                 ):
                     raise StoreError(
                         "Handoff request does not match the persisted intent"
@@ -1120,6 +1136,8 @@ class OrchestratorStore:
                     str(persisted["branch"]),
                     persisted["handoff_base_branch"],
                     str(persisted["handoff_body"]),
+                    persisted["handoff_head_sha"],
+                    str(persisted["handoff_verification_evidence"] or ""),
                 )
             if persisted["handoff_status"] == "completed":
                 raise StoreError("Handoff intent is already completed")
@@ -1127,6 +1145,7 @@ class OrchestratorStore:
                 """
                 UPDATE pbis
                 SET branch = ?, handoff_base_branch = ?, handoff_body = ?,
+                    handoff_head_sha = ?, handoff_verification_evidence = ?,
                     handoff_status = 'pending'
                 WHERE project_id = ? AND repository_name = ? AND number = ?
                 """,
@@ -1134,6 +1153,8 @@ class OrchestratorStore:
                     branch,
                     base_branch,
                     body,
+                    head_sha,
+                    verification_evidence,
                     row.project_id,
                     row.repository,
                     row.pbi_number,
@@ -1143,7 +1164,14 @@ class OrchestratorStore:
             persisted_row = self._run_for_id(connection, run_id)
             if persisted_row is None:
                 raise StoreError(f"Unknown run: {run_id}")
-            return HandoffIntent(persisted_row, branch, base_branch, body)
+            return HandoffIntent(
+                persisted_row,
+                branch,
+                base_branch,
+                body,
+                head_sha,
+                verification_evidence,
+            )
 
     def pending_handoff(self, run_id: str, lease_token: str) -> HandoffIntent | None:
         with self._lock:
@@ -1153,7 +1181,9 @@ class OrchestratorStore:
             self._require_lease(run, lease_token)
             row = self._connection.execute(
                 """
-                SELECT branch, handoff_base_branch, handoff_body, handoff_status
+                SELECT branch, handoff_base_branch, handoff_body,
+                       handoff_head_sha, handoff_verification_evidence,
+                       handoff_status
                 FROM pbis
                 WHERE project_id = ? AND repository_name = ? AND number = ?
                 """,
@@ -1166,6 +1196,8 @@ class OrchestratorStore:
                 str(row["branch"]),
                 row["handoff_base_branch"],
                 str(row["handoff_body"] or ""),
+                row["handoff_head_sha"],
+                str(row["handoff_verification_evidence"] or ""),
             )
 
     def renew_lease(self, run_id: str, lease_token: str) -> RunState:
