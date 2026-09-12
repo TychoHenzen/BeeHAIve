@@ -76,6 +76,10 @@ class FailureRequest(BaseModel):
     recursive_spawn_depth: int = Field(default=0, ge=0)
 
 
+class TaskQuestionAnswer(BaseModel):
+    answer: str = Field(min_length=1, max_length=1_000)
+
+
 class RoutingAttemptRequest(BaseModel):
     outcome: Literal["failure", "retry", "success"]
     input_tokens: int = Field(default=0, ge=0)
@@ -1151,6 +1155,18 @@ def create_app(
             raise HTTPException(status_code=404, detail="Run not found")
         return {"run": _run_dict(run), "routing": routing.as_dict()}
 
+    @app.post("/runs/{run_id}/question/answer")
+    def answer_task_question(  # pyright: ignore[reportUnusedFunction]
+        run_id: str,
+        request: TaskQuestionAnswer,
+        _auth: None = Depends(require_mutation_access),
+    ) -> dict[str, object]:
+        return _run_dict(
+            _handle_store_error(
+                lambda: orchestrator.answer_task_question(run_id, request.answer)
+            )
+        )
+
     @app.post("/runs/{run_id}/lease")
     def renew_lease(  # pyright: ignore[reportUnusedFunction]
         run_id: str,
@@ -1296,6 +1312,9 @@ def _run_dict(
         "owner_id": run.owner_id,
         "lease_token": run.lease_token,
         "lease_expires_at": run.lease_expires_at,
+        "task_contract": run.task_contract,
+        "task_result": run.task_result,
+        "task_answer": run.task_answer,
     }
     if routing is not None:
         result["routing"] = routing

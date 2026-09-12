@@ -12,6 +12,7 @@ from conftest import FakeProvider
 
 import beehaiive.agent as agent_module
 from beehaiive.agent import AgentWorkerManager, CodexExecModelExecutor
+from beehaiive.contracts import TaskContract, TaskOutcome, TaskResult
 from beehaiive.demo import demo_review_adapters
 from beehaiive.models import (
     PbiSnapshot,
@@ -147,6 +148,56 @@ def test_codex_executor_parses_final_message_without_passing_credentials(
     assert result.result == "inventory complete; token present=False"
     assert result.input_tokens == 12
     assert result.output_tokens == 7
+
+
+def test_codex_executor_validates_structured_task_results(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "structured_runner.py"
+    script.write_text(
+        "import json\n"
+        "print(json.dumps({'type': 'agent_message', 'text': json.dumps({"
+        "'outcome': 'pass', 'evidence': {'summary': 'inventory complete'}, "
+        "'artifact_refs': []})}))\n",
+        encoding="utf-8",
+    )
+    executor = ScriptExecutor(tmp_path, script)
+    contract = TaskContract.inventory("owner/api", 1, "Demo")
+    executor.prepare_run("structured-1", "owner/api")
+    executor.set_task_contract("structured-1", contract)
+    try:
+        router = ModelRouter(RoutingStore())
+        result = executor.execute(
+            router.config.spec_for(ModelTier.LUNA),
+            router.begin("structured-1").decision,
+        )
+        assert result.outcome is AttemptOutcome.SUCCESS
+        assert result.task_result is not None
+        assert result.task_result.outcome.value == "pass"
+    finally:
+        executor.release_run("structured-1")
+
+    invalid_script = tmp_path / "invalid_structured_runner.py"
+    invalid_script.write_text(
+        "import json\n"
+        "print(json.dumps({'type': 'agent_message', 'text': 'not-json'}))\n",
+        encoding="utf-8",
+    )
+    invalid_executor = ScriptExecutor(tmp_path, invalid_script)
+    invalid_executor.prepare_run("structured-2", "owner/api")
+    invalid_executor.set_task_contract("structured-2", contract)
+    try:
+        router = ModelRouter(RoutingStore())
+        result = invalid_executor.execute(
+            router.config.spec_for(ModelTier.LUNA),
+            router.begin("structured-2").decision,
+        )
+        assert result.outcome is AttemptOutcome.SUCCESS
+        assert result.task_result is not None
+        assert result.task_result.outcome is TaskOutcome.FAIL
+        assert result.task_result.validation_reason is not None
+    finally:
+        invalid_executor.release_run("structured-2")
 
 
 def test_codex_executor_terminates_timed_out_process_tree(tmp_path: Path) -> None:
@@ -1192,6 +1243,15 @@ def test_agent_run_completion_and_failure_persist_bounded_state() -> None:
             store.complete_agent_run(run.run_id, "result", lease_token)
 
         implementation = store.advance(run.run_id, Stage.IMPLEMENT, lease_token)
+        contract = TaskContract.inventory("owner/api", run.pbi_number, run.title)
+        store.ensure_task_contract(
+            run.run_id, contract, implementation.lease_token or ""
+        )
+        store.record_task_result(
+            run.run_id,
+            TaskResult(TaskOutcome.PASS, {}),
+            implementation.lease_token or "",
+        )
         completed = store.complete_agent_run(
             run.run_id,
             "x" * 5_000,

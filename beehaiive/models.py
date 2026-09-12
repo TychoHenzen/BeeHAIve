@@ -187,6 +187,9 @@ class RunState:
     lease_token: str | None = None
     lease_expires_at: str | None = None
     last_result: str | None = None
+    task_contract: Mapping[str, object] | None = None
+    task_result: Mapping[str, object] | None = None
+    task_answer: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
