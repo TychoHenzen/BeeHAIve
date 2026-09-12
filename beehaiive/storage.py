@@ -32,7 +32,7 @@ class StoreError(RuntimeError):
 
 MAX_AGENT_SESSION_EVENTS = 100
 MAX_AGENT_SESSION_EVENT_LENGTH = 4_000
-MAX_AGENT_SESSION_BYTES = 64_000
+MAX_AGENT_SESSION_TEXT_BYTES = 64_000
 
 
 def _task_claimability_state(
@@ -1702,12 +1702,16 @@ class OrchestratorStore:
             )
             return self._run_for_id(connection, run_id) or row
 
-    def fail_agent_run_after_lease_loss(self, run_id: str, error: str) -> RunState:
+    def fail_agent_run_after_lease_loss(
+        self, run_id: str, error: str, *, expected_lease_token: str
+    ) -> RunState:
         """Record a worker failure even when its lease can no longer be used."""
 
         normalized_error = error.strip()
         if not normalized_error:
             raise StoreError("A failure reason is required")
+        if not expected_lease_token.strip():
+            raise StoreError("A run lease token is required")
         normalized_error = normalized_error[:MAX_AGENT_RESULT_LENGTH]
         with self._transaction() as connection:
             row = self._run_for_id(connection, run_id)
@@ -1722,16 +1726,18 @@ class OrchestratorStore:
                 row.stage is not Stage.PULL_REQUEST and not task_paused
             )
             now = _now()
-            connection.execute(
+            updated = connection.execute(
                 """
                 UPDATE runs
                 SET status = 'failed', execution_token = NULL,
                     last_error = ?, last_result = NULL, lease_token = NULL,
                     lease_expires_at = NULL, updated_at = ?
-                WHERE run_id = ? AND status = 'active'
+                WHERE run_id = ? AND status = 'active' AND lease_token = ?
                 """,
-                (normalized_error, now, run_id),
+                (normalized_error, now, run_id, expected_lease_token),
             )
+            if updated.rowcount == 0:
+                return self._run_for_id(connection, run_id) or row
             connection.execute(
                 """
                 UPDATE pbis SET claimable = ?, last_error = ?
@@ -2271,7 +2277,7 @@ class OrchestratorStore:
             (
                 run_id,
                 worker_id.strip(),
-                task[:MAX_AGENT_SESSION_EVENT_LENGTH],
+                task,
                 now,
                 now,
             ),
@@ -2345,38 +2351,18 @@ class OrchestratorStore:
             )
             history = connection.execute(
                 """
-                SELECT sequence, kind, source_type, role, text, timestamp
+                SELECT sequence, length(CAST(text AS BLOB)) AS text_bytes
                 FROM agent_session_events WHERE run_id = ? ORDER BY sequence
                 """,
                 (run_id,),
             ).fetchall()
-            event_sizes = [
-                len(
-                    (
-                        json.dumps(
-                            {
-                                "sequence": int(event["sequence"]),
-                                "kind": str(event["kind"]),
-                                "source_type": str(event["source_type"]),
-                                "role": event["role"],
-                                "text": str(event["text"]),
-                                "timestamp": str(event["timestamp"]),
-                            },
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        )
-                        + "\n"
-                    ).encode("utf-8")
-                )
-                for event in history
-            ]
-            total_bytes = sum(event_sizes)
+            total_bytes = sum(int(row["text_bytes"]) for row in history)
             while (
                 len(history) > MAX_AGENT_SESSION_EVENTS
-                or total_bytes > MAX_AGENT_SESSION_BYTES
+                or total_bytes > MAX_AGENT_SESSION_TEXT_BYTES
             ):
                 oldest = history.pop(0)
-                total_bytes -= event_sizes.pop(0)
+                total_bytes -= int(oldest["text_bytes"])
                 connection.execute(
                     """
                     DELETE FROM agent_session_events

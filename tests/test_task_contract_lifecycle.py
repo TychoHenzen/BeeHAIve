@@ -423,7 +423,11 @@ def test_lease_loss_after_answer_keeps_question_claimable(tmp_path) -> None:
 
     answered = service.answer_task_question(run.run_id, "main")
     store.mark_task_question_resumed(run.run_id)
-    failed = store.fail_agent_run_after_lease_loss(run.run_id, "stale worker handoff")
+    failed = store.fail_agent_run_after_lease_loss(
+        run.run_id,
+        "stale worker handoff",
+        expected_lease_token=implementation.lease_token or "",
+    )
 
     assert failed.status.value == "failed"
     assert (

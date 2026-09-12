@@ -1386,16 +1386,11 @@ def test_agent_session_events_are_bounded_and_lease_fenced(
         )
     session = store.get_agent_session(run.run_id)
     assert session is not None
-    assert [event["sequence"] for event in session["events"]] == list(range(114, 121))
-    total_bytes = sum(
-        len(
-            (
-                json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
-            ).encode("utf-8")
-        )
-        for event in session["events"]
+    assert [event["sequence"] for event in session["events"]] == list(range(113, 121))
+    total_text_bytes = sum(
+        len(str(event["text"]).encode("utf-8")) for event in session["events"]
     )
-    assert total_bytes <= 64_000
+    assert total_text_bytes == 64_000
     assert all(len(str(event["text"])) <= 4_000 for event in session["events"])
 
     store._connection.execute(
@@ -1717,6 +1712,7 @@ def test_worker_manager_recovers_expired_session_without_cleaning_other_runs(
     first_executor = ImmediateExecutor(
         ModelExecution(AttemptOutcome.FAILURE, failure_context="unused"), repository
     )
+    first_executor.task = "configured task " + "x" * 5_000
     orchestrator, store, routing_store, run = service_with_run(first_executor)
     workflow_service, workflow_store = workflow_service_for(tmp_path, repository)
 
@@ -1759,6 +1755,7 @@ def test_worker_manager_recovers_expired_session_without_cleaning_other_runs(
         assert recovered_session is not None
         assert recovered_session["session_id"] == original_session["session_id"]
         assert recovered_session["task"] == original_session["task"]
+        assert len(str(recovered_session["task"])) > 4_000
         assert recovered_session["worker_id"] == second_manager._worker_id
         assert second_executor._session_tasks[run.run_id] == original_session["task"]
         assert not Path(original_workspace.worktree_path).exists()
@@ -1767,6 +1764,167 @@ def test_worker_manager_recovers_expired_session_without_cleaning_other_runs(
         workflow_service.cleanup_dashboard_run_workspaces()
         first_executor.release_run(run.run_id)
         second_executor.release_run(run.run_id)
+        workflow_store.close()
+        store.close()
+        routing_store.close()
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    [
+        "workspace_cleanup",
+        "worker_start",
+        "expired_lease_race",
+        "rotated_lease_race",
+    ],
+)
+def test_worker_manager_handles_failed_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_point: str
+) -> None:
+    repository = make_git_repository(tmp_path / "repository")
+    executor = ImmediateExecutor(
+        ModelExecution(AttemptOutcome.FAILURE, failure_context="unused"), repository
+    )
+    executor.task = "persisted recovery task"
+    orchestrator, store, routing_store, run = service_with_run(executor)
+    workflow_service, workflow_store = workflow_service_for(tmp_path, repository)
+
+    class IdleThread:
+        def __init__(self, target, args, name, daemon) -> None:
+            del target, args, name, daemon
+
+        def start(self) -> None:
+            return None
+
+    monkeypatch.setattr(agent_module, "Thread", IdleThread)
+    original_manager = AgentWorkerManager(orchestrator, executor, workflow_service)
+    original_manager.start(run)
+    lease_token = run.lease_token
+    assert lease_token is not None
+    store.record_agent_session_event(
+        run.run_id, lease_token, "progress", "turn.started", None, "saved progress"
+    )
+    original_session = store.get_agent_session(run.run_id)
+    assert original_session is not None
+    store._connection.execute(
+        "UPDATE runs SET lease_expires_at = ? WHERE run_id = ?",
+        ("2000-01-01T00:00:00+00:00", run.run_id),
+    )
+
+    recovery_executor = ImmediateExecutor(
+        ModelExecution(AttemptOutcome.FAILURE, failure_context="unused"), repository
+    )
+    recovery_executor.task = ""
+    recovery_manager = AgentWorkerManager(
+        orchestrator, recovery_executor, workflow_service
+    )
+    try:
+        with monkeypatch.context() as context:
+            if failure_point != "worker_start":
+
+                def fail_cleanup(_run_id: str) -> None:
+                    raise RuntimeError("workspace cleanup failed")
+
+                context.setattr(
+                    workflow_service, "cleanup_dashboard_run_workspaces", fail_cleanup
+                )
+            else:
+
+                class FailingThread:
+                    def __init__(self, target, args, name, daemon) -> None:
+                        del target, args, name, daemon
+
+                    def start(self) -> None:
+                        raise RuntimeError("thread start failed")
+
+                context.setattr(agent_module, "Thread", FailingThread)
+
+            if failure_point in {"expired_lease_race", "rotated_lease_race"}:
+                fail_agent_run = store.fail_agent_run
+
+                def fail_after_lease_change(
+                    run_id: str,
+                    error: str,
+                    claimed_token: str,
+                    *,
+                    claimable: bool | None = None,
+                ) -> RunState:
+                    if failure_point == "expired_lease_race":
+                        store._connection.execute(
+                            "UPDATE runs SET lease_expires_at = ? WHERE run_id = ?",
+                            ("2000-01-01T00:00:00+00:00", run_id),
+                        )
+                    else:
+                        store._connection.execute(
+                            """
+                            UPDATE runs
+                            SET owner_id = ?, lease_token = ?, lease_expires_at = ?
+                            WHERE run_id = ?
+                            """,
+                            (
+                                "replacement-worker",
+                                "replacement-lease-token",
+                                "2099-01-01T00:00:00+00:00",
+                                run_id,
+                            ),
+                        )
+                    return fail_agent_run(
+                        run_id, error, claimed_token, claimable=claimable
+                    )
+
+                context.setattr(store, "fail_agent_run", fail_after_lease_change)
+            assert recovery_manager.recover() == ()
+
+        result_run = store.get_run(run.run_id)
+        assert result_run is not None
+        if failure_point == "rotated_lease_race":
+            assert result_run.status is RunStatus.ACTIVE
+            assert result_run.lease_token == "replacement-lease-token"
+            assert result_run.owner_id == "replacement-worker"
+        else:
+            assert result_run.status is RunStatus.FAILED
+            assert result_run.lease_token is None
+            assert "Agent recovery failed" in (result_run.last_error or "")
+        assert run.run_id not in recovery_manager._threads
+        assert run.run_id not in recovery_manager._workspace_leases
+        failed_session = store.get_agent_session(run.run_id)
+        assert failed_session is not None
+        assert failed_session["session_id"] == original_session["session_id"]
+        assert failed_session["task"] == original_session["task"]
+        assert failed_session["events"] == original_session["events"]
+        assert failed_session["worker_id"] == recovery_manager._worker_id
+        assert recovery_manager.recover() == ()
+    finally:
+        workflow_service.cleanup_dashboard_run_workspaces()
+        executor.release_run(run.run_id)
+        recovery_executor.release_run(run.run_id)
+        workflow_store.close()
+        store.close()
+        routing_store.close()
+
+
+def test_worker_manager_recovery_rejects_claim_without_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = make_git_repository(tmp_path / "repository")
+    executor = ImmediateExecutor(
+        ModelExecution(AttemptOutcome.FAILURE, failure_context="unused"), repository
+    )
+    orchestrator, store, routing_store, run = service_with_run(executor)
+    workflow_service, workflow_store = workflow_service_for(tmp_path, repository)
+    assert run.lease_token is not None
+    store.start_agent_session(run.run_id, "worker-1", "persisted task", run.lease_token)
+    manager = AgentWorkerManager(orchestrator, executor, workflow_service)
+    monkeypatch.setattr(
+        manager,
+        "claim",
+        lambda *_args, **_kwargs: replace(run, lease_token=None),
+    )
+
+    try:
+        with pytest.raises(StoreError, match="no lease token"):
+            manager.recover()
+    finally:
         workflow_store.close()
         store.close()
         routing_store.close()
@@ -1791,13 +1949,12 @@ def test_worker_claim_persists_session_before_start() -> None:
         with pytest.raises(StoreError, match="agent task"):
             manager.claim("project-1", "owner/api", "dashboard-operator", task=" ")
         assert store.active_runs_for_project("project-1") == ()
-        run = manager.claim(
-            "project-1", "owner/api", "dashboard-operator", task="persisted task"
-        )
+        task = "persisted task " + "x" * 5_000
+        run = manager.claim("project-1", "owner/api", "dashboard-operator", task=task)
         assert run is not None
         session = store.get_agent_session(run.run_id)
         assert session is not None
-        assert session["task"] == "persisted task"
+        assert session["task"] == task
         assert session["worker_id"] == manager._worker_id
     finally:
         store.close()
@@ -2574,7 +2731,7 @@ def test_worker_manager_recovers_when_failure_lease_is_lost() -> None:
 
     class LeaseLossStore:
         def __init__(self) -> None:
-            self.recovery: tuple[str, str] | None = None
+            self.recovery: tuple[str, str, str] | None = None
 
         def get_run(self, run_id: str) -> RunState:
             assert run_id == run.run_id
@@ -2584,8 +2741,10 @@ def test_worker_manager_recovers_when_failure_lease_is_lost() -> None:
             del run_id, error, lease_token
             raise StoreError("lease changed")
 
-        def fail_agent_run_after_lease_loss(self, run_id: str, error: str) -> None:
-            self.recovery = (run_id, error)
+        def fail_agent_run_after_lease_loss(
+            self, run_id: str, error: str, *, expected_lease_token: str
+        ) -> None:
+            self.recovery = (run_id, error, expected_lease_token)
 
     class LeaseLossOrchestrator:
         def __init__(self) -> None:
@@ -2605,6 +2764,7 @@ def test_worker_manager_recovers_when_failure_lease_is_lost() -> None:
     assert orchestrator.store.recovery == (
         run.run_id,
         "Agent worker failed: worker exploded",
+        "lease-1",
     )
 
 
@@ -2698,14 +2858,29 @@ def test_lease_loss_failure_recovery_clears_active_worker_state() -> None:
         with pytest.raises(StoreError, match="Unknown run"):
             store.set_run_claimable("missing", False)
         with pytest.raises(StoreError, match="failure reason"):
-            store.fail_agent_run_after_lease_loss(run.run_id, " ")
+            store.fail_agent_run_after_lease_loss(
+                run.run_id, " ", expected_lease_token=lease
+            )
+        with pytest.raises(StoreError, match="lease token"):
+            store.fail_agent_run_after_lease_loss(
+                run.run_id, "worker failed", expected_lease_token=""
+            )
         with pytest.raises(StoreError, match="Unknown run"):
-            store.fail_agent_run_after_lease_loss("missing", "worker failed")
+            store.fail_agent_run_after_lease_loss(
+                "missing", "worker failed", expected_lease_token=lease
+            )
         failed = store.fail_agent_run_after_lease_loss(
-            implementation.run_id, "lease expired while executing"
+            implementation.run_id,
+            "lease expired while executing",
+            expected_lease_token=lease,
         )
         assert failed.status is RunStatus.FAILED
         assert failed.lease_token is None
-        assert store.fail_agent_run_after_lease_loss(run.run_id, "ignored") == failed
+        assert (
+            store.fail_agent_run_after_lease_loss(
+                run.run_id, "ignored", expected_lease_token=lease
+            )
+            == failed
+        )
     finally:
         store.close()

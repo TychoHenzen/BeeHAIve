@@ -129,7 +129,11 @@ _BEARER_TOKEN = re.compile(r"\bBearer\s+\S+", re.IGNORECASE)
 _URL_CREDENTIALS = re.compile(r"(https?://)[^/\s:@]+:[^@\s]+@", re.IGNORECASE)
 
 
-def redact_worker_text(text: str, secret_values: tuple[str, ...] = ()) -> str:
+def redact_worker_text(
+    text: str,
+    secret_values: tuple[str, ...] = (),
+    max_length: int | None = MAX_AGENT_OUTPUT_LENGTH,
+) -> str:
     """Remove common credential forms before worker text reaches durable state."""
 
     redacted = text
@@ -140,9 +144,10 @@ def redact_worker_text(text: str, secret_values: tuple[str, ...] = ()) -> str:
     redacted = _SECRET_JSON.sub(r"\1[redacted]", redacted)
     redacted = _BEARER_TOKEN.sub("Bearer [redacted]", redacted)
     redacted = _URL_CREDENTIALS.sub(r"\1[redacted]@", redacted)
-    return _SECRET_ASSIGNMENT.sub(
+    redacted = _SECRET_ASSIGNMENT.sub(
         lambda match: f"{match.group(1)}=[redacted]", redacted
-    )[:MAX_AGENT_OUTPUT_LENGTH]
+    )
+    return redacted if max_length is None else redacted[:max_length]
 
 
 class CodexExecModelExecutor:
@@ -1164,7 +1169,10 @@ class AgentWorkerManager:
             repository,
             owner_id,
             expected_run_id=expected_run_id,
-            agent_session=(self._worker_id, redact_worker_text(task, secret_values)),
+            agent_session=(
+                self._worker_id,
+                redact_worker_text(task, secret_values, max_length=None),
+            ),
         )
 
     def recover(self) -> tuple[str, ...]:
@@ -1189,8 +1197,29 @@ class AgentWorkerManager:
             )
             if run is None:
                 continue
-            service.cleanup_dashboard_run_workspaces(run.run_id)
-            self.start(run)
+            lease_token = run.lease_token
+            if lease_token is None:
+                raise StoreError("Recovered agent run has no lease token")
+            try:
+                service.cleanup_dashboard_run_workspaces(run.run_id)
+                self.start(run)
+            except Exception as exc:
+                current = store.get_run(run.run_id)
+                if (
+                    current is not None
+                    and current.status is RunStatus.ACTIVE
+                    and current.lease_token == lease_token
+                ):
+                    failure = redact_worker_text(f"Agent recovery failed: {exc}")
+                    try:
+                        store.fail_agent_run(run.run_id, failure, lease_token)
+                    except StoreError:
+                        store.fail_agent_run_after_lease_loss(
+                            run.run_id,
+                            failure,
+                            expected_lease_token=lease_token,
+                        )
+                continue
             recovered.append(run.run_id)
         return tuple(recovered)
 
@@ -1254,7 +1283,7 @@ class AgentWorkerManager:
                 for value in getattr(self.executor, "_secret_values", ())
                 if isinstance(value, str)
             )
-            session_task = redact_worker_text(task, secret_values)
+            session_task = redact_worker_text(task, secret_values, max_length=None)
             store.start_agent_session(
                 run.run_id,
                 self._worker_id,
@@ -1552,7 +1581,7 @@ class AgentWorkerManager:
                         self.orchestrator.store, "fail_agent_run_after_lease_loss", None
                     )
                     if callable(recover):
-                        recover(run_id, failure)
+                        recover(run_id, failure, expected_lease_token=lease_token)
         finally:
             heartbeat_stop.set()
             cleanup_error: WorkflowError | None = None
