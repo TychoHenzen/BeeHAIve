@@ -19,6 +19,7 @@ from beehaiive.workflow import (
     Constitution,
     DeterministicCheckRunner,
     GateResult,
+    GitDeliveryStatus,
     GitWorktreeManager,
     HandoffStatus,
     LeaseStatus,
@@ -99,6 +100,1082 @@ def _service(
         checks or [FixtureCheck("tests")],
     )
     return service, store, repository
+
+
+def _delivery_service(
+    tmp_path: Path,
+    *,
+    identity: bool = True,
+    push_remote: Path | None = None,
+) -> tuple[WorkflowService, WorkflowStore, Path, Path]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    repository = _repository(tmp_path)
+    remote = tmp_path / "owner" / "api.git"
+    remote.parent.mkdir()
+    subprocess.run(
+        ("git", "init", "--bare", str(remote)), check=True, capture_output=True
+    )
+    _git(repository, "remote", "add", "origin", str(remote))
+    _git(repository, "push", "origin", "master")
+    if push_remote is not None:
+        push_remote.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ("git", "init", "--bare", str(push_remote)),
+            check=True,
+            capture_output=True,
+        )
+        _git(repository, "remote", "set-url", "--push", "origin", str(push_remote))
+    if not identity:
+        _git(repository, "config", "--unset", "user.name")
+        _git(repository, "config", "--unset", "user.email")
+    store = WorkflowStore(tmp_path / "workflow.sqlite3")
+    service = WorkflowService(
+        store,
+        repository,
+        Constitution.load(CONSTITUTION_PATH),
+        [FixtureCheck("tests")],
+    )
+    return service, store, repository, remote
+
+
+def test_commit_and_push_records_exact_commit_for_handoff_and_remote(
+    tmp_path: Path,
+) -> None:
+    service, store, repository, _remote = _delivery_service(tmp_path)
+    base_head = _git(repository, "rev-parse", "HEAD")
+    worktree = tmp_path / "leased-worktree"
+    lease = service.acquire_workspace(
+        "dashboard-run:delivery-run", "codex/delivery", worktree
+    )
+    (worktree / "change.txt").write_text("leased change\n", encoding="utf-8")
+
+    result = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:delivery-run",
+        "owner/api",
+        "deliver leased change",
+        lambda: None,
+    )
+
+    assert result.status is GitDeliveryStatus.PUSHED
+    assert result.commit_sha == service.worktrees.head(worktree)
+    assert service.worktrees.clean(worktree)
+    assert (
+        _git(
+            repository,
+            "ls-remote",
+            "--exit-code",
+            "origin",
+            "refs/heads/codex/delivery",
+        ).split()[0]
+        == result.commit_sha
+    )
+    repeated = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:delivery-run",
+        "owner/api",
+        "ignored after push",
+        lambda: None,
+    )
+    assert repeated.status is GitDeliveryStatus.PUSHED
+    assert repeated.commit_sha == result.commit_sha
+    gate = store.latest_gate(lease.lease_id, "git_delivery")
+    assert gate is not None and gate.allowed
+    assert {check.name: check.evidence for check in gate.checks}[
+        "commit_sha"
+    ] == result.commit_sha
+
+    handoff = service.handoff(
+        lease.lease_id,
+        WorkflowRole.WRITER,
+        WorkflowRole.REVIEWER,
+        result.commit_sha or "",
+        "implementation complete",
+    )
+    assert handoff.commit_sha == result.commit_sha
+    assert _git(repository, "rev-parse", "HEAD") == base_head
+    assert _git(repository, "status", "--porcelain") == ""
+    service.discard_workspace(lease.lease_id, "test cleanup")
+    store.close()
+    reloaded = WorkflowStore(tmp_path / "workflow.sqlite3")
+    persisted = reloaded.latest_gate(lease.lease_id, "git_delivery")
+    assert persisted is not None and persisted.allowed
+    assert {check.name: check.evidence for check in persisted.checks}[
+        "commit_sha"
+    ] == result.commit_sha
+    reloaded.close()
+
+
+def test_delivery_commits_changes_added_after_a_successful_push(
+    tmp_path: Path,
+) -> None:
+    service, store, repository, _remote = _delivery_service(tmp_path)
+    worktree = tmp_path / "post-push-worktree"
+    lease = service.acquire_workspace(
+        "dashboard-run:post-push", "codex/post-push", worktree
+    )
+    change = worktree / "change.txt"
+    change.write_text("first version\n", encoding="utf-8")
+    first = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:post-push",
+        "owner/api",
+        "deliver first version",
+        lambda: None,
+    )
+    assert first.status is GitDeliveryStatus.PUSHED
+
+    change.write_text("second version\n", encoding="utf-8")
+    second = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:post-push",
+        "owner/api",
+        "deliver second version",
+        lambda: None,
+    )
+
+    assert second.status is GitDeliveryStatus.PUSHED
+    assert second.commit_sha != first.commit_sha
+    assert second.commit_sha == service.worktrees.head(worktree)
+    assert service.worktrees.clean(worktree)
+    remote_head = _git(
+        repository,
+        "ls-remote",
+        "--exit-code",
+        "origin",
+        f"refs/heads/{lease.branch}",
+    ).split()[0]
+    assert remote_head == second.commit_sha
+
+    local_head = _commit(worktree, "local.txt", "existing local commit\n")
+    needs_retry = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:post-push",
+        "owner/api",
+        "deliver existing local commit",
+        lambda: None,
+    )
+    assert needs_retry.status is GitDeliveryStatus.BLOCKED
+    assert needs_retry.commit_sha == local_head
+    retried = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:post-push",
+        "owner/api",
+        "retry existing local commit",
+        lambda: None,
+    )
+    assert retried.status is GitDeliveryStatus.PUSHED
+    assert retried.commit_sha == local_head
+    assert (
+        _git(
+            repository,
+            "ls-remote",
+            "--exit-code",
+            "origin",
+            f"refs/heads/{lease.branch}",
+        ).split()[0]
+        == local_head
+    )
+    service.discard_workspace(lease.lease_id, "test cleanup")
+    store.close()
+
+
+def test_delivery_uses_the_configured_push_url_for_push_and_verification(
+    tmp_path: Path,
+) -> None:
+    push_remote = tmp_path / "push" / "owner" / "api.git"
+    service, store, _repository_path, fetch_remote = _delivery_service(
+        tmp_path, push_remote=push_remote
+    )
+    worktree = tmp_path / "pushurl-worktree"
+    lease = service.acquire_workspace(
+        "dashboard-run:pushurl-run", "codex/pushurl", worktree
+    )
+    (worktree / "change.txt").write_text("pushurl change\n", encoding="utf-8")
+
+    result = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:pushurl-run",
+        "owner/api",
+        "deliver to configured push URL",
+        lambda: None,
+    )
+
+    assert result.status is GitDeliveryStatus.PUSHED
+    assert (
+        result.commit_sha
+        == _git(
+            worktree,
+            "ls-remote",
+            "--exit-code",
+            str(push_remote),
+            "refs/heads/codex/pushurl",
+        ).split()[0]
+    )
+    assert (
+        service.worktrees.run_git(
+            "ls-remote", "--exit-code", str(fetch_remote), "refs/heads/codex/pushurl"
+        ).returncode
+        != 0
+    )
+    service.discard_workspace(lease.lease_id, "test cleanup")
+    store.close()
+
+
+def test_clean_worktree_is_a_noop_without_creating_remote_branch(
+    tmp_path: Path,
+) -> None:
+    service, store, repository, _remote = _delivery_service(tmp_path)
+    lease = service.acquire_workspace(
+        "dashboard-run:noop-run", "codex/noop", tmp_path / "noop-worktree"
+    )
+
+    result = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:noop-run",
+        "owner/api",
+        "unused message",
+        lambda: None,
+    )
+
+    assert result.status is GitDeliveryStatus.NO_CHANGES
+    assert result.commit_sha is None
+    assert _git(repository, "ls-remote", "origin", "refs/heads/codex/noop") == ""
+    repeated = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:noop-run",
+        "owner/api",
+        "unused message",
+        lambda: None,
+    )
+    assert repeated.status is GitDeliveryStatus.NO_CHANGES
+    service.release_workspace(lease.lease_id)
+    store.close()
+
+
+def test_delivery_retry_pushes_the_same_saved_commit_after_remote_recovers(
+    tmp_path: Path,
+) -> None:
+    service, store, repository, remote = _delivery_service(tmp_path)
+    worktree = tmp_path / "retry-worktree"
+    lease = service.acquire_workspace(
+        "dashboard-run:retry-run", "codex/retry", worktree
+    )
+    (worktree / "change.txt").write_text("preserve on failure\n", encoding="utf-8")
+    unavailable = remote.with_name("api.offline")
+    remote.rename(unavailable)
+
+    blocked = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:retry-run",
+        "owner/api",
+        "save once",
+        lambda: None,
+    )
+
+    assert blocked.status is GitDeliveryStatus.BLOCKED
+    assert blocked.commit_sha == service.worktrees.head(worktree)
+    assert service.worktrees.clean(worktree)
+    assert "offline" not in blocked.evidence
+    blocked_gate = store.latest_gate(lease.lease_id, "git_delivery")
+    assert blocked_gate is not None
+    assert all(str(remote) not in check.evidence for check in blocked_gate.checks)
+
+    later_change = worktree / "later.txt"
+    later_change.write_text("not part of the saved commit\n", encoding="utf-8")
+    mismatch = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:retry-run",
+        "owner/api",
+        "must not replace saved commit",
+        lambda: None,
+    )
+    assert mismatch.status is GitDeliveryStatus.BLOCKED
+    assert mismatch.commit_sha == blocked.commit_sha
+    assert later_change.is_file()
+    later_change.unlink()
+
+    unavailable.rename(remote)
+    retried = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:retry-run",
+        "owner/api",
+        "ignored on retry",
+        lambda: None,
+    )
+
+    assert retried.status is GitDeliveryStatus.PUSHED
+    assert retried.commit_sha == blocked.commit_sha
+    assert (
+        _git(
+            repository,
+            "ls-remote",
+            "--exit-code",
+            "origin",
+            "refs/heads/codex/retry",
+        ).split()[0]
+        == blocked.commit_sha
+    )
+    service.discard_workspace(lease.lease_id, "test cleanup")
+    store.close()
+
+
+@pytest.mark.parametrize(
+    ("failure_point", "expected_status", "expected_evidence"),
+    [
+        (
+            "wrong_branch_before_staging",
+            GitDeliveryStatus.BLOCKED,
+            "current branch does not match",
+        ),
+        ("stage_failure", GitDeliveryStatus.BLOCKED, "could not be staged"),
+        (
+            "nothing_to_stage",
+            GitDeliveryStatus.NO_CHANGES,
+            "no committable changes",
+        ),
+        (
+            "diff_failure",
+            GitDeliveryStatus.BLOCKED,
+            "Staged changes could not be verified",
+        ),
+        (
+            "wrong_branch_after_staging",
+            GitDeliveryStatus.BLOCKED,
+            "current branch does not match",
+        ),
+        (
+            "commit_failure",
+            GitDeliveryStatus.BLOCKED,
+            "could not create the commit",
+        ),
+        (
+            "missing_commit_sha",
+            GitDeliveryStatus.BLOCKED,
+            "new commit could not be verified",
+        ),
+        (
+            "dirty_after_commit",
+            GitDeliveryStatus.BLOCKED,
+            "worktree is not clean",
+        ),
+        (
+            "remote_mismatch_before_push",
+            GitDeliveryStatus.BLOCKED,
+            "configured push remote",
+        ),
+        (
+            "dirty_before_push",
+            GitDeliveryStatus.BLOCKED,
+            "Push requires the recorded commit",
+        ),
+        (
+            "remote_mismatch_after_push",
+            GitDeliveryStatus.BLOCKED,
+            "configured push remote",
+        ),
+        (
+            "unverifiable_remote_push",
+            GitDeliveryStatus.BLOCKED,
+            "Push could not be verified",
+        ),
+    ],
+)
+def test_delivery_preserves_work_across_git_failure_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+    expected_status: GitDeliveryStatus,
+    expected_evidence: str,
+) -> None:
+    service, store, repository, remote = _delivery_service(tmp_path)
+    worktree = tmp_path / "failure-worktree"
+    lease = service.acquire_workspace(
+        "dashboard-run:failure-run", "codex/failure", worktree
+    )
+    change = worktree / "change.txt"
+    change.write_text("preserve this change\n", encoding="utf-8")
+    late_change = worktree / "late.txt"
+    alternate_remote: Path | None = None
+    if failure_point in {"remote_mismatch_before_push", "remote_mismatch_after_push"}:
+        alternate_remote = tmp_path / "unapproved" / "repository.git"
+        alternate_remote.parent.mkdir(parents=True)
+        subprocess.run(
+            ("git", "init", "--bare", str(alternate_remote)),
+            check=True,
+            capture_output=True,
+        )
+
+    original_run_git = service.worktrees.run_git
+    validation_calls = 0
+    commit_created = False
+
+    def validate_run() -> None:
+        nonlocal validation_calls
+        validation_calls += 1
+        if (
+            failure_point == "wrong_branch_before_staging" and validation_calls == 2
+        ) or (failure_point == "wrong_branch_after_staging" and validation_calls == 3):
+            _git(worktree, "switch", "-c", "codex/unexpected")
+        elif failure_point == "nothing_to_stage" and validation_calls == 2:
+            change.unlink()
+        elif failure_point == "dirty_before_push" and validation_calls == 4:
+            late_change.write_text("preserve this later change\n", encoding="utf-8")
+        elif (
+            failure_point == "remote_mismatch_before_push" and validation_calls == 4
+        ) or (failure_point == "remote_mismatch_after_push" and validation_calls == 6):
+            assert alternate_remote is not None
+            _git(
+                repository,
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                str(alternate_remote),
+            )
+
+    def intercept_git(*arguments: str) -> subprocess.CompletedProcess[str]:
+        nonlocal commit_created
+        if failure_point == "stage_failure" and "add" in arguments:
+            return subprocess.CompletedProcess(
+                arguments, 1, "", "injected stage failure"
+            )
+        if (
+            failure_point == "diff_failure"
+            and "diff" in arguments
+            and "--cached" in arguments
+        ):
+            return subprocess.CompletedProcess(
+                arguments, 2, "", "injected diff failure"
+            )
+        if failure_point == "commit_failure" and "commit" in arguments:
+            return subprocess.CompletedProcess(
+                arguments, 1, "", "injected commit failure"
+            )
+        if (
+            failure_point == "missing_commit_sha"
+            and commit_created
+            and arguments[-2:] == ("rev-parse", "HEAD")
+        ):
+            return subprocess.CompletedProcess(
+                arguments, 1, "", "injected head failure"
+            )
+        if failure_point == "unverifiable_remote_push" and "ls-remote" in arguments:
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+
+        result = original_run_git(*arguments)
+        if "commit" in arguments and "-m" in arguments and result.returncode == 0:
+            commit_created = True
+            if failure_point == "dirty_after_commit":
+                late_change.write_text("preserve this later change\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(service.worktrees, "run_git", intercept_git)
+    result = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:failure-run",
+        "owner/api",
+        "deliver failure-path change",
+        validate_run,
+    )
+    gate = store.latest_gate(lease.lease_id, "git_delivery")
+    store.close()
+
+    assert result.status is expected_status
+    assert expected_evidence in result.evidence
+    assert gate is not None
+    assert gate.allowed is (expected_status is GitDeliveryStatus.NO_CHANGES)
+
+    remote_row = _git(
+        repository, "ls-remote", str(remote), f"refs/heads/{lease.branch}"
+    )
+    remote_sha = remote_row.split()[0] if remote_row else None
+    if failure_point in {"remote_mismatch_after_push", "unverifiable_remote_push"}:
+        assert result.commit_sha is not None
+        assert remote_sha == result.commit_sha
+    else:
+        assert remote_sha is None
+
+    if failure_point in {"wrong_branch_before_staging", "stage_failure"}:
+        assert _git(worktree, "status", "--porcelain") == "?? change.txt"
+    elif failure_point == "wrong_branch_after_staging" or failure_point in {
+        "diff_failure",
+        "commit_failure",
+    }:
+        assert _git(worktree, "diff", "--cached", "--name-only") == "change.txt"
+    elif failure_point == "nothing_to_stage":
+        assert _git(worktree, "status", "--porcelain") == ""
+    elif failure_point == "missing_commit_sha":
+        assert _git(worktree, "rev-parse", "HEAD") != _git(
+            repository, "rev-parse", "HEAD"
+        )
+        assert result.commit_sha is None
+    elif failure_point in {"dirty_after_commit", "dirty_before_push"}:
+        assert result.commit_sha == _git(worktree, "rev-parse", "HEAD")
+        assert late_change.read_text(encoding="utf-8") == (
+            "preserve this later change\n"
+        )
+
+
+def test_delivery_rejects_missing_host_identity_before_staging(
+    tmp_path: Path,
+) -> None:
+    service, store, _repository_path, _remote = _delivery_service(
+        tmp_path / "identity", identity=False
+    )
+    service.worktrees.host_git_identity = (None, None)
+    worktree = tmp_path / "identity-worktree"
+    lease = service.acquire_workspace(
+        "dashboard-run:identity-run", "codex/identity", worktree
+    )
+    (worktree / "change.txt").write_text("keep unstaged\n", encoding="utf-8")
+    original_status = service.worktrees._git(
+        "-C", str(worktree), "status", "--porcelain"
+    )
+
+    missing_identity = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:identity-run",
+        "owner/api",
+        "must not stage",
+        lambda: None,
+    )
+
+    assert missing_identity.status is GitDeliveryStatus.BLOCKED
+    assert "user.name" in missing_identity.evidence
+    assert (
+        service.worktrees._git("-C", str(worktree), "status", "--porcelain")
+        == original_status
+    )
+    service.discard_workspace(lease.lease_id, "test cleanup")
+    store.close()
+
+
+def test_delivery_rejects_unknown_lease_agent_and_empty_message(
+    tmp_path: Path,
+) -> None:
+    service, store, _repository_path, _remote = _delivery_service(tmp_path)
+    worktree = tmp_path / "invalid-input-worktree"
+    lease = service.acquire_workspace(
+        "dashboard-run:invalid-input", "codex/invalid-input", worktree
+    )
+    (worktree / "change.txt").write_text("leave untouched\n", encoding="utf-8")
+    original_status = _git(worktree, "status", "--porcelain")
+
+    with pytest.raises(WorkflowError, match="Unknown workspace lease"):
+        service.commit_and_push(
+            "missing-lease",
+            lease.lease_token,
+            "dashboard-run:invalid-input",
+            "owner/api",
+            "unused",
+            lambda: None,
+        )
+    with pytest.raises(WorkflowError, match="does not belong to this run"):
+        service.commit_and_push(
+            lease.lease_id,
+            lease.lease_token,
+            "dashboard-run:other-run",
+            "owner/api",
+            "unused",
+            lambda: None,
+        )
+    invalid_message = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:invalid-input",
+        "owner/api",
+        "   ",
+        lambda: None,
+    )
+
+    assert invalid_message.status is GitDeliveryStatus.BLOCKED
+    assert "valid commit message" in invalid_message.evidence
+    assert _git(worktree, "status", "--porcelain") == original_status
+    service.discard_workspace(lease.lease_id, "test cleanup")
+    store.close()
+
+
+def test_delivery_revalidates_the_lease_after_run_validation(tmp_path: Path) -> None:
+    service, store, _repository_path, _remote = _delivery_service(tmp_path)
+    worktree = tmp_path / "revalidation-worktree"
+    lease = service.acquire_workspace(
+        "dashboard-run:revalidation", "codex/revalidation", worktree
+    )
+    change = worktree / "change.txt"
+    change.write_text("leave untouched\n", encoding="utf-8")
+    original_status = _git(worktree, "status", "--porcelain")
+
+    def update_lease(field: str, value: str) -> None:
+        with store._transaction() as connection:
+            connection.execute(
+                f"UPDATE workflow_leases SET {field} = ? WHERE lease_id = ?",
+                (value, lease.lease_id),
+            )
+
+    for field, value, message in (
+        ("lease_token", "replaced-token", "Lease token is invalid"),
+        ("agent_id", "dashboard-run:other", "does not belong to this run"),
+    ):
+        changed = False
+
+        def change_after_validation(field: str = field, value: str = value) -> None:
+            nonlocal changed
+            if not changed:
+                update_lease(field, value)
+                changed = True
+
+        with pytest.raises(WorkflowError, match=message):
+            service.commit_and_push(
+                lease.lease_id,
+                lease.lease_token,
+                "dashboard-run:revalidation",
+                "owner/api",
+                "must not stage",
+                change_after_validation,
+            )
+        update_lease(field, getattr(lease, field))
+
+    stopped = False
+
+    def stop_after_validation() -> None:
+        nonlocal stopped
+        if not stopped:
+            store.stop_lease(lease.lease_id, "test lease change")
+            stopped = True
+
+    with pytest.raises(WorkflowError, match="Workspace lease is stopped"):
+        service.commit_and_push(
+            lease.lease_id,
+            lease.lease_token,
+            "dashboard-run:revalidation",
+            "owner/api",
+            "must not stage",
+            stop_after_validation,
+        )
+    assert _git(worktree, "status", "--porcelain") == original_status
+    store.close()
+
+
+def test_delivery_blocks_when_git_state_probes_fail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, store, repository, remote = _delivery_service(tmp_path)
+    worktree = tmp_path / "probe-failure-worktree"
+    lease = service.acquire_workspace(
+        "dashboard-run:probe-failure", "codex/probe-failure", worktree
+    )
+    (worktree / "change.txt").write_text("leave untouched\n", encoding="utf-8")
+    original_status = _git(worktree, "status", "--porcelain")
+    original_run_git = service.worktrees.run_git
+
+    def failed_status(*arguments: str) -> subprocess.CompletedProcess[str]:
+        if "--untracked-files=all" in arguments:
+            return subprocess.CompletedProcess(arguments, 1, "", "")
+        return original_run_git(*arguments)
+
+    monkeypatch.setattr(service.worktrees, "run_git", failed_status)
+    status_result = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:probe-failure",
+        "owner/api",
+        "must not stage",
+        lambda: None,
+    )
+    assert status_result.status is GitDeliveryStatus.BLOCKED
+    assert "status could not be verified" in status_result.evidence
+
+    def missing_head(*arguments: str) -> subprocess.CompletedProcess[str]:
+        if arguments[-2:] == ("rev-parse", "HEAD"):
+            return subprocess.CompletedProcess(arguments, 1, "", "")
+        return original_run_git(*arguments)
+
+    monkeypatch.setattr(service.worktrees, "run_git", missing_head)
+    head_result = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:probe-failure",
+        "owner/api",
+        "must not stage",
+        lambda: None,
+    )
+    assert head_result.status is GitDeliveryStatus.BLOCKED
+    assert "HEAD could not be verified" in head_result.evidence
+
+    def unavailable_prefix(*arguments: str) -> subprocess.CompletedProcess[str]:
+        if "--show-prefix" in arguments:
+            raise OSError("private Git failure")
+        return original_run_git(*arguments)
+
+    monkeypatch.setattr(service.worktrees, "run_git", unavailable_prefix)
+    prefix_result = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:probe-failure",
+        "owner/api",
+        "must not stage",
+        lambda: None,
+    )
+    assert prefix_result.status is GitDeliveryStatus.BLOCKED
+    assert "private Git failure" not in prefix_result.evidence
+
+    def missing_common_dir(*arguments: str) -> subprocess.CompletedProcess[str]:
+        if "--git-common-dir" in arguments and "-C" in arguments:
+            return subprocess.CompletedProcess(arguments, 1, "", "")
+        return original_run_git(*arguments)
+
+    monkeypatch.setattr(service.worktrees, "run_git", missing_common_dir)
+    common_result = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:probe-failure",
+        "owner/api",
+        "must not stage",
+        lambda: None,
+    )
+    assert common_result.status is GitDeliveryStatus.BLOCKED
+    assert "repository could not be verified" in common_result.evidence
+
+    monkeypatch.setattr(service.worktrees, "run_git", original_run_git)
+    _git(repository, "remote", "remove", "origin")
+    no_remote = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:probe-failure",
+        "owner/api",
+        "must not stage",
+        lambda: None,
+    )
+    assert no_remote.status is GitDeliveryStatus.BLOCKED
+    assert "configured push remote" in no_remote.evidence
+    _git(repository, "remote", "add", "origin", str(remote))
+    assert _git(worktree, "status", "--porcelain") == original_status
+    service.discard_workspace(lease.lease_id, "test cleanup")
+    store.close()
+
+
+def test_delivery_rejects_stored_path_and_detached_head_before_staging(
+    tmp_path: Path,
+) -> None:
+    service, store, repository, _remote = _delivery_service(tmp_path)
+    worktree = tmp_path / "fenced-worktree"
+    lease = service.acquire_workspace(
+        "dashboard-run:fenced-run", "codex/fenced", worktree
+    )
+    change = worktree / "change.txt"
+    change.write_text("leave untouched\n", encoding="utf-8")
+    original_status = _git(worktree, "status", "--porcelain")
+
+    def set_lease_path(path: Path) -> None:
+        with store._transaction() as connection:
+            connection.execute(
+                "UPDATE workflow_leases SET worktree_path = ? WHERE lease_id = ?",
+                (str(path.resolve()), lease.lease_id),
+            )
+
+    nested = worktree / "nested"
+    nested.mkdir()
+    set_lease_path(nested)
+    wrong_path = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:fenced-run",
+        "owner/api",
+        "must not stage",
+        lambda: None,
+    )
+    assert wrong_path.status is GitDeliveryStatus.BLOCKED
+    assert "exact leased worktree" in wrong_path.evidence
+    assert _git(worktree, "status", "--porcelain") == original_status
+
+    set_lease_path(repository)
+    repository_path = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:fenced-run",
+        "owner/api",
+        "must not stage",
+        lambda: None,
+    )
+    assert repository_path.status is GitDeliveryStatus.BLOCKED
+    assert "not isolated" in repository_path.evidence
+
+    not_a_repository = tmp_path / "not-a-repository"
+    not_a_repository.mkdir()
+    set_lease_path(not_a_repository)
+    invalid_repository = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:fenced-run",
+        "owner/api",
+        "must not stage",
+        lambda: None,
+    )
+    assert invalid_repository.status is GitDeliveryStatus.BLOCKED
+    assert "could not be opened" in invalid_repository.evidence
+    set_lease_path(worktree)
+
+    _git(worktree, "switch", "--detach", "HEAD")
+    detached = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:fenced-run",
+        "owner/api",
+        "must not stage",
+        lambda: None,
+    )
+    assert detached.status is GitDeliveryStatus.BLOCKED
+    assert "Detached HEAD" in detached.evidence
+    assert _git(worktree, "status", "--porcelain") == original_status
+    _git(worktree, "switch", lease.branch)
+    service.discard_workspace(lease.lease_id, "test cleanup")
+    store.close()
+
+
+def test_delivery_rejects_a_worktree_specific_push_url_before_staging(
+    tmp_path: Path,
+) -> None:
+    service, store, repository, _remote = _delivery_service(tmp_path)
+    worktree = tmp_path / "worktree-pushurl"
+    lease = service.acquire_workspace(
+        "dashboard-run:worktree-pushurl", "codex/worktree-pushurl", worktree
+    )
+    (worktree / "change.txt").write_text("leave untouched\n", encoding="utf-8")
+    original_status = _git(worktree, "status", "--porcelain")
+    unapproved_remote = tmp_path / "unapproved" / "owner" / "api.git"
+    unapproved_remote.parent.mkdir(parents=True)
+    subprocess.run(
+        ("git", "init", "--bare", str(unapproved_remote)),
+        check=True,
+        capture_output=True,
+    )
+    _git(repository, "config", "extensions.worktreeConfig", "true")
+    _git(
+        worktree,
+        "config",
+        "--worktree",
+        "remote.origin.pushurl",
+        str(unapproved_remote),
+    )
+    assert _git(worktree, "remote", "get-url", "--push", "--all", "origin") == str(
+        unapproved_remote
+    )
+
+    result = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:worktree-pushurl",
+        "owner/api",
+        "must not stage",
+        lambda: None,
+    )
+
+    assert result.status is GitDeliveryStatus.BLOCKED
+    assert "configured push remote" in result.evidence
+    assert _git(worktree, "status", "--porcelain") == original_status
+    assert (
+        service.worktrees.run_git(
+            "ls-remote",
+            "--exit-code",
+            str(unapproved_remote),
+            "refs/heads/codex/worktree-pushurl",
+        ).returncode
+        != 0
+    )
+    service.discard_workspace(lease.lease_id, "test cleanup")
+    store.close()
+
+
+def test_delivery_rejects_a_worktree_path_outside_its_repository(
+    tmp_path: Path,
+) -> None:
+    service, store, _repository_path, _remote = _delivery_service(tmp_path)
+    worktree = tmp_path / "foreign-path-worktree"
+    lease = service.acquire_workspace(
+        "dashboard-run:foreign-path", "codex/foreign-path", worktree
+    )
+    change = worktree / "change.txt"
+    change.write_text("leave untouched\n", encoding="utf-8")
+    original_status = _git(worktree, "status", "--porcelain")
+    foreign_root = tmp_path / "foreign"
+    foreign_root.mkdir()
+    foreign_repository = _repository(foreign_root)
+    foreign_worktree = tmp_path / "foreign-path"
+    _git(
+        foreign_repository,
+        "worktree",
+        "add",
+        "--detach",
+        str(foreign_worktree),
+        "master",
+    )
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE workflow_leases SET worktree_path = ? WHERE lease_id = ?",
+            (str(foreign_worktree.resolve()), lease.lease_id),
+        )
+
+    result = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:foreign-path",
+        "owner/api",
+        "must not stage",
+        lambda: None,
+    )
+
+    assert result.status is GitDeliveryStatus.BLOCKED
+    assert "different repository" in result.evidence
+    assert _git(worktree, "status", "--porcelain") == original_status
+    store.close()
+
+
+def test_delivery_checks_run_and_workspace_tokens_before_git_mutations(
+    tmp_path: Path,
+) -> None:
+    service, store, _repository_path, _remote = _delivery_service(tmp_path)
+    worktree = tmp_path / "fenced-worktree"
+    lease = service.acquire_workspace(
+        "dashboard-run:fenced-run", "codex/fenced", worktree
+    )
+    (worktree / "change.txt").write_text("leave untouched\n", encoding="utf-8")
+    original_status = _git(worktree, "status", "--porcelain")
+
+    def reject_run() -> None:
+        raise WorkflowError("Dashboard run lease changed")
+
+    with pytest.raises(WorkflowError, match="Lease token is invalid"):
+        service.commit_and_push(
+            lease.lease_id,
+            "wrong-token",
+            "dashboard-run:fenced-run",
+            "owner/api",
+            "fenced commit",
+            lambda: None,
+        )
+    with pytest.raises(WorkflowError, match="run lease changed"):
+        service.commit_and_push(
+            lease.lease_id,
+            lease.lease_token,
+            "dashboard-run:fenced-run",
+            "owner/api",
+            "fenced commit",
+            reject_run,
+        )
+    invalid_message = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:fenced-run",
+        "owner/api",
+        "\x00",
+        lambda: None,
+    )
+    assert invalid_message.status is GitDeliveryStatus.BLOCKED
+
+    assert _git(worktree, "status", "--porcelain") == original_status
+    store.close()
+
+
+def test_expired_delivery_lease_keeps_the_uncommitted_worktree(
+    tmp_path: Path,
+) -> None:
+    service, store, _repository_path, _remote = _delivery_service(tmp_path)
+    worktree = tmp_path / "expired-worktree"
+    lease = service.acquire_workspace(
+        "dashboard-run:expired-run", "codex/expired", worktree
+    )
+    change = worktree / "change.txt"
+    change.write_text("preserve after expiry\n", encoding="utf-8")
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE workflow_leases SET expires_at = ? WHERE lease_id = ?",
+            ((datetime.now(UTC) - timedelta(minutes=1)).isoformat(), lease.lease_id),
+        )
+
+    with pytest.raises(WorkflowError, match="Workspace lease is stopped"):
+        service.commit_and_push(
+            lease.lease_id,
+            lease.lease_token,
+            "dashboard-run:expired-run",
+            "owner/api",
+            "expired commit",
+            lambda: None,
+        )
+
+    assert change.read_text(encoding="utf-8") == "preserve after expiry\n"
+    expired = store.get_lease(lease.lease_id)
+    assert expired is not None and expired.status is LeaseStatus.STOPPED
+    store.close()
+
+
+def test_delivery_rejects_remote_credentials_and_branch_mismatch(
+    tmp_path: Path,
+) -> None:
+    service, store, repository, _remote = _delivery_service(tmp_path)
+    worktree = tmp_path / "remote-worktree"
+    lease = service.acquire_workspace(
+        "dashboard-run:remote-run", "codex/remote", worktree
+    )
+    (worktree / "change.txt").write_text("keep unstaged\n", encoding="utf-8")
+    _git(
+        repository,
+        "remote",
+        "set-url",
+        "--push",
+        "origin",
+        "https://operator:secret@example.invalid/owner/api.git",
+    )
+    original_status = service.worktrees._git(
+        "-C", str(worktree), "status", "--porcelain"
+    )
+
+    remote_mismatch = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:remote-run",
+        "owner/api",
+        "must not stage",
+        lambda: None,
+    )
+
+    assert remote_mismatch.status is GitDeliveryStatus.BLOCKED
+    assert "secret" not in remote_mismatch.evidence
+    gate = store.latest_gate(lease.lease_id, "git_delivery")
+    assert gate is not None
+    assert all("secret" not in check.evidence for check in gate.checks)
+    _git(repository, "remote", "set-url", "--push", "origin", str(_remote))
+    _git(worktree, "checkout", "-b", "codex/wrong-branch")
+    wrong_branch = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:remote-run",
+        "owner/api",
+        "must not stage",
+        lambda: None,
+    )
+    assert wrong_branch.status is GitDeliveryStatus.BLOCKED
+    assert (
+        service.worktrees._git("-C", str(worktree), "status", "--porcelain")
+        == original_status
+    )
+    service.discard_workspace(lease.lease_id, "test cleanup")
+    store.close()
 
 
 def test_production_workflow_composition_loads_persistent_dependencies(
@@ -572,6 +1649,45 @@ def test_restart_cleanup_removes_only_unfinished_dashboard_workspaces(
     assert still_retained is not None
     assert still_retained.status is LeaseStatus.RETAINED
     assert (retained_path / "change.txt").read_text(encoding="utf-8") == "keep\n"
+    store.close()
+
+
+def test_restart_cleanup_preserves_dirty_and_uninspectable_workspaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, store, _repository_path = _service(tmp_path)
+    clean_path = tmp_path / "clean-worktree"
+    dirty_path = tmp_path / "dirty-worktree"
+    unknown_path = tmp_path / "unknown-worktree"
+    clean_lease = service.acquire_workspace(
+        "dashboard-run:run-clean", "codex/clean", clean_path
+    )
+    dirty_lease = service.acquire_workspace(
+        "dashboard-run:run-dirty", "codex/dirty", dirty_path
+    )
+    unknown_lease = service.acquire_workspace(
+        "dashboard-run:run-unknown", "codex/unknown", unknown_path
+    )
+    dirty_file = dirty_path / "keep.txt"
+    dirty_file.write_text("preserve\n", encoding="utf-8")
+    original_clean = service.worktrees.clean
+
+    def clean_or_fail(path: Path) -> bool:
+        if Path(path).resolve() == unknown_path.resolve():
+            raise WorkflowError("Git status unavailable")
+        return original_clean(path)
+
+    monkeypatch.setattr(service.worktrees, "clean", clean_or_fail)
+    cleaned = service.cleanup_dashboard_run_workspaces()
+    results = {lease.lease_id: lease for lease in cleaned}
+
+    assert results[clean_lease.lease_id].status is LeaseStatus.RELEASED
+    assert not clean_path.exists()
+    assert results[dirty_lease.lease_id].status is LeaseStatus.STOPPED
+    assert dirty_file.read_text(encoding="utf-8") == "preserve\n"
+    assert results[unknown_lease.lease_id].status is LeaseStatus.STOPPED
+    assert unknown_path.is_dir()
     store.close()
 
 

@@ -644,23 +644,25 @@ def run_fixture_actions(
         raise SmokeFailure("The dashboard stop action was not rendered")
     record_action(devtools, outcomes, "stop", "succeeded.", before)
     deadline = time.monotonic() + 5
-    cleaned = None
+    preserved = None
     while time.monotonic() < deadline:
-        cleaned = workflow_service.workspace_for_run(run_id)
+        preserved = workflow_service.workspace_for_run(run_id)
         if (
-            cleaned is not None
-            and cleaned.status.value == "released"
-            and not Path(cleaned.worktree_path).exists()
+            preserved is not None
+            and preserved.status.value == "retained"
+            and Path(preserved.worktree_path, "worker-output.txt").is_file()
+            and not workflow_service.worktrees.clean(preserved.worktree_path)
         ):
             break
         time.sleep(0.05)
     if (
-        cleaned is None
-        or cleaned.status.value != "released"
-        or Path(cleaned.worktree_path).exists()
+        preserved is None
+        or preserved.status.value != "retained"
+        or not Path(preserved.worktree_path, "worker-output.txt").is_file()
+        or workflow_service.worktrees.clean(preserved.worktree_path)
     ):
-        raise SmokeFailure("Stopping the fixture writer did not clean its worktree")
-    workspace_proof["cleanup_after_stop"] = True
+        raise SmokeFailure("Stopping the fixture writer did not preserve its changes")
+    workspace_proof["preserved_changes_after_stop"] = True
     outcomes["workspace"] = workspace_proof
 
     before = len(action_log_snapshot(devtools)["rows"])

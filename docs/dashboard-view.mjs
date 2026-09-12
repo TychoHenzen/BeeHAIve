@@ -120,6 +120,30 @@ export function createDashboardView({
     details.append(renderEscalation(pbi.escalation, pbi.escalation_log));
     details.append(renderActivity(pbi.activity || []));
     card.append(details);
+    if (pbi.delivery) {
+      const delivery = element("section");
+      delivery.append(element("h3", `Git delivery: ${pbi.delivery.status}`));
+      if (pbi.delivery.commit_sha) {
+        delivery.append(element("div", `Commit: ${pbi.delivery.commit_sha}`, "mono"));
+      }
+      if (pbi.delivery.evidence) {
+        delivery.append(element("div", pbi.delivery.evidence, "muted"));
+      }
+      card.append(delivery);
+      if (pbi.delivery.retry_available && pbi.run_id) {
+        const retry = element("button", "Retry commit and push", "secondary");
+        retry.type = "button";
+        retry.addEventListener("click", () => runAction({
+          action: "commit_push",
+          repository,
+          pbi_number: pbi.number,
+          run_id: pbi.run_id,
+        }));
+        const controls = element("div", undefined, "actions");
+        controls.append(retry);
+        card.append(controls);
+      }
+    }
     if (pbi.last_error) card.append(element("p", `Failure: ${pbi.last_error}`, "status failure"));
     if (pbi.result) card.append(element("p", `Result: ${pbi.result}`, "status success"));
     if (pbi.status !== "active" || !pbi.run_id) return card;
