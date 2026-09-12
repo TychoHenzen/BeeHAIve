@@ -78,6 +78,10 @@ def test_artifact_and_contract_validation_rejects_invalid_values() -> None:
                 "allowed_outcomes": ["pass"],
             }
         )
+    with pytest.raises(ContractError, match="Contract version must be an integer"):
+        TaskContract("test", True, "inspect", {}, (), (), (TaskOutcome.PASS,))
+    with pytest.raises(ContractError, match="Contract version must be an integer"):
+        TaskContract("test", 1.0, "inspect", {}, (), (), (TaskOutcome.PASS,))
     with pytest.raises(ContractError, match="Contract inputs"):
         TaskContract.from_dict(
             {
@@ -90,6 +94,8 @@ def test_artifact_and_contract_validation_rejects_invalid_values() -> None:
                 "allowed_outcomes": ["pass"],
             }
         )
+    with pytest.raises(ContractError, match="Contract inputs must be an object"):
+        TaskContract("test", 1, "inspect", [], (), (), (TaskOutcome.PASS,))
     with pytest.raises(ContractError, match="Task contract must be an object"):
         TaskContract.from_dict(None)
     base = {
@@ -218,6 +224,35 @@ def test_pass_requires_evidence_and_required_artifact() -> None:
         ({"id": "report", "path": "report.txt"},),
     ).validated(required)
     assert result.artifact_refs == ({"id": "report", "path": "report.txt"},)
+
+
+def test_pass_inventory_evidence_matches_contract_inputs() -> None:
+    inventory = TaskContract.inventory(
+        "owner/api", 32, "Inspect", branch="main", tracked_file_count=1
+    )
+    matching = {
+        "repository": "owner/api",
+        "branch": "main",
+        "tracked_file_count": 1,
+    }
+    assert (
+        TaskResult.from_payload(
+            {"outcome": "pass", "evidence": matching, "artifact_refs": []}, inventory
+        ).evidence
+        == matching
+    )
+
+    for evidence in (
+        {"repository": "other/repo", "branch": False, "tracked_file_count": -1},
+        {"repository": "owner/api", "branch": "main", "tracked_file_count": True},
+    ):
+        with pytest.raises(
+            ContractError, match="Evidence does not match contract inputs"
+        ):
+            TaskResult.from_payload(
+                {"outcome": "pass", "evidence": evidence, "artifact_refs": []},
+                inventory,
+            )
 
 
 def test_non_pass_results_have_terminal_requirements() -> None:

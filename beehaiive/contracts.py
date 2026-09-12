@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections.abc import Mapping, Sequence
@@ -234,10 +235,14 @@ class TaskContract:
         )
 
     def validate(self) -> None:
+        if type(self.version) is not int:
+            raise ContractError("Contract version must be an integer")
         if self.version != 1:
             raise ContractError(f"Unknown contract version: {self.version}")
         _text(self.contract_id, "Contract id")
         _text(self.step_id, "Step id")
+        if not isinstance(cast(object, self.inputs), Mapping):
+            raise ContractError("Contract inputs must be an object")
         _bounded_value(self.inputs)
         _validate_unique_strings(self.capabilities, "Contract capabilities")
         if len(self.capabilities) > MAX_CONTRACT_ITEMS:
@@ -382,6 +387,19 @@ class TaskResult:
             if missing_evidence:
                 raise ContractError(
                     "Missing required evidence: " + ", ".join(missing_evidence)
+                )
+            bounded_inputs = cast(dict[str, object], _bounded_value(contract.inputs))
+            mismatched_evidence = [
+                key
+                for key in contract.required_evidence
+                if key in bounded_inputs
+                and json.dumps(bounded_evidence[key], sort_keys=True)
+                != json.dumps(bounded_inputs[key], sort_keys=True)
+            ]
+            if mismatched_evidence:
+                raise ContractError(
+                    "Evidence does not match contract inputs: "
+                    + ", ".join(mismatched_evidence)
                 )
         declared = {artifact.artifact_id for artifact in contract.required_artifacts}
         references: list[Mapping[str, object]] = []
