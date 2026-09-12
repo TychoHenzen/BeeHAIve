@@ -5,10 +5,10 @@ dashboard reads the live Project state, claims one repository writer run, and
 can execute one bounded local demo task.
 
 The demo task is named **bounded repository inventory**. It asks the Codex CLI
-to inspect a temporary credential-free copy of the configured checkout and
-report its repository name, current branch, and tracked-file count. It does not
-edit files, create files, access the network, read credentials, or start
-another agent. Its plain-text result is shown on the completed PBI card.
+to inspect the exact leased Git worktree and report its repository name,
+current branch, and tracked-file count. The default task does not edit files.
+The dashboard worker can write only inside its leased worktree. Its plain-text
+result is shown on the completed PBI card.
 
 This delivery does not claim autonomous swarms, multi-device coordination,
 production pull-request review adapters, or automatic pull-request creation.
@@ -81,12 +81,13 @@ Before clicking an action such as **Start writer**, enter the value of
 5. Wait for the completed PBI card. Its **Result** field contains the agent's
    plain-text inventory result, and the completed-run count increases.
 
-The worker uses `codex exec --sandbox read-only --ephemeral --json` with a
-finite timeout. It receives an explicit model selected by the routing tier and
-a temporary copy that excludes local environment and credential files. The
-service renews the run lease while the process runs. **Stop**, failure, sync
-removal, and service shutdown terminate the process tree, mark the run failed
-with a reason, and clear the lease.
+The dashboard worker uses `codex exec --sandbox workspace-write --ephemeral
+--json` in a unique leased worktree. It disables network access and child
+agents, passes a filtered environment, and rejects credential-like tracked
+files. The service renews both run and worktree leases while the process runs.
+Success retains uncommitted changes for a later commit or handoff. Stop,
+failure, expiry, restart, and shutdown terminate the process tree and remove
+the worker worktree.
 
 If the demo fails, read the PBI **Failure** field and the action log. Check the
 GitHub token, exact project allowlist, `codex` availability, and the local

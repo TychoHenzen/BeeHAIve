@@ -509,6 +509,114 @@ def test_worktree_path_identity_preserves_internal_whitespace(tmp_path: Path) ->
     store.close()
 
 
+def test_successful_run_workspace_is_retained_until_explicit_release(
+    tmp_path: Path,
+) -> None:
+    service, store, _repository_path = _service(tmp_path)
+    worktree = tmp_path / "retained-worktree"
+    lease = service.acquire_workspace(
+        "dashboard-run:run-retained", "codex/retained", worktree
+    )
+    (worktree / "change.txt").write_text("uncommitted\n", encoding="utf-8")
+
+    retained = service.retain_workspace(lease.lease_id, lease.lease_token)
+
+    assert retained.status is LeaseStatus.RETAINED
+    assert retained.expires_at is None
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE workflow_leases SET expires_at = ? WHERE lease_id = ?",
+            ((datetime.now(UTC) - timedelta(minutes=1)).isoformat(), lease.lease_id),
+        )
+    recovered = service.workspace_for_run("run-retained")
+    assert recovered is not None
+    assert recovered.status is LeaseStatus.RETAINED
+    assert recovered.expires_at is not None
+    assert (worktree / "change.txt").read_text(encoding="utf-8") == "uncommitted\n"
+
+    with pytest.raises(WorkflowError, match="uncommitted"):
+        service.release_workspace(lease.lease_id)
+    with pytest.raises(WorkflowError, match="branch or worktree"):
+        service.acquire_workspace("other-run", lease.branch, tmp_path / "other")
+
+    _git(worktree, "add", "change.txt")
+    _git(worktree, "commit", "-m", "consume retained worktree")
+    released = service.release_workspace(lease.lease_id)
+    assert released.status is LeaseStatus.RELEASED
+    assert not worktree.exists()
+    store.close()
+
+
+def test_restart_cleanup_removes_only_unfinished_dashboard_workspaces(
+    tmp_path: Path,
+) -> None:
+    service, store, _repository_path = _service(tmp_path)
+    active_path = tmp_path / "active-worktree"
+    retained_path = tmp_path / "retained-worktree"
+    active = service.acquire_workspace(
+        "dashboard-run:run-active", "codex/active-run", active_path
+    )
+    retained = service.acquire_workspace(
+        "dashboard-run:run-success", "codex/success-run", retained_path
+    )
+    (retained_path / "change.txt").write_text("keep\n", encoding="utf-8")
+    service.retain_workspace(retained.lease_id, retained.lease_token)
+
+    cleaned = service.cleanup_dashboard_run_workspaces()
+
+    assert len(cleaned) == 1
+    assert cleaned[0].lease_id == active.lease_id
+    assert cleaned[0].status is LeaseStatus.RELEASED
+    assert not active_path.exists()
+    still_retained = service.workspace_for_run("run-success")
+    assert still_retained is not None
+    assert still_retained.status is LeaseStatus.RETAINED
+    assert (retained_path / "change.txt").read_text(encoding="utf-8") == "keep\n"
+    store.close()
+
+
+def test_retained_lease_validates_state_and_can_be_discarded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, store, _repository_path = _service(tmp_path)
+    lease = service.acquire_workspace(
+        "dashboard-run:retained",
+        "codex/retained",
+        tmp_path / "retained-worktree",
+    )
+
+    with pytest.raises(WorkflowError, match="Unknown workspace lease"):
+        store.retain_lease("missing-lease", "token")
+    with pytest.raises(WorkflowError, match="Lease token is invalid"):
+        store.retain_lease(lease.lease_id, "wrong-token")
+    retained = service.retain_workspace(lease.lease_id, lease.lease_token)
+    with pytest.raises(WorkflowError, match="Workspace lease is retained"):
+        store.retain_lease(lease.lease_id, lease.lease_token)
+    with pytest.raises(WorkflowError, match="cannot be renewed"):
+        store._set_lease_status(lease.lease_id, LeaseStatus.ACTIVE, None)
+
+    discarded = service.discard_workspace(lease.lease_id, "discard retained workspace")
+    assert retained.status is LeaseStatus.RETAINED
+    assert discarded.status is LeaseStatus.RELEASED
+    assert not Path(lease.worktree_path).exists()
+
+    lost = service.acquire_workspace(
+        "dashboard-run:lost",
+        "codex/lost",
+        tmp_path / "lost-worktree",
+    )
+    original_get_lease = store.get_lease
+    monkeypatch.setattr(store, "get_lease", lambda _lease_id: None)
+    with pytest.raises(WorkflowError, match="Workspace lease disappeared"):
+        store.retain_lease(lost.lease_id, lost.lease_token)
+    monkeypatch.setattr(store, "get_lease", original_get_lease)
+    lost_retained = store.get_lease(lost.lease_id)
+    assert lost_retained is not None
+    assert lost_retained.status is LeaseStatus.RETAINED
+    service.discard_workspace(lost.lease_id, "discard test workspace")
+    store.close()
+
+
 def test_worktree_leases_prevent_concurrent_duplicate_writes(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
     store = WorkflowStore()

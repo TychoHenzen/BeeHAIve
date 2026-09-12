@@ -327,7 +327,9 @@ def create_app(
                 )
         else:
             agent_worker = AgentWorkerManager(
-                orchestrator, cast(CancellableModelExecutor, effective_executor)
+                orchestrator,
+                cast(CancellableModelExecutor, effective_executor),
+                workflow_service,
             )
     if (
         review_service is not None

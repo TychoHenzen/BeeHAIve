@@ -5,7 +5,10 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
+import time
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -568,7 +571,11 @@ def record_action(
     return response
 
 
-def run_fixture_actions(devtools: DevTools) -> dict[str, dict[str, Any]]:
+def run_fixture_actions(
+    devtools: DevTools,
+    workflow_service: Any | None = None,
+    worker_repository: Path | None = None,
+) -> dict[str, dict[str, Any]]:
     outcomes: dict[str, dict[str, Any]] = {}
     set_input(devtools, "#api-key", FIXTURE_API_KEY)
     before = len(action_log_snapshot(devtools)["rows"])
@@ -579,7 +586,47 @@ def run_fixture_actions(devtools: DevTools) -> dict[str, dict[str, Any]]:
     before = len(action_log_snapshot(devtools)["rows"])
     if not click_repository_button(devtools, "owner/api", "Start writer"):
         raise SmokeFailure("The dashboard start-writer action was not rendered")
-    record_action(devtools, outcomes, "start_writer", "succeeded.", before)
+    start_response = record_action(
+        devtools, outcomes, "start_writer", "succeeded.", before
+    )
+    if workflow_service is None or worker_repository is None:
+        raise SmokeFailure("The fixture writer workflow is not configured")
+    _repository, _pbi_number, run_id, _attempt = action_run_target(
+        start_response, "start_writer"
+    )
+    deadline = time.monotonic() + 5
+    workspace = None
+    while time.monotonic() < deadline:
+        workspace = workflow_service.workspace_for_run(run_id)
+        if (
+            workspace is not None
+            and Path(workspace.worktree_path, "worker-output.txt").is_file()
+        ):
+            break
+        time.sleep(0.05)
+    if (
+        workspace is None
+        or not Path(workspace.worktree_path, "worker-output.txt").is_file()
+    ):
+        raise SmokeFailure("The fixture writer did not write in its leased worktree")
+    source_status = subprocess.run(
+        ("git", "status", "--porcelain"),
+        cwd=worker_repository,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if source_status.returncode != 0 or source_status.stdout:
+        raise SmokeFailure("The fixture writer changed the source checkout")
+    workspace_proof = {
+        "run_associated_with_lease": workspace.agent_id == f"dashboard-run:{run_id}",
+        "active_lease": workspace.status.value == "active",
+        "unique_branch": bool(workspace.branch),
+        "isolated_path": Path(workspace.worktree_path).resolve()
+        != worker_repository.resolve(),
+        "worker_file_created": True,
+        "source_checkout_clean": True,
+    }
 
     before = len(action_log_snapshot(devtools)["rows"])
     if not click_button(devtools, "Record approval"):
@@ -596,6 +643,25 @@ def run_fixture_actions(devtools: DevTools) -> dict[str, dict[str, Any]]:
     if not click_button(devtools, "Stop"):
         raise SmokeFailure("The dashboard stop action was not rendered")
     record_action(devtools, outcomes, "stop", "succeeded.", before)
+    deadline = time.monotonic() + 5
+    cleaned = None
+    while time.monotonic() < deadline:
+        cleaned = workflow_service.workspace_for_run(run_id)
+        if (
+            cleaned is not None
+            and cleaned.status.value == "released"
+            and not Path(cleaned.worktree_path).exists()
+        ):
+            break
+        time.sleep(0.05)
+    if (
+        cleaned is None
+        or cleaned.status.value != "released"
+        or Path(cleaned.worktree_path).exists()
+    ):
+        raise SmokeFailure("Stopping the fixture writer did not clean its worktree")
+    workspace_proof["cleanup_after_stop"] = True
+    outcomes["workspace"] = workspace_proof
 
     before = len(action_log_snapshot(devtools)["rows"])
     if not click_repository_button(devtools, "owner/empty", "Start writer"):
@@ -767,6 +833,8 @@ def run_browser_smoke(
     secrets_to_redact: tuple[str, ...],
     server_output: io.StringIO,
     live_timeout: float | None = None,
+    fixture_workflow_service: Any | None = None,
+    fixture_worker_repository: Path | None = None,
 ) -> dict[str, Any]:
     report: dict[str, Any] = {"passed": False, "actions": {}}
     report["provider_identity"] = provider_identity_probe(project_id)
@@ -936,7 +1004,9 @@ def run_browser_smoke(
         timeout=refresh_timeout,
     )
     if mode == "fixture":
-        report["actions"] = run_fixture_actions(devtools)
+        report["actions"] = run_fixture_actions(
+            devtools, fixture_workflow_service, fixture_worker_repository
+        )
     elif allow_mutations:
         if not os.environ.get("BEEHAIIVE_API_KEY"):
             raise SmokeFailure("Live mutation proof needs BEEHAIIVE_API_KEY")
