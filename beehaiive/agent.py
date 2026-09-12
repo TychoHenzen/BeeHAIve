@@ -10,7 +10,7 @@ import shutil
 import signal
 import subprocess
 import time
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Collection, Generator, Mapping
 from contextlib import contextmanager, nullcontext, suppress
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -1126,6 +1126,10 @@ class CodexExecModelExecutor:
         return final_message, input_tokens, output_tokens
 
 
+class WorkerCapacityError(StoreError):
+    """A worker start lost a race for a configured capacity slot."""
+
+
 class AgentWorkerManager:
     """Start, stop, and clean up one bounded worker per dashboard run."""
 
@@ -1140,6 +1144,7 @@ class AgentWorkerManager:
         self.workflow_service = workflow_service
         self._lock = Lock()
         self._threads: dict[str, Thread] = {}
+        self._max_concurrent_workers: int | None = None
         self._workspace_leases: dict[str, WorkspaceLease] = {}
         self._workspace_validators: dict[str, Callable[[], None]] = {}
         self._delivery_lock = Lock()
@@ -1147,6 +1152,24 @@ class AgentWorkerManager:
         register = getattr(orchestrator, "register_worker_canceller", None)
         if callable(register):
             register(self.cancel)
+
+    @property
+    def active_worker_count(self) -> int:
+        with self._lock:
+            return len(self._threads)
+
+    def has_capacity(self) -> bool:
+        with self._lock:
+            return (
+                self._max_concurrent_workers is None
+                or len(self._threads) < self._max_concurrent_workers
+            )
+
+    def set_max_concurrent_workers(self, maximum: int) -> None:
+        if type(maximum) is not int or maximum <= 0:
+            raise StoreError("Maximum concurrent workers must be a positive integer")
+        with self._lock:
+            self._max_concurrent_workers = maximum
 
     def claim(
         self,
@@ -1175,13 +1198,20 @@ class AgentWorkerManager:
             ),
         )
 
-    def recover(self) -> tuple[str, ...]:
+    def recover(self, project_ids: Collection[str] | None = None) -> tuple[str, ...]:
         service = self.workflow_service
         if service is None:
             return ()
         store = self.orchestrator.store
         recovered: list[str] = []
         for previous_run in store.active_agent_sessions():
+            if project_ids is not None and previous_run.project_id not in project_ids:
+                continue
+            with self._lock:
+                if previous_run.run_id in self._threads:
+                    continue
+            if not self.has_capacity():
+                break
             session = store.get_agent_session(previous_run.run_id)
             task = None if session is None else session.get("task")
             if not isinstance(task, str) or not task.strip():
@@ -1203,6 +1233,8 @@ class AgentWorkerManager:
             try:
                 service.cleanup_dashboard_run_workspaces(run.run_id)
                 self.start(run)
+            except WorkerCapacityError:
+                continue
             except Exception as exc:
                 current = store.get_run(run.run_id)
                 if (
@@ -1231,6 +1263,11 @@ class AgentWorkerManager:
         with self._lock:
             if run.run_id in self._threads:
                 raise StoreError("An agent worker is already active")
+            if (
+                self._max_concurrent_workers is not None
+                and len(self._threads) >= self._max_concurrent_workers
+            ):
+                raise WorkerCapacityError("Maximum concurrent agent workers reached")
             thread = Thread(
                 target=self._run,
                 args=(run.run_id, run.lease_token),

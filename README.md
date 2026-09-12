@@ -44,6 +44,9 @@ BEEHAIIVE_REVIEW_MODE=demo
 BEEHAIIVE_AGENT_REPOSITORY_NAME=<owner>/<repository>
 # BEEHAIIVE_AGENT_TIMEOUT_SECONDS=120
 # BEEHAIIVE_CODEX_EXECUTABLE=codex
+# BEEHAIIVE_SCHEDULER_ENABLED=false
+# BEEHAIIVE_SCHEDULER_POLL_INTERVAL_SECONDS=600
+# BEEHAIIVE_SCHEDULER_MAX_CONCURRENCY=1
 ```
 
 The project ID is exactly `<owner>:<number>`. The tracked launcher reads the
@@ -54,6 +57,10 @@ seconds. Project discovery is cached for 10 minutes by default, so the
 dashboard's five-second polling does not repeat the full GraphQL discovery.
 Set `BEEHAIIVE_GITHUB_DISCOVERY_CACHE_SECONDS` to a finite non-negative number
 to change that interval. Do not commit `.env` or place its values in screenshots.
+The continuous scheduler is off by default. Enable it with
+`BEEHAIIVE_SCHEDULER_ENABLED=true`; it polls only `BEEHAIIVE_ALLOWED_PROJECTS`,
+uses the configured dashboard worker, and shares its process-wide worker limit
+with manual starts. Its status appears in the project dashboard response.
 
 Start the service from the repository root so the launcher loads `.env`:
 

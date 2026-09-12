@@ -732,7 +732,10 @@ def test_provider_caches_discovery_and_serves_stale_snapshot_on_limit() -> None:
     assert len(cached_client.calls) == 3
     sync_store = OrchestratorStore()
     try:
-        Orchestrator(sync_store, cached_provider).synchronize("owner:7")
+        orchestrator = Orchestrator(sync_store, cached_provider)
+        orchestrator.synchronize("owner:7")
+        assert len(cached_client.calls) == 3
+        orchestrator.synchronize("owner:7", force_refresh=True)
         assert len(cached_client.calls) == 6
     finally:
         sync_store.close()
@@ -933,8 +936,14 @@ def test_provider_preserves_create_errors_when_recheck_fails(
 
 
 class StubProvider:
+    def __init__(self) -> None:
+        self.cache_invalidated = False
+
     def discover_project(self, project_id: str) -> ProjectSnapshot:
         return ProjectSnapshot(project_id, "Planning", ())
+
+    def invalidate_discovery_cache(self) -> None:
+        self.cache_invalidated = True
 
     def create_handoff(self, request: HandoffRequest) -> HandoffResult:
         return HandoffResult(request.branch, "https://example.test/pull/1", 1)
@@ -995,6 +1004,8 @@ def test_environment_provider_delegates(monkeypatch: pytest.MonkeyPatch) -> None
     assert provider.validate_handoff("owner/api", "codex/api-1", None) == "main"
     pull_request = provider.get_pull_request("owner/api", 1)
     provider.update_source_branch(pull_request, "worktree", "head", "head")
+    provider.invalidate_discovery_cache()
+    assert stub.cache_invalidated
     assert factory_calls == 1
 
 

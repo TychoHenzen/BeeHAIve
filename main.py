@@ -42,6 +42,7 @@ from beehaiive.routing import (
     RoutingError,
     RoutingStore,
 )
+from beehaiive.scheduler import AgentScheduler, SchedulerConfig
 from beehaiive.storage import (
     DEFAULT_EVENT_LIMIT,
     MAX_EVENT_LIMIT,
@@ -364,12 +365,26 @@ def create_app(
             authorizer=review_authorizer,
         )
 
+    configured_projects = _configured_project_ids(allowed_project_ids)
+    scheduler_config = SchedulerConfig.from_environment()
+    scheduler = None
+    if scheduler_config.enabled:
+        if agent_worker is None:
+            raise ValueError(
+                "The scheduler requires a configured dashboard agent worker"
+            )
+        scheduler = AgentScheduler(
+            orchestrator, agent_worker, configured_projects, scheduler_config
+        )
+
     app = FastAPI(title="BeeHAIve")
 
     if agent_worker is not None:
 
         @app.on_event("shutdown")  # pyright: ignore[reportDeprecated]
-        async def shutdown_agent_workers() -> None:  # pyright: ignore[reportUnusedFunction]
+        async def shutdown_background_workers() -> None:  # pyright: ignore[reportUnusedFunction]
+            if scheduler is not None:
+                scheduler.shutdown()
             agent_worker.shutdown()
 
     if require_review_adapters and review_operations_enabled:
@@ -393,7 +408,12 @@ def create_app(
 
         @app.on_event("startup")  # pyright: ignore[reportDeprecated]
         async def recover_agent_workers() -> None:  # pyright: ignore[reportUnusedFunction]
-            agent_worker.recover()
+            if scheduler is not None:
+                agent_worker.recover(scheduler.project_ids)
+            else:
+                agent_worker.recover()
+            if scheduler is not None:
+                scheduler.start()
 
     configured_api_key = (
         api_key if api_key is not None else os.environ.get("BEEHAIIVE_API_KEY")
@@ -403,7 +423,6 @@ def create_app(
         if review_actor is not None
         else os.environ.get("BEEHAIIVE_REVIEW_ACTOR")
     )
-    configured_projects = _configured_project_ids(allowed_project_ids)
     configured_workflow_actor = (
         workflow_actor
         if workflow_actor is not None
@@ -947,7 +966,9 @@ def create_app(
         project_id: str,
         _auth: None = Depends(require_mutation_access),
     ) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
-        return _handle_store_error(lambda: orchestrator.synchronize(project_id))
+        return _handle_store_error(
+            lambda: orchestrator.synchronize(project_id, force_refresh=True)
+        )
 
     @app.get("/projects/{project_id}")
     def project_state(  # pyright: ignore[reportUnusedFunction]
@@ -980,6 +1001,9 @@ def create_app(
                 event_limit,
                 archived,
                 workflow_service,
+                scheduler,
+                scheduler_config,
+                agent_worker,
             )
         )
 
@@ -1139,6 +1163,9 @@ def create_app(
                     DEFAULT_EVENT_LIMIT,
                     archived,
                     workflow_service,
+                    scheduler,
+                    scheduler_config,
+                    agent_worker,
                 ),
             }
         completed = orchestrator.store.finish_action(
@@ -1153,6 +1180,9 @@ def create_app(
                 DEFAULT_EVENT_LIMIT,
                 archived,
                 workflow_service,
+                scheduler,
+                scheduler_config,
+                agent_worker,
             ),
         }
 
@@ -1383,11 +1413,29 @@ def _dashboard_state(
     event_limit: int,
     archived: bool = False,
     workflow_service: WorkflowService | None = None,
+    scheduler: AgentScheduler | None = None,
+    scheduler_config: SchedulerConfig | None = None,
+    agent_worker: AgentWorkerManager | None = None,
 ) -> dict[str, object]:
     orchestrator.synchronize(project_id)
     state = orchestrator.store.project_state(project_id, event_limit)
     actions = orchestrator.store.actions_for_project(project_id)
     dashboard = build_dashboard_state(state, actions, archived)
+    if scheduler is not None:
+        scheduler_status = scheduler.status_for(project_id)
+        if scheduler_status is not None:
+            dashboard["scheduler"] = scheduler_status
+    elif scheduler_config is not None and not scheduler_config.enabled:
+        dashboard["scheduler"] = {
+            "enabled": False,
+            "running": False,
+            "poll_interval_seconds": scheduler_config.poll_interval_seconds,
+            "max_concurrency": scheduler_config.max_concurrency,
+            "active_workers": getattr(agent_worker, "active_worker_count", 0),
+            "last_poll_at": None,
+            "last_error": None,
+            "last_started_run_ids": [],
+        }
     if workflow_service is None:
         return dashboard
     repositories = cast(list[dict[str, object]], dashboard["repositories"])
@@ -1407,10 +1455,20 @@ def _dashboard_state_or_none(
     event_limit: int,
     archived: bool = False,
     workflow_service: WorkflowService | None = None,
+    scheduler: AgentScheduler | None = None,
+    scheduler_config: SchedulerConfig | None = None,
+    agent_worker: AgentWorkerManager | None = None,
 ) -> dict[str, object] | None:
     try:
         return _dashboard_state(
-            orchestrator, project_id, event_limit, archived, workflow_service
+            orchestrator,
+            project_id,
+            event_limit,
+            archived,
+            workflow_service,
+            scheduler,
+            scheduler_config,
+            agent_worker,
         )
     except (ProviderError, StoreError):
         return None
@@ -1508,7 +1566,7 @@ def _execute_dashboard_action(
 ) -> dict[str, object]:
     if isinstance(request, DashboardStartRequest):
         if request.repository is None:
-            return orchestrator.synchronize(project_id)
+            return orchestrator.synchronize(project_id, force_refresh=True)
         if agent_worker is None:
             raise StoreError("Agent worker is not configured")
         task = getattr(getattr(agent_worker, "executor", None), "task", None)
