@@ -83,6 +83,8 @@ class HandoffRequest:
     base_branch: str | None
     body: str
     run_id: str
+    head_sha: str | None = None
+    verification_evidence: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +95,8 @@ class HandoffIntent:
     branch: str
     base_branch: str | None
     body: str
+    head_sha: str | None = None
+    verification_evidence: str = ""
 
 
 @dataclass(frozen=True, slots=True)

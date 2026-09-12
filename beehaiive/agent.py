@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 from uuid import uuid4
 
 from .contracts import ContractError, TaskContract, TaskOutcome, TaskResult
-from .models import RunState, RunStatus, Stage
+from .models import HandoffIntent, RunState, RunStatus, Stage
 from .routing import (
     AttemptOutcome,
     ModelExecution,
@@ -31,6 +31,7 @@ from .routing import (
 from .storage import StoreError
 from .workflow import (
     GitDeliveryResult,
+    GitDeliveryStatus,
     LeaseStatus,
     WorkflowError,
     WorkflowService,
@@ -1533,6 +1534,23 @@ class AgentWorkerManager:
             heartbeat_thread.start()
         preserve_workspace = False
         try:
+            pending_lookup = getattr(self.orchestrator.store, "pending_handoff", None)
+            pending_handoff = (
+                cast(HandoffIntent | None, pending_lookup(run_id, lease_token))
+                if callable(pending_lookup)
+                else None
+            )
+            if pending_handoff is not None:
+                self.orchestrator.handoff(
+                    run_id,
+                    pending_handoff.branch,
+                    pending_handoff.base_branch,
+                    pending_handoff.body,
+                    lease_token,
+                    head_sha=pending_handoff.head_sha,
+                    verification_evidence=pending_handoff.verification_evidence,
+                )
+                return
             self.orchestrator.advance(run_id, Stage.IMPLEMENT, lease_token)
             if validate_workspace_lease is not None:
                 validate_workspace_lease()
@@ -1580,14 +1598,58 @@ class AgentWorkerManager:
                     )
                     preserve_workspace = True
                     delivery = self.commit_and_push(run_id)
+                    task_result = getattr(routing, "task_result", None)
+                    if delivery.status is not GitDeliveryStatus.PUSHED:
+                        result = self._delivery_summary(
+                            routing.execution_result
+                            or "Bounded agent completed the demo",
+                            delivery,
+                        )
+                        self.orchestrator.store.complete_agent_run(
+                            run_id, result, lease_token
+                        )
+                        return
+                    if not delivery.commit_sha:
+                        raise StoreError(
+                            "A verified pushed commit is required before "
+                            "pull-request handoff"
+                        )
+                    if (
+                        not isinstance(task_result, TaskResult)
+                        or task_result.outcome is not TaskOutcome.PASS
+                    ):
+                        raise StoreError(
+                            "A passing structured task result is required before "
+                            "pull-request handoff"
+                        )
                     result = self._delivery_summary(
                         routing.execution_result or "Bounded agent completed the demo",
                         delivery,
                     )
-                    self.orchestrator.store.complete_agent_run(
+                    secret_values = tuple(
+                        value
+                        for value in getattr(self.executor, "_secret_values", ())
+                        if isinstance(value, str)
+                    )
+                    verification_evidence = redact_worker_text(
+                        json.dumps(
+                            {
+                                "task_result": task_result.as_dict(),
+                                "git_delivery": delivery.as_dict(),
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        secret_values,
+                    )
+                    self.orchestrator.handoff(
                         run_id,
+                        delivery.branch,
+                        None,
                         result,
                         lease_token,
+                        head_sha=delivery.commit_sha,
+                        verification_evidence=verification_evidence,
                     )
                 except Exception as exc:
                     reopen = getattr(self.orchestrator, "recover_routing_problem", None)

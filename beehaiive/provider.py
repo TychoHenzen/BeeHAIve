@@ -638,13 +638,16 @@ query(
   repository(owner: $owner, name: $name) {
     id
     defaultBranchRef { name target { oid } }
-    ref(qualifiedName: $qualifiedBranch) { name }
+    ref(qualifiedName: $qualifiedBranch) { name target { oid } }
     pullRequests(
       first: 100
       after: $pullRequestCursor
       states: [OPEN, CLOSED, MERGED]
     ) {
-      nodes { number url headRefName baseRefName body }
+      nodes {
+        id number url title body state isDraft
+        headRefName headRefOid baseRefName
+      }
       pageInfo { hasNextPage endCursor }
     }
   }
@@ -676,7 +679,21 @@ mutation($input: CreateRefInput!) {
 CREATE_PULL_REQUEST_MUTATION = """
 mutation($input: CreatePullRequestInput!) {
   createPullRequest(input: $input) {
-    pullRequest { number url }
+    pullRequest {
+      id number url title body state isDraft
+      headRefName headRefOid baseRefName
+    }
+  }
+}
+"""
+
+UPDATE_PULL_REQUEST_MUTATION = """
+mutation($input: UpdatePullRequestInput!) {
+  updatePullRequest(input: $input) {
+    pullRequest {
+      id number url title body state isDraft
+      headRefName headRefOid baseRefName
+    }
   }
 }
 """
@@ -1095,10 +1112,27 @@ def _handoff_marker(request: HandoffRequest) -> str:
     return f"<!-- beehaiive-handoff:{encoded} -->"
 
 
-def _handoff_body(body: str, marker: str) -> str:
-    if marker in body:
+def _handoff_body(body: str, marker: str, request: HandoffRequest | None = None) -> str:
+    if marker in body and request is None:
         return body
-    return f"{body.rstrip()}\n\n{marker}" if body.strip() else marker
+    body_without_marker = body.replace(marker, "").rstrip()
+    sections = [body_without_marker] if body_without_marker.strip() else []
+    if request is not None:
+        issue_url = (
+            f"https://github.com/{request.repository}/issues/{request.pbi_number}"
+        )
+        sections.extend(
+            (
+                f"PBI: [#{request.pbi_number}]({issue_url})",
+                f"Run: `{request.run_id}`",
+            )
+        )
+        if request.head_sha:
+            sections.append(f"Pushed head: `{request.head_sha}`")
+        if request.verification_evidence:
+            sections.extend(("Verification evidence:", request.verification_evidence))
+    sections.append(marker)
+    return "\n\n".join(sections)
 
 
 def _pull_request_matches(
@@ -1585,7 +1619,17 @@ class GitHubProjectProvider:
     def create_handoff(self, request: HandoffRequest) -> HandoffResult:
         owner, name = self._repository_parts(request.repository)
         _validate_branch_name(request.branch)
+        head_sha = request.head_sha
+        if head_sha is not None:
+            normalized_head = head_sha.strip().lower()
+            if len(normalized_head) not in {40, 64} or any(
+                char not in "0123456789abcdef" for char in normalized_head
+            ):
+                raise ProviderError("Verified handoff head must be a Git object ID")
+            if not request.verification_evidence.strip():
+                raise ProviderError("Verified handoff evidence is required")
         identity_marker = _handoff_marker(request)
+        pull_request_body = _handoff_body(request.body, identity_marker, request)
         qualified_branch = f"refs/heads/{request.branch}"
         data = self._client.execute(
             REPOSITORY_QUERY,
@@ -1615,7 +1659,24 @@ class GitHubProjectProvider:
         if base_branch != default_branch_name:
             _, base_oid = self._resolve_custom_base_branch(owner, name, base_branch)
 
-        if repository.get("ref") is None:
+        raw_branch_ref = repository.get("ref")
+        branch_ref = _mapping(raw_branch_ref) if raw_branch_ref is not None else None
+        if head_sha is not None:
+            branch_oid = (
+                _mapping(branch_ref.get("target")).get("oid")
+                if branch_ref is not None
+                else None
+            )
+            if (
+                branch_ref is None
+                or branch_ref.get("name") != qualified_branch
+                or not isinstance(branch_oid, str)
+                or branch_oid.lower() != head_sha.strip().lower()
+            ):
+                raise ProviderError(
+                    "GitHub branch head does not match the verified pushed head"
+                )
+        elif branch_ref is None:
             try:
                 create_data = self._client.execute(
                     CREATE_REF_MUTATION,
@@ -1663,7 +1724,16 @@ class GitHubProjectProvider:
             initial_repository=repository,
         )
         if existing is not None:
-            return existing
+            return self._update_matching_pull_request(
+                existing,
+                owner,
+                name,
+                qualified_branch,
+                request,
+                base_branch,
+                identity_marker,
+                pull_request_body,
+            )
 
         try:
             pull_request_data = self._client.execute(
@@ -1674,7 +1744,8 @@ class GitHubProjectProvider:
                         "baseRefName": base_branch,
                         "headRefName": request.branch,
                         "title": request.title,
-                        "body": _handoff_body(request.body, identity_marker),
+                        "body": pull_request_body,
+                        "draft": True,
                     }
                 },
             )
@@ -1692,15 +1763,180 @@ class GitHubProjectProvider:
                 raise create_error from None
             if existing is None:
                 raise create_error from None
-            return existing
+            return self._update_matching_pull_request(
+                existing,
+                owner,
+                name,
+                qualified_branch,
+                request,
+                base_branch,
+                identity_marker,
+                pull_request_body,
+            )
         pull_request = _mapping(
             _mapping(pull_request_data.get("createPullRequest")).get("pullRequest")
         )
-        url = pull_request.get("url")
-        number = pull_request.get("number")
-        if not isinstance(url, str) or not isinstance(number, int):
+        return self._validated_handoff_result(
+            pull_request, request, base_branch, identity_marker, pull_request_body
+        )
+
+    def _validated_handoff_result(
+        self,
+        pull_request: Mapping[str, Any],
+        request: HandoffRequest,
+        base_branch: str,
+        identity_marker: str,
+        expected_body: str,
+    ) -> HandoffResult:
+        if not pull_request:
             raise ProviderError("GitHub did not return a pull-request record")
+        if not _pull_request_matches(
+            pull_request, request.branch, base_branch, identity_marker
+        ):
+            raise ProviderError(
+                "GitHub returned a pull request for a different handoff"
+            )
+        number = pull_request.get("number")
+        url = _required_text(pull_request.get("url"), "pull-request URL")
+        pull_request_id = _required_text(pull_request.get("id"), "pull-request id")
+        state = pull_request.get("state")
+        if state != "OPEN":
+            raise ProviderError(
+                f"Matching pull request #{number} is not open; refusing to update it"
+            )
+        if pull_request.get("isDraft") is not True:
+            raise ProviderError(
+                f"Matching pull request #{number} is not a draft; refusing to update it"
+            )
+        if (
+            not isinstance(number, int)
+            or number <= 0
+            or url is None
+            or pull_request_id is None
+            or pull_request.get("title") != request.title
+            or pull_request.get("body") != expected_body
+        ):
+            raise ProviderError("GitHub did not confirm the pull-request handoff")
+        if request.head_sha is not None:
+            pull_request_head = pull_request.get("headRefOid")
+            if (
+                not isinstance(pull_request_head, str)
+                or pull_request_head.lower() != request.head_sha.strip().lower()
+            ):
+                raise ProviderError(
+                    "Pull-request head does not match the verified pushed head"
+                )
         return HandoffResult(request.branch, url, number)
+
+    def _update_matching_pull_request(
+        self,
+        existing: Mapping[str, Any],
+        owner: str,
+        name: str,
+        qualified_branch: str,
+        request: HandoffRequest,
+        base_branch: str,
+        identity_marker: str,
+        pull_request_body: str,
+    ) -> HandoffResult:
+        if not _pull_request_matches(
+            existing, request.branch, base_branch, identity_marker
+        ):
+            raise ProviderError(
+                "An existing pull request has a different handoff identity; "
+                "refusing to update it"
+            )
+        current = existing
+        for attempt in range(2):
+            self._validated_handoff_identity(
+                current, request, base_branch, identity_marker
+            )
+            pull_request_id = _required_text(current.get("id"), "pull-request id")
+            if pull_request_id is None:
+                raise ProviderError("GitHub returned incomplete pull-request identity")
+            try:
+                update_data = self._client.execute(
+                    UPDATE_PULL_REQUEST_MUTATION,
+                    {
+                        "input": {
+                            "pullRequestId": pull_request_id,
+                            "title": request.title,
+                            "body": pull_request_body,
+                        }
+                    },
+                )
+            except ProviderError as update_error:
+                if attempt:
+                    raise
+                try:
+                    latest = self._find_existing_pull_request(
+                        owner,
+                        name,
+                        qualified_branch,
+                        request.branch,
+                        base_branch,
+                        identity_marker,
+                    )
+                except ProviderError:
+                    raise update_error from None
+                if latest is None:
+                    raise update_error from None
+                self._validated_handoff_identity(
+                    latest, request, base_branch, identity_marker
+                )
+                if (
+                    latest.get("title") == request.title
+                    and latest.get("body") == pull_request_body
+                ):
+                    return self._validated_handoff_result(
+                        latest,
+                        request,
+                        base_branch,
+                        identity_marker,
+                        pull_request_body,
+                    )
+                current = latest
+                continue
+            updated = _mapping(
+                _mapping(update_data.get("updatePullRequest")).get("pullRequest")
+            )
+            return self._validated_handoff_result(
+                updated, request, base_branch, identity_marker, pull_request_body
+            )
+        raise ProviderError("GitHub could not update the matching draft pull request")
+
+    def _validated_handoff_identity(
+        self,
+        pull_request: Mapping[str, Any],
+        request: HandoffRequest,
+        base_branch: str,
+        identity_marker: str,
+    ) -> None:
+        if not _pull_request_matches(
+            pull_request, request.branch, base_branch, identity_marker
+        ):
+            raise ProviderError(
+                "An existing pull request has a different handoff identity; "
+                "refusing to update it"
+            )
+        number = pull_request.get("number")
+        if pull_request.get("state") != "OPEN":
+            raise ProviderError(
+                f"Matching pull request #{number} is not open; refusing to update it"
+            )
+        if pull_request.get("isDraft") is not True:
+            raise ProviderError(
+                f"Matching pull request #{number} is not a draft; refusing to update it"
+            )
+        if request.head_sha is not None:
+            pull_request_head = pull_request.get("headRefOid")
+            if (
+                not isinstance(pull_request_head, str)
+                or pull_request_head.lower() != request.head_sha.strip().lower()
+            ):
+                raise ProviderError(
+                    "Pull-request head does not match the verified pushed head"
+                )
 
     def _find_existing_pull_request(
         self,
@@ -1711,9 +1947,11 @@ class GitHubProjectProvider:
         base_branch: str,
         identity_marker: str,
         initial_repository: Mapping[str, Any] | None = None,
-    ) -> HandoffResult | None:
+    ) -> Mapping[str, Any] | None:
         cursor: str | None = None
         repository = initial_repository
+        matching: Mapping[str, Any] | None = None
+        conflicting: Mapping[str, Any] | None = None
         while True:
             if repository is None:
                 data = self._client.execute(
@@ -1726,19 +1964,28 @@ class GitHubProjectProvider:
                     },
                 )
                 repository = _mapping(_mapping(data.get("repository")))
-            for pull_request in _nodes(repository.get("pullRequests", {})):
+            for raw_pull_request in _nodes(repository.get("pullRequests", {})):
+                pull_request = _mapping(raw_pull_request)
+                if (
+                    pull_request.get("headRefName") != branch
+                    or pull_request.get("baseRefName") != base_branch
+                ):
+                    continue
                 if _pull_request_matches(
                     pull_request, branch, base_branch, identity_marker
                 ):
-                    url = pull_request.get("url")
-                    number = pull_request.get("number")
-                    if isinstance(url, str) and isinstance(number, int):
-                        return HandoffResult(branch, url, number)
+                    if matching is not None:
+                        raise ProviderError(
+                            "More than one pull request matches this handoff identity"
+                        )
+                    matching = pull_request
+                elif conflicting is None:
+                    conflicting = pull_request
             has_next, cursor = _next_cursor(
                 _mapping(repository.get("pullRequests", {}))
             )
             if not has_next:
-                return None
+                return matching or conflicting
             repository = None
 
 

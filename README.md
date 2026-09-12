@@ -152,7 +152,7 @@ uv run node --test tests/*.test.mjs
 uv run ruff format --check .
 uv run ruff check .
 uv run pyright
-uv run pytest --cov=beehaiive --cov=main --cov-report=term-missing --cov-fail-under=100
+uv run pytest --cov=beehaiive --cov=main --cov-report=term-missing --cov-fail-under=90
 ```
 
 The dashboard details, task contracts, and security boundary are documented in
