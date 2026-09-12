@@ -1099,8 +1099,17 @@ class AgentWorkerManager:
             is_alive = getattr(thread, "is_alive", lambda: False)
             if is_alive():
                 thread.join(timeout=1)
+        live_workers = [
+            run_id
+            for run_id, thread in items
+            if getattr(thread, "is_alive", lambda: False)()
+        ]
         if cancellation_error is not None:
             raise cancellation_error
+        if live_workers:
+            raise StoreError(
+                "Agent workers did not stop before shutdown: " + ", ".join(live_workers)
+            )
         for run_id, _thread in items:
             run = self.orchestrator.store.get_run(run_id)
             if run is not None and run.status is RunStatus.ACTIVE:
@@ -1136,7 +1145,7 @@ class AgentWorkerManager:
                 target=heartbeat, name=f"beehaiive-lease-{run_id[:8]}", daemon=True
             )
             heartbeat_thread.start()
-        completed = False
+        preserve_workspace = False
         try:
             self.orchestrator.advance(run_id, Stage.IMPLEMENT, lease_token)
             if validate_workspace_lease is not None:
@@ -1183,12 +1192,12 @@ class AgentWorkerManager:
                         workflow_service.retain_workspace(
                             workspace_lease.lease_id, workspace_lease.lease_token
                         )
+                        preserve_workspace = True
                     self.orchestrator.store.complete_agent_run(
                         run_id,
                         routing.execution_result or "Bounded agent completed the demo",
                         lease_token,
                     )
-                    completed = True
                 except Exception as exc:
                     reopen = getattr(self.orchestrator, "recover_routing_problem", None)
                     if callable(reopen):
@@ -1233,7 +1242,7 @@ class AgentWorkerManager:
             if (
                 workspace_lease is not None
                 and workflow_service is not None
-                and not completed
+                and not preserve_workspace
             ):
                 try:
                     workflow_service.discard_workspace(
@@ -1251,7 +1260,7 @@ class AgentWorkerManager:
             if (
                 workspace_lease is not None
                 and workflow_service is not None
-                and not completed
+                and not preserve_workspace
                 and cleanup_error is not None
             ):
                 raise StoreError(f"Worker workspace cleanup failed: {cleanup_error}")

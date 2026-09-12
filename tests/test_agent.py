@@ -1318,11 +1318,24 @@ def test_worker_manager_shutdown_attempts_all_cancellations_after_failure() -> N
     assert all(thread.joins == [5] for thread in threads.values())
 
 
-def test_worker_manager_shutdown_uses_second_bounded_join() -> None:
+def test_worker_manager_shutdown_preserves_workspace_when_worker_stays_alive(
+    tmp_path: Path,
+) -> None:
+    repository = make_git_repository(tmp_path / "repository")
     executor = ImmediateExecutor(
-        ModelExecution(AttemptOutcome.SUCCESS, result="unused")
+        ModelExecution(AttemptOutcome.SUCCESS, result="unused"), repository
     )
     service, store, routing_store, run = service_with_run(executor)
+    workflow_service, workflow_store = workflow_service_for(tmp_path, repository)
+
+    manager = AgentWorkerManager(service, executor, workflow_service)
+    lease = workflow_service.acquire_workspace(
+        f"dashboard-run:{run.run_id}",
+        "codex/stuck-worker",
+        tmp_path / "stuck-worker-worktree",
+    )
+    output = Path(lease.worktree_path) / "worker-output.txt"
+    output.write_text("keep this output\n", encoding="utf-8")
 
     class StuckThread:
         def __init__(self) -> None:
@@ -1335,17 +1348,26 @@ def test_worker_manager_shutdown_uses_second_bounded_join() -> None:
             return True
 
     thread = StuckThread()
-    manager = AgentWorkerManager(service, executor)
     manager._threads[run.run_id] = thread  # type: ignore[assignment]
+    manager._workspace_leases[run.run_id] = lease
     try:
-        manager.shutdown()
+        with pytest.raises(StoreError, match="did not stop before shutdown"):
+            manager.shutdown()
         assert thread.joins == [5, 1]
-        stopped = store.get_run(run.run_id)
-        assert stopped is not None
-        assert stopped.status is RunStatus.FAILED
+        still_active = store.get_run(run.run_id)
+        assert still_active is not None
+        assert still_active.status is RunStatus.ACTIVE
+        current_lease = workflow_service.workspace_for_run(run.run_id)
+        assert current_lease is not None
+        assert current_lease.status is LeaseStatus.ACTIVE
+        assert output.read_text(encoding="utf-8") == "keep this output\n"
     finally:
+        remaining = workflow_service.workspace_for_run(run.run_id)
+        if remaining is not None and remaining.status is not LeaseStatus.RELEASED:
+            workflow_service.discard_workspace(remaining.lease_id, "test cleanup")
         store.close()
         routing_store.close()
+        workflow_store.close()
 
 
 def test_worker_manager_persists_model_failure(tmp_path: Path) -> None:
@@ -1773,7 +1795,10 @@ def test_worker_manager_persists_human_handoff_without_claimability() -> None:
     )
 
 
-def test_worker_manager_reopens_routing_when_result_persistence_fails() -> None:
+def test_worker_manager_reopens_routing_when_result_persistence_fails(
+    tmp_path: Path,
+) -> None:
+    repository = make_git_repository(tmp_path / "repository")
     run = RunState(
         "persist-run",
         "project-1",
@@ -1812,6 +1837,9 @@ def test_worker_manager_reopens_routing_when_result_persistence_fails() -> None:
 
         def run_implementation_attempt(self, run_id: str, lease_token: str):
             del run_id, lease_token
+            (worktree / "worker-output.txt").write_text(
+                "successful work\n", encoding="utf-8"
+            )
             return SimpleNamespace(
                 state=SimpleNamespace(
                     status=RoutingStatus.RESOLVED,
@@ -1826,20 +1854,41 @@ def test_worker_manager_reopens_routing_when_result_persistence_fails() -> None:
             self.recovery = (run_id, reason)
 
     executor = ImmediateExecutor(
-        ModelExecution(AttemptOutcome.SUCCESS, result="unused")
+        ModelExecution(AttemptOutcome.SUCCESS, result="unused"), repository
     )
     orchestrator = PersistenceOrchestrator()
-    manager = AgentWorkerManager(orchestrator, executor)
-    manager._run(run.run_id, run.lease_token or "")
-
-    assert orchestrator.recovery is not None
-    assert orchestrator.recovery[0] == run.run_id
-    assert "database unavailable" in orchestrator.recovery[1]
-    assert orchestrator.store.failure == (
-        run.run_id,
-        "Agent worker failed: database unavailable",
-        "lease-1",
+    workflow_service, workflow_store = workflow_service_for(tmp_path, repository)
+    manager = AgentWorkerManager(orchestrator, executor, workflow_service)
+    lease = workflow_service.acquire_workspace(
+        f"dashboard-run:{run.run_id}",
+        "codex/persist-run",
+        tmp_path / "persist-run-worktree",
     )
+    worktree = Path(lease.worktree_path)
+    manager._workspace_leases[run.run_id] = lease
+
+    try:
+        manager._run(run.run_id, run.lease_token or "")
+
+        assert orchestrator.recovery is not None
+        assert orchestrator.recovery[0] == run.run_id
+        assert "database unavailable" in orchestrator.recovery[1]
+        assert orchestrator.store.failure == (
+            run.run_id,
+            "Agent worker failed: database unavailable",
+            "lease-1",
+        )
+        retained = workflow_service.workspace_for_run(run.run_id)
+        assert retained is not None
+        assert retained.status is LeaseStatus.RETAINED
+        assert (worktree / "worker-output.txt").read_text(encoding="utf-8") == (
+            "successful work\n"
+        )
+    finally:
+        remaining = workflow_service.workspace_for_run(run.run_id)
+        if remaining is not None and remaining.status is not LeaseStatus.RELEASED:
+            workflow_service.discard_workspace(remaining.lease_id, "test cleanup")
+        workflow_store.close()
 
 
 def test_worker_manager_recovers_when_failure_lease_is_lost() -> None:
