@@ -109,6 +109,8 @@ export function createDashboardView({
     if (pbi.pull_request_url) card.append(renderEvidenceLink("Pull request", pbi.pull_request_url));
     card.append(renderProgress(pbi.stage_progress || []));
     const details = element("div", undefined, "details");
+    if (pbi.task_contract) details.append(renderTaskContract(pbi.task_contract));
+    if (pbi.task_result) details.append(renderTaskResult(pbi.task_result));
     details.append(renderListSection("Subtasks", pbi.subtasks, (item) => `${item.id || "subtask"}: ${item.title || ""}`));
     if (pbi.planning_status) card.append(element("div", `Project status: ${pbi.planning_status}`, "muted"));
     details.append(renderListSection("Pull requests", pbi.pull_requests, (item) => pullRequestLabel(item)));
@@ -153,6 +155,39 @@ export function createDashboardView({
     link.rel = "noopener noreferrer";
     container.append(element("span", `${label}: `), link);
     return container;
+  }
+
+  function renderTaskContract(contract) {
+    const section = element("section");
+    section.append(element("h3", "Task contract"));
+    section.append(element("div", `${contract.contract_id || "unknown"} v${contract.version ?? "?"} · ${contract.step_id || "unknown"}`, "muted"));
+    if (contract.inputs && typeof contract.inputs === "object") section.append(element("div", `Inputs: ${JSON.stringify(contract.inputs)}`, "muted"));
+    if (Array.isArray(contract.capabilities)) section.append(element("div", `Capabilities: ${contract.capabilities.join(", ") || "none"}`, "muted"));
+    if (Array.isArray(contract.allowed_outcomes)) section.append(element("div", `Allowed outcomes: ${contract.allowed_outcomes.join(", ") || "none"}`, "muted"));
+    if (Array.isArray(contract.required_evidence)) section.append(element("div", `Required evidence: ${contract.required_evidence.join(", ") || "none"}`, "muted"));
+    if (Array.isArray(contract.required_artifacts)) {
+      const artifacts = element("ul");
+      contract.required_artifacts.forEach((artifact) => {
+        const id = artifact?.id || "unknown";
+        const description = artifact?.description ? `: ${artifact.description}` : "";
+        const required = artifact?.required === false ? " (optional)" : " (required)";
+        artifacts.append(element("li", `${id}${description}${required}`, "muted"));
+      });
+      section.append(element("div", "Required artifacts:"), artifacts);
+    }
+    return section;
+  }
+
+  function renderTaskResult(result) {
+    const section = element("section");
+    section.append(element("h3", `Task outcome: ${result.outcome || "unknown"}`));
+    if (result.question) section.append(element("div", `Question: ${result.question}`, "status pending"));
+    if (result.required_action) section.append(element("div", `Required action: ${result.required_action}`, "status pending"));
+    if (result.answer) section.append(element("div", `Answer: ${result.answer}`, "muted"));
+    if (result.validation_reason) section.append(element("div", `Validation: ${result.validation_reason}`, "status failure"));
+    if (result.evidence && typeof result.evidence === "object") section.append(element("div", `Evidence: ${JSON.stringify(result.evidence)}`, "muted"));
+    if (Array.isArray(result.artifact_refs)) section.append(element("div", `Artifacts: ${JSON.stringify(result.artifact_refs)}`, "muted"));
+    return section;
   }
 
   function renderProgress(progress) {

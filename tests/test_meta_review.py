@@ -9,6 +9,7 @@ from conftest import FakeProvider
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from beehaiive.contracts import TaskContract, TaskOutcome, TaskResult
 from beehaiive.meta_review import (
     MAX_META_REVIEW_EVIDENCE_REFS,
     MetaReviewError,
@@ -71,7 +72,14 @@ def _complete(
     run = store.claim_next("project-1", "owner/api", f"worker-{pbi_number}")
     assert run is not None
     lease_token = run.lease_token or ""
-    store.advance(run.run_id, Stage.IMPLEMENT, lease_token)
+    implementation = store.advance(run.run_id, Stage.IMPLEMENT, lease_token)
+    contract = TaskContract.inventory("owner/api", pbi_number, f"PBI {pbi_number}")
+    store.ensure_task_contract(run.run_id, contract, implementation.lease_token or "")
+    store.record_task_result(
+        run.run_id,
+        TaskResult(TaskOutcome.PASS, {}),
+        implementation.lease_token or "",
+    )
     completed = store.complete_agent_run(run.run_id, result, lease_token)
     assert completed.status.value == "completed"
     return completed.run_id

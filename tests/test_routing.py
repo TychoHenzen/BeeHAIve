@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
+from beehaiive.contracts import TaskOutcome, TaskResult
 from beehaiive.models import (
     HandoffRequest,
     HandoffResult,
@@ -70,12 +71,14 @@ class FakeRoutingModel:
         input_tokens: int = 1,
         output_tokens: int = 1,
         recursive_spawn_depth: int = 0,
+        task_result: TaskResult | None = None,
     ) -> None:
         self.calls = 0
         self.outcomes = outcomes
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
         self.recursive_spawn_depth = recursive_spawn_depth
+        self.task_result = task_result
         self.models: list[str] = []
 
     def run(self) -> AttemptOutcome:
@@ -91,6 +94,7 @@ class FakeRoutingModel:
             output_tokens=self.output_tokens,
             failure_context="The fake model did not resolve the problem.",
             recursive_spawn_depth=self.recursive_spawn_depth,
+            task_result=self.task_result,
         )
 
 
@@ -692,7 +696,12 @@ def test_implement_advance_api_exposes_the_initial_routing_decision() -> None:
 def test_run_attempt_api_executes_the_selected_model() -> None:
     routing_store = RoutingStore()
     router = ModelRouter(routing_store, _config())
-    model = FakeRoutingModel((AttemptOutcome.SUCCESS,), input_tokens=7, output_tokens=3)
+    model = FakeRoutingModel(
+        (AttemptOutcome.SUCCESS,),
+        input_tokens=7,
+        output_tokens=3,
+        task_result=TaskResult(TaskOutcome.PASS, {}),
+    )
     orchestrator_store = OrchestratorStore()
     service = Orchestrator(orchestrator_store, RoutingProvider(), router, model)
     client = TestClient(
@@ -775,6 +784,137 @@ def test_run_attempt_surfaces_router_errors(
 
     routing_store.close()
     orchestrator_store.close()
+
+
+def test_run_attempt_does_not_handoff_when_task_result_persistence_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    routing_store = RoutingStore()
+    router = ModelRouter(routing_store, _config())
+
+    class QuestionModel:
+        def execute(
+            self, _spec: ModelSpec, _decision: RoutingDecision
+        ) -> ModelExecution:
+            return ModelExecution(
+                AttemptOutcome.SUCCESS,
+                task_result=TaskResult(
+                    TaskOutcome.QUESTION, {}, question="Which branch?"
+                ),
+            )
+
+    model = QuestionModel()
+    orchestrator_store = OrchestratorStore()
+    service = Orchestrator(orchestrator_store, RoutingProvider(), router, model)
+    service.synchronize("owner:7")
+    run = service.claim("owner:7", "owner/api", "worker-1")
+    assert run is not None
+    token = run.lease_token or ""
+    service.advance(run.run_id, Stage.IMPLEMENT, token)
+
+    def reject_result(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise StoreError("result storage unavailable")
+
+    monkeypatch.setattr(orchestrator_store, "record_task_result", reject_result)
+    with pytest.raises(StoreError, match="result storage unavailable"):
+        service.run_implementation_attempt(run.run_id, token)
+    assert router.snapshot(run.run_id).state.status is RoutingStatus.ACTIVE
+    assert router.snapshot(run.run_id).attempts == ()
+
+    routing_store.close()
+    orchestrator_store.close()
+
+
+def test_successful_model_call_without_task_result_cannot_complete() -> None:
+    routing_store = RoutingStore()
+    router = ModelRouter(routing_store, _config())
+    store = OrchestratorStore()
+    model = FakeRoutingModel((AttemptOutcome.SUCCESS,))
+    service = Orchestrator(store, RoutingProvider(), router, model)
+    service.synchronize("owner:7")
+    run = service.claim("owner:7", "owner/api", "worker-1")
+    assert run is not None
+    lease = run.lease_token or ""
+    service.advance(run.run_id, Stage.IMPLEMENT, lease)
+
+    routed = service.run_implementation_attempt(run.run_id, lease)
+
+    assert routed.task_result is not None
+    assert routed.task_result.outcome is TaskOutcome.FAIL
+    assert routed.attempt is not None
+    assert routed.attempt.outcome is AttemptOutcome.SUCCESS
+    assert routed.state.status is not RoutingStatus.RESOLVED
+    with pytest.raises(StoreError, match="Only a passing"):
+        store.complete_agent_run(run.run_id, routed.execution_result or "done", lease)
+    routing_store.close()
+    store.close()
+
+
+def test_orchestrator_rejects_an_invalid_executor_contract() -> None:
+    routing_store = RoutingStore()
+    store = OrchestratorStore()
+
+    class InvalidContractExecutor:
+        def build_task_contract(self, _run: object) -> object:
+            return object()
+
+    service = Orchestrator(
+        store,
+        RoutingProvider(),
+        ModelRouter(routing_store),
+        InvalidContractExecutor(),  # type: ignore[arg-type]
+    )
+    service.synchronize("owner:7")
+    run = service.claim("owner:7", "owner/api", "worker-1")
+    assert run is not None
+    service.advance(run.run_id, Stage.IMPLEMENT, run.lease_token or "")
+    with pytest.raises(StoreError, match="invalid task contract"):
+        service.run_implementation_attempt(run.run_id, run.lease_token or "")
+
+    routing_store.close()
+    store.close()
+
+
+def test_routing_translates_structured_task_outcomes() -> None:
+    cases = (
+        (TaskResult(TaskOutcome.PASS, {}), RoutingStatus.RESOLVED),
+        (
+            TaskResult(TaskOutcome.FAIL, {}, validation_reason="checks failed"),
+            RoutingStatus.ACTIVE,
+        ),
+        (
+            TaskResult(TaskOutcome.BLOCKED, {}, required_action="Grant access"),
+            RoutingStatus.HUMAN_HANDOFF,
+        ),
+        (
+            TaskResult(TaskOutcome.QUESTION, {}, question="Which branch?"),
+            RoutingStatus.HUMAN_HANDOFF,
+        ),
+    )
+    store = RoutingStore()
+    router = ModelRouter(store)
+
+    class StructuredModel:
+        def __init__(self, result: TaskResult) -> None:
+            self.result = result
+
+        def execute(
+            self, _spec: ModelSpec, _decision: RoutingDecision
+        ) -> ModelExecution:
+            return ModelExecution(AttemptOutcome.SUCCESS, task_result=self.result)
+
+    try:
+        for index, (task_result, status) in enumerate(cases):
+            problem_id = f"task-outcome-{index}"
+            router.begin(problem_id)
+            routed = router.execute(problem_id, StructuredModel(task_result))
+            assert routed.state.status is status
+            assert routed.task_result == task_result
+            assert routed.attempt is not None
+            assert routed.attempt.outcome is AttemptOutcome.SUCCESS
+    finally:
+        store.close()
 
 
 def test_run_attempt_rejects_a_lost_execution_claim(
@@ -1802,6 +1942,12 @@ def test_routing_rejects_invalid_transitions_and_persists_transaction_failures()
         router.handoff_limit_reason("missing")
     with pytest.raises(RoutingError, match="Unknown attempt outcome"):
         router.record("problem-1", "unknown")
+    with pytest.raises(RoutingError, match="Unknown routing transition outcome"):
+        router.record(
+            "problem-1",
+            AttemptOutcome.SUCCESS,
+            transition_outcome="unknown",
+        )
     with pytest.raises(RoutingError, match="Unknown routing problem"):
         router.record("missing", AttemptOutcome.SUCCESS)
     with pytest.raises(RoutingError, match="must not be negative"):

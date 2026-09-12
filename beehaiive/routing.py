@@ -12,6 +12,8 @@ from pathlib import Path
 from threading import Lock, RLock
 from typing import Protocol
 
+from .contracts import TaskOutcome, TaskResult
+
 
 class RoutingError(RuntimeError):
     """Raised when a routing transition cannot be applied."""
@@ -45,6 +47,7 @@ class ModelExecution:
     failure_context: str = ""
     recursive_spawn_depth: int = 0
     result: str = ""
+    task_result: TaskResult | None = None
 
     def __post_init__(self) -> None:
         if self.input_tokens < 0 or self.output_tokens < 0:
@@ -318,6 +321,7 @@ class RoutingResult:
     attempt: RoutingAttempt | None
     attempts: tuple[RoutingAttempt, ...]
     execution_result: str | None = None
+    task_result: TaskResult | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -325,6 +329,9 @@ class RoutingResult:
             "decision": self.decision.as_dict(),
             "attempt": None if self.attempt is None else self.attempt.as_dict(),
             "attempts": [attempt.as_dict() for attempt in self.attempts],
+            "task_result": (
+                None if self.task_result is None else self.task_result.as_dict()
+            ),
         }
 
 
@@ -768,6 +775,39 @@ class ModelRouter:
                 self.store.get_attempts(normalized_id),
             )
 
+    def reopen_human_handoff(self, problem_id: str, reason: str) -> RoutingResult:
+        """Make a human handoff retryable after an operator answers its question."""
+
+        normalized_id = _problem_id(problem_id)
+        context = _compact_context(reason)
+        if not context:
+            raise RoutingError("A routing recovery reason is required")
+        with self.coordinate(normalized_id):
+            current = self.snapshot(normalized_id)
+            if current.state.status is not RoutingStatus.HUMAN_HANDOFF:
+                return current
+            state = self.store.reopen_problem(
+                normalized_id,
+                current.state.round,
+                replace(
+                    current.state,
+                    status=RoutingStatus.ACTIVE,
+                    current_tier=self.config.writer.tier,
+                    triage_index=0,
+                    consecutive_failures=0,
+                    required_action=None,
+                    last_failure_context=context,
+                    next_reason="retry after operator answer",
+                    updated_at=_now(),
+                ),
+            )
+            return RoutingResult(
+                state,
+                self._decision(state),
+                None,
+                self.store.get_attempts(normalized_id),
+            )
+
     @contextmanager
     def coordinate(self, problem_id: str) -> Generator[None]:
         """Serialize external run transitions with model execution."""
@@ -781,6 +821,7 @@ class ModelRouter:
         problem_id: str,
         executor: ModelExecutor,
         before_record: Callable[[], None] | None = None,
+        persist_task_result: Callable[[ModelExecution], TaskResult] | None = None,
     ) -> RoutingResult:
         """Invoke the selected model and persist its measured routing result."""
 
@@ -815,6 +856,12 @@ class ModelRouter:
                 execution = _failed_model_execution(exc)
             if before_record is not None:
                 before_record()
+            if persist_task_result is not None:
+                execution = replace(
+                    execution, task_result=persist_task_result(execution)
+                )
+            routed_outcome, task_failure, task_handoff = _task_transition(execution)
+            failure_context = task_failure or execution.failure_context
             usage_violation = self._usage_violation(current, execution)
             if usage_violation is not None:
                 remaining_tokens = current.decision.remaining_tokens
@@ -826,6 +873,7 @@ class ModelRouter:
                     self.record(
                         normalized_id,
                         AttemptOutcome.FAILURE,
+                        transition_outcome=AttemptOutcome.FAILURE,
                         input_tokens=bounded_input,
                         output_tokens=bounded_output,
                         failure_context=usage_violation,
@@ -836,17 +884,21 @@ class ModelRouter:
                         force_human_reason=usage_violation,
                     ),
                     execution_result=execution.result or None,
+                    task_result=execution.task_result,
                 )
             return replace(
                 self.record(
                     normalized_id,
                     execution.outcome,
+                    transition_outcome=routed_outcome,
                     input_tokens=execution.input_tokens,
                     output_tokens=execution.output_tokens,
-                    failure_context=execution.failure_context,
+                    failure_context=failure_context,
                     recursive_spawn_depth=execution.recursive_spawn_depth,
+                    force_human_reason=task_handoff,
                 ),
                 execution_result=execution.result or None,
+                task_result=execution.task_result,
             )
 
     def record(
@@ -854,6 +906,7 @@ class ModelRouter:
         problem_id: str,
         outcome: AttemptOutcome | str,
         *,
+        transition_outcome: AttemptOutcome | str | None = None,
         input_tokens: int = 0,
         output_tokens: int = 0,
         failure_context: str = "",
@@ -866,6 +919,16 @@ class ModelRouter:
             resolved_outcome = AttemptOutcome(outcome)
         except ValueError as exc:
             raise RoutingError(f"Unknown attempt outcome: {outcome}") from exc
+        try:
+            resolved_transition = AttemptOutcome(
+                transition_outcome
+                if transition_outcome is not None
+                else resolved_outcome
+            )
+        except ValueError as exc:
+            raise RoutingError(
+                f"Unknown routing transition outcome: {transition_outcome}"
+            ) from exc
         if input_tokens < 0 or output_tokens < 0:
             raise RoutingError("Token usage must not be negative")
         if recursive_spawn_depth < 0:
@@ -877,7 +940,7 @@ class ModelRouter:
             raise RoutingError(f"Unknown routing problem: {normalized_id}")
         can_resolve_human_handoff = (
             state.status is RoutingStatus.HUMAN_HANDOFF
-            and resolved_outcome is AttemptOutcome.SUCCESS
+            and resolved_transition is AttemptOutcome.SUCCESS
         )
         if state.status is not RoutingStatus.ACTIVE and not can_resolve_human_handoff:
             raise RoutingError(
@@ -886,11 +949,11 @@ class ModelRouter:
 
         context = _compact_context(failure_context)
         if (
-            resolved_outcome in {AttemptOutcome.FAILURE, AttemptOutcome.RETRY}
+            resolved_transition in {AttemptOutcome.FAILURE, AttemptOutcome.RETRY}
             and not context
         ):
             raise RoutingError("Failure context is required for an unresolved attempt")
-        if resolved_outcome is AttemptOutcome.RETRY and state.current_tier in {
+        if resolved_transition is AttemptOutcome.RETRY and state.current_tier in {
             self.config.writer.tier,
             ModelTier.HUMAN,
         }:
@@ -903,12 +966,12 @@ class ModelRouter:
         total_depth = max(state.recursive_spawn_depth, recursive_spawn_depth)
         consecutive_failures = (
             state.consecutive_failures + 1
-            if resolved_outcome is AttemptOutcome.FAILURE
+            if resolved_transition is AttemptOutcome.FAILURE
             else state.consecutive_failures
         )
         attempt_bounces = (
             state.bounce_count + 1
-            if resolved_outcome is not AttemptOutcome.SUCCESS
+            if resolved_transition is not AttemptOutcome.SUCCESS
             else state.bounce_count
         )
         attempt = RoutingAttempt(
@@ -930,7 +993,7 @@ class ModelRouter:
         )
         next_state = self._next_state(
             state,
-            resolved_outcome,
+            resolved_transition,
             context,
             attempt_round,
             total_tokens,
@@ -1191,6 +1254,27 @@ def _failed_model_execution(error: Exception) -> ModelExecution:
         failure_context=failure_context,
         recursive_spawn_depth=usage_value("recursive_spawn_depth"),
     )
+
+
+def _task_transition(
+    execution: ModelExecution,
+) -> tuple[AttemptOutcome | str, str, str | None]:
+    result = execution.task_result
+    if result is None:
+        return execution.outcome, "", None
+    if result.outcome is TaskOutcome.PASS:
+        return AttemptOutcome.SUCCESS, "", None
+    if result.outcome is TaskOutcome.FAIL:
+        return (
+            AttemptOutcome.FAILURE,
+            result.validation_reason or "Task reported failure",
+            None,
+        )
+    if result.outcome is TaskOutcome.BLOCKED:
+        reason = result.required_action or "Task is blocked"
+        return AttemptOutcome.FAILURE, reason, reason
+    reason = result.question or "Task requires an operator answer"
+    return AttemptOutcome.FAILURE, reason, reason
 
 
 def _problem_id(value: str) -> str:

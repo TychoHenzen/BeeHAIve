@@ -16,6 +16,7 @@ from tempfile import TemporaryDirectory
 from threading import Lock, Thread, current_thread
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from .contracts import ContractError, TaskContract, TaskOutcome, TaskResult
 from .models import RunState, RunStatus, Stage
 from .routing import (
     AttemptOutcome,
@@ -159,6 +160,7 @@ class CodexExecModelExecutor:
         self._processes: dict[str, subprocess.Popen[Any]] = {}
         self._active_attempts: set[str] = set()
         self._cancelled: set[str] = set()
+        self._task_contracts: dict[str, TaskContract] = {}
         self._secret_values = tuple(
             value
             for name, value in os.environ.items()
@@ -193,7 +195,9 @@ class CodexExecModelExecutor:
         """Run the fixed safe task and return only its final agent message."""
 
         problem_id = decision.problem_id
-        prompt = self._prompt(spec, decision)
+        with self._lock:
+            contract = self._task_contracts.get(problem_id)
+        prompt = self._prompt(spec, decision, contract)
         with self._lock:
             self._active_attempts.add(problem_id)
             if problem_id in self._cancelled:
@@ -253,6 +257,9 @@ class CodexExecModelExecutor:
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
                         failure_context=f"Bounded agent failed: {detail}",
+                        task_result=(
+                            TaskResult.invalid(detail) if contract is not None else None
+                        ),
                     )
                 if not result:
                     return ModelExecution(
@@ -260,12 +267,33 @@ class CodexExecModelExecutor:
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
                         failure_context="Bounded agent returned no result",
+                        task_result=(
+                            TaskResult.invalid("Bounded agent returned no result")
+                            if contract is not None
+                            else None
+                        ),
                     )
+                task_result = None
+                if contract is not None:
+                    try:
+                        task_result = TaskResult.from_payload(
+                            json.loads(result), contract
+                        )
+                    except (ContractError, json.JSONDecodeError) as exc:
+                        reason = f"Invalid structured task result: {exc}"
+                        return ModelExecution(
+                            AttemptOutcome.SUCCESS,
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            failure_context=reason,
+                            task_result=TaskResult.invalid(reason),
+                        )
                 return ModelExecution(
                     AttemptOutcome.SUCCESS,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     result=result,
+                    task_result=task_result,
                 )
         finally:
             with self._lock:
@@ -380,10 +408,26 @@ class CodexExecModelExecutor:
         with self._lock:
             self._active_attempts.add(problem_id)
 
+    def build_task_contract(self, run: RunState) -> TaskContract:
+        return TaskContract.inventory(
+            run.repository,
+            run.pbi_number,
+            run.title,
+            branch=self._discover_repository_branch(),
+            tracked_file_count=len(self._repository_files()),
+            answer=run.task_answer,
+        )
+
+    def set_task_contract(self, problem_id: str, contract: TaskContract) -> None:
+        contract.validate()
+        with self._lock:
+            self._task_contracts[problem_id] = contract
+
     def release_run(self, problem_id: str) -> None:
         with self._lock:
             self._active_attempts.discard(problem_id)
             self._cancelled.discard(problem_id)
+            self._task_contracts.pop(problem_id, None)
 
     def validate_repository(self, repository: str) -> None:
         if self.repository_name is None:
@@ -397,10 +441,15 @@ class CodexExecModelExecutor:
                 f"claimed repository {repository!r}"
             )
 
-    def _prompt(self, spec: ModelSpec, decision: RoutingDecision) -> str:
+    def _prompt(
+        self,
+        spec: ModelSpec,
+        decision: RoutingDecision,
+        contract: TaskContract | None = None,
+    ) -> str:
         branch = self._discover_repository_branch()
         tracked_file_count = len(self._repository_files())
-        return (
+        prompt = (
             "BeeHAIve dashboard demo.\n"
             f"Task name: {DEMO_TASK_NAME}\n"
             f"Task: {self.task}\n"
@@ -411,6 +460,17 @@ class CodexExecModelExecutor:
             "The task is read-only. Do not report success unless the inspection "
             "completed."
         )
+        if contract is not None:
+            prompt += (
+                "\nThe following versioned task contract is authoritative. Return "
+                "exactly one JSON object with outcome, evidence, artifact_refs, "
+                "question, required_action, and validation_reason. Always include "
+                "evidence as an object and artifact_refs as an array, even when "
+                "empty. Use null for unused optional fields. Do not include answer. "
+                "Add no markdown fences or extra text.\n"
+                f"{json.dumps(contract.as_dict(), sort_keys=True)}"
+            )
+        return prompt
 
     def _command(
         self,
@@ -798,10 +858,19 @@ class AgentWorkerManager:
             routing = self.orchestrator.run_implementation_attempt(run_id, lease_token)
             attempt = routing.attempt
             if routing.state.status is RoutingStatus.HUMAN_HANDOFF:
-                failure = routing.state.required_action or "Human action required"
+                task_result = getattr(routing, "task_result", None)
+                failure = (
+                    task_result.question
+                    if isinstance(task_result, TaskResult)
+                    and task_result.outcome is TaskOutcome.QUESTION
+                    else task_result.required_action
+                    if isinstance(task_result, TaskResult)
+                    and task_result.outcome is TaskOutcome.BLOCKED
+                    else routing.state.required_action or "Human action required"
+                )
                 self.orchestrator.store.fail_agent_run(
                     run_id,
-                    redact_worker_text(failure),
+                    redact_worker_text(failure or "Human action required"),
                     lease_token,
                     claimable=False,
                 )

@@ -96,6 +96,23 @@ test("rendering live state exposes current stages and active actions", () => {
               { label: "Backlog", status: "complete" },
               { label: "Pull request", status: "current" },
             ],
+            task_contract: {
+              contract_id: "test.contract",
+              version: 1,
+              step_id: "inspect",
+              inputs: { repository: "owner/api", pbi_number: 1 },
+              capabilities: ["read_repository"],
+              allowed_outcomes: ["pass", "fail", "blocked", "question"],
+              required_evidence: ["summary"],
+              required_artifacts: [
+                { id: "report", description: "Inventory report", required: true },
+              ],
+            },
+            task_result: {
+              outcome: "pass",
+              evidence: { summary: "done" },
+              artifact_refs: [{ id: "report", path: "report.txt" }],
+            },
             subtasks: [{ id: "#2", title: "Test API" }],
             escalation: { current: 0, current_tier: "terra", consecutive: 0 },
             escalation_log: [{ tier: "terra", resolved: false }],
@@ -136,6 +153,12 @@ test("rendering live state exposes current stages and active actions", () => {
   assert.match(dashboardOutput.textContent, /Pull request/);
   assert.match(dashboardOutput.textContent, /Tier terra/);
   assert.match(dashboardOutput.textContent, /Result: inventory complete/);
+  assert.match(dashboardOutput.textContent, /Task outcome: pass/);
+  assert.match(dashboardOutput.textContent, /Inputs:.*owner\/api/);
+  assert.match(dashboardOutput.textContent, /Allowed outcomes:.*question/);
+  assert.match(dashboardOutput.textContent, /Required evidence:.*summary/);
+  assert.match(dashboardOutput.textContent, /Inventory report/);
+  assert.match(dashboardOutput.textContent, /Artifacts:/);
   assert.equal(actionLog.hidden, false);
 
   const startButton = findNode(

@@ -5,34 +5,37 @@ import pytest
 from conftest import FakeProvider
 from fastapi.testclient import TestClient
 
+import main as main_module
 from beehaiive.agent import AgentWorkerManager, CodexExecModelExecutor
+from beehaiive.contracts import TaskContract, TaskOutcome, TaskResult
 from beehaiive.dashboard import build_dashboard_state
 from beehaiive.models import (
     PbiSnapshot,
     ProjectSnapshot,
     RepositorySnapshot,
+    RunState,
     Stage,
 )
 from beehaiive.orchestrator import Orchestrator
 from beehaiive.provider import ProviderError
 from beehaiive.routing import AttemptOutcome, ModelExecution, ModelRouter, RoutingStore
 from beehaiive.storage import OrchestratorStore, StoreError, _json_mapping
-from main import (
-    DashboardStartRequest,
-    DashboardStopRequest,
-    _dashboard_pbi,
-    _execute_dashboard_action,
-    create_app,
-)
 
 
 class ImmediateDemoExecutor(CodexExecModelExecutor):
     def __init__(self) -> None:
         super().__init__(Path.cwd(), repository_name="owner/api")
 
+    def build_task_contract(self, run: RunState) -> TaskContract:
+        return TaskContract.inventory(run.repository, run.pbi_number, run.title)
+
     def execute(self, spec, decision) -> ModelExecution:
         del spec, decision
-        return ModelExecution(AttemptOutcome.SUCCESS, result="demo result")
+        return ModelExecution(
+            AttemptOutcome.SUCCESS,
+            result="demo result",
+            task_result=TaskResult(TaskOutcome.PASS, {}),
+        )
 
 
 def dashboard_snapshot(
@@ -106,6 +109,16 @@ def test_dashboard_projection_exposes_optional_run_details() -> None:
                             "stage": "pull_request",
                             "status": "active",
                             "run_id": "run-1",
+                            "task_contract": {
+                                "contract_id": "test.contract",
+                                "version": 1,
+                                "step_id": "inspect",
+                            },
+                            "task_result": {
+                                "outcome": "pass",
+                                "evidence": {"summary": "done"},
+                                "artifact_refs": [{"id": "report"}],
+                            },
                             "events": [
                                 {
                                     "type": "review",
@@ -159,6 +172,8 @@ def test_dashboard_projection_exposes_optional_run_details() -> None:
         "current_tier": "terra",
     }
     assert pbi["escalation_log"] == [{"tier": "terra"}]
+    assert pbi["task_contract"]["contract_id"] == "test.contract"
+    assert pbi["task_result"]["artifact_refs"] == [{"id": "report"}]
 
     completed = build_dashboard_state(
         {
@@ -370,7 +385,7 @@ def test_dashboard_api_exposes_terminal_project_and_pull_request_state() -> None
     )
     service = Orchestrator(OrchestratorStore(), FakeProvider(snapshot))
     client = TestClient(
-        create_app(orchestrator=service, allowed_project_ids={"project-1"})
+        main_module.create_app(orchestrator=service, allowed_project_ids={"project-1"})
     )
 
     response = client.get("/projects/project-1/dashboard")
@@ -388,7 +403,7 @@ def test_dashboard_api_exposes_terminal_project_and_pull_request_state() -> None
 def test_live_dashboard_route_reports_repositories_and_writers() -> None:
     service = Orchestrator(OrchestratorStore(), FakeProvider(dashboard_snapshot()))
     client = TestClient(
-        create_app(orchestrator=service, allowed_project_ids={"project-1"})
+        main_module.create_app(orchestrator=service, allowed_project_ids={"project-1"})
     )
 
     service.synchronize("project-1")
@@ -430,7 +445,7 @@ def test_dashboard_refresh_synchronizes_current_state() -> None:
     provider = FakeProvider(dashboard_snapshot())
     service = Orchestrator(OrchestratorStore(), provider)
     client = TestClient(
-        create_app(
+        main_module.create_app(
             orchestrator=service,
             api_key="test-key",
             allowed_project_ids={"project-1"},
@@ -453,7 +468,7 @@ def test_dashboard_refresh_synchronizes_current_state() -> None:
 def test_dashboard_reads_require_project_allowlist_without_api_key() -> None:
     service = Orchestrator(OrchestratorStore(), FakeProvider(dashboard_snapshot()))
     client = TestClient(
-        create_app(orchestrator=service, allowed_project_ids={"project-1"})
+        main_module.create_app(orchestrator=service, allowed_project_ids={"project-1"})
     )
 
     assert client.get("/projects/secret/dashboard").status_code == 403
@@ -471,7 +486,7 @@ def test_dashboard_actions_preserve_state_and_report_results() -> None:
             del run_id
 
     client = TestClient(
-        create_app(
+        main_module.create_app(
             orchestrator=service,
             api_key="test-key",
             allowed_project_ids={"project-1"},
@@ -670,10 +685,12 @@ def test_dashboard_actions_preserve_state_and_report_results() -> None:
     assert synced.json()["action"]["status"] == "succeeded"
 
     with pytest.raises(StoreError, match="Unknown run"):
-        _execute_dashboard_action(
+        main_module._execute_dashboard_action(
             service,
             "project-1",
-            DashboardStopRequest(action="stop", approved=True, run_id="missing"),
+            main_module.DashboardStopRequest(
+                action="stop", approved=True, run_id="missing"
+            ),
         )
 
 
@@ -682,7 +699,7 @@ def test_dashboard_action_failure_can_return_no_existing_state() -> None:
         OrchestratorStore(), FailingDashboardProvider(dashboard_snapshot())
     )
     client = TestClient(
-        create_app(
+        main_module.create_app(
             orchestrator=service,
             api_key="test-key",
             allowed_project_ids={"project-1"},
@@ -698,7 +715,7 @@ def test_dashboard_action_failure_can_return_no_existing_state() -> None:
     assert response.status_code == 200
     assert response.json()["action"]["status"] == "failed"
     assert response.json()["state"] is None
-    assert _dashboard_pbi(service, "project-1", "owner/api", 1) is None
+    assert main_module._dashboard_pbi(service, "project-1", "owner/api", 1) is None
 
     invalid_target = client.post(
         "/projects/project-1/actions",
@@ -771,7 +788,7 @@ def test_action_store_records_lifecycle_and_validates_limits(
 
 def test_dashboard_runtime_assets_are_served_without_sample_data() -> None:
     service = Orchestrator(OrchestratorStore(), FakeProvider(dashboard_snapshot()))
-    client = TestClient(create_app(orchestrator=service))
+    client = TestClient(main_module.create_app(orchestrator=service))
 
     page = client.get("/dashboard")
     script = client.get("/dashboard.js")
@@ -797,7 +814,7 @@ def test_dashboard_worker_completes_bounded_demo_and_persists_result() -> None:
     worker = AgentWorkerManager(service, executor)
 
     with TestClient(
-        create_app(
+        main_module.create_app(
             orchestrator=service,
             api_key="test-key",
             allowed_project_ids={"project-1"},
@@ -847,10 +864,10 @@ def test_dashboard_stop_cancels_worker_before_stopping_run() -> None:
 
     worker = RecordingWorker()
     try:
-        result = _execute_dashboard_action(
+        result = main_module._execute_dashboard_action(
             service,
             "project-1",
-            DashboardStopRequest(
+            main_module.DashboardStopRequest(
                 action="stop",
                 run_id=run.run_id,
                 approved=True,
@@ -868,10 +885,10 @@ def test_dashboard_start_requires_a_worker_before_claiming() -> None:
     service.synchronize("project-1")
     try:
         with pytest.raises(StoreError, match="worker is not configured"):
-            _execute_dashboard_action(
+            main_module._execute_dashboard_action(
                 service,
                 "project-1",
-                DashboardStartRequest(
+                main_module.DashboardStartRequest(
                     action="start", approved=True, repository="owner/api"
                 ),
             )
@@ -891,10 +908,10 @@ def test_dashboard_start_failure_stops_claimed_run() -> None:
 
     try:
         with pytest.raises(StoreError, match="thread start failed"):
-            _execute_dashboard_action(
+            main_module._execute_dashboard_action(
                 service,
                 "project-1",
-                DashboardStartRequest(
+                main_module.DashboardStartRequest(
                     action="start", approved=True, repository="owner/api"
                 ),
                 FailingWorker(),
@@ -927,10 +944,10 @@ def test_dashboard_start_cleanup_failure_is_reported() -> None:
     service.stop = fail_stop  # type: ignore[method-assign]
     try:
         with pytest.raises(StoreError, match="cleanup failed: cleanup unavailable"):
-            _execute_dashboard_action(
+            main_module._execute_dashboard_action(
                 service,
                 "project-1",
-                DashboardStartRequest(
+                main_module.DashboardStartRequest(
                     action="start", approved=True, repository="owner/api"
                 ),
                 FailingWorker(),

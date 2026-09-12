@@ -1,6 +1,13 @@
 """Durable orchestration primitives for BeeHAIve."""
 
 from .conflict_repair import ConflictRepairAgent, ConflictRepairService
+from .contracts import (
+    ArtifactRequirement,
+    ContractError,
+    TaskContract,
+    TaskOutcome,
+    TaskResult,
+)
 from .models import (
     HandoffRequest,
     HandoffResult,
@@ -69,6 +76,8 @@ __all__ = [
     "AllowListReviewAuthorizer",
     "ConflictRepairAgent",
     "ConflictRepairService",
+    "ArtifactRequirement",
+    "ContractError",
     "CheckResult",
     "CommandCheck",
     "Constitution",
@@ -120,6 +129,9 @@ __all__ = [
     "RoutingLimits",
     "RoutingStore",
     "Stage",
+    "TaskContract",
+    "TaskOutcome",
+    "TaskResult",
     "WorkspaceLease",
     "WorkflowError",
     "WorkflowRole",

@@ -140,6 +140,6 @@ uv run pyright
 uv run pytest --cov=beehaiive --cov=main --cov-report=term-missing --cov-fail-under=100
 ```
 
-The dashboard details and security boundary are documented in
-[`docs/dashboard.md`](docs/dashboard.md), [`docs/meta-review.md`](docs/meta-review.md),
-and [`docs/security.md`](docs/security.md).
+The dashboard details, task contracts, and security boundary are documented in
+[`docs/dashboard.md`](docs/dashboard.md), [`docs/task-contracts.md`](docs/task-contracts.md),
+[`docs/meta-review.md`](docs/meta-review.md), and [`docs/security.md`](docs/security.md).

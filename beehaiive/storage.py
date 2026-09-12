@@ -12,6 +12,7 @@ from threading import RLock
 from typing import cast
 from uuid import uuid4
 
+from .contracts import ContractError, TaskContract, TaskOutcome, TaskResult
 from .models import (
     ARCHIVE_PROJECT_STATUS,
     PROJECT_TERMINAL_STATUSES,
@@ -27,6 +28,58 @@ from .models import (
 
 class StoreError(RuntimeError):
     """Raised when persisted orchestration state cannot satisfy an operation."""
+
+
+def _task_claimability_state(
+    contract_json: object,
+    result_json: object,
+    answer: object,
+    answer_resumed: object,
+) -> tuple[bool, bool]:
+    if contract_json is None:
+        return result_json is not None, False
+    if not isinstance(contract_json, str) or not contract_json:
+        return True, False
+    if not isinstance(result_json, str) or not result_json:
+        return True, False
+    try:
+        contract = TaskContract.from_dict(json.loads(contract_json))
+        result = TaskResult.from_payload(
+            json.loads(result_json), contract, allow_answer=True
+        )
+    except (ValueError, TypeError, RecursionError):
+        return True, False
+    answered_question = (
+        result.outcome is TaskOutcome.QUESTION
+        and result.answer is not None
+        and result.answer == answer
+        and bool(answer_resumed)
+    )
+    paused = result.outcome is TaskOutcome.BLOCKED or (
+        result.outcome is TaskOutcome.QUESTION and not answered_question
+    )
+    return paused, answered_question
+
+
+def _task_claimability_for_run(
+    connection: sqlite3.Connection, run_id: str
+) -> tuple[bool, bool]:
+    row = connection.execute(
+        """
+        SELECT task_contract_json, task_result_json, task_answer,
+               task_answer_resumed
+        FROM runs WHERE run_id = ?
+        """,
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        return True, False
+    return _task_claimability_state(
+        row["task_contract_json"],
+        row["task_result_json"],
+        row["task_answer"],
+        row["task_answer_resumed"],
+    )
 
 
 _STAGE_ORDER = {
@@ -70,6 +123,16 @@ def _json_mapping(value: object) -> dict[str, object]:
     except json.JSONDecodeError:
         return {}
     return cast(dict[str, object], decoded) if isinstance(decoded, dict) else {}
+
+
+def _json_mapping_or_none(value: object) -> dict[str, object] | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    return cast(dict[str, object], decoded) if isinstance(decoded, dict) else None
 
 
 def _archive_eligible(pbi: PbiSnapshot, run_status: str | None = None) -> bool:
@@ -191,6 +254,10 @@ class OrchestratorStore:
                     execution_token TEXT,
                     last_error TEXT,
                     last_result TEXT,
+                    task_contract_json TEXT,
+                    task_result_json TEXT,
+                    task_answer TEXT,
+                    task_answer_resumed INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL,
                     UNIQUE (project_id, repository_name, pbi_number),
                     FOREIGN KEY (project_id, repository_name, pbi_number)
@@ -343,11 +410,19 @@ class OrchestratorStore:
                 "lease_expires_at",
                 "execution_token",
                 "last_result",
+                "task_contract_json",
+                "task_result_json",
+                "task_answer",
             ):
                 if column not in run_columns:
                     self._connection.execute(
                         f"ALTER TABLE runs ADD COLUMN {column} TEXT"
                     )
+            if "task_answer_resumed" not in run_columns:
+                self._connection.execute(
+                    "ALTER TABLE runs ADD COLUMN task_answer_resumed "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
             for column in (
                 "handoff_base_branch",
                 "handoff_body",
@@ -456,7 +531,10 @@ class OrchestratorStore:
                     )
                     existing = connection.execute(
                         """
-                        SELECT p.stage, p.run_id, r.status AS run_status
+                        SELECT p.stage, p.run_id, p.claimable,
+                               r.status AS run_status, r.task_contract_json,
+                               r.task_result_json, r.task_answer,
+                               r.task_answer_resumed
                         FROM pbis AS p
                         LEFT JOIN runs AS r
                           ON r.project_id = p.project_id
@@ -492,6 +570,12 @@ class OrchestratorStore:
                         continue
 
                     current_stage = Stage(str(existing["stage"]))
+                    task_pause, _ = _task_claimability_state(
+                        existing["task_contract_json"],
+                        existing["task_result_json"],
+                        existing["task_answer"],
+                        existing["task_answer_resumed"],
+                    )
                     merged_stage = (
                         max(
                             (current_stage, incoming_stage),
@@ -529,6 +613,7 @@ class OrchestratorStore:
                                 incoming_stage is not None
                                 and merged_stage is not Stage.PULL_REQUEST
                                 and existing["run_status"] != RunStatus.COMPLETED.value
+                                and not task_pause
                             ),
                             current_stage.value,
                             merged_stage.value,
@@ -626,7 +711,8 @@ class OrchestratorStore:
                 """
                 SELECT p.*, r.run_id, r.status, r.attempt,
                        r.owner_id, r.lease_token, r.lease_expires_at,
-                       r.last_error AS run_error, r.last_result AS run_result
+                       r.last_error AS run_error, r.last_result AS run_result,
+                       r.task_contract_json, r.task_result_json, r.task_answer
                 FROM pbis AS p
                 JOIN repositories AS repository
                   ON repository.project_id = p.project_id
@@ -1133,6 +1219,226 @@ class OrchestratorStore:
                 (_now(), run_id, execution_token),
             )
 
+    def ensure_task_contract(
+        self, run_id: str, contract: TaskContract, lease_token: str
+    ) -> RunState:
+        try:
+            contract_data = contract.as_dict()
+        except ContractError as exc:
+            raise StoreError(str(exc)) from exc
+        with self._transaction() as connection:
+            row = self._run_for_id(connection, run_id)
+            if row is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            self._require_lease(row, lease_token)
+            if row.status is not RunStatus.ACTIVE or row.stage is not Stage.IMPLEMENT:
+                raise StoreError(
+                    "Only an active implementation run can set a task contract"
+                )
+            if row.task_contract == contract_data:
+                return row
+            connection.execute(
+                """
+                UPDATE runs
+                SET task_contract_json = ?, task_result_json = NULL,
+                    task_answer_resumed = 0, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (json.dumps(contract_data, sort_keys=True), _now(), run_id),
+            )
+            self._record_event(
+                connection,
+                row.project_id,
+                row.repository,
+                row.pbi_number,
+                run_id,
+                "task_contract",
+                row.stage,
+                row.stage,
+                {"contract": contract_data},
+            )
+            return self._run_for_id(connection, run_id) or row
+
+    def record_task_result(
+        self, run_id: str, result: TaskResult, lease_token: str
+    ) -> RunState:
+        with self._transaction() as connection:
+            row = self._run_for_id(connection, run_id)
+            if row is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            self._require_lease(row, lease_token)
+            if row.status is not RunStatus.ACTIVE or row.stage is not Stage.IMPLEMENT:
+                raise StoreError(
+                    "Only an active implementation run can record a task result"
+                )
+            if row.task_contract is None:
+                raise StoreError("A task contract is required before its result")
+            try:
+                contract = TaskContract.from_dict(row.task_contract)
+                validated = result.validated(contract)
+                if validated.answer is not None:
+                    raise ContractError("Worker task results cannot contain an answer")
+                result_data = validated.as_dict()
+            except ContractError as exc:
+                raise StoreError(str(exc)) from exc
+            connection.execute(
+                """
+                UPDATE runs SET task_result_json = ?, task_answer_resumed = 0,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (json.dumps(result_data, sort_keys=True), _now(), run_id),
+            )
+            self._record_event(
+                connection,
+                row.project_id,
+                row.repository,
+                row.pbi_number,
+                run_id,
+                "task_result",
+                row.stage,
+                row.stage,
+                {"result": result_data},
+            )
+            return self._run_for_id(connection, run_id) or row
+
+    def answer_task_question(self, run_id: str, answer: str) -> RunState:
+        if not answer.strip():
+            raise StoreError("An answer is required")
+        with self._transaction() as connection:
+            row = self._run_for_id(connection, run_id)
+            if row is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            if row.task_contract is None or row.task_result is None:
+                raise StoreError("Run has no pending task question")
+            try:
+                contract = TaskContract.from_dict(row.task_contract)
+                current = TaskResult.from_payload(
+                    row.task_result, contract, allow_answer=True
+                )
+            except ContractError as exc:
+                raise StoreError(str(exc)) from exc
+            if current.outcome is not TaskOutcome.QUESTION:
+                raise StoreError("Run has no pending task question")
+            answered = TaskResult(
+                current.outcome,
+                current.evidence,
+                current.artifact_refs,
+                current.question,
+                current.required_action,
+                current.validation_reason,
+                answer,
+            ).validated(contract)
+            if current.answer is not None:
+                if current.answer == answered.answer:
+                    connection.execute(
+                        """
+                        UPDATE runs SET task_answer_resumed = 0, updated_at = ?
+                        WHERE run_id = ?
+                        """,
+                        (_now(), run_id),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE pbis SET claimable = 0
+                        WHERE project_id = ? AND repository_name = ? AND number = ?
+                        """,
+                        (row.project_id, row.repository, row.pbi_number),
+                    )
+                    return self._run_for_id(connection, run_id) or row
+                raise StoreError("A different answer is already recorded")
+            result_data = answered.as_dict()
+            connection.execute(
+                """
+                UPDATE runs
+                SET task_result_json = ?, task_answer = ?, last_error = NULL,
+                    task_answer_resumed = 0, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    json.dumps(result_data, sort_keys=True),
+                    cast(str, answered.answer),
+                    _now(),
+                    run_id,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE pbis SET claimable = 0, last_error = NULL
+                WHERE project_id = ? AND repository_name = ? AND number = ?
+                """,
+                (row.project_id, row.repository, row.pbi_number),
+            )
+            self._record_event(
+                connection,
+                row.project_id,
+                row.repository,
+                row.pbi_number,
+                run_id,
+                "question_answered",
+                row.stage,
+                row.stage,
+                {"answer": cast(str, answered.answer)},
+            )
+            return self._run_for_id(connection, run_id) or row
+
+    def mark_task_question_resumed(self, run_id: str) -> RunState:
+        with self._transaction() as connection:
+            row = self._run_for_id(connection, run_id)
+            if row is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            if row.task_contract is None or row.task_result is None:
+                raise StoreError("Run has no answered task question")
+            try:
+                contract = TaskContract.from_dict(row.task_contract)
+                result = TaskResult.from_payload(
+                    row.task_result, contract, allow_answer=True
+                )
+            except ContractError as exc:
+                raise StoreError(str(exc)) from exc
+            if (
+                result.outcome is not TaskOutcome.QUESTION
+                or result.answer is None
+                or result.answer != row.task_answer
+            ):
+                raise StoreError("Run has no answered task question")
+            previous = connection.execute(
+                "SELECT task_answer_resumed FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            connection.execute(
+                """
+                UPDATE runs SET task_answer_resumed = 1, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (_now(), run_id),
+            )
+            connection.execute(
+                """
+                UPDATE pbis SET claimable = ?, last_error = NULL
+                WHERE project_id = ? AND repository_name = ? AND number = ?
+                """,
+                (
+                    int(row.stage is not Stage.PULL_REQUEST),
+                    row.project_id,
+                    row.repository,
+                    row.pbi_number,
+                ),
+            )
+            if previous is not None and not bool(previous["task_answer_resumed"]):
+                self._record_event(
+                    connection,
+                    row.project_id,
+                    row.repository,
+                    row.pbi_number,
+                    run_id,
+                    "question_resumed",
+                    row.stage,
+                    row.stage,
+                    {},
+                )
+            return self._run_for_id(connection, run_id) or row
+
     @property
     def lease_heartbeat_seconds(self) -> float:
         return max(0.05, self._lease_seconds / 3)
@@ -1232,6 +1538,19 @@ class OrchestratorStore:
             self._require_lease(row, lease_token)
             if row.status is not RunStatus.ACTIVE or row.stage is not Stage.IMPLEMENT:
                 raise StoreError("Only an active implementation run can complete")
+            task_result_data = row.task_result
+            if row.task_contract is None:
+                raise StoreError("A task contract is required before completion")
+            if task_result_data is None:
+                raise StoreError("A task result is required before completion")
+            try:
+                task_result = TaskResult.from_payload(
+                    task_result_data, TaskContract.from_dict(row.task_contract)
+                )
+            except ContractError as exc:
+                raise StoreError(str(exc)) from exc
+            if task_result.outcome is not TaskOutcome.PASS:
+                raise StoreError("Only a passing task result can complete")
             now = _now()
             connection.execute(
                 """
@@ -1259,7 +1578,10 @@ class OrchestratorStore:
                 "completed",
                 row.stage,
                 row.stage,
-                {"result": normalized_result},
+                {
+                    "result": normalized_result,
+                    "task_result": task_result_data,
+                },
             )
             return self._run_for_id(connection, run_id) or row
 
@@ -1286,6 +1608,15 @@ class OrchestratorStore:
             if row.status is RunStatus.FAILED:
                 return row
             self._require_lease(row, lease_token)
+            task_paused, answered_question = _task_claimability_for_run(
+                connection, run_id
+            )
+            requested_claimable = (
+                row.stage is not Stage.PULL_REQUEST if claimable is None else claimable
+            )
+            effective_claimable = (
+                requested_claimable or answered_question
+            ) and not task_paused
             now = _now()
             connection.execute(
                 """
@@ -1303,17 +1634,16 @@ class OrchestratorStore:
                 WHERE project_id = ? AND repository_name = ? AND number = ?
                 """,
                 (
-                    int(
-                        row.stage is not Stage.PULL_REQUEST
-                        if claimable is None
-                        else claimable
-                    ),
-                    normalized_error,
+                    int(effective_claimable),
+                    None if answered_question else normalized_error,
                     row.project_id,
                     row.repository,
                     row.pbi_number,
                 ),
             )
+            details: dict[str, object] = {"error": normalized_error}
+            if answered_question:
+                details["superseded_by_answer"] = True
             self._record_event(
                 connection,
                 row.project_id,
@@ -1323,7 +1653,7 @@ class OrchestratorStore:
                 "failure",
                 row.stage,
                 row.stage,
-                {"error": normalized_error},
+                details,
             )
             return self._run_for_id(connection, run_id) or row
 
@@ -1340,6 +1670,12 @@ class OrchestratorStore:
                 raise StoreError(f"Unknown run: {run_id}")
             if row.status in {RunStatus.COMPLETED, RunStatus.FAILED}:
                 return row
+            task_paused, answered_question = _task_claimability_for_run(
+                connection, run_id
+            )
+            effective_claimable = (
+                row.stage is not Stage.PULL_REQUEST and not task_paused
+            )
             now = _now()
             connection.execute(
                 """
@@ -1357,13 +1693,19 @@ class OrchestratorStore:
                 WHERE project_id = ? AND repository_name = ? AND number = ?
                 """,
                 (
-                    int(row.stage is not Stage.PULL_REQUEST),
-                    normalized_error,
+                    int(effective_claimable),
+                    None if answered_question else normalized_error,
                     row.project_id,
                     row.repository,
                     row.pbi_number,
                 ),
             )
+            details: dict[str, object] = {
+                "error": normalized_error,
+                "lease_lost": True,
+            }
+            if answered_question:
+                details["superseded_by_answer"] = True
             self._record_event(
                 connection,
                 row.project_id,
@@ -1373,7 +1715,7 @@ class OrchestratorStore:
                 "failure",
                 row.stage,
                 row.stage,
-                {"error": normalized_error, "lease_lost": True},
+                details,
             )
             return self._run_for_id(connection, run_id) or row
 
@@ -1949,7 +2291,8 @@ class OrchestratorStore:
                 pbis: list[dict[str, object]] = []
                 pbi_rows = self._connection.execute(
                     """
-                    SELECT p.*, r.status, r.attempt, r.last_result AS run_result
+                    SELECT p.*, r.status, r.attempt, r.last_result AS run_result,
+                           r.task_contract_json, r.task_result_json, r.task_answer
                     FROM pbis AS p
                     LEFT JOIN runs AS r
                       ON r.project_id = p.project_id
@@ -1976,6 +2319,13 @@ class OrchestratorStore:
                             "pull_request_url": pbi_row["pull_request_url"],
                             "last_error": pbi_row["last_error"],
                             "result": pbi_row["run_result"],
+                            "task_contract": _json_mapping_or_none(
+                                pbi_row["task_contract_json"]
+                            ),
+                            "task_result": _json_mapping_or_none(
+                                pbi_row["task_result_json"]
+                            ),
+                            "task_answer": pbi_row["task_answer"],
                             "active": bool(pbi_row["active"]),
                             "archived": bool(pbi_row["archived"]),
                             "planning_status": pbi_row["planning_status"],
@@ -2062,7 +2412,8 @@ class OrchestratorStore:
                    p.branch, p.pull_request_url, p.last_error,
                    r.run_id, r.status, r.attempt, r.owner_id, r.lease_token,
                    r.lease_expires_at, r.last_error AS run_error,
-                   r.last_result AS run_result
+                   r.last_result AS run_result, r.task_contract_json,
+                   r.task_result_json, r.task_answer
             FROM runs AS r
             JOIN pbis AS p
               ON p.project_id = r.project_id
@@ -2094,6 +2445,9 @@ class OrchestratorStore:
             lease_token=row["lease_token"],
             lease_expires_at=row["lease_expires_at"],
             last_result=row["run_result"],
+            task_contract=_json_mapping_or_none(row["task_contract_json"]),
+            task_result=_json_mapping_or_none(row["task_result_json"]),
+            task_answer=row["task_answer"],
         )
 
     def _events_for_project(
