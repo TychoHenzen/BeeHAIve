@@ -1850,13 +1850,22 @@ class WorkflowService:
         previous_state = previous_checks.get("delivery_status")
         previous_sha = previous_checks.get("commit_sha") or None
         if previous_state == GitDeliveryStatus.PUSHED.value and previous_sha:
-            return GitDeliveryResult(
-                GitDeliveryStatus.PUSHED,
-                lease_id,
-                lease.branch,
-                previous_sha,
-                "The recorded commit was already pushed.",
-            )
+            if not dirty and head == previous_sha:
+                return GitDeliveryResult(
+                    GitDeliveryStatus.PUSHED,
+                    lease_id,
+                    lease.branch,
+                    previous_sha,
+                    "The recorded commit was already pushed.",
+                )
+            if not dirty:
+                return record(
+                    GitDeliveryStatus.BLOCKED,
+                    "blocked",
+                    head,
+                    "The worktree HEAD changed after the previous push; retry to "
+                    "deliver the new commit.",
+                )
         if previous_state == GitDeliveryStatus.NO_CHANGES.value and not dirty:
             return GitDeliveryResult(
                 GitDeliveryStatus.NO_CHANGES,

@@ -208,6 +208,84 @@ def test_commit_and_push_records_exact_commit_for_handoff_and_remote(
     reloaded.close()
 
 
+def test_delivery_commits_changes_added_after_a_successful_push(
+    tmp_path: Path,
+) -> None:
+    service, store, repository, _remote = _delivery_service(tmp_path)
+    worktree = tmp_path / "post-push-worktree"
+    lease = service.acquire_workspace(
+        "dashboard-run:post-push", "codex/post-push", worktree
+    )
+    change = worktree / "change.txt"
+    change.write_text("first version\n", encoding="utf-8")
+    first = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:post-push",
+        "owner/api",
+        "deliver first version",
+        lambda: None,
+    )
+    assert first.status is GitDeliveryStatus.PUSHED
+
+    change.write_text("second version\n", encoding="utf-8")
+    second = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:post-push",
+        "owner/api",
+        "deliver second version",
+        lambda: None,
+    )
+
+    assert second.status is GitDeliveryStatus.PUSHED
+    assert second.commit_sha != first.commit_sha
+    assert second.commit_sha == service.worktrees.head(worktree)
+    assert service.worktrees.clean(worktree)
+    remote_head = _git(
+        repository,
+        "ls-remote",
+        "--exit-code",
+        "origin",
+        f"refs/heads/{lease.branch}",
+    ).split()[0]
+    assert remote_head == second.commit_sha
+
+    local_head = _commit(worktree, "local.txt", "existing local commit\n")
+    needs_retry = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:post-push",
+        "owner/api",
+        "deliver existing local commit",
+        lambda: None,
+    )
+    assert needs_retry.status is GitDeliveryStatus.BLOCKED
+    assert needs_retry.commit_sha == local_head
+    retried = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:post-push",
+        "owner/api",
+        "retry existing local commit",
+        lambda: None,
+    )
+    assert retried.status is GitDeliveryStatus.PUSHED
+    assert retried.commit_sha == local_head
+    assert (
+        _git(
+            repository,
+            "ls-remote",
+            "--exit-code",
+            "origin",
+            f"refs/heads/{lease.branch}",
+        ).split()[0]
+        == local_head
+    )
+    service.discard_workspace(lease.lease_id, "test cleanup")
+    store.close()
+
+
 def test_delivery_uses_the_configured_push_url_for_push_and_verification(
     tmp_path: Path,
 ) -> None:
