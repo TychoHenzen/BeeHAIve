@@ -388,3 +388,49 @@ test("rendering archived PBIs exposes completion and branch evidence", () => {
   assert.equal(links[0].href, "https://example.test/issues/1");
   assert.equal(links[1].href, "https://example.test/pull/9");
 });
+
+test("blocked delivery exposes a retry action for its run", () => {
+  const dashboardOutput = new FakeNode("section");
+  const actionPayloads = [];
+  const view = createDashboardView({
+    document: new FakeDocument(),
+    summaryOutput: new FakeNode("section"),
+    dashboardOutput,
+    actionLog: new FakeNode("section"),
+    actionsOutput: new FakeNode("div"),
+    runAction: (payload) => actionPayloads.push(payload),
+  });
+  view.render({
+    counts: {},
+    repositories: [{
+      name: "owner/api",
+      active: true,
+      writer: { status: "idle" },
+      pbis: [{
+        number: 40,
+        title: "Commit and push",
+        status: "completed",
+        run_id: "run-40",
+        delivery: {
+          status: "push_failed",
+          commit_sha: "abc123",
+          evidence: "Local commit preserved.",
+          retry_available: true,
+        },
+      }],
+    }],
+  });
+
+  const retry = findNode(
+    dashboardOutput,
+    (node) => node.tag === "button" && node.textContent === "Retry commit and push",
+  );
+  assert.ok(retry);
+  retry.click();
+  assert.deepEqual(actionPayloads, [{
+    action: "commit_push",
+    repository: "owner/api",
+    pbi_number: 40,
+    run_id: "run-40",
+  }]);
+});

@@ -29,7 +29,13 @@ from .routing import (
     RoutingStatus,
 )
 from .storage import StoreError
-from .workflow import LeaseStatus, WorkflowError, WorkflowService, WorkspaceLease
+from .workflow import (
+    GitDeliveryResult,
+    LeaseStatus,
+    WorkflowError,
+    WorkflowService,
+    WorkspaceLease,
+)
 
 if TYPE_CHECKING:
     from .orchestrator import Orchestrator
@@ -986,6 +992,7 @@ class AgentWorkerManager:
         self._threads: dict[str, Thread] = {}
         self._workspace_leases: dict[str, WorkspaceLease] = {}
         self._workspace_validators: dict[str, Callable[[], None]] = {}
+        self._delivery_lock = Lock()
         if workflow_service is not None:
             workflow_service.cleanup_dashboard_run_workspaces()
         register = getattr(orchestrator, "register_worker_canceller", None)
@@ -1083,6 +1090,78 @@ class AgentWorkerManager:
 
     def cancel(self, run_id: str) -> None:
         self.executor.cancel(run_id)
+
+    def commit_and_push(self, run_id: str) -> GitDeliveryResult:
+        service = self.workflow_service
+        if service is None:
+            raise StoreError("Workflow service is required for Git delivery")
+        with self._delivery_lock:
+            run = self.orchestrator.store.get_run(run_id)
+            if run is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            if run.status not in {
+                RunStatus.ACTIVE,
+                RunStatus.COMPLETED,
+                RunStatus.FAILED,
+            }:
+                raise StoreError("Run is not eligible for Git delivery")
+            if run.status is RunStatus.ACTIVE and not run.lease_token:
+                raise StoreError("An active run lease is required for Git delivery")
+            lease = service.workspace_for_run(run_id)
+            if lease is None:
+                raise StoreError(
+                    "A leased dashboard worktree is required for Git delivery"
+                )
+            if (
+                run.status is not RunStatus.ACTIVE
+                and lease.status is not LeaseStatus.RETAINED
+            ):
+                raise StoreError(
+                    "A retained worktree is required to retry Git delivery"
+                )
+            service_repository = service.worktrees.repository
+            executor_repository = getattr(
+                self.executor, "repository", service_repository
+            )
+            if Path(executor_repository).resolve() != service_repository:
+                raise StoreError(
+                    "Agent executor and workflow service must use the same repository"
+                )
+            validate_repository = getattr(self.executor, "validate_repository", None)
+            if callable(validate_repository):
+                validate_repository(run.repository)
+            expected_status = run.status
+            expected_token = run.lease_token
+
+            def validate_run() -> None:
+                current = self.orchestrator.store.get_run(run_id)
+                if (
+                    current is None
+                    or current.project_id != run.project_id
+                    or current.repository != run.repository
+                    or current.pbi_number != run.pbi_number
+                    or current.status is not expected_status
+                    or current.lease_token != expected_token
+                ):
+                    raise WorkflowError("Dashboard run lease changed")
+
+            return service.commit_and_push(
+                lease.lease_id,
+                lease.lease_token,
+                f"dashboard-run:{run_id}",
+                run.repository,
+                f"Implement PBI #{run.pbi_number}: {run.title}",
+                validate_run,
+            )
+
+    @staticmethod
+    def _delivery_summary(result: str, delivery: GitDeliveryResult) -> str:
+        commit = delivery.commit_sha or "none"
+        summary = (
+            f"Git delivery: {delivery.status.value}; branch {delivery.branch}; "
+            f"commit {commit}. {delivery.evidence}"
+        )
+        return redact_worker_text(f"{result}\n{summary}")
 
     def shutdown(self) -> None:
         with self._lock:
@@ -1188,14 +1267,19 @@ class AgentWorkerManager:
                 and routing.state.status is RoutingStatus.RESOLVED
             ):
                 try:
-                    if workspace_lease is not None and workflow_service is not None:
-                        workflow_service.retain_workspace(
-                            workspace_lease.lease_id, workspace_lease.lease_token
-                        )
-                        preserve_workspace = True
+                    assert workspace_lease is not None and workflow_service is not None
+                    workflow_service.retain_workspace(
+                        workspace_lease.lease_id, workspace_lease.lease_token
+                    )
+                    preserve_workspace = True
+                    delivery = self.commit_and_push(run_id)
+                    result = self._delivery_summary(
+                        routing.execution_result or "Bounded agent completed the demo",
+                        delivery,
+                    )
                     self.orchestrator.store.complete_agent_run(
                         run_id,
-                        routing.execution_result or "Bounded agent completed the demo",
+                        result,
                         lease_token,
                     )
                 except Exception as exc:
@@ -1244,12 +1328,34 @@ class AgentWorkerManager:
                 and workflow_service is not None
                 and not preserve_workspace
             ):
-                try:
-                    workflow_service.discard_workspace(
-                        workspace_lease.lease_id, "Dashboard worker did not complete"
-                    )
-                except WorkflowError as exc:
-                    cleanup_error = exc
+                worktree_path = Path(workspace_lease.worktree_path)
+                dirty = False
+                if worktree_path.is_dir():
+                    try:
+                        dirty = not workflow_service.worktrees.clean(worktree_path)
+                    except WorkflowError:
+                        dirty = True
+                if dirty:
+                    try:
+                        current = workflow_service.store.get_lease(
+                            workspace_lease.lease_id
+                        )
+                        if current is not None and current.status is LeaseStatus.ACTIVE:
+                            workflow_service.retain_workspace(
+                                workspace_lease.lease_id,
+                                workspace_lease.lease_token,
+                            )
+                    except WorkflowError:
+                        pass
+                    preserve_workspace = True
+                else:
+                    try:
+                        workflow_service.discard_workspace(
+                            workspace_lease.lease_id,
+                            "Dashboard worker did not complete",
+                        )
+                    except WorkflowError as exc:
+                        cleanup_error = exc
             self.executor.release_run(run_id)
             with self._lock:
                 self._workspace_leases.pop(run_id, None)

@@ -1,6 +1,7 @@
 import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from conftest import FakeProvider
@@ -63,6 +64,27 @@ def make_dashboard_git_repository(path: Path) -> Path:
         ("git", "commit", "-m", "base"), cwd=path, check=True, capture_output=True
     )
     return path
+
+
+def configure_dashboard_remote(repository: Path, root: Path) -> Path:
+    remote = root / "owner" / "api.git"
+    remote.parent.mkdir()
+    subprocess.run(
+        ("git", "init", "--bare", str(remote)), check=True, capture_output=True
+    )
+    subprocess.run(
+        ("git", "remote", "add", "origin", str(remote)),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ("git", "push", "origin", "master"),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+    )
+    return remote
 
 
 def dashboard_snapshot(
@@ -830,6 +852,66 @@ def test_dashboard_runtime_assets_are_served_without_sample_data() -> None:
     assert view_script.status_code == 200
 
 
+def test_dashboard_delivery_projection_handles_missing_lease_and_gate() -> None:
+    workflow_service = SimpleNamespace(workspace_for_run=lambda _run_id: None)
+    assert main_module._dashboard_delivery(workflow_service, "missing") is None
+
+    lease = SimpleNamespace(
+        lease_id="lease-40",
+        branch="codex/40",
+        status=LeaseStatus.RETAINED,
+    )
+    workflow_service.workspace_for_run = lambda _run_id: lease
+    workflow_service.store = SimpleNamespace(latest_gate=lambda _lease_id, _gate: None)
+    assert main_module._dashboard_delivery(workflow_service, "run-40") is None
+
+    workflow_service.store.latest_gate = lambda _lease_id, _gate: SimpleNamespace(
+        checks=(SimpleNamespace(name="other", evidence="value"),)
+    )
+    assert main_module._dashboard_delivery(workflow_service, "run-40") is None
+
+    workflow_service.store.latest_gate = lambda _lease_id, _gate: SimpleNamespace(
+        checks=(
+            SimpleNamespace(name="delivery_status", evidence="push_failed"),
+            SimpleNamespace(name="commit_sha", evidence="abc123"),
+            SimpleNamespace(name="evidence", evidence="local commit preserved"),
+        )
+    )
+    delivery = main_module._dashboard_delivery(workflow_service, "run-40")
+    assert delivery == {
+        "status": "push_failed",
+        "commit_sha": "abc123",
+        "branch": "codex/40",
+        "evidence": "local commit preserved",
+        "retry_available": True,
+    }
+
+
+def test_dashboard_delivery_rejects_a_run_outside_the_requested_scope() -> None:
+    orchestrator = SimpleNamespace(store=SimpleNamespace(get_run=lambda _run_id: None))
+    with pytest.raises(main_module.HTTPException) as raised:
+        main_module._require_dashboard_delivery_run(
+            orchestrator,
+            "project-1",
+            "owner/api",
+            40,
+            "missing-run",
+        )
+    assert raised.value.status_code == 403
+
+
+def test_dashboard_commit_push_requires_a_worker() -> None:
+    request = main_module.DashboardCommitPushRequest(
+        action="commit_push",
+        approved=True,
+        repository="owner/api",
+        pbi_number=40,
+        run_id="run-40",
+    )
+    with pytest.raises(StoreError, match="Agent worker is not configured"):
+        main_module._execute_dashboard_action(SimpleNamespace(), "project-1", request)
+
+
 def test_dashboard_worker_completes_bounded_demo_and_persists_result(
     tmp_path: Path,
 ) -> None:
@@ -886,12 +968,14 @@ def test_dashboard_worker_completes_bounded_demo_and_persists_result(
 
         assert run is not None
         assert run.status.value == "completed"
-        assert run.last_result == "demo result"
+        assert (run.last_result or "").startswith(
+            "demo result\nGit delivery: no_changes"
+        )
         assert run.lease_token is None
         state = client.get("/projects/project-1/dashboard").json()
         pbi = state["repositories"][0]["pbis"][0]
         assert pbi["status"] == "completed"
-        assert pbi["result"] == "demo result"
+        assert pbi["result"] == run.last_result
         assert pbi["claimable"] is False
 
     lease = workflow_service.workspace_for_run(run_id)
@@ -901,6 +985,124 @@ def test_dashboard_worker_completes_bounded_demo_and_persists_result(
     workflow_store.close()
     service.store.close()
     service.model_router.store.close()
+
+
+def test_dashboard_retries_a_blocked_push_without_recommitting(tmp_path: Path) -> None:
+    repository = make_dashboard_git_repository(tmp_path / "repository")
+    remote = configure_dashboard_remote(repository, tmp_path)
+
+    class WritingDemoExecutor(ImmediateDemoExecutor):
+        def execute(self, spec, decision) -> ModelExecution:
+            workspace = self._execution_repository_for(decision.problem_id)
+            (workspace / "change.txt").write_text("save me\n", encoding="utf-8")
+            return super().execute(spec, decision)
+
+    executor = WritingDemoExecutor(repository)
+    service = Orchestrator(
+        OrchestratorStore(),
+        FakeProvider(dashboard_snapshot()),
+        ModelRouter(RoutingStore()),
+        executor,
+    )
+    workflow_store = WorkflowStore(tmp_path / "workflow.db")
+
+    class PassingCheck:
+        name = "fixture"
+
+        def run(self, workspace: Path) -> CheckResult:
+            assert workspace.exists()
+            return CheckResult(self.name, True, "passed")
+
+    workflow_service = WorkflowService(
+        workflow_store,
+        repository,
+        Constitution.load(Path(__file__).parents[1] / "constitution.json"),
+        [PassingCheck()],
+    )
+    worker = AgentWorkerManager(service, executor, workflow_service)
+    offline = remote.with_name("api.offline")
+    remote.rename(offline)
+    client = TestClient(
+        main_module.create_app(
+            orchestrator=service,
+            api_key="test-key",
+            allowed_project_ids={"project-1"},
+            agent_worker=worker,
+            workflow_service=workflow_service,
+        )
+    )
+    try:
+        service.synchronize("project-1")
+        started = client.post(
+            "/projects/project-1/actions",
+            headers={"X-API-Key": "test-key"},
+            json={"action": "start", "approved": True, "repository": "owner/api"},
+        )
+        assert started.status_code == 200
+        run_id = started.json()["result"]["run"]["run_id"]
+        deadline = time.monotonic() + 3
+        run = service.store.get_run(run_id)
+        while run is not None and run.status.value == "active":
+            if time.monotonic() >= deadline:
+                raise AssertionError("The worker did not preserve the blocked commit")
+            time.sleep(0.02)
+            run = service.store.get_run(run_id)
+        assert run is not None and run.status.value == "completed"
+        lease = workflow_service.workspace_for_run(run_id)
+        assert lease is not None and lease.status is LeaseStatus.RETAINED
+        saved_sha = workflow_service.worktrees.head(lease.worktree_path)
+        assert "Git delivery: blocked" in (run.last_result or "")
+
+        blocked_state = client.get("/projects/project-1/dashboard").json()
+        delivery = blocked_state["repositories"][0]["pbis"][0]["delivery"]
+        assert delivery["status"] == "push_failed"
+        assert delivery["commit_sha"] == saved_sha
+        assert delivery["retry_available"] is True
+
+        offline.rename(remote)
+        retried = client.post(
+            "/projects/project-1/actions",
+            headers={"X-API-Key": "test-key"},
+            json={
+                "action": "commit_push",
+                "approved": True,
+                "repository": "owner/api",
+                "pbi_number": 1,
+                "run_id": run_id,
+            },
+        )
+
+        assert retried.status_code == 200
+        assert retried.json()["action"]["status"] == "succeeded"
+        assert retried.json()["result"]["delivery"]["status"] == "pushed"
+        assert retried.json()["result"]["delivery"]["commit_sha"] == saved_sha
+        delivered_state = retried.json()["state"]["repositories"][0]["pbis"][0][
+            "delivery"
+        ]
+        assert delivered_state["status"] == "pushed"
+        assert delivered_state["retry_available"] is False
+        remote_head = subprocess.run(
+            (
+                "git",
+                "ls-remote",
+                "--exit-code",
+                str(remote),
+                f"refs/heads/{lease.branch}",
+            ),
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.split()[0]
+        assert remote_head == saved_sha
+        assert workflow_service.worktrees.clean(lease.worktree_path)
+    finally:
+        worker.shutdown()
+        if offline.exists():
+            offline.rename(remote)
+        workflow_store.close()
+        service.store.close()
+        service.model_router.store.close()
 
 
 def test_dashboard_stop_cancels_worker_before_stopping_run() -> None:

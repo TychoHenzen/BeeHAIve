@@ -149,6 +149,27 @@ def make_git_repository(path: Path) -> Path:
     return path
 
 
+def configure_test_remote(repository: Path, root: Path) -> Path:
+    remote = root / "owner" / "api.git"
+    remote.parent.mkdir()
+    subprocess.run(
+        ("git", "init", "--bare", str(remote)), check=True, capture_output=True
+    )
+    subprocess.run(
+        ("git", "remote", "add", "origin", str(remote)),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ("git", "push", "origin", "master"),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+    )
+    return remote
+
+
 class PassingWorkflowCheck:
     name = "tests"
 
@@ -1170,6 +1191,141 @@ def test_worker_start_requires_workflow_service() -> None:
     routing_store.close()
 
 
+def test_worker_manager_commit_and_push_rejects_invalid_run_context() -> None:
+    repository = Path.cwd().resolve()
+
+    class FakeStore:
+        def __init__(self, run) -> None:
+            self.run = run
+
+        def get_run(self, run_id: str):
+            if self.run is None or self.run.run_id != run_id:
+                return None
+            return self.run
+
+    class FakeWorkflowService:
+        def __init__(self, lease) -> None:
+            self.lease = lease
+            self.worktrees = SimpleNamespace(repository=repository)
+
+        def cleanup_dashboard_run_workspaces(self):
+            return ()
+
+        def workspace_for_run(self, _run_id: str):
+            return self.lease
+
+        def commit_and_push(self, *_arguments):
+            raise AssertionError("Git delivery must not run for invalid state")
+
+    def run_state(status=RunStatus.ACTIVE, lease_token="run-token"):
+        return SimpleNamespace(
+            run_id="run-40",
+            project_id="project-1",
+            repository="owner/api",
+            pbi_number=40,
+            title="Commit and push",
+            status=status,
+            lease_token=lease_token,
+        )
+
+    def lease_state(status=LeaseStatus.ACTIVE):
+        return SimpleNamespace(
+            lease_id="lease-40",
+            lease_token="workspace-token",
+            status=status,
+        )
+
+    cases = (
+        (run_state(), lease_state(), False, repository, "Workflow service is required"),
+        (None, lease_state(), True, repository, "Unknown run"),
+        (
+            run_state("cancelled"),
+            lease_state(),
+            True,
+            repository,
+            "not eligible for Git delivery",
+        ),
+        (
+            run_state(lease_token=None),
+            lease_state(),
+            True,
+            repository,
+            "active run lease",
+        ),
+        (run_state(), None, True, repository, "leased dashboard worktree"),
+        (
+            run_state(RunStatus.FAILED),
+            lease_state(),
+            True,
+            repository,
+            "retained worktree",
+        ),
+        (
+            run_state(),
+            lease_state(),
+            True,
+            repository / "other",
+            "same repository",
+        ),
+    )
+    for run, lease, use_service, executor_repository, error in cases:
+        store = FakeStore(run)
+        service = FakeWorkflowService(lease) if use_service else None
+        manager = AgentWorkerManager(
+            SimpleNamespace(store=store),
+            SimpleNamespace(repository=executor_repository),
+            service,
+        )
+        with pytest.raises(StoreError, match=error):
+            manager.commit_and_push("run-40")
+
+
+def test_worker_manager_revalidates_run_before_git_delivery() -> None:
+    repository = Path.cwd().resolve()
+    run = SimpleNamespace(
+        run_id="run-40",
+        project_id="project-1",
+        repository="owner/api",
+        pbi_number=40,
+        title="Commit and push",
+        status=RunStatus.ACTIVE,
+        lease_token="run-token",
+    )
+
+    class FakeStore:
+        current = run
+
+        def get_run(self, _run_id: str):
+            return self.current
+
+    store = FakeStore()
+
+    class FakeWorkflowService:
+        worktrees = SimpleNamespace(repository=repository)
+
+        def cleanup_dashboard_run_workspaces(self):
+            return ()
+
+        def workspace_for_run(self, _run_id: str):
+            return SimpleNamespace(
+                lease_id="lease-40",
+                lease_token="workspace-token",
+                status=LeaseStatus.ACTIVE,
+            )
+
+        def commit_and_push(self, *_arguments):
+            store.current = SimpleNamespace(**(vars(run) | {"pbi_number": 41}))
+            _arguments[-1]()
+
+    manager = AgentWorkerManager(
+        SimpleNamespace(store=store),
+        SimpleNamespace(repository=repository),
+        FakeWorkflowService(),
+    )
+    with pytest.raises(WorkflowError, match="Dashboard run lease changed"):
+        manager.commit_and_push(run.run_id)
+
+
 def test_worker_start_rejects_executor_repository_mismatch(tmp_path: Path) -> None:
     workflow_repository = make_git_repository(tmp_path / "workflow-repository")
     executor_repository = make_git_repository(tmp_path / "executor-repository")
@@ -1557,6 +1713,14 @@ def test_dashboard_worker_writes_only_in_retained_worktree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repository = make_git_repository(tmp_path / "repository")
+    remote = configure_test_remote(repository, tmp_path)
+    source_head = subprocess.run(
+        ("git", "rev-parse", "HEAD"),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
     script = tmp_path / "writer.py"
     script.write_text(
         "import json, os, pathlib, subprocess\n"
@@ -1599,6 +1763,7 @@ def test_dashboard_worker_writes_only_in_retained_worktree(
             current = state_store.get_run(run.run_id)
 
         assert current is not None and current.status is RunStatus.COMPLETED
+        assert "Git delivery: pushed" in (current.last_result or "")
         lease = workflow_service.workspace_for_run(run.run_id)
         assert lease is not None
         assert lease.status is LeaseStatus.RETAINED
@@ -1617,13 +1782,46 @@ def test_dashboard_worker_writes_only_in_retained_worktree(
         assert source_status.stdout == ""
         assert lease.lease_id and lease.lease_token and lease.branch
         assert executor._workspace_leases == {}
-
-        subprocess.run(("git", "add", "worker-output.txt"), cwd=worktree, check=True)
-        subprocess.run(
-            ("git", "commit", "-m", "consume worker output"),
+        delivered_sha = subprocess.run(
+            ("git", "rev-parse", "HEAD"),
             cwd=worktree,
             check=True,
             capture_output=True,
+            text=True,
+        ).stdout.strip()
+        remote_head = subprocess.run(
+            (
+                "git",
+                "ls-remote",
+                "--exit-code",
+                str(remote),
+                f"refs/heads/{lease.branch}",
+            ),
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.split()[0]
+        assert delivered_sha == remote_head
+        assert (
+            subprocess.run(
+                ("git", "status", "--porcelain"),
+                cwd=worktree,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            == ""
+        )
+        assert (
+            subprocess.run(
+                ("git", "rev-parse", "HEAD"),
+                cwd=repository,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            == source_head
         )
         workflow_service.release_workspace(lease.lease_id)
         assert not worktree.exists()
@@ -1634,8 +1832,9 @@ def test_dashboard_worker_writes_only_in_retained_worktree(
         routing_store.close()
 
 
-def test_dashboard_worker_shutdown_kills_child_and_discards_worktree(
+def test_dashboard_worker_shutdown_kills_child_and_preserves_changes(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repository = make_git_repository(tmp_path / "repository")
     script = tmp_path / "slow_writer.py"
@@ -1672,14 +1871,27 @@ def test_dashboard_worker_shutdown_kills_child_and_discards_worktree(
             lease = workflow_service.workspace_for_run(run.run_id)
         assert lease is not None
 
+        def fail_clean(_worktree: Path) -> bool:
+            raise WorkflowError("Git status unavailable")
+
+        def fail_retain(_lease_id: str, _lease_token: str | None) -> None:
+            raise WorkflowError("Lease changed")
+
+        monkeypatch.setattr(workflow_service.worktrees, "clean", fail_clean)
+        monkeypatch.setattr(workflow_service, "retain_workspace", fail_retain)
+
         manager.shutdown()
 
         stopped = state_store.get_run(run.run_id)
         assert stopped is not None and stopped.status is RunStatus.FAILED
-        cleaned = workflow_service.workspace_for_run(run.run_id)
-        assert cleaned is not None and cleaned.status is LeaseStatus.RELEASED
-        assert not Path(lease.worktree_path).exists()
+        preserved = workflow_service.workspace_for_run(run.run_id)
+        assert preserved is not None and preserved.status is LeaseStatus.STOPPED
+        assert (
+            Path(lease.worktree_path, "worker-output.txt").read_text(encoding="utf-8")
+            == "started\n"
+        )
         assert not executor._processes
+        workflow_service.discard_workspace(lease.lease_id, "test cleanup")
     finally:
         manager.shutdown()
         workflow_store.close()

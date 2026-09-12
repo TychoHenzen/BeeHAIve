@@ -29,8 +29,9 @@ environment variables used by the service.
 
 Read-only state needs no API key. Operator actions require `BEEHAIIVE_API_KEY`
 and the dashboard API-key field. The dashboard exposes sync, start writer, stop,
-approval, and clarification actions. In documented demo mode, start writer
-claims one PBI and runs the bounded repository-inventory worker. A completed
+approval, clarification, and retry commit-and-push actions. In documented demo
+mode, start writer claims one PBI and runs the bounded repository-inventory
+worker. A completed
 result is shown on the PBI card. Every action is recorded as `pending`,
 `succeeded`, or `failed`; a response always includes the latest available run
 state.
@@ -39,10 +40,17 @@ The dashboard worker runs `codex exec` with a writable sandbox rooted at one
 unique Git worktree. It disables network access and child agents, filters the
 child environment, and requires the configured repository identity to match the
 claimed repository. Both the dashboard run lease and worktree lease are renewed
-while the process runs. Success retains uncommitted changes for later handoff.
-Stop, failure, expiry, restart, and service shutdown terminate the process tree
-and remove the worker worktree. Demo review mode disables review operations. It
-is not a live pull-request review.
+while the process runs. On success, dirty changes are committed with host Git
+`user.name` and `user.email`, then pushed to the configured `origin` on the exact
+leased branch without force. A clean worktree is a no-op.
+
+The service records the commit SHA and push result. A blocked push keeps the
+local commit and retained worktree. The PBI card exposes a retry action that
+pushes the same SHA. Pushes use host Git authentication. Credentials are not
+sent to the model child or stored in delivery evidence. Failed or cancelled
+workers with uncommitted changes keep their worktrees for recovery. Clean
+unsuccessful worktrees are removed. Demo review mode disables review operations.
+It is not a live pull-request review.
 
 A new local database is synchronized from GitHub when the dashboard first
 refreshes. Later refreshes synchronize again before reading the projection, so

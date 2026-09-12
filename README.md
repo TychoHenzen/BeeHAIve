@@ -85,9 +85,16 @@ The dashboard worker uses `codex exec --sandbox workspace-write --ephemeral
 --json` in a unique leased worktree. It disables network access and child
 agents, passes a filtered environment, and rejects credential-like tracked
 files. The service renews both run and worktree leases while the process runs.
-Success retains uncommitted changes for a later commit or handoff. Stop,
-failure, expiry, restart, and shutdown terminate the process tree and remove
-the worker worktree.
+On success, the service commits dirty changes with the host Git identity and
+pushes the exact leased branch to the configured `origin` without force. A
+clean tree is a no-op. A blocked push keeps its commit and worktree for the
+dashboard retry action. Failed or cancelled worktrees with changes are kept
+for recovery rather than discarded.
+
+Set `git config user.name` and `git config user.email` in the host checkout.
+Push uses host Git authentication. Credentials are not sent to the model child
+or saved in delivery evidence. Check the PBI card's **Git delivery** status for
+the commit SHA and push result.
 
 If the demo fails, read the PBI **Failure** field and the action log. Check the
 GitHub token, exact project allowlist, `codex` availability, and the local

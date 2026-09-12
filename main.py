@@ -52,6 +52,7 @@ from beehaiive.workflow import (
     CommandCheck,
     Constitution,
     DeterministicCheck,
+    LeaseStatus,
     WorkflowError,
     WorkflowRole,
     WorkflowService,
@@ -194,6 +195,13 @@ class DashboardClarifyRequest(DashboardActionBase):
     clarification: str = ""
 
 
+class DashboardCommitPushRequest(DashboardActionBase):
+    action: Literal["commit_push"]
+    repository: str
+    pbi_number: int
+    run_id: str
+
+
 class MetaReviewRequest(BaseModel):
     since: str | None = Field(default=None, max_length=40)
     record_limit: int = Field(
@@ -214,7 +222,8 @@ DashboardActionRequest = Annotated[
     DashboardStartRequest
     | DashboardStopRequest
     | DashboardApproveRequest
-    | DashboardClarifyRequest,
+    | DashboardClarifyRequest
+    | DashboardCommitPushRequest,
     Field(discriminator="action"),
 ]
 
@@ -958,7 +967,13 @@ def create_app(
         _access: None = Depends(require_project_access),
     ) -> dict[str, object]:
         return _handle_store_error(
-            lambda: _dashboard_state(orchestrator, project_id, event_limit, archived)
+            lambda: _dashboard_state(
+                orchestrator,
+                project_id,
+                event_limit,
+                archived,
+                workflow_service,
+            )
         )
 
     @app.get("/projects/{project_id}/actions")
@@ -1038,22 +1053,45 @@ def create_app(
                 raise HTTPException(
                     status_code=403, detail="Repository is not authorized"
                 )
-        if isinstance(request, (DashboardApproveRequest, DashboardClarifyRequest)):
+        if isinstance(
+            request,
+            (
+                DashboardApproveRequest,
+                DashboardClarifyRequest,
+                DashboardCommitPushRequest,
+            ),
+        ):
             pbi = _dashboard_pbi(
                 orchestrator, project_id, request.repository, request.pbi_number
             )
             if pbi is None:
                 raise HTTPException(status_code=403, detail="PBI is not authorized")
-            _require_active_dashboard_run(
-                orchestrator,
-                project_id,
-                request.repository,
-                request.pbi_number,
-                request.run_id,
-            )
+            if isinstance(request, DashboardCommitPushRequest):
+                _require_dashboard_delivery_run(
+                    orchestrator,
+                    project_id,
+                    request.repository,
+                    request.pbi_number,
+                    request.run_id,
+                )
+            else:
+                _require_active_dashboard_run(
+                    orchestrator,
+                    project_id,
+                    request.repository,
+                    request.pbi_number,
+                    request.run_id,
+                )
         pbi_number = (
             request.pbi_number
-            if isinstance(request, (DashboardApproveRequest, DashboardClarifyRequest))
+            if isinstance(
+                request,
+                (
+                    DashboardApproveRequest,
+                    DashboardClarifyRequest,
+                    DashboardCommitPushRequest,
+                ),
+            )
             else None
         )
         run_id = (
@@ -1064,6 +1102,7 @@ def create_app(
                     DashboardStopRequest,
                     DashboardApproveRequest,
                     DashboardClarifyRequest,
+                    DashboardCommitPushRequest,
                 ),
             )
             else None
@@ -1080,7 +1119,7 @@ def create_app(
             result = _execute_dashboard_action(
                 orchestrator, project_id, request, agent_worker
             )
-        except (ProviderError, StoreError) as exc:
+        except (ProviderError, StoreError, WorkflowError) as exc:
             failed = orchestrator.store.finish_action(
                 str(action["id"]), "failed", error=str(exc)
             )
@@ -1088,7 +1127,11 @@ def create_app(
                 "action": failed,
                 "result": None,
                 "state": _dashboard_state_or_none(
-                    orchestrator, project_id, DEFAULT_EVENT_LIMIT, archived
+                    orchestrator,
+                    project_id,
+                    DEFAULT_EVENT_LIMIT,
+                    archived,
+                    workflow_service,
                 ),
             }
         completed = orchestrator.store.finish_action(
@@ -1098,7 +1141,11 @@ def create_app(
             "action": completed,
             "result": result,
             "state": _dashboard_state(
-                orchestrator, project_id, DEFAULT_EVENT_LIMIT, archived
+                orchestrator,
+                project_id,
+                DEFAULT_EVENT_LIMIT,
+                archived,
+                workflow_service,
             ),
         }
 
@@ -1328,11 +1375,23 @@ def _dashboard_state(
     project_id: str,
     event_limit: int,
     archived: bool = False,
+    workflow_service: WorkflowService | None = None,
 ) -> dict[str, object]:
     orchestrator.synchronize(project_id)
     state = orchestrator.store.project_state(project_id, event_limit)
     actions = orchestrator.store.actions_for_project(project_id)
-    return build_dashboard_state(state, actions, archived)
+    dashboard = build_dashboard_state(state, actions, archived)
+    if workflow_service is None:
+        return dashboard
+    repositories = cast(list[dict[str, object]], dashboard["repositories"])
+    for repository in repositories:
+        for pbi in cast(list[dict[str, object]], repository["pbis"]):
+            run_id = pbi.get("run_id")
+            if isinstance(run_id, str):
+                delivery = _dashboard_delivery(workflow_service, run_id)
+                if delivery is not None:
+                    pbi["delivery"] = delivery
+    return dashboard
 
 
 def _dashboard_state_or_none(
@@ -1340,11 +1399,37 @@ def _dashboard_state_or_none(
     project_id: str,
     event_limit: int,
     archived: bool = False,
+    workflow_service: WorkflowService | None = None,
 ) -> dict[str, object] | None:
     try:
-        return _dashboard_state(orchestrator, project_id, event_limit, archived)
+        return _dashboard_state(
+            orchestrator, project_id, event_limit, archived, workflow_service
+        )
     except (ProviderError, StoreError):
         return None
+
+
+def _dashboard_delivery(
+    workflow_service: WorkflowService, run_id: str
+) -> dict[str, object] | None:
+    lease = workflow_service.workspace_for_run(run_id)
+    if lease is None:
+        return None
+    gate = workflow_service.store.latest_gate(lease.lease_id, "git_delivery")
+    if gate is None:
+        return None
+    checks = {check.name: check.evidence for check in gate.checks}
+    status = checks.get("delivery_status")
+    if status is None:
+        return None
+    return {
+        "status": status,
+        "commit_sha": checks.get("commit_sha") or None,
+        "branch": lease.branch,
+        "evidence": checks.get("evidence", ""),
+        "retry_available": lease.status is LeaseStatus.RETAINED
+        and status not in {"pushed", "no_changes"},
+    }
 
 
 def _dashboard_pbi(
@@ -1384,6 +1469,27 @@ def _require_active_dashboard_run(
         or run.status is not RunStatus.ACTIVE
     ):
         raise HTTPException(status_code=403, detail="Run is not authorized")
+    return run
+
+
+def _require_dashboard_delivery_run(
+    orchestrator: Orchestrator,
+    project_id: str,
+    repository: str,
+    pbi_number: int,
+    run_id: str,
+) -> RunState:
+    run = orchestrator.store.get_run(run_id)
+    if (
+        run is None
+        or run.project_id != project_id
+        or run.repository != repository
+        or run.pbi_number != pbi_number
+        or run.status not in {RunStatus.COMPLETED, RunStatus.FAILED}
+    ):
+        raise HTTPException(
+            status_code=403, detail="Run is not authorized for Git delivery"
+        )
     return run
 
 
@@ -1433,6 +1539,10 @@ def _execute_dashboard_action(
         if not request.clarification.strip():
             raise StoreError("A clarification message is required")
         return {"message": request.clarification.strip()}
+    if isinstance(request, DashboardCommitPushRequest):
+        if agent_worker is None:
+            raise StoreError("Agent worker is not configured")
+        return {"delivery": agent_worker.commit_and_push(request.run_id).as_dict()}
     return {"approved": True}
 
 
