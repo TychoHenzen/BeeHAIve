@@ -80,10 +80,13 @@ class Orchestrator:
     def register_worker_canceller(self, canceller: Callable[[str], None]) -> None:
         self._worker_canceller = canceller
 
-    def synchronize(self, project_id: str) -> dict[str, object]:
-        invalidate = getattr(self.provider, "invalidate_discovery_cache", None)
-        if callable(invalidate):
-            invalidate()
+    def synchronize(
+        self, project_id: str, *, force_refresh: bool = False
+    ) -> dict[str, object]:
+        if force_refresh:
+            invalidate = getattr(self.provider, "invalidate_discovery_cache", None)
+            if callable(invalidate):
+                invalidate()
         snapshot = self.provider.discover_project(project_id)
         self._cancel_removed_workers(snapshot)
         self.store.sync_project(snapshot)

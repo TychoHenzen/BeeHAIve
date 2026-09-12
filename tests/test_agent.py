@@ -12,7 +12,11 @@ import pytest
 from conftest import FakeProvider
 
 import beehaiive.agent as agent_module
-from beehaiive.agent import AgentWorkerManager, CodexExecModelExecutor
+from beehaiive.agent import (
+    AgentWorkerManager,
+    CodexExecModelExecutor,
+    WorkerCapacityError,
+)
 from beehaiive.contracts import TaskContract, TaskOutcome, TaskResult
 from beehaiive.demo import demo_review_adapters
 from beehaiive.models import (
@@ -1515,6 +1519,120 @@ def test_worker_manager_uses_run_title_when_executor_task_is_empty(
         workflow_store.close()
         store.close()
         routing_store.close()
+
+
+def test_worker_manager_enforces_shared_concurrency_limit(
+    tmp_path: Path,
+) -> None:
+    repository = make_git_repository(tmp_path / "repository")
+    executor = ImmediateExecutor(
+        ModelExecution(AttemptOutcome.SUCCESS, result="unused"), repository
+    )
+    service, store, routing_store, run = service_with_run(executor)
+    workflow_service, workflow_store = workflow_service_for(tmp_path, repository)
+    manager = AgentWorkerManager(service, executor, workflow_service)
+    try:
+        assert manager.active_worker_count == 0
+        assert manager.has_capacity()
+        manager.set_max_concurrent_workers(1)
+        manager._threads["occupied"] = Thread(target=lambda: None)
+        assert manager.active_worker_count == 1
+        assert not manager.has_capacity()
+        with pytest.raises(StoreError, match="Maximum concurrent"):
+            manager.start(run)
+        for invalid_maximum in (True, 0, 1.5):
+            with pytest.raises(StoreError, match="positive integer"):
+                manager.set_max_concurrent_workers(invalid_maximum)
+    finally:
+        manager._threads.clear()
+        workflow_store.close()
+        store.close()
+        routing_store.close()
+
+
+def test_worker_recovery_defers_runs_at_capacity_and_filters_projects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runs = [
+        SimpleNamespace(
+            run_id=run_id,
+            project_id=project_id,
+            repository=f"owner/{run_id}",
+            title=run_id,
+        )
+        for run_id, project_id in (
+            ("run-1", "allowed"),
+            ("run-2", "allowed"),
+            ("run-3", "outside"),
+        )
+    ]
+
+    class RecoveryStore:
+        def __init__(self) -> None:
+            self.runs = runs
+
+        def active_agent_sessions(self) -> tuple[SimpleNamespace, ...]:
+            return tuple(self.runs)
+
+        def get_agent_session(self, run_id: str) -> dict[str, str]:
+            return {"task": run_id}
+
+    class RecoveryOrchestrator:
+        def __init__(self) -> None:
+            self.store = RecoveryStore()
+
+        def claim(
+            self,
+            project_id: str,
+            repository: str,
+            owner_id: str,
+            *,
+            expected_run_id: str,
+            agent_session: tuple[str, str],
+        ) -> SimpleNamespace:
+            del project_id, repository, owner_id, agent_session
+            return SimpleNamespace(
+                run_id=expected_run_id, lease_token=f"lease-{expected_run_id}"
+            )
+
+    class RecoveryWorkflow:
+        def cleanup_dashboard_run_workspaces(self, run_id: str) -> None:
+            del run_id
+
+    orchestrator = RecoveryOrchestrator()
+    manager = AgentWorkerManager(
+        orchestrator,
+        SimpleNamespace(_secret_values=()),
+        RecoveryWorkflow(),
+    )
+    manager.set_max_concurrent_workers(1)
+    started: list[str] = []
+    capacity_race = True
+
+    def start(run: SimpleNamespace) -> None:
+        nonlocal capacity_race
+        started.append(run.run_id)
+        if run.run_id == "run-1" and capacity_race:
+            capacity_race = False
+            raise WorkerCapacityError("slot was claimed concurrently")
+        manager._threads[run.run_id] = Thread(target=lambda: None)
+
+    monkeypatch.setattr(manager, "start", start)
+    assert manager.recover({"allowed"}) == ("run-2",)
+    assert started == ["run-1", "run-2"]
+    assert [run.run_id for run in orchestrator.store.runs] == [
+        "run-1",
+        "run-2",
+        "run-3",
+    ]
+
+    orchestrator.store.runs = [runs[1], runs[0]]
+    assert manager.recover({"allowed"}) == ()
+    assert len(started) == 2
+    manager._threads.clear()
+    orchestrator.store.runs = [runs[0]]
+    assert manager.recover({"allowed"}) == ("run-1",)
+    assert started == ["run-1", "run-2", "run-1"]
 
 
 def test_worker_start_requires_workflow_service() -> None:
