@@ -1,8 +1,9 @@
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
-from threading import Event, Lock
+from threading import Barrier, Event, Lock
 from typing import Any
 
 import pytest
@@ -1442,7 +1443,14 @@ class HandoffGraphQLClient:
             self.ref_creations += 1
             self.ref_oids.append(variables["input"]["oid"])
             self.branch_sha = str(variables["input"]["oid"])
-            return {"createRef": {"ref": {"name": variables["input"]["name"]}}}
+            return {
+                "createRef": {
+                    "ref": {
+                        "name": variables["input"]["name"],
+                        "target": {"oid": self.branch_sha},
+                    }
+                }
+            }
         if "CreatePullRequestInput" in query:
             self.pull_request_creations += 1
             self.pull_request_bases.append(variables["input"]["baseRefName"])
@@ -1491,6 +1499,40 @@ class HandoffGraphQLClient:
                 },
             }
         }
+
+
+class ConcurrentProviderHandoffGraphQLClient(HandoffGraphQLClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self._state_lock = Lock()
+        self._initial_reads = Barrier(2)
+        self.repository_reads = 0
+        self.ref_create_attempts = 0
+
+    def execute(self, query: str, variables: dict[str, object]) -> dict[str, Any]:
+        if "pullRequestCursor" in variables:
+            with self._state_lock:
+                self.repository_reads += 1
+                initial_read = self.repository_reads <= 2
+                response = deepcopy(super().execute(query, variables))
+            if initial_read:
+                self._initial_reads.wait(timeout=5)
+            return response
+        if "CreateRefInput" in query:
+            with self._state_lock:
+                self.ref_create_attempts += 1
+                if self.ref_exists:
+                    raise ProviderError("reference already exists")
+                return super().execute(query, variables)
+        if "CreatePullRequestInput" in query:
+            with self._state_lock:
+                if self.pull_requests:
+                    raise ProviderError("pull request already exists")
+                return super().execute(query, variables)
+        if "UpdatePullRequestInput" in query:
+            with self._state_lock:
+                return super().execute(query, variables)
+        return super().execute(query, variables)
 
 
 def test_github_provider_discovers_linked_repositories_without_items() -> None:
@@ -1749,6 +1791,34 @@ def test_github_provider_reuses_existing_branch_and_pull_request() -> None:
     assert client.pull_request_bases == ["main"]
 
 
+def test_github_provider_concurrent_calls_converge_on_one_artifact() -> None:
+    client = ConcurrentProviderHandoffGraphQLClient()
+    provider = GitHubProjectProvider("owner", 7, "token", client=client)
+    request = HandoffRequest(
+        project_id="owner:7",
+        repository="owner/api",
+        pbi_number=1,
+        title="API one",
+        branch="codex/api-1",
+        base_branch=None,
+        body="Closes #1",
+        run_id="run-1",
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(provider.create_handoff, request)
+        second = executor.submit(provider.create_handoff, request)
+        results = (first.result(), second.result())
+
+    assert results[0] == results[1]
+    assert results[0].branch == request.branch
+    assert client.repository_reads >= 2
+    assert client.ref_create_attempts == 2
+    assert client.ref_creations == 1
+    assert client.pull_request_creations == 1
+    assert len(client.pull_requests) == 1
+
+
 def test_github_provider_does_not_reuse_pull_request_for_another_run() -> None:
     client = HandoffGraphQLClient()
     provider = GitHubProjectProvider("owner", 7, "token", client=client)
@@ -1762,16 +1832,7 @@ def test_github_provider_does_not_reuse_pull_request_for_another_run() -> None:
         body="Closes #1",
         run_id="run-1",
     )
-    second_request = HandoffRequest(
-        project_id="owner:7",
-        repository="owner/api",
-        pbi_number=2,
-        title="API two",
-        branch="codex/api-1",
-        base_branch=None,
-        body="Closes #2",
-        run_id="run-2",
-    )
+    second_request = replace(first_request, run_id="run-2")
 
     first = provider.create_handoff(first_request)
     with pytest.raises(ProviderError, match="different handoff identity"):
@@ -1853,7 +1914,10 @@ class PaginatedPullRequestClient(HandoffGraphQLClient):
                     "name": "main",
                     "target": {"oid": "base-oid"},
                 },
-                "ref": {"name": variables["qualifiedBranch"]},
+                "ref": {
+                    "name": variables["qualifiedBranch"],
+                    "target": {"oid": "base-oid"},
+                },
                 "pullRequests": {
                     "nodes": nodes,
                     "pageInfo": {
@@ -1870,29 +1934,44 @@ class RacingHandoffGraphQLClient(HandoffGraphQLClient):
         super().__init__()
         self.fail_ref_once = True
         self.fail_pull_request_once = True
+        self.events: list[str] = []
+        self.ref_create_attempts = 0
+        self.pull_request_create_attempts = 0
 
     def execute(self, query: str, variables: dict[str, object]) -> dict[str, Any]:
-        if "CreateRefInput" in query and self.fail_ref_once:
-            self.fail_ref_once = False
-            self.ref_exists = True
-            raise ProviderError("reference already exists")
-        if "CreatePullRequestInput" in query and self.fail_pull_request_once:
-            self.fail_pull_request_once = False
-            self.pull_requests.append(
-                {
-                    "id": "pull-request-node-8",
-                    "number": 8,
-                    "url": "https://example.test/owner/api/pull/8",
-                    "title": variables["input"]["title"],
-                    "state": "OPEN",
-                    "isDraft": variables["input"]["draft"],
-                    "headRefName": variables["input"]["headRefName"],
-                    "headRefOid": self.branch_sha,
-                    "baseRefName": variables["input"]["baseRefName"],
-                    "body": variables["input"]["body"],
-                }
-            )
-            raise ProviderError("pull request already exists")
+        if "pullRequestCursor" in variables:
+            self.events.append("read")
+        if "CreateRefInput" in query:
+            self.events.append("create-ref")
+            self.ref_create_attempts += 1
+            if self.fail_ref_once:
+                self.fail_ref_once = False
+                self.ref_exists = True
+                self.ref_creations += 1
+                raise ProviderError("reference creation timed out after commit")
+        if "CreatePullRequestInput" in query:
+            self.events.append("create-pull-request")
+            self.pull_request_create_attempts += 1
+            if self.fail_pull_request_once:
+                self.fail_pull_request_once = False
+                self.pull_request_creations += 1
+                self.pull_requests.append(
+                    {
+                        "id": "pull-request-node-8",
+                        "number": 8,
+                        "url": "https://example.test/owner/api/pull/8",
+                        "title": variables["input"]["title"],
+                        "state": "OPEN",
+                        "isDraft": variables["input"]["draft"],
+                        "headRefName": variables["input"]["headRefName"],
+                        "headRefOid": self.branch_sha,
+                        "baseRefName": variables["input"]["baseRefName"],
+                        "body": variables["input"]["body"],
+                    }
+                )
+                raise ProviderError("pull request creation timed out after commit")
+        if "UpdatePullRequestInput" in query:
+            self.events.append("update-pull-request")
         return super().execute(query, variables)
 
 
@@ -1909,7 +1988,7 @@ def test_github_provider_paginates_pull_requests_when_reusing_one() -> None:
         body="Closes #1",
         run_id="run-1",
     )
-    client.pull_requests[-1]["body"] = _handoff_marker(request)
+    client.pull_requests[-1]["body"] = _handoff_marker(request, "main")
 
     result = provider.create_handoff(request)
 
@@ -1933,8 +2012,69 @@ def test_github_provider_recovers_from_create_races() -> None:
 
     result = provider.create_handoff(request)
 
+    assert result.branch == request.branch
     assert result.pull_request_number == 8
+    assert client.ref_exists
+    assert client.ref_create_attempts == 1
+    assert client.pull_request_create_attempts == 1
     assert len(client.pull_requests) == 1
+    ref_index = client.events.index("create-ref")
+    pr_index = client.events.index("create-pull-request")
+    assert client.events[ref_index + 1] == "read"
+    assert client.events[pr_index + 1] == "read"
+
+
+class WrongTargetRacingHandoffGraphQLClient(RacingHandoffGraphQLClient):
+    def execute(self, query: str, variables: dict[str, object]) -> dict[str, Any]:
+        if "CreateRefInput" in query and self.fail_ref_once:
+            self.fail_ref_once = False
+            self.ref_exists = True
+            self.branch_sha = "unexpected-oid"
+            raise ProviderError("reference creation timed out")
+        return super().execute(query, variables)
+
+
+def test_github_provider_rejects_ambiguous_branch_with_unexpected_target() -> None:
+    client = WrongTargetRacingHandoffGraphQLClient()
+    provider = GitHubProjectProvider("owner", 7, "token", client=client)
+    request = HandoffRequest(
+        project_id="owner:7",
+        repository="owner/api",
+        pbi_number=1,
+        title="API one",
+        branch="codex/api-1",
+        base_branch=None,
+        body="Closes #1",
+        run_id="run-1",
+    )
+
+    with pytest.raises(ProviderError, match="intended base commit"):
+        provider.create_handoff(request)
+
+    assert client.pull_request_creations == 0
+
+
+def test_github_provider_rejects_unverified_branch_target_mismatch() -> None:
+    client = HandoffGraphQLClient()
+    client.ref_exists = True
+    client.branch_sha = "unexpected-oid"
+    provider = GitHubProjectProvider("owner", 7, "token", client=client)
+    request = HandoffRequest(
+        project_id="owner:7",
+        repository="owner/api",
+        pbi_number=1,
+        title="API one",
+        branch="codex/api-1",
+        base_branch=None,
+        body="Closes #1",
+        run_id="run-1",
+    )
+
+    with pytest.raises(ProviderError, match="intended base commit"):
+        provider.create_handoff(request)
+
+    assert client.ref_creations == 0
+    assert client.pull_request_creations == 0
 
 
 def test_github_provider_creates_and_updates_verified_draft() -> None:
@@ -1964,7 +2104,7 @@ def test_github_provider_creates_and_updates_verified_draft() -> None:
             title="API one updated",
             branch="codex/api-1",
             base_branch=None,
-            body="Updated implementation summary",
+            body="Implementation summary",
             run_id="run-1",
             head_sha="a" * 40,
             verification_evidence='{"outcome":"pass","tests":12}',
@@ -1985,7 +2125,109 @@ def test_github_provider_creates_and_updates_verified_draft() -> None:
     assert "run-1" in body
     assert "a" * 40 in body
     assert '{"outcome":"pass","tests":12}' in body
-    assert _handoff_marker(request) in body
+    assert _handoff_marker(request, "main") in body
+
+
+def test_github_provider_does_not_reuse_pull_request_for_changed_body_intent() -> None:
+    client = HandoffGraphQLClient()
+    provider = GitHubProjectProvider("owner", 7, "token", client=client)
+    request = HandoffRequest(
+        project_id="owner:7",
+        repository="owner/api",
+        pbi_number=1,
+        title="API one",
+        branch="codex/api-1",
+        base_branch=None,
+        body="Implementation summary",
+        run_id="run-1",
+    )
+    provider.create_handoff(request)
+
+    with pytest.raises(ProviderError, match="different handoff identity"):
+        provider.create_handoff(replace(request, body="Changed implementation summary"))
+
+    assert client.pull_request_creations == 1
+    assert client.pull_request_updates == 0
+
+
+def test_github_provider_upgrades_exact_legacy_handoff_marker() -> None:
+    client = HandoffGraphQLClient()
+    client.ref_exists = True
+    provider = GitHubProjectProvider("owner", 7, "token", client=client)
+    request = HandoffRequest(
+        project_id="owner:7",
+        repository="owner/api",
+        pbi_number=1,
+        title="API one",
+        branch="codex/api-1",
+        base_branch=None,
+        body="Implementation summary",
+        run_id="run-1",
+    )
+    legacy_marker = provider_module._legacy_handoff_marker(request)
+    legacy_body = provider_module._handoff_body(request.body, legacy_marker, request)
+    client.pull_requests.append(
+        {
+            "id": "pull-request-node-8",
+            "number": 8,
+            "url": "https://example.test/owner/api/pull/8",
+            "title": request.title,
+            "state": "OPEN",
+            "isDraft": True,
+            "headRefName": request.branch,
+            "headRefOid": client.branch_sha,
+            "baseRefName": "main",
+            "body": legacy_body,
+        }
+    )
+
+    result = provider.create_handoff(request)
+
+    assert result.pull_request_number == 8
+    assert client.pull_request_creations == 0
+    assert client.pull_request_updates == 1
+    assert _handoff_marker(request, "main") in client.pull_requests[0]["body"]
+
+
+def test_github_provider_does_not_upgrade_legacy_pr_for_changed_body_intent() -> None:
+    client = HandoffGraphQLClient()
+    client.ref_exists = True
+    provider = GitHubProjectProvider("owner", 7, "token", client=client)
+    original = HandoffRequest(
+        project_id="owner:7",
+        repository="owner/api",
+        pbi_number=1,
+        title="API one",
+        branch="codex/api-1",
+        base_branch=None,
+        body="Original implementation summary",
+        run_id="run-1",
+    )
+    legacy_marker = provider_module._legacy_handoff_marker(original)
+    client.pull_requests.append(
+        {
+            "id": "pull-request-node-8",
+            "number": 8,
+            "url": "https://example.test/owner/api/pull/8",
+            "title": original.title,
+            "state": "OPEN",
+            "isDraft": True,
+            "headRefName": original.branch,
+            "headRefOid": client.branch_sha,
+            "baseRefName": "main",
+            "body": provider_module._handoff_body(
+                original.body, legacy_marker, original
+            ),
+        }
+    )
+
+    with pytest.raises(ProviderError, match="different handoff identity"):
+        provider.create_handoff(
+            replace(original, body="Changed implementation summary")
+        )
+
+    assert client.pull_request_updates == 0
+    assert client.pull_request_creations == 0
 
 
 def test_github_provider_adds_verified_metadata_when_body_has_marker() -> None:
@@ -2005,7 +2247,7 @@ def test_github_provider_adds_verified_metadata_when_body_has_marker() -> None:
         head_sha="a" * 40,
         verification_evidence='{"outcome":"pass"}',
     )
-    request = replace(request, body=_handoff_marker(request))
+    request = replace(request, body=_handoff_marker(request, "main"))
 
     provider.create_handoff(request)
 
@@ -2014,7 +2256,7 @@ def test_github_provider_adds_verified_metadata_when_body_has_marker() -> None:
     assert "Run: `run-1`" in body
     assert "Pushed head: `" + "a" * 40 + "`" in body
     assert '{"outcome":"pass"}' in body
-    assert body.count(_handoff_marker(request)) == 1
+    assert body.count(_handoff_marker(request, "main")) == 1
 
 
 @pytest.mark.parametrize(
@@ -2051,7 +2293,7 @@ def test_github_provider_never_updates_ready_or_closed_pull_requests(
             "headRefName": request.branch,
             "headRefOid": client.branch_sha,
             "baseRefName": "main",
-            "body": _handoff_marker(request),
+            "body": _handoff_marker(request, "main"),
         }
     )
     provider = GitHubProjectProvider("owner", 7, "token", client=client)
@@ -2101,7 +2343,7 @@ def test_github_provider_recovers_from_update_race() -> None:
             title="API one updated",
             branch="codex/api-1",
             base_branch=None,
-            body="Updated summary",
+            body="Closes #1",
             run_id="run-1",
         )
     )
