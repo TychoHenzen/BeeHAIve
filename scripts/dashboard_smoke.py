@@ -151,6 +151,16 @@ def main(argv: list[str] | None = None) -> int:
             secrets_to_redact,
             environment.server_output,
             live_timeout=args.live_timeout,
+            fixture_workflow_service=(
+                environment.resources.workflow_service
+                if args.mode == "fixture" and environment.resources is not None
+                else None
+            ),
+            fixture_worker_repository=(
+                environment.resources.worker_repository
+                if args.mode == "fixture" and environment.resources is not None
+                else None
+            ),
         )
     except Exception as error:
         report["browser"] = {

@@ -35,13 +35,14 @@ result is shown on the PBI card. Every action is recorded as `pending`,
 `succeeded`, or `failed`; a response always includes the latest available run
 state.
 
-The demo worker runs `codex exec` with a read-only sandbox, an ephemeral
-session, and a finite timeout. It reads a temporary credential-free copy of the
-checkout configured by `BEEHAIIVE_AGENT_REPOSITORY`, and requires its exact
-`BEEHAIIVE_AGENT_REPOSITORY_NAME` identity to match the claimed repository.
-Stop, failure, project removal, and service shutdown terminate the process tree
-and clear the run lease. Demo review mode disables review operations. It is not
-a live pull-request review.
+The dashboard worker runs `codex exec` with a writable sandbox rooted at one
+unique Git worktree. It disables network access and child agents, filters the
+child environment, and requires the configured repository identity to match the
+claimed repository. Both the dashboard run lease and worktree lease are renewed
+while the process runs. Success retains uncommitted changes for later handoff.
+Stop, failure, expiry, restart, and service shutdown terminate the process tree
+and remove the worker worktree. Demo review mode disables review operations. It
+is not a live pull-request review.
 
 A new local database is synchronized from GitHub when the dashboard first
 refreshes. Later refreshes synchronize again before reading the projection, so

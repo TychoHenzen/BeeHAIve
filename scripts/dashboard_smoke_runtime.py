@@ -5,7 +5,9 @@ from __future__ import annotations
 import io
 import os
 import shutil
+import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -63,19 +65,6 @@ class FixtureProvider:
         self, repository: str, branch: str, requested_base: str | None
     ) -> str:
         return self.resolve_base_branch(repository, requested_base)
-
-
-class FixtureWorker:
-    """Keep fixture runs active so the browser can exercise each control."""
-
-    def start(self, run: Any) -> None:
-        del run
-
-    def cancel(self, run_id: str) -> None:
-        del run_id
-
-    def shutdown(self) -> None:
-        return None
 
 
 class DiscoveryCountingProvider:
@@ -178,6 +167,8 @@ class ApplicationResources:
     app: Any
     stores: list[Any]
     provider: Any
+    workflow_service: Any
+    worker_repository: Path | None
 
 
 @contextmanager
@@ -214,6 +205,12 @@ def build_app(mode: str, project_id: str, directory: Path) -> ApplicationResourc
     from beehaiive.review import ReviewStore
     from beehaiive.routing import ModelRouter, RoutingStore
     from beehaiive.storage import OrchestratorStore
+    from beehaiive.workflow import (
+        CommandCheck,
+        Constitution,
+        WorkflowService,
+        WorkflowStore,
+    )
 
     if mode == "fixture":
         provider: Any = FixtureProvider()
@@ -247,13 +244,85 @@ def build_app(mode: str, project_id: str, directory: Path) -> ApplicationResourc
         runtime_stores.append(review_store)
         model_router = ModelRouter(routing_store)
         orchestrator = Orchestrator(state_store, provider, model_router)
-        agent_worker: Any = FixtureWorker() if mode == "fixture" else None
+        workflow_service: WorkflowService
+        worker_repository: Path | None = None
         if mode == "live":
             from beehaiive.agent import AgentWorkerManager, CodexExecModelExecutor
 
             executor = CodexExecModelExecutor.from_environment()
             orchestrator.model_executor = executor
-            agent_worker = AgentWorkerManager(orchestrator, executor)
+            with isolated_module_environment(directory):
+                import main
+
+                workflow_service = main._production_workflow_service()
+        else:
+            from beehaiive.agent import AgentWorkerManager, CodexExecModelExecutor
+
+            worker_repository = directory / "worker-repository"
+            worker_repository.mkdir()
+            for arguments in (
+                ("init", "-b", "master"),
+                ("config", "user.email", "smoke@example.test"),
+                ("config", "user.name", "Dashboard Smoke"),
+            ):
+                result = subprocess.run(
+                    ("git", *arguments),
+                    cwd=worker_repository,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    raise SmokeFailure(result.stderr or result.stdout)
+            (worker_repository / "README.md").write_text(
+                "fixture repository\n", encoding="utf-8"
+            )
+            subprocess.run(
+                ("git", "add", "README.md"), cwd=worker_repository, check=True
+            )
+            subprocess.run(
+                ("git", "commit", "-m", "fixture base"),
+                cwd=worker_repository,
+                check=True,
+                capture_output=True,
+            )
+            writer_script = directory / "writer_fixture.py"
+            writer_script.write_text(
+                "import pathlib, time\n"
+                "pathlib.Path('worker-output.txt').write_text("
+                "'leased\\n', encoding='utf-8')\n"
+                "time.sleep(300)\n",
+                encoding="utf-8",
+            )
+
+            class FixtureWriterExecutor(CodexExecModelExecutor):
+                def _workspace_command_for_execution(
+                    self, prompt: str, model: str, worktree: Path
+                ) -> list[str]:
+                    return [
+                        sys.executable,
+                        str(writer_script),
+                        "--cd",
+                        str(worktree),
+                        prompt,
+                    ]
+
+            executor = FixtureWriterExecutor(
+                worker_repository,
+                executable=sys.executable,
+                repository_name="owner/api",
+                timeout_seconds=600,
+            )
+            orchestrator.model_executor = executor
+            workflow_store = WorkflowStore(directory / "workflow.db")
+            workflow_service = WorkflowService(
+                workflow_store,
+                worker_repository,
+                Constitution.load(Path(__file__).parents[1] / "constitution.json"),
+                [CommandCheck("fixture", ("git", "status", "--short"))],
+            )
+        runtime_stores.append(workflow_service.store)
+        agent_worker = AgentWorkerManager(orchestrator, executor, workflow_service)
         with isolated_module_environment(directory):
             import main
 
@@ -265,6 +334,7 @@ def build_app(mode: str, project_id: str, directory: Path) -> ApplicationResourc
                 routing_store=routing_store,
                 model_router=model_router,
                 agent_worker=agent_worker,
+                workflow_service=workflow_service,
             )
     except Exception as error:
         cleanup_errors = close_stores(runtime_stores)
@@ -274,7 +344,13 @@ def build_app(mode: str, project_id: str, directory: Path) -> ApplicationResourc
                 f"Application setup failed and cleanup failed: {details}"
             ) from error
         raise
-    return ApplicationResources(app=app, stores=runtime_stores, provider=provider)
+    return ApplicationResources(
+        app=app,
+        stores=runtime_stores,
+        provider=provider,
+        workflow_service=workflow_service,
+        worker_repository=worker_repository,
+    )
 
 
 def start_server(
@@ -398,7 +474,12 @@ class SmokeEnvironment:
             self.resources = None
         if self.directory.exists():
             try:
-                shutil.rmtree(self.directory)
+
+                def remove_readonly(function: Any, path: str, _error: Any) -> None:
+                    os.chmod(path, stat.S_IWRITE)
+                    function(path)
+
+                shutil.rmtree(self.directory, onerror=remove_readonly)
             except OSError as error:
                 errors.append(str(error))
         return errors

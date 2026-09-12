@@ -1,3 +1,4 @@
+import subprocess
 import time
 from pathlib import Path
 
@@ -20,11 +21,18 @@ from beehaiive.orchestrator import Orchestrator
 from beehaiive.provider import ProviderError
 from beehaiive.routing import AttemptOutcome, ModelExecution, ModelRouter, RoutingStore
 from beehaiive.storage import OrchestratorStore, StoreError, _json_mapping
+from beehaiive.workflow import (
+    CheckResult,
+    Constitution,
+    LeaseStatus,
+    WorkflowService,
+    WorkflowStore,
+)
 
 
 class ImmediateDemoExecutor(CodexExecModelExecutor):
-    def __init__(self) -> None:
-        super().__init__(Path.cwd(), repository_name="owner/api")
+    def __init__(self, repository: Path | None = None) -> None:
+        super().__init__(repository or Path.cwd(), repository_name="owner/api")
 
     def build_task_contract(self, run: RunState) -> TaskContract:
         return TaskContract.inventory(run.repository, run.pbi_number, run.title)
@@ -36,6 +44,25 @@ class ImmediateDemoExecutor(CodexExecModelExecutor):
             result="demo result",
             task_result=TaskResult(TaskOutcome.PASS, {}),
         )
+
+
+def make_dashboard_git_repository(path: Path) -> Path:
+    path.mkdir()
+    for arguments in (
+        ("init", "-b", "master"),
+        ("config", "user.email", "tests@example.test"),
+        ("config", "user.name", "Dashboard Tests"),
+    ):
+        result = subprocess.run(
+            ("git", *arguments), cwd=path, capture_output=True, text=True
+        )
+        assert result.returncode == 0, result.stderr or result.stdout
+    (path / "README.md").write_text("base\n", encoding="utf-8")
+    subprocess.run(("git", "add", "README.md"), cwd=path, check=True)
+    subprocess.run(
+        ("git", "commit", "-m", "base"), cwd=path, check=True, capture_output=True
+    )
+    return path
 
 
 def dashboard_snapshot(
@@ -803,15 +830,33 @@ def test_dashboard_runtime_assets_are_served_without_sample_data() -> None:
     assert view_script.status_code == 200
 
 
-def test_dashboard_worker_completes_bounded_demo_and_persists_result() -> None:
-    executor = ImmediateDemoExecutor()
+def test_dashboard_worker_completes_bounded_demo_and_persists_result(
+    tmp_path: Path,
+) -> None:
+    repository = make_dashboard_git_repository(tmp_path / "repository")
+    executor = ImmediateDemoExecutor(repository)
     service = Orchestrator(
         OrchestratorStore(),
         FakeProvider(dashboard_snapshot()),
         ModelRouter(RoutingStore()),
         executor,
     )
-    worker = AgentWorkerManager(service, executor)
+    workflow_store = WorkflowStore(tmp_path / "workflow.db")
+
+    class PassingCheck:
+        name = "tests"
+
+        def run(self, workspace: Path) -> CheckResult:
+            assert workspace.exists()
+            return CheckResult(self.name, True, "fixture passed")
+
+    workflow_service = WorkflowService(
+        workflow_store,
+        repository,
+        Constitution.load(Path(__file__).parents[1] / "constitution.json"),
+        [PassingCheck()],
+    )
+    worker = AgentWorkerManager(service, executor, workflow_service)
 
     with TestClient(
         main_module.create_app(
@@ -819,6 +864,7 @@ def test_dashboard_worker_completes_bounded_demo_and_persists_result() -> None:
             api_key="test-key",
             allowed_project_ids={"project-1"},
             agent_worker=worker,
+            workflow_service=workflow_service,
         )
     ) as client:
         service.synchronize("project-1")
@@ -847,6 +893,14 @@ def test_dashboard_worker_completes_bounded_demo_and_persists_result() -> None:
         assert pbi["status"] == "completed"
         assert pbi["result"] == "demo result"
         assert pbi["claimable"] is False
+
+    lease = workflow_service.workspace_for_run(run_id)
+    assert lease is not None and lease.status is LeaseStatus.RETAINED
+    assert Path(lease.worktree_path).is_dir()
+    workflow_service.release_workspace(lease.lease_id)
+    workflow_store.close()
+    service.store.close()
+    service.model_router.store.close()
 
 
 def test_dashboard_stop_cancels_worker_before_stopping_run() -> None:

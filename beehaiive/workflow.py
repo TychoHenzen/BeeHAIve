@@ -34,6 +34,7 @@ class LeaseStatus(StrEnum):
     """Lifecycle state of one isolated worktree lease."""
 
     ACTIVE = "active"
+    RETAINED = "retained"
     RELEASED = "released"
     STOPPED = "stopped"
 
@@ -481,6 +482,10 @@ class WorkflowStore:
         self._lock = RLock()
         self._initialize()
 
+    @property
+    def lease_heartbeat_seconds(self) -> float:
+        return max(self._lease_ttl_seconds / 3, 0.01)
+
     def close(self) -> None:
         with self._lock:
             self._connection.close()
@@ -518,10 +523,18 @@ class WorkflowStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
-                CREATE UNIQUE INDEX IF NOT EXISTS active_workflow_branch
-                    ON workflow_leases(branch) WHERE status = 'active';
-                CREATE UNIQUE INDEX IF NOT EXISTS active_workflow_worktree
-                    ON workflow_leases(worktree_path) WHERE status = 'active';
+                DROP INDEX IF EXISTS active_workflow_branch;
+                DROP INDEX IF EXISTS active_workflow_worktree;
+                CREATE UNIQUE INDEX active_workflow_branch
+                    ON workflow_leases(branch)
+                    WHERE status IN ('active', 'retained');
+                CREATE UNIQUE INDEX active_workflow_worktree
+                    ON workflow_leases(worktree_path)
+                    WHERE status IN ('active', 'retained');
+                CREATE UNIQUE INDEX IF NOT EXISTS active_dashboard_run_workspace
+                    ON workflow_leases(agent_id)
+                    WHERE agent_id GLOB 'dashboard-run:*'
+                    AND status IN ('active', 'retained');
                 CREATE TABLE IF NOT EXISTS workflow_handoffs (
                     handoff_id TEXT PRIMARY KEY,
                     lease_id TEXT NOT NULL,
@@ -918,6 +931,32 @@ class WorkflowStore:
             ).fetchone()
         return None if row is None else self._lease_from_row(row)
 
+    def get_lease_for_agent(self, agent_id: str) -> WorkspaceLease | None:
+        with self._transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM workflow_leases
+                WHERE agent_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (agent_id,),
+            ).fetchone()
+        return None if row is None else self._lease_from_row(row)
+
+    def dashboard_run_leases(self) -> tuple[WorkspaceLease, ...]:
+        with self._transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM workflow_leases
+                WHERE agent_id GLOB 'dashboard-run:*'
+                AND status IN (?, ?)
+                ORDER BY created_at
+                """,
+                (LeaseStatus.ACTIVE.value, LeaseStatus.STOPPED.value),
+            ).fetchall()
+        return tuple(self._lease_from_row(row) for row in rows)
+
     def reclaim_expired(self) -> tuple[WorkspaceLease, ...]:
         with self._transaction(reclaim_expired=False) as connection:
             expired_ids = self._expire_active_leases(connection)
@@ -1006,6 +1045,36 @@ class WorkflowStore:
             raise WorkflowError("Workspace lease disappeared")
         return lease
 
+    def retain_lease(self, lease_id: str, lease_token: str | None) -> WorkspaceLease:
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM workflow_leases WHERE lease_id = ?", (lease_id,)
+            ).fetchone()
+            if row is None:
+                raise WorkflowError(f"Unknown workspace lease: {lease_id}")
+            if LeaseStatus(str(row["status"])) is not LeaseStatus.ACTIVE:
+                raise WorkflowError(f"Workspace lease is {row['status']}")
+            if not lease_token or row["lease_token"] != lease_token:
+                raise WorkflowError("Lease token is invalid")
+            connection.execute(
+                """
+                UPDATE workflow_leases
+                SET status = ?, expires_at = NULL, updated_at = ?
+                WHERE lease_id = ? AND status = ? AND lease_token = ?
+                """,
+                (
+                    LeaseStatus.RETAINED.value,
+                    _now(),
+                    lease_id,
+                    LeaseStatus.ACTIVE.value,
+                    lease_token,
+                ),
+            )
+        lease = self.get_lease(lease_id)
+        if lease is None:
+            raise WorkflowError("Workspace lease disappeared")
+        return lease
+
     def acquire_lease(
         self, agent_id: str, branch: str, worktree_path: str
     ) -> WorkspaceLease:
@@ -1077,6 +1146,9 @@ class WorkflowStore:
             if current_status is LeaseStatus.STOPPED:
                 if not allow_stopped:
                     return self._lease_from_row(row)
+            elif current_status is LeaseStatus.RETAINED:
+                if status not in {LeaseStatus.RELEASED, LeaseStatus.STOPPED}:
+                    raise WorkflowError("A retained workspace cannot be renewed")
             else:
                 assert current_status is LeaseStatus.ACTIVE
             if status is LeaseStatus.RELEASED:
@@ -1344,6 +1416,13 @@ class GitWorktreeManager:
             self.store.ensure_release_allowed(lease_id)
             self._git("worktree", "remove", lease.worktree_path)
             return self.store.release_lease(lease_id)
+        if lease.status is LeaseStatus.RETAINED:
+            if not self.clean(lease.worktree_path):
+                raise WorkflowError(
+                    "Cannot release a retained workspace with uncommitted changes"
+                )
+            self._git("worktree", "remove", lease.worktree_path)
+            return self.store.release_lease(lease_id)
         if lease.status is LeaseStatus.STOPPED:
             self._cleanup_stopped_worktree(lease.worktree_path)
             self._delete_reclaimed_branch(lease.branch)
@@ -1515,6 +1594,25 @@ class WorkflowService:
     ) -> WorkspaceLease:
         return self.worktrees.acquire(agent_id, branch, worktree, base_ref)
 
+    def retain_workspace(
+        self, lease_id: str, lease_token: str | None
+    ) -> WorkspaceLease:
+        return self.store.retain_lease(lease_id, lease_token)
+
+    def workspace_for_run(self, run_id: str) -> WorkspaceLease | None:
+        run_id = _required(run_id, "run id")
+        return self.store.get_lease_for_agent(f"dashboard-run:{run_id}")
+
+    def cleanup_dashboard_run_workspaces(self) -> tuple[WorkspaceLease, ...]:
+        cleaned: list[WorkspaceLease] = []
+        for lease in self.store.dashboard_run_leases():
+            if lease.status is LeaseStatus.ACTIVE:
+                self.store.stop_lease(
+                    lease.lease_id, "Dashboard worker did not survive service restart"
+                )
+            cleaned.append(self.worktrees.release(lease.lease_id))
+        return tuple(cleaned)
+
     def release_workspace(self, lease_id: str) -> WorkspaceLease:
         return self.worktrees.release(lease_id)
 
@@ -1526,6 +1624,8 @@ class WorkflowService:
             raise WorkflowError(f"Unknown workspace lease: {lease_id}")
         if lease.status is LeaseStatus.ACTIVE:
             self.stop(lease_id, reason)
+        elif lease.status is LeaseStatus.RETAINED:
+            self.store.stop_lease(lease_id, reason)
         return self.worktrees.release(lease_id)
 
     def before_model_call(self, lease_id: str) -> GateResult:
