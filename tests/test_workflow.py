@@ -1691,6 +1691,29 @@ def test_restart_cleanup_preserves_dirty_and_uninspectable_workspaces(
     store.close()
 
 
+def test_restart_cleanup_can_target_one_dashboard_run(tmp_path: Path) -> None:
+    service, store, _repository_path = _service(tmp_path)
+    target = service.acquire_workspace(
+        "dashboard-run:run-target",
+        "codex/run-target",
+        tmp_path / "target-worktree",
+    )
+    other = service.acquire_workspace(
+        "dashboard-run:run-other",
+        "codex/run-other",
+        tmp_path / "other-worktree",
+    )
+
+    cleaned = service.cleanup_dashboard_run_workspaces("run-target")
+
+    assert [lease.lease_id for lease in cleaned] == [target.lease_id]
+    assert cleaned[0].status is LeaseStatus.RELEASED
+    assert service.store.get_lease(other.lease_id) == other
+    assert Path(other.worktree_path).is_dir()
+    service.cleanup_dashboard_run_workspaces()
+    store.close()
+
+
 def test_retained_lease_validates_state_and_can_be_discarded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

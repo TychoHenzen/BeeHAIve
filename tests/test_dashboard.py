@@ -168,6 +168,10 @@ def test_dashboard_projection_exposes_optional_run_details() -> None:
                                 "evidence": {"summary": "done"},
                                 "artifact_refs": [{"id": "report"}],
                             },
+                            "agent_session": {
+                                "session_id": "run-1",
+                                "events": [{"sequence": 1, "text": "started"}],
+                            },
                             "events": [
                                 {
                                     "type": "review",
@@ -223,6 +227,8 @@ def test_dashboard_projection_exposes_optional_run_details() -> None:
     assert pbi["escalation_log"] == [{"tier": "terra"}]
     assert pbi["task_contract"]["contract_id"] == "test.contract"
     assert pbi["task_result"]["artifact_refs"] == [{"id": "report"}]
+    assert pbi["agent_session"]["session_id"] == "run-1"
+    assert pbi["agent_session"]["events"][0]["sequence"] == 1
 
     completed = build_dashboard_state(
         {
@@ -528,6 +534,10 @@ def test_dashboard_actions_preserve_state_and_report_results() -> None:
     service = Orchestrator(OrchestratorStore(), FakeProvider(dashboard_snapshot()))
 
     class RecordingWorker:
+        def claim(self, project_id, repository, owner_id, task):
+            del task
+            return service.claim(project_id, repository, owner_id)
+
         def start(self, run) -> None:
             del run
 
@@ -1153,11 +1163,46 @@ def test_dashboard_start_requires_a_worker_before_claiming() -> None:
         service.store.close()
 
 
+def test_dashboard_start_uses_configured_task_and_keeps_display_label() -> None:
+    service = Orchestrator(OrchestratorStore(), FakeProvider(dashboard_snapshot()))
+    service.synchronize("project-1")
+
+    class ConfiguredWorker:
+        executor = SimpleNamespace(task="custom task")
+        task: str | None = None
+
+        def claim(self, project_id, repository, owner_id, task):
+            self.task = task
+            return service.claim(project_id, repository, owner_id)
+
+        def start(self, run) -> None:
+            del run
+
+    worker = ConfiguredWorker()
+    try:
+        result = main_module._execute_dashboard_action(
+            service,
+            "project-1",
+            main_module.DashboardStartRequest(
+                action="start", approved=True, repository="owner/api"
+            ),
+            worker,
+        )
+        assert worker.task == "custom task"
+        assert result["worker"]["task"] == main_module.DEMO_TASK_NAME
+    finally:
+        service.store.close()
+
+
 def test_dashboard_start_failure_stops_claimed_run() -> None:
     service = Orchestrator(OrchestratorStore(), FakeProvider(dashboard_snapshot()))
     service.synchronize("project-1")
 
     class FailingWorker:
+        def claim(self, project_id, repository, owner_id, task):
+            assert task == main_module.DEFAULT_DEMO_TASK
+            return service.claim(project_id, repository, owner_id)
+
         def start(self, run) -> None:
             del run
             raise RuntimeError("thread start failed")
@@ -1187,6 +1232,10 @@ def test_dashboard_start_cleanup_failure_is_reported() -> None:
     service.synchronize("project-1")
 
     class FailingWorker:
+        def claim(self, project_id, repository, owner_id, task):
+            del task
+            return service.claim(project_id, repository, owner_id)
+
         def start(self, run) -> None:
             del run
             raise RuntimeError("thread start failed")

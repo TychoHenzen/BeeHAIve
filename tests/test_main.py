@@ -83,6 +83,27 @@ def test_project_routes_sync_and_claim_repository_work() -> None:
     assert claim_response.json()["stage"] == "refine"
 
 
+def test_app_startup_recovers_agent_workers() -> None:
+    class RecoveryProbe:
+        def __init__(self) -> None:
+            self.recovered = False
+
+        def recover(self) -> None:
+            self.recovered = True
+
+        def shutdown(self) -> None:
+            return None
+
+    worker = RecoveryProbe()
+    app = create_app(
+        orchestrator=Orchestrator(OrchestratorStore(), ApiProvider()),
+        agent_worker=worker,
+    )
+
+    with TestClient(app):
+        assert worker.recovered
+
+
 def test_run_routes_advance_handoff_and_fail() -> None:
     service = Orchestrator(OrchestratorStore(), ApiProvider())
     project_client = TestClient(

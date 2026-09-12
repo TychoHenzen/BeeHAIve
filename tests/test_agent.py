@@ -221,6 +221,161 @@ def test_codex_executor_parses_final_message_without_passing_credentials(
     assert result.output_tokens == 7
 
 
+def test_codex_executor_streams_redacted_session_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "abc-secret")
+    script = tmp_path / "session_runner.py"
+    script.write_text(
+        "import json\n"
+        "print(json.dumps({'type': 'thread.started'}))\n"
+        "print(json.dumps({'type': 'item.completed', 'item': {"
+        "'type': 'agent_message', 'text': 'Bearer abc-secret'}}))\n"
+        "print(json.dumps({'type': 'item.completed', 'item': {"
+        "'type': 'command_execution', 'command': 'password=hidden'}}))\n"
+        "print(json.dumps({'type': 'turn.completed'}))\n",
+        encoding="utf-8",
+    )
+    executor = ScriptExecutor(tmp_path, script)
+    events: list[tuple[str, str, str | None, str]] = []
+    executor.set_session_event_handler("run-1", lambda *event: events.append(event))
+    router = ModelRouter(RoutingStore())
+    result = executor.execute(
+        router.config.spec_for(ModelTier.LUNA), router.begin("run-1").decision
+    )
+
+    assert result.outcome is AttemptOutcome.SUCCESS
+    assert events == [
+        ("progress", "thread.started", None, "thread.started"),
+        ("message", "item.completed", "assistant", "Bearer [redacted]"),
+        ("progress", "item.completed", None, "item.completed"),
+        ("progress", "turn.completed", None, "turn.completed"),
+    ]
+    executor.set_session_event_handler("run-1", None)
+    assert "run-1" not in executor._session_event_handlers
+
+
+def test_bounded_communicator_skips_oversized_lines_and_flushes_final_line() -> None:
+    payload = json.dumps({"type": "turn.started"})
+    script = (
+        "import sys\n"
+        "sys.stdout.write('x' * 64001 + '\\n')\n"
+        "sys.stdout.write('y' * 100000 + '\\n')\n"
+        f"sys.stdout.write({payload!r})\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    lines: list[str] = []
+
+    _, _, timed_out = CodexExecModelExecutor._communicate_bounded(
+        process, 5, lines.append
+    )
+
+    assert not timed_out
+    assert lines == [payload]
+
+
+def test_bounded_communicator_persists_flushed_event_before_process_exit(
+    tmp_path: Path,
+) -> None:
+    store = OrchestratorStore()
+    service = Orchestrator(store, FakeProvider(agent_snapshot()))
+    service.synchronize("project-1")
+    run = service.claim("project-1", "owner/api", "worker-1")
+    assert run is not None
+    lease_token = run.lease_token or ""
+    store.start_agent_session(run.run_id, "worker-1", "task", lease_token)
+    executor = CodexExecModelExecutor(tmp_path, repository_name="owner/api")
+    payload = json.dumps({"type": "thread.started"})
+    script = f"import time\nprint({payload!r}, flush=True)\ntime.sleep(30)\n"
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    event_persisted = Event()
+    outcome: list[tuple[str, str, bool]] = []
+
+    def record_event(kind: str, source_type: str, role: str | None, text: str) -> None:
+        store.record_agent_session_event(
+            run.run_id, lease_token, kind, source_type, role, text
+        )
+        event_persisted.set()
+
+    def communicate() -> None:
+        def record_line(line: str) -> None:
+            executor._record_session_line(line, record_event)
+
+        outcome.append(
+            CodexExecModelExecutor._communicate_bounded(process, 30, record_line)
+        )
+
+    communicator = Thread(target=communicate, daemon=True)
+    communicator.start()
+    try:
+        assert event_persisted.wait(timeout=5)
+        assert process.poll() is None
+        pbi = store.project_state("project-1")["repositories"][0]["pbis"][0]
+        session = pbi["agent_session"]
+        assert session["state"] == "active"
+        assert session["events"][0]["text"] == "thread.started"
+    finally:
+        if process.poll() is None:
+            process.kill()
+        communicator.join(timeout=5)
+        store.close()
+    assert not communicator.is_alive()
+    assert len(outcome) == 1
+
+
+def test_bounded_communicator_propagates_session_write_failures() -> None:
+    def fail_write(_line: str) -> None:
+        raise RuntimeError("session persistence failed")
+
+    for script in (
+        "print('session event')",
+        "import sys; sys.stdout.write('session event')",
+    ):
+        process = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        with pytest.raises(RuntimeError, match="session persistence failed"):
+            CodexExecModelExecutor._communicate_bounded(process, 5, fail_write)
+
+
+def test_session_event_parser_ignores_non_message_payloads(tmp_path: Path) -> None:
+    executor = CodexExecModelExecutor(tmp_path, repository_name="owner/api")
+    events: list[tuple[str, str, str | None, str]] = []
+
+    def record(kind: str, source: str, role: str | None, text: str) -> None:
+        events.append((kind, source, role, text))
+
+    executor._record_session_line("not json", record)
+    assert executor._session_event("[]") is None
+    assert executor._session_event(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "reasoning", "text": "private reasoning"},
+            }
+        )
+    ) == ("progress", "item.completed", None, "item.completed")
+    assert (
+        executor._session_event(json.dumps({"type": "custom.event", "text": "ignored"}))
+        is None
+    )
+    executor._record_session_line(
+        json.dumps({"type": "agent_message", "text": "top-level message"}), record
+    )
+
+    assert events == [("message", "agent_message", "assistant", "top-level message")]
+
+
 def test_codex_executor_validates_structured_task_results(
     tmp_path: Path,
 ) -> None:
@@ -593,6 +748,7 @@ def test_executor_prompt_contains_verified_repository_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     executor = CodexExecModelExecutor(tmp_path, repository_name="owner/api")
+    executor.set_session_task("prompt-metadata", "persisted executable task")
     monkeypatch.setattr(executor, "_discover_repository_branch", lambda: "feature/demo")
     monkeypatch.setattr(
         executor,
@@ -600,14 +756,15 @@ def test_executor_prompt_contains_verified_repository_metadata(
         lambda: (Path("README.md"), Path("main.py")),
     )
 
-    prompt = executor._prompt(
-        ModelRouter(RoutingStore()).config.spec_for(ModelTier.LUNA),
-        ModelRouter(RoutingStore()).begin("prompt-metadata").decision,
-    )
+    router = ModelRouter(RoutingStore())
+    spec = router.config.spec_for(ModelTier.LUNA)
+    prompt = executor._prompt(spec, router.begin("prompt-metadata").decision)
+    default_prompt = executor._prompt(spec, router.begin("default-task").decision)
 
     assert "Verified current branch: feature/demo" in prompt
     assert "Verified tracked file count: 2" in prompt
-    assert ".git" in prompt
+    assert "Task: persisted executable task" in prompt
+    assert ".git" in default_prompt
 
 
 def test_executor_safe_checkout_excludes_local_secret_files(tmp_path: Path) -> None:
@@ -1044,6 +1201,9 @@ def test_executor_bounds_stdout_and_stderr_collection(
             del size
             return next(self.chunks, b"")
 
+        def read1(self, size):
+            return self.read(size)
+
         def close(self) -> None:
             self.closed = True
 
@@ -1087,6 +1247,9 @@ def test_executor_bounds_stdout_and_stderr_collection(
             del size
             return b"ignored"
 
+        def read1(self, size):
+            return self.read(size)
+
         def close(self) -> None:
             self.closed = True
 
@@ -1122,6 +1285,159 @@ def test_executor_text_parser_rejects_unsupported_values() -> None:
     assert agent_module._text_value(3) == ""
 
 
+def test_agent_session_round_trips_through_project_state(tmp_path: Path) -> None:
+    database = tmp_path / "state.sqlite3"
+    store = OrchestratorStore(database)
+    service = Orchestrator(store, FakeProvider(agent_snapshot()))
+    service.synchronize("project-1")
+    run = service.claim("project-1", "owner/api", "worker-1")
+    assert run is not None
+    lease_token = run.lease_token or ""
+
+    store.start_agent_session(
+        run.run_id, "agent-process-1", "bounded repository inventory", lease_token
+    )
+    store.record_agent_session_event(
+        run.run_id, lease_token, "progress", "turn.started", None, "turn started"
+    )
+    store.record_agent_session_event(
+        run.run_id,
+        lease_token,
+        "message",
+        "item.completed",
+        "assistant",
+        "Repository inventory is ready.",
+    )
+
+    session = store.get_agent_session(run.run_id)
+    assert session is not None
+    assert session["session_id"] == run.run_id
+    assert session["worker_id"] == "agent-process-1"
+    assert session["task"] == "bounded repository inventory"
+    assert session["state"] == "active"
+    assert [event["sequence"] for event in session["events"]] == [1, 2]
+
+    pbi = store.project_state("project-1")["repositories"][0]["pbis"][0]
+    assert pbi["agent_session"] == session
+    store.close()
+
+    reopened = OrchestratorStore(database)
+    persisted = reopened.get_agent_session(run.run_id)
+    assert persisted == session
+    reopened.close()
+
+
+def test_agent_session_rejects_invalid_start_and_event_requests(
+    tmp_path: Path,
+) -> None:
+    store = OrchestratorStore(tmp_path / "state.sqlite3")
+    service = Orchestrator(store, FakeProvider(agent_snapshot()))
+    service.synchronize("project-1")
+    run = service.claim("project-1", "owner/api", "worker-1")
+    assert run is not None
+    lease_token = run.lease_token or ""
+
+    with pytest.raises(StoreError, match="worker and task are required"):
+        store.start_agent_session(run.run_id, "", "task", lease_token)
+    with pytest.raises(StoreError, match="active run is required"):
+        store.start_agent_session("missing", "worker", "task", lease_token)
+    with pytest.raises(StoreError, match="event kind and source type are required"):
+        store.record_agent_session_event(
+            run.run_id, lease_token, "tool", "item.completed", None, "ignored"
+        )
+    with pytest.raises(StoreError, match="active run is required"):
+        store.record_agent_session_event(
+            "missing", lease_token, "progress", "turn.started", None, "ignored"
+        )
+    with pytest.raises(StoreError, match="session has not been started"):
+        store.record_agent_session_event(
+            run.run_id, lease_token, "progress", "turn.started", None, "ignored"
+        )
+    store.close()
+
+
+def test_agent_session_events_are_bounded_and_lease_fenced(
+    tmp_path: Path,
+) -> None:
+    store = OrchestratorStore(tmp_path / "state.sqlite3")
+    service = Orchestrator(store, FakeProvider(agent_snapshot()))
+    service.synchronize("project-1")
+    run = service.claim("project-1", "owner/api", "worker-1")
+    assert run is not None
+    lease_token = run.lease_token or ""
+    store.start_agent_session(run.run_id, "worker-1", "bounded task", lease_token)
+
+    for index in range(110):
+        store.record_agent_session_event(
+            run.run_id, lease_token, "progress", "turn.started", None, str(index)
+        )
+    session = store.get_agent_session(run.run_id)
+    assert session is not None
+    assert [event["sequence"] for event in session["events"]] == list(range(11, 111))
+
+    for _ in range(10):
+        store.record_agent_session_event(
+            run.run_id,
+            lease_token,
+            "message",
+            "agent_message",
+            "assistant",
+            "é" * 4_000,
+        )
+    session = store.get_agent_session(run.run_id)
+    assert session is not None
+    assert [event["sequence"] for event in session["events"]] == list(range(114, 121))
+    total_bytes = sum(
+        len(
+            (
+                json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+            ).encode("utf-8")
+        )
+        for event in session["events"]
+    )
+    assert total_bytes <= 64_000
+    assert all(len(str(event["text"])) <= 4_000 for event in session["events"])
+
+    store._connection.execute(
+        "UPDATE runs SET lease_expires_at = ? WHERE run_id = ?",
+        ("2000-01-01T00:00:00+00:00", run.run_id),
+    )
+    reclaimed = service.claim("project-1", "owner/api", "worker-2")
+    assert reclaimed is not None and reclaimed.run_id == run.run_id
+    with pytest.raises(StoreError, match="Invalid or missing run lease token"):
+        store.record_agent_session_event(
+            run.run_id, lease_token, "progress", "turn.started", None, "stale"
+        )
+    store.close()
+
+
+def test_recovered_run_reuses_its_persisted_task_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = ImmediateExecutor(
+        ModelExecution(AttemptOutcome.FAILURE, failure_context="unused")
+    )
+    service, store, routing_store, run = service_with_run(executor)
+    lease_token = run.lease_token or ""
+    contract = TaskContract.inventory(
+        "owner/api", 1, "Persisted task", branch="codex/persisted", tracked_file_count=7
+    )
+    service.advance(run.run_id, Stage.IMPLEMENT, lease_token)
+    store.ensure_task_contract(run.run_id, contract, lease_token)
+    persisted_run = store.get_run(run.run_id)
+    assert persisted_run is not None
+
+    monkeypatch.setattr(
+        executor,
+        "build_task_contract",
+        lambda _run: pytest.fail("recovery rebuilt its persisted task contract"),
+    )
+
+    assert service._task_contract_for_run(persisted_run) == contract
+    store.close()
+    routing_store.close()
+
+
 def test_worker_manager_rejects_duplicates_and_shutdowns(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1150,6 +1466,16 @@ def test_worker_manager_rejects_duplicates_and_shutdowns(
         with pytest.raises(StoreError, match="active leased"):
             manager.start(replace(run, lease_token=None))
         manager.start(run)
+        session = store.get_agent_session(run.run_id)
+        assert session is not None
+        assert session["session_id"] == run.run_id
+        assert session["task"] == executor.task
+        executor._session_event_handlers[run.run_id](
+            "message", "item.completed", "assistant", "token=private"
+        )
+        session = store.get_agent_session(run.run_id)
+        assert session is not None
+        assert session["events"][0]["text"] == "token=[redacted]"
         with pytest.raises(StoreError, match="already active"):
             manager.start(run)
         manager.shutdown()
@@ -1160,6 +1486,40 @@ def test_worker_manager_rejects_duplicates_and_shutdowns(
         store.close()
         routing_store.close()
         workflow_store.close()
+
+
+def test_worker_manager_uses_run_title_when_executor_task_is_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = make_git_repository(tmp_path / "repository")
+    executor = ImmediateExecutor(
+        ModelExecution(AttemptOutcome.FAILURE, failure_context="unused"), repository
+    )
+    executor.task = ""
+    service, store, routing_store, run = service_with_run(executor)
+    workflow_service, workflow_store = workflow_service_for(tmp_path, repository)
+
+    class IdleThread:
+        def __init__(self, target, args, name, daemon) -> None:
+            del target, args, name, daemon
+
+        def start(self) -> None:
+            return None
+
+        def join(self, timeout=None) -> None:
+            return None
+
+    monkeypatch.setattr(agent_module, "Thread", IdleThread)
+    manager = AgentWorkerManager(service, executor, workflow_service)
+    try:
+        manager.start(run)
+        session = store.get_agent_session(run.run_id)
+        assert session is not None and session["task"] == run.title
+    finally:
+        manager.shutdown()
+        workflow_store.close()
+        store.close()
+        routing_store.close()
 
 
 def test_worker_start_requires_workflow_service() -> None:
@@ -1185,6 +1545,7 @@ def test_worker_start_requires_workflow_service() -> None:
                 "token",
             ),
         )
+    assert manager.recover() == ()
 
     assert not executor._active_attempts
     store.close()
@@ -1345,6 +1706,100 @@ def test_worker_start_rejects_executor_repository_mismatch(tmp_path: Path) -> No
         assert workflow_service.workspace_for_run(run.run_id) is None
     finally:
         workflow_store.close()
+        store.close()
+    routing_store.close()
+
+
+def test_worker_manager_recovers_expired_session_without_cleaning_other_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = make_git_repository(tmp_path / "repository")
+    first_executor = ImmediateExecutor(
+        ModelExecution(AttemptOutcome.FAILURE, failure_context="unused"), repository
+    )
+    orchestrator, store, routing_store, run = service_with_run(first_executor)
+    workflow_service, workflow_store = workflow_service_for(tmp_path, repository)
+
+    class IdleThread:
+        def __init__(self, target, args, name, daemon) -> None:
+            del target, args, name, daemon
+
+        def start(self) -> None:
+            return None
+
+        def join(self, timeout=None) -> None:
+            return None
+
+    monkeypatch.setattr(agent_module, "Thread", IdleThread)
+    first_manager = AgentWorkerManager(orchestrator, first_executor, workflow_service)
+    first_manager.start(run)
+    original_session = store.get_agent_session(run.run_id)
+    assert original_session is not None
+    original_workspace = workflow_service.workspace_for_run(run.run_id)
+    assert original_workspace is not None
+    other_workspace = workflow_service.acquire_workspace(
+        "dashboard-run:other", "codex/other", tmp_path / "other-worktree"
+    )
+    second_executor = ImmediateExecutor(
+        ModelExecution(AttemptOutcome.FAILURE, failure_context="unused"), repository
+    )
+    second_executor.task = ""
+    second_manager = AgentWorkerManager(orchestrator, second_executor, workflow_service)
+    try:
+        with monkeypatch.context() as context:
+            context.setattr(store, "get_agent_session", lambda _run_id: {"task": ""})
+            assert second_manager.recover() == ()
+        assert Path(original_workspace.worktree_path).exists()
+        store._connection.execute(
+            "UPDATE runs SET lease_expires_at = ? WHERE run_id = ?",
+            ("2000-01-01T00:00:00+00:00", run.run_id),
+        )
+        assert second_manager.recover() == (run.run_id,)
+        recovered_session = store.get_agent_session(run.run_id)
+        assert recovered_session is not None
+        assert recovered_session["session_id"] == original_session["session_id"]
+        assert recovered_session["task"] == original_session["task"]
+        assert recovered_session["worker_id"] == second_manager._worker_id
+        assert second_executor._session_tasks[run.run_id] == original_session["task"]
+        assert not Path(original_workspace.worktree_path).exists()
+        assert workflow_store.get_lease(other_workspace.lease_id) == other_workspace
+    finally:
+        workflow_service.cleanup_dashboard_run_workspaces()
+        first_executor.release_run(run.run_id)
+        second_executor.release_run(run.run_id)
+        workflow_store.close()
+        store.close()
+        routing_store.close()
+
+
+def test_worker_claim_persists_session_before_start() -> None:
+    executor = ImmediateExecutor(
+        ModelExecution(AttemptOutcome.FAILURE, failure_context="unused")
+    )
+    store = OrchestratorStore()
+    routing_store = RoutingStore()
+    orchestrator = Orchestrator(
+        store,
+        FakeProvider(agent_snapshot()),
+        ModelRouter(routing_store),
+        executor,
+    )
+    orchestrator.synchronize("project-1")
+    manager = AgentWorkerManager(orchestrator, executor)
+
+    try:
+        with pytest.raises(StoreError, match="agent task"):
+            manager.claim("project-1", "owner/api", "dashboard-operator", task=" ")
+        assert store.active_runs_for_project("project-1") == ()
+        run = manager.claim(
+            "project-1", "owner/api", "dashboard-operator", task="persisted task"
+        )
+        assert run is not None
+        session = store.get_agent_session(run.run_id)
+        assert session is not None
+        assert session["task"] == "persisted task"
+        assert session["worker_id"] == manager._worker_id
+    finally:
         store.close()
         routing_store.close()
 

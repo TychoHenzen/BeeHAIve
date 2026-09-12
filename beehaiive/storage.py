@@ -30,6 +30,11 @@ class StoreError(RuntimeError):
     """Raised when persisted orchestration state cannot satisfy an operation."""
 
 
+MAX_AGENT_SESSION_EVENTS = 100
+MAX_AGENT_SESSION_EVENT_LENGTH = 4_000
+MAX_AGENT_SESSION_BYTES = 64_000
+
+
 def _task_claimability_state(
     contract_json: object,
     result_json: object,
@@ -283,6 +288,28 @@ class OrchestratorStore:
                     FOREIGN KEY (project_id, repository_name, pbi_number)
                         REFERENCES pbis(project_id, repository_name, number)
                         ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS agent_sessions (
+                    run_id TEXT PRIMARY KEY,
+                    worker_id TEXT NOT NULL,
+                    task TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS agent_session_events (
+                    run_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    role TEXT,
+                    text TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    PRIMARY KEY (run_id, sequence),
+                    FOREIGN KEY (run_id)
+                        REFERENCES agent_sessions(run_id) ON DELETE CASCADE
                 );
 
                 CREATE TABLE IF NOT EXISTS handoffs (
@@ -703,9 +730,16 @@ class OrchestratorStore:
         repository: str,
         owner_id: str,
         lease_token: str | None = None,
+        *,
+        expected_run_id: str | None = None,
+        agent_session: tuple[str, str] | None = None,
     ) -> RunState | None:
         if not owner_id.strip():
             raise StoreError("A worker owner is required")
+        if agent_session is not None and (
+            not agent_session[0].strip() or not agent_session[1].strip()
+        ):
+            raise StoreError("An agent worker and task are required")
         with self._transaction() as connection:
             active = connection.execute(
                 """
@@ -725,10 +759,13 @@ class OrchestratorStore:
                  AND r.pbi_number = p.number
                 WHERE p.project_id = ? AND p.repository_name = ?
                   AND r.status = 'active'
+                  AND (? IS NULL OR r.run_id = ?)
                 LIMIT 1
                 """,
-                (project_id, repository),
+                (project_id, repository, expected_run_id, expected_run_id),
             ).fetchone()
+            if expected_run_id is not None and active is None:
+                return None
             if active is not None:
                 active_run = self._run_from_row(active)
                 if (
@@ -738,6 +775,10 @@ class OrchestratorStore:
                     and _lease_is_active(active_run.lease_expires_at)
                 ):
                     self._renew_lease(connection, active_run.run_id, lease_token)
+                    if agent_session is not None:
+                        self._upsert_agent_session(
+                            connection, active_run.run_id, *agent_session
+                        )
                     return self._run_for_id(connection, active_run.run_id)
                 if _lease_is_active(active_run.lease_expires_at):
                     return None
@@ -770,6 +811,8 @@ class OrchestratorStore:
                     Stage(str(active["stage"])),
                     {"owner_id": owner_id},
                 )
+                if agent_session is not None:
+                    self._upsert_agent_session(connection, run_id, *agent_session)
                 return self._run_for_id(connection, run_id)
 
             candidate = connection.execute(
@@ -888,6 +931,8 @@ class OrchestratorStore:
                     current_stage,
                     {},
                 )
+            if agent_session is not None:
+                self._upsert_agent_session(connection, run_id, *agent_session)
             return self._run_for_id(connection, run_id)
 
     def advance(self, run_id: str, target: Stage, lease_token: str) -> RunState:
@@ -2208,6 +2253,211 @@ class OrchestratorStore:
         with self._lock:
             return self._run_for_id(self._connection, run_id)
 
+    @staticmethod
+    def _upsert_agent_session(
+        connection: sqlite3.Connection, run_id: str, worker_id: str, task: str
+    ) -> None:
+        now = _now()
+        connection.execute(
+            """
+            INSERT INTO agent_sessions(
+                run_id, worker_id, task, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(run_id) DO UPDATE SET
+                worker_id = excluded.worker_id,
+                updated_at = excluded.updated_at
+            """,
+            (
+                run_id,
+                worker_id.strip(),
+                task[:MAX_AGENT_SESSION_EVENT_LENGTH],
+                now,
+                now,
+            ),
+        )
+
+    def start_agent_session(
+        self, run_id: str, worker_id: str, task: str, lease_token: str
+    ) -> None:
+        if not worker_id.strip() or not task.strip():
+            raise StoreError("An agent worker and task are required")
+        with self._transaction() as connection:
+            run = self._run_for_id(connection, run_id)
+            if run is None or run.status is not RunStatus.ACTIVE:
+                raise StoreError("An active run is required for an agent session")
+            self._require_lease(run, lease_token)
+            self._upsert_agent_session(connection, run_id, worker_id, task)
+
+    def record_agent_session_event(
+        self,
+        run_id: str,
+        lease_token: str,
+        kind: str,
+        source_type: str,
+        role: str | None,
+        text: str,
+    ) -> None:
+        if kind not in {"progress", "message"} or not source_type.strip():
+            raise StoreError("An agent event kind and source type are required")
+        event_text = text[:MAX_AGENT_SESSION_EVENT_LENGTH]
+        with self._transaction() as connection:
+            run = self._run_for_id(connection, run_id)
+            if run is None or run.status is not RunStatus.ACTIVE:
+                raise StoreError("An active run is required for an agent event")
+            self._require_lease(run, lease_token)
+            if (
+                connection.execute(
+                    "SELECT 1 FROM agent_sessions WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                is None
+            ):
+                raise StoreError("Agent session has not been started")
+            sequence = int(
+                connection.execute(
+                    """
+                    SELECT COALESCE(MAX(sequence), 0) + 1
+                    FROM agent_session_events WHERE run_id = ?
+                    """,
+                    (run_id,),
+                ).fetchone()[0]
+            )
+            timestamp = _now()
+            connection.execute(
+                """
+                INSERT INTO agent_session_events(
+                    run_id, sequence, kind, source_type, role, text, timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    sequence,
+                    kind,
+                    source_type.strip()[:120],
+                    role.strip()[:20] if role and role.strip() else None,
+                    event_text,
+                    timestamp,
+                ),
+            )
+            connection.execute(
+                "UPDATE agent_sessions SET updated_at = ? WHERE run_id = ?",
+                (timestamp, run_id),
+            )
+            history = connection.execute(
+                """
+                SELECT sequence, kind, source_type, role, text, timestamp
+                FROM agent_session_events WHERE run_id = ? ORDER BY sequence
+                """,
+                (run_id,),
+            ).fetchall()
+            event_sizes = [
+                len(
+                    (
+                        json.dumps(
+                            {
+                                "sequence": int(event["sequence"]),
+                                "kind": str(event["kind"]),
+                                "source_type": str(event["source_type"]),
+                                "role": event["role"],
+                                "text": str(event["text"]),
+                                "timestamp": str(event["timestamp"]),
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                )
+                for event in history
+            ]
+            total_bytes = sum(event_sizes)
+            while (
+                len(history) > MAX_AGENT_SESSION_EVENTS
+                or total_bytes > MAX_AGENT_SESSION_BYTES
+            ):
+                oldest = history.pop(0)
+                total_bytes -= event_sizes.pop(0)
+                connection.execute(
+                    """
+                    DELETE FROM agent_session_events
+                    WHERE run_id = ? AND sequence = ?
+                    """,
+                    (run_id, oldest["sequence"]),
+                )
+
+    def get_agent_session(self, run_id: str) -> dict[str, object] | None:
+        with self._lock:
+            return self._agent_session_for_run(self._connection, run_id)
+
+    def active_agent_sessions(self) -> tuple[RunState, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT s.run_id FROM agent_sessions AS s
+                JOIN runs AS r ON r.run_id = s.run_id
+                WHERE r.status = 'active' ORDER BY s.created_at
+                """
+            ).fetchall()
+            return tuple(
+                run
+                for row in rows
+                if (run := self._run_for_id(self._connection, str(row["run_id"])))
+                is not None
+            )
+
+    def _agent_session_for_run(
+        self, connection: sqlite3.Connection, run_id: str
+    ) -> dict[str, object] | None:
+        row = connection.execute(
+            """
+            SELECT s.*, r.status, r.attempt, r.lease_expires_at,
+                   r.task_contract_json, r.task_result_json,
+                   p.branch, p.pull_request_url
+            FROM agent_sessions AS s
+            JOIN runs AS r ON r.run_id = s.run_id
+            JOIN pbis AS p
+              ON p.project_id = r.project_id
+             AND p.repository_name = r.repository_name
+             AND p.number = r.pbi_number
+            WHERE s.run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        events = connection.execute(
+            """
+            SELECT sequence, kind, source_type, role, text, timestamp
+            FROM agent_session_events WHERE run_id = ? ORDER BY sequence
+            """,
+            (run_id,),
+        ).fetchall()
+        return {
+            "session_id": str(row["run_id"]),
+            "worker_id": str(row["worker_id"]),
+            "task": str(row["task"]),
+            "state": str(row["status"]),
+            "attempt": int(row["attempt"]),
+            "lease_expires_at": row["lease_expires_at"],
+            "branch": row["branch"],
+            "pull_request_url": row["pull_request_url"],
+            "task_contract": _json_mapping_or_none(row["task_contract_json"]),
+            "task_result": _json_mapping_or_none(row["task_result_json"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+            "events": [
+                {
+                    "sequence": int(event["sequence"]),
+                    "kind": str(event["kind"]),
+                    "source_type": str(event["source_type"]),
+                    "role": event["role"],
+                    "text": str(event["text"]),
+                    "timestamp": str(event["timestamp"]),
+                }
+                for event in events
+            ],
+        }
+
     def active_runs_for_project(self, project_id: str) -> tuple[RunState, ...]:
         with self._lock:
             rows = self._connection.execute(
@@ -2305,34 +2555,42 @@ class OrchestratorStore:
                 ).fetchall()
                 for pbi_row in pbi_rows:
                     events = events_by_pbi.get((repository, int(pbi_row["number"])), [])
-                    pbis.append(
-                        {
-                            "id": f"{repository}#{pbi_row['number']}",
-                            "number": pbi_row["number"],
-                            "title": pbi_row["title"],
-                            "stage": pbi_row["stage"],
-                            "run_id": pbi_row["run_id"],
-                            "metadata": _json_mapping(pbi_row["metadata_json"]),
-                            "status": pbi_row["status"],
-                            "attempt": pbi_row["attempt"],
-                            "branch": pbi_row["branch"],
-                            "pull_request_url": pbi_row["pull_request_url"],
-                            "last_error": pbi_row["last_error"],
-                            "result": pbi_row["run_result"],
-                            "task_contract": _json_mapping_or_none(
-                                pbi_row["task_contract_json"]
-                            ),
-                            "task_result": _json_mapping_or_none(
-                                pbi_row["task_result_json"]
-                            ),
-                            "task_answer": pbi_row["task_answer"],
-                            "active": bool(pbi_row["active"]),
-                            "archived": bool(pbi_row["archived"]),
-                            "planning_status": pbi_row["planning_status"],
-                            "claimable": bool(pbi_row["claimable"]),
-                            "events": events,
-                        }
+                    pbi: dict[str, object] = {
+                        "id": f"{repository}#{pbi_row['number']}",
+                        "number": pbi_row["number"],
+                        "title": pbi_row["title"],
+                        "stage": pbi_row["stage"],
+                        "run_id": pbi_row["run_id"],
+                        "metadata": _json_mapping(pbi_row["metadata_json"]),
+                        "status": pbi_row["status"],
+                        "attempt": pbi_row["attempt"],
+                        "branch": pbi_row["branch"],
+                        "pull_request_url": pbi_row["pull_request_url"],
+                        "last_error": pbi_row["last_error"],
+                        "result": pbi_row["run_result"],
+                        "task_contract": _json_mapping_or_none(
+                            pbi_row["task_contract_json"]
+                        ),
+                        "task_result": _json_mapping_or_none(
+                            pbi_row["task_result_json"]
+                        ),
+                        "task_answer": pbi_row["task_answer"],
+                        "active": bool(pbi_row["active"]),
+                        "archived": bool(pbi_row["archived"]),
+                        "planning_status": pbi_row["planning_status"],
+                        "claimable": bool(pbi_row["claimable"]),
+                        "events": events,
+                    }
+                    agent_session = (
+                        self._agent_session_for_run(
+                            self._connection, str(pbi_row["run_id"])
+                        )
+                        if pbi_row["run_id"]
+                        else None
                     )
+                    if agent_session is not None:
+                        pbi["agent_session"] = agent_session
+                    pbis.append(pbi)
                 repositories.append(
                     {
                         "name": repository,

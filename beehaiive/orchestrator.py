@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from threading import Event, Lock, Thread
+from typing import cast
 
 from .checks import blocking_check_failure
 from .contracts import TaskContract, TaskResult
@@ -95,8 +96,18 @@ class Orchestrator:
         repository: str,
         owner_id: str,
         lease_token: str | None = None,
+        *,
+        expected_run_id: str | None = None,
+        agent_session: tuple[str, str] | None = None,
     ) -> RunState | None:
-        return self.store.claim_next(project_id, repository, owner_id, lease_token)
+        return self.store.claim_next(
+            project_id,
+            repository,
+            owner_id,
+            lease_token,
+            expected_run_id=expected_run_id,
+            agent_session=agent_session,
+        )
 
     def advance(self, run_id: str, target: Stage, lease_token: str) -> RunState:
         run = self.store.advance(run_id, target, lease_token)
@@ -173,6 +184,13 @@ class Orchestrator:
             self.store.release_execution(run_id, execution_token)
 
     def _task_contract_for_run(self, run: RunState) -> TaskContract:
+        if run.task_contract is not None:
+            inputs = run.task_contract.get("inputs")
+            persisted_answer: object = None
+            if isinstance(inputs, Mapping):
+                persisted_answer = cast(Mapping[str, object], inputs).get("answer")
+            if persisted_answer == run.task_answer:
+                return TaskContract.from_dict(run.task_contract)
         if self.model_executor is not None:
             builder = getattr(self.model_executor, "build_task_contract", None)
             if callable(builder):
