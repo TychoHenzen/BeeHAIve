@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 import beehaiive.scheduler as scheduler_module
+from beehaiive.agent import WorkerCapacityError
 from beehaiive.scheduler import (
     DEFAULT_DEMO_TASK,
     SCHEDULER_ENABLED_ENV,
@@ -231,6 +232,17 @@ def test_poll_records_sync_claim_and_worker_start_errors_without_secrets() -> No
     assert status["last_started_run_ids"] == []
 
 
+def test_poll_defers_a_claim_when_capacity_is_taken_before_start() -> None:
+    states = {"project": {"repositories": [{"name": "owner/a", "active": True}]}}
+    scheduler, orchestrator, worker = _scheduler(states)
+    worker.start_error = WorkerCapacityError("Maximum concurrent agent workers reached")
+
+    assert scheduler.poll_once() == ()
+    assert len(worker.claims) == 1
+    assert orchestrator.stopped == []
+    assert "WorkerCapacityError" in str(scheduler.status_for("project"))
+
+
 def test_poll_handles_empty_projects_and_unclaimable_repositories() -> None:
     states = {"project": {"repositories": "invalid"}}
     scheduler, _orchestrator, worker = _scheduler(states)
@@ -294,6 +306,32 @@ def test_scheduler_status_reports_a_running_background_thread() -> None:
     assert scheduler.status_for("project")["running"] is True
     release.set()
     scheduler.shutdown()
+
+
+def test_scheduler_shutdown_uses_a_bounded_join(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler, orchestrator, _worker = _scheduler({"project": {"repositories": []}})
+    entered = Event()
+    release = Event()
+
+    def wait_during_sync(project_id: str) -> None:
+        del project_id
+        entered.set()
+        assert release.wait(1)
+
+    monkeypatch.setattr(orchestrator, "synchronize", wait_during_sync)
+    monkeypatch.setattr(
+        scheduler_module, "SCHEDULER_SHUTDOWN_TIMEOUT_SECONDS", 0.01, raising=False
+    )
+    scheduler.start()
+    assert entered.wait(1)
+    with pytest.raises(TimeoutError, match="scheduler did not stop"):
+        scheduler.shutdown()
+    assert scheduler.status_for("project")["running"] is True
+    release.set()
+    scheduler.shutdown()
+    assert scheduler.status_for("project")["running"] is False
 
 
 def test_scheduler_start_failure_clears_thread(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -11,7 +11,12 @@ from threading import Event, Lock, Thread
 from typing import cast
 from uuid import uuid4
 
-from .agent import DEFAULT_DEMO_TASK, AgentWorkerManager, redact_worker_text
+from .agent import (
+    DEFAULT_DEMO_TASK,
+    AgentWorkerManager,
+    WorkerCapacityError,
+    redact_worker_text,
+)
 from .orchestrator import Orchestrator
 
 SCHEDULER_ENABLED_ENV = "BEEHAIIVE_SCHEDULER_ENABLED"
@@ -19,6 +24,7 @@ SCHEDULER_POLL_INTERVAL_ENV = "BEEHAIIVE_SCHEDULER_POLL_INTERVAL_SECONDS"
 SCHEDULER_MAX_CONCURRENCY_ENV = "BEEHAIIVE_SCHEDULER_MAX_CONCURRENCY"
 DEFAULT_SCHEDULER_POLL_INTERVAL_SECONDS = 600.0
 DEFAULT_SCHEDULER_MAX_CONCURRENCY = 1
+SCHEDULER_SHUTDOWN_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,7 +147,12 @@ class AgentScheduler:
             self._stop_event.set()
         if thread is None:
             return
-        thread.join()
+        thread.join(timeout=SCHEDULER_SHUTDOWN_TIMEOUT_SECONDS)
+        if thread.is_alive():
+            raise TimeoutError(
+                "Agent scheduler did not stop within "
+                f"{SCHEDULER_SHUTDOWN_TIMEOUT_SECONDS:g} seconds"
+            )
 
     def poll_once(self) -> tuple[str, ...]:
         errors: list[str] = []
@@ -198,6 +209,9 @@ class AgentScheduler:
                         continue
                     try:
                         self.worker.start(run)
+                    except WorkerCapacityError as exc:
+                        errors.append(self._error_summary(exc))
+                        continue
                     except Exception as exc:
                         error_summary = self._error_summary(exc)
                         try:
