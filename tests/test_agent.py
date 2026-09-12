@@ -1286,6 +1286,38 @@ def test_worker_start_reports_workspace_cleanup_failure(
         routing_store.close()
 
 
+def test_worker_manager_shutdown_attempts_all_cancellations_after_failure() -> None:
+    class FailingExecutor:
+        def __init__(self) -> None:
+            self.cancelled: list[str] = []
+
+        def cancel(self, run_id: str) -> None:
+            self.cancelled.append(run_id)
+            if run_id == "run-1":
+                raise RuntimeError("taskkill failed")
+
+    class FakeThread:
+        def __init__(self) -> None:
+            self.joins: list[float | None] = []
+
+        def join(self, timeout=None) -> None:
+            self.joins.append(timeout)
+
+        def is_alive(self) -> bool:
+            return False
+
+    executor = FailingExecutor()
+    manager = AgentWorkerManager(SimpleNamespace(), executor)
+    threads = {run_id: FakeThread() for run_id in ("run-1", "run-2")}
+    manager._threads.update(threads)  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="taskkill failed"):
+        manager.shutdown()
+
+    assert executor.cancelled == ["run-1", "run-2"]
+    assert all(thread.joins == [5] for thread in threads.values())
+
+
 def test_worker_manager_shutdown_uses_second_bounded_join() -> None:
     executor = ImmediateExecutor(
         ModelExecution(AttemptOutcome.SUCCESS, result="unused")

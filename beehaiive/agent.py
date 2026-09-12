@@ -1087,13 +1087,20 @@ class AgentWorkerManager:
     def shutdown(self) -> None:
         with self._lock:
             items = list(self._threads.items())
+        cancellation_error: Exception | None = None
         for run_id, _thread in items:
-            self.cancel(run_id)
+            try:
+                self.cancel(run_id)
+            except Exception as exc:
+                if cancellation_error is None:
+                    cancellation_error = exc
         for _run_id, thread in items:
             thread.join(timeout=5)
             is_alive = getattr(thread, "is_alive", lambda: False)
             if is_alive():
                 thread.join(timeout=1)
+        if cancellation_error is not None:
+            raise cancellation_error
         for run_id, _thread in items:
             run = self.orchestrator.store.get_run(run_id)
             if run is not None and run.status is RunStatus.ACTIVE:
