@@ -187,6 +187,14 @@ class ReviewRepairStatus(StrEnum):
     HUMAN_ACTION_REQUIRED = "human_action_required"
 
 
+class ReviewRepairTransitionStatus(StrEnum):
+    NOT_REQUIRED = "not_required"
+    PENDING = "pending"
+    COMPLETED = "completed"
+    RETRY_REQUIRED = "retry_required"
+    HUMAN_ACTION_REQUIRED = "human_action_required"
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -516,6 +524,7 @@ class ReviewSnapshot:
     readers: tuple[ReaderResult, ...]
     findings: tuple[ReviewFinding, ...]
     merge_allowed: bool
+    repair_attempt: ReviewRepairAttempt | None = None
 
     def as_dict(self) -> dict[str, object]:
         open_findings = [
@@ -523,13 +532,21 @@ class ReviewSnapshot:
             for finding in self.findings
             if finding.status is FindingStatus.OPEN
         ]
-        return {
+        result: dict[str, object] = {
             "cycle": self.cycle.as_dict(),
             "readers": [reader.as_dict() for reader in self.readers],
             "findings": [finding.as_dict() for finding in self.findings],
             "writer_feedback": open_findings,
             "merge_allowed": self.merge_allowed,
         }
+        if self.repair_attempt is not None:
+            result["repair"] = {
+                "attempt_id": self.repair_attempt.attempt_id,
+                "status": self.repair_attempt.status.value,
+                "required_action": self.repair_attempt.required_action,
+                "review_transition": self.repair_attempt.review_transition_as_dict(),
+            }
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -572,6 +589,18 @@ class ReviewRepairAttempt:
     result: str | None = None
     required_action: str | None = None
     cancellation_requested: bool = False
+    review_transition_status: ReviewRepairTransitionStatus = (
+        ReviewRepairTransitionStatus.NOT_REQUIRED
+    )
+    review_transition_cycle_id: str | None = None
+    review_transition_required_action: str | None = None
+
+    def review_transition_as_dict(self) -> dict[str, object]:
+        return {
+            "status": self.review_transition_status.value,
+            "cycle_id": self.review_transition_cycle_id,
+            "required_action": self.review_transition_required_action,
+        }
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -590,6 +619,7 @@ class ReviewRepairAttempt:
             "result": self.result,
             "required_action": self.required_action,
             "cancellation_requested": self.cancellation_requested,
+            "review_transition": self.review_transition_as_dict(),
         }
 
 
@@ -729,6 +759,9 @@ class ReviewStore:
                     result TEXT,
                     required_action TEXT,
                     cancellation_requested INTEGER NOT NULL DEFAULT 0,
+                    review_transition_status TEXT NOT NULL DEFAULT 'not_required',
+                    review_transition_cycle_id TEXT,
+                    review_transition_required_action TEXT,
                     FOREIGN KEY(cycle_id) REFERENCES review_cycles(cycle_id)
                 );
                 CREATE INDEX IF NOT EXISTS review_cycles_by_pull_request
@@ -752,6 +785,25 @@ class ReviewStore:
                 if column not in cycle_columns:
                     self._connection.execute(
                         f"ALTER TABLE review_cycles ADD COLUMN {column} TEXT"
+                    )
+            repair_columns = {
+                str(row["name"])
+                for row in self._connection.execute(
+                    "PRAGMA table_info(review_repair_attempts)"
+                ).fetchall()
+            }
+            for column, definition in (
+                (
+                    "review_transition_status",
+                    "TEXT NOT NULL DEFAULT 'not_required'",
+                ),
+                ("review_transition_cycle_id", "TEXT"),
+                ("review_transition_required_action", "TEXT"),
+            ):
+                if column not in repair_columns:
+                    self._connection.execute(
+                        f"ALTER TABLE review_repair_attempts ADD COLUMN "
+                        f"{column} {definition}"
                     )
             reader_columns = {
                 str(row["name"])
@@ -914,7 +966,7 @@ class ReviewStore:
             ),
         )
 
-    def _repair_attempt_from_row(self, row: sqlite3.Row) -> ReviewRepairAttempt:
+    def repair_attempt_from_row(self, row: sqlite3.Row) -> ReviewRepairAttempt:
         push_evidence = row["push_evidence_json"]
         return ReviewRepairAttempt(
             attempt_id=str(row["attempt_id"]),
@@ -934,6 +986,11 @@ class ReviewStore:
             result=row["result"],
             required_action=row["required_action"],
             cancellation_requested=bool(row["cancellation_requested"]),
+            review_transition_status=ReviewRepairTransitionStatus(
+                str(row["review_transition_status"])
+            ),
+            review_transition_cycle_id=row["review_transition_cycle_id"],
+            review_transition_required_action=row["review_transition_required_action"],
         )
 
     def cycle_row(
@@ -1049,7 +1106,26 @@ class ReviewStore:
             cycle.status is ReviewCycleStatus.PASSED
             and not any(finding.status is FindingStatus.OPEN for finding in findings)
         )
-        return ReviewSnapshot(cycle, readers, findings, merge_allowed)
+        repair_row = connection.execute(
+            """
+            SELECT * FROM review_repair_attempts
+            WHERE cycle_id = ? OR review_transition_cycle_id = ?
+               OR (pull_request_id = ? AND review_transition_status IN (?, ?, ?))
+            ORDER BY updated_at DESC LIMIT 1
+            """,
+            (
+                cycle_id,
+                cycle_id,
+                cycle.pull_request_id,
+                ReviewRepairTransitionStatus.PENDING.value,
+                ReviewRepairTransitionStatus.RETRY_REQUIRED.value,
+                ReviewRepairTransitionStatus.HUMAN_ACTION_REQUIRED.value,
+            ),
+        ).fetchone()
+        repair_attempt = (
+            None if repair_row is None else self.repair_attempt_from_row(repair_row)
+        )
+        return ReviewSnapshot(cycle, readers, findings, merge_allowed, repair_attempt)
 
     def current_snapshot(self, pull_request_id: str) -> ReviewSnapshot:
         with self._lock:
@@ -1105,21 +1181,21 @@ class ReviewStore:
             if cycle is None:
                 raise ReviewError(f"Unknown review cycle: {cycle_id}")
             pull_request_id = str(cycle["pull_request_id"])
-            current = self.current_cycle_row(connection, pull_request_id)
-            if current is None or str(current["cycle_id"]) != cycle_id:
-                raise ReviewError("Findings must be selected from the current cycle")
-
             existing = connection.execute(
                 "SELECT * FROM review_repair_attempts WHERE cycle_id = ?",
                 (cycle_id,),
             ).fetchone()
             if existing is not None:
-                attempt = self._repair_attempt_from_row(existing)
+                attempt = self.repair_attempt_from_row(existing)
                 if attempt.finding_ids != selected:
                     raise ReviewError(
                         "A different repair selection already claimed this cycle"
                     )
                 return attempt, False
+
+            current = self.current_cycle_row(connection, pull_request_id)
+            if current is None or str(current["cycle_id"]) != cycle_id:
+                raise ReviewError("Findings must be selected from the current cycle")
 
             readers = self._readers(connection, cycle_id)
             cycle_finding_ids = {
@@ -1181,7 +1257,7 @@ class ReviewStore:
                 (attempt_id,),
             ).fetchone()
             assert row is not None
-            return self._repair_attempt_from_row(row), True
+            return self.repair_attempt_from_row(row), True
 
     def repair_attempt(self, attempt_id: str) -> ReviewRepairAttempt:
         attempt_id = _required(attempt_id, "repair attempt id", 100)
@@ -1192,19 +1268,26 @@ class ReviewStore:
             ).fetchone()
         if row is None:
             raise ReviewError(f"Unknown repair attempt: {attempt_id}")
-        return self._repair_attempt_from_row(row)
+        return self.repair_attempt_from_row(row)
 
     def pending_repair_attempts(self) -> tuple[ReviewRepairAttempt, ...]:
         with self._lock:
             rows = self._connection.execute(
-                "SELECT * FROM review_repair_attempts WHERE status IN (?, ?, ?)",
+                """
+                SELECT * FROM review_repair_attempts
+                WHERE status IN (?, ?, ?)
+                   OR (status = ? AND review_transition_status IN (?, ?))
+                """,
                 (
                     ReviewRepairStatus.QUEUED.value,
                     ReviewRepairStatus.RUNNING.value,
                     ReviewRepairStatus.PUSHING.value,
+                    ReviewRepairStatus.SUCCEEDED.value,
+                    ReviewRepairTransitionStatus.PENDING.value,
+                    ReviewRepairTransitionStatus.RETRY_REQUIRED.value,
                 ),
             ).fetchall()
-        return tuple(self._repair_attempt_from_row(row) for row in rows)
+        return tuple(self.repair_attempt_from_row(row) for row in rows)
 
     def claim_repair_attempt(self, attempt_id: str) -> bool:
         with self.transaction() as connection:
@@ -1342,7 +1425,9 @@ class ReviewStore:
                 """
                 UPDATE review_repair_attempts
                 SET status = ?, commit_sha = ?, push_evidence_json = ?, result = ?,
-                    required_action = ?, updated_at = ?
+                    required_action = ?, updated_at = ?,
+                    review_transition_status = ?, review_transition_cycle_id = NULL,
+                    review_transition_required_action = NULL
                 WHERE attempt_id = ?
                 """,
                 (
@@ -1352,7 +1437,45 @@ class ReviewStore:
                     None if result is None else result[:4_000],
                     None if required_action is None else required_action[:1_000],
                     _now(),
+                    (
+                        ReviewRepairTransitionStatus.PENDING.value
+                        if status is ReviewRepairStatus.SUCCEEDED
+                        else ReviewRepairTransitionStatus.NOT_REQUIRED.value
+                    ),
                     attempt_id,
+                ),
+            )
+        return self.repair_attempt(attempt_id)
+
+    def fail_repair_transition(
+        self,
+        attempt_id: str,
+        status: ReviewRepairTransitionStatus,
+        required_action: str,
+    ) -> ReviewRepairAttempt:
+        if status not in {
+            ReviewRepairTransitionStatus.RETRY_REQUIRED,
+            ReviewRepairTransitionStatus.HUMAN_ACTION_REQUIRED,
+        }:
+            raise ReviewError("Repair transition failure status is invalid")
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE review_repair_attempts
+                SET review_transition_status = ?,
+                    review_transition_required_action = ?, updated_at = ?
+                WHERE attempt_id = ? AND status = ?
+                    AND review_transition_cycle_id IS NULL
+                    AND review_transition_status IN (?, ?)
+                """,
+                (
+                    status.value,
+                    _required(required_action, "repair transition action", 1_000),
+                    _now(),
+                    _required(attempt_id, "repair attempt id", 100),
+                    ReviewRepairStatus.SUCCEEDED.value,
+                    ReviewRepairTransitionStatus.PENDING.value,
+                    ReviewRepairTransitionStatus.RETRY_REQUIRED.value,
                 ),
             )
         return self.repair_attempt(attempt_id)
@@ -1536,6 +1659,11 @@ class ReviewService:
             raise
         except Exception as exc:
             raise ReviewAdapterError("Pull-request provider failed") from exc
+        return self._validate_provider_target(pull_request_id, target)
+
+    def _validate_provider_target(
+        self, pull_request_id: str, target: PullRequestTarget
+    ) -> PullRequestTarget:
         if target.pull_request_id != pull_request_id:
             raise ReviewError("Pull-request provider returned the wrong pull request")
         if not target.ready:
@@ -1625,6 +1753,140 @@ class ReviewService:
             github_evidence_json=evidence_json,
         )
 
+    def start_repair_followup_cycle(
+        self, attempt_id: str, target: PullRequestTarget
+    ) -> ReviewRepairAttempt:
+        attempt_id = _required(attempt_id, "repair attempt id", 100)
+        initial_attempt = self.store.repair_attempt(attempt_id)
+        target = self._validate_provider_target(initial_attempt.pull_request_id, target)
+        if target.head_sha != initial_attempt.commit_sha:
+            raise ReviewError("Review head does not match the pushed repair")
+
+        with self.store.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM review_repair_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if row is None:
+                raise ReviewError(f"Unknown repair attempt: {attempt_id}")
+            attempt = self.store.repair_attempt_from_row(row)
+            if attempt.status is not ReviewRepairStatus.SUCCEEDED:
+                raise ReviewError("Only a successful repair can start a review cycle")
+            if (
+                attempt.review_transition_status
+                is ReviewRepairTransitionStatus.COMPLETED
+            ):
+                return attempt
+            if attempt.review_transition_status not in {
+                ReviewRepairTransitionStatus.PENDING,
+                ReviewRepairTransitionStatus.RETRY_REQUIRED,
+            }:
+                return attempt
+            cycle_id, action = self._resolve_repair_followup_cycle(
+                connection, attempt, target
+            )
+            if action is not None:
+                return self._require_repair_human_action(connection, attempt_id, action)
+            assert cycle_id is not None
+            return self._complete_repair_transition(connection, attempt_id, cycle_id)
+
+    def _resolve_repair_followup_cycle(
+        self,
+        connection: sqlite3.Connection,
+        attempt: ReviewRepairAttempt,
+        target: PullRequestTarget,
+    ) -> tuple[str | None, str | None]:
+        commit_sha = attempt.commit_sha
+        evidence = attempt.push_evidence
+        if (
+            commit_sha is None
+            or commit_sha == attempt.head_sha
+            or evidence is None
+            or evidence.get("expected_head") != attempt.head_sha
+            or evidence.get("pushed_head") != commit_sha
+            or target.head_sha != commit_sha
+        ):
+            return None, (
+                "Verify the repair commit and current pull-request head before "
+                "starting a fresh review cycle."
+            )
+
+        current = self.store.current_cycle_row(connection, attempt.pull_request_id)
+        if current is None:
+            return None, (
+                "The repair's review cycle is unavailable. Verify the pull-request "
+                "head and start a fresh review cycle manually."
+            )
+        current_cycle_id = str(current["cycle_id"])
+        if current_cycle_id != attempt.cycle_id:
+            if str(current["head_sha"]) != commit_sha:
+                return None, (
+                    "A newer review cycle superseded this repair. Verify the "
+                    "pull-request head and start a fresh review cycle manually."
+                )
+            return current_cycle_id, None
+        return (
+            self._start_cycle_in_transaction(
+                connection,
+                attempt.pull_request_id,
+                commit_sha,
+                expected_cycle_id=attempt.cycle_id,
+                github_evidence_json=target.evidence_json,
+            ),
+            None,
+        )
+
+    def _complete_repair_transition(
+        self, connection: sqlite3.Connection, attempt_id: str, cycle_id: str
+    ) -> ReviewRepairAttempt:
+        connection.execute(
+            """
+            UPDATE review_repair_attempts
+            SET review_transition_status = ?, review_transition_cycle_id = ?,
+                review_transition_required_action = NULL, updated_at = ?
+            WHERE attempt_id = ? AND review_transition_cycle_id IS NULL
+            """,
+            (
+                ReviewRepairTransitionStatus.COMPLETED.value,
+                cycle_id,
+                _now(),
+                attempt_id,
+            ),
+        )
+        updated = connection.execute(
+            "SELECT * FROM review_repair_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        assert updated is not None
+        return self.store.repair_attempt_from_row(updated)
+
+    def _require_repair_human_action(
+        self,
+        connection: sqlite3.Connection,
+        attempt_id: str,
+        action: str,
+    ) -> ReviewRepairAttempt:
+        connection.execute(
+            """
+            UPDATE review_repair_attempts
+            SET review_transition_status = ?,
+                review_transition_required_action = ?, updated_at = ?
+            WHERE attempt_id = ?
+            """,
+            (
+                ReviewRepairTransitionStatus.HUMAN_ACTION_REQUIRED.value,
+                action[:1_000],
+                _now(),
+                attempt_id,
+            ),
+        )
+        updated = connection.execute(
+            "SELECT * FROM review_repair_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        assert updated is not None
+        return self.store.repair_attempt_from_row(updated)
+
     def _start_cycle(
         self,
         pull_request_id: str,
@@ -1634,82 +1896,99 @@ class ReviewService:
         github_evidence_json: str | None = None,
     ) -> ReviewSnapshot:
         with self.store.transaction() as connection:
-            current = self.store.current_cycle_row(connection, pull_request_id)
-            current_cycle_id = None if current is None else str(current["cycle_id"])
-            if current_cycle_id != expected_cycle_id:
-                if (
-                    current is not None
-                    and str(current["head_sha"]) == head_sha
-                    and ReviewCycleStatus(str(current["status"]))
-                    is not ReviewCycleStatus.FAILED
-                ):
-                    assert current_cycle_id is not None
-                    return self.store.snapshot(current_cycle_id)
-                raise ReviewError("Review cycle changed while starting a new cycle")
-            if current is not None:
-                current_status = ReviewCycleStatus(str(current["status"]))
-                if (
-                    str(current["head_sha"]) == head_sha
-                    and current_status is not ReviewCycleStatus.FAILED
-                ):
-                    cycle_id = str(current["cycle_id"])
-                    return self.store.snapshot(cycle_id)
-                connection.execute(
-                    """
-                    UPDATE review_cycles
-                    SET status = ?, required_action = ?, updated_at = ?
-                    WHERE cycle_id = ?
-                    """,
-                    (
-                        ReviewCycleStatus.SUPERSEDED.value,
-                        "A newer review cycle must authorize merge",
-                        _now(),
-                        str(current["cycle_id"]),
-                    ),
-                )
-                cycle_number = int(current["cycle_number"]) + 1
-            else:
-                cycle_number = 1
-            cycle_id = str(uuid4())
-            timestamp = _now()
-            connection.execute(
-                """
-                UPDATE review_findings
-                SET stale = 1, updated_at = ?
-                WHERE pull_request_id = ? AND head_sha != ? AND stale = 0
-                """,
-                (timestamp, pull_request_id, head_sha),
+            cycle_id = self._start_cycle_in_transaction(
+                connection,
+                pull_request_id,
+                head_sha,
+                expected_cycle_id=expected_cycle_id,
+                github_evidence_json=github_evidence_json,
             )
+        return self.store.snapshot(cycle_id)
+
+    def _start_cycle_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        pull_request_id: str,
+        head_sha: str,
+        *,
+        expected_cycle_id: str | None,
+        github_evidence_json: str | None = None,
+    ) -> str:
+        current = self.store.current_cycle_row(connection, pull_request_id)
+        current_cycle_id = None if current is None else str(current["cycle_id"])
+        if current_cycle_id != expected_cycle_id:
+            if (
+                current is not None
+                and str(current["head_sha"]) == head_sha
+                and ReviewCycleStatus(str(current["status"]))
+                is not ReviewCycleStatus.FAILED
+            ):
+                assert current_cycle_id is not None
+                return current_cycle_id
+            raise ReviewError("Review cycle changed while starting a new cycle")
+        if current is not None:
+            current_status = ReviewCycleStatus(str(current["status"]))
+            if (
+                str(current["head_sha"]) == head_sha
+                and current_status is not ReviewCycleStatus.FAILED
+            ):
+                return str(current["cycle_id"])
             connection.execute(
                 """
-                INSERT INTO review_cycles(
-                    cycle_id, pull_request_id, head_sha, cycle_number, status,
-                    human_approval, required_action, github_evidence_json,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                UPDATE review_cycles
+                SET status = ?, required_action = ?, updated_at = ?
+                WHERE cycle_id = ?
                 """,
                 (
-                    cycle_id,
-                    pull_request_id,
-                    head_sha,
-                    cycle_number,
-                    ReviewCycleStatus.ACTIVE.value,
-                    "Awaiting four specialized review readers",
-                    github_evidence_json,
-                    timestamp,
-                    timestamp,
+                    ReviewCycleStatus.SUPERSEDED.value,
+                    "A newer review cycle must authorize merge",
+                    _now(),
+                    str(current["cycle_id"]),
                 ),
             )
-            for concern in REQUIRED_CONCERNS:
-                connection.execute(
-                    """
-                    INSERT INTO review_readers(
-                        cycle_id, concern, status, finding_ids_json, reader, updated_at
-                    ) VALUES (?, ?, ?, '[]', 'automated', ?)
-                    """,
-                    (cycle_id, concern.value, ReaderStatus.PENDING.value, timestamp),
-                )
-        return self.store.snapshot(cycle_id)
+            cycle_number = int(current["cycle_number"]) + 1
+        else:
+            cycle_number = 1
+        cycle_id = str(uuid4())
+        timestamp = _now()
+        connection.execute(
+            """
+            UPDATE review_findings
+            SET stale = 1, updated_at = ?
+            WHERE pull_request_id = ? AND head_sha != ? AND stale = 0
+            """,
+            (timestamp, pull_request_id, head_sha),
+        )
+        connection.execute(
+            """
+            INSERT INTO review_cycles(
+                cycle_id, pull_request_id, head_sha, cycle_number, status,
+                human_approval, required_action, github_evidence_json,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+            """,
+            (
+                cycle_id,
+                pull_request_id,
+                head_sha,
+                cycle_number,
+                ReviewCycleStatus.ACTIVE.value,
+                "Awaiting four specialized review readers",
+                github_evidence_json,
+                timestamp,
+                timestamp,
+            ),
+        )
+        for concern in REQUIRED_CONCERNS:
+            connection.execute(
+                """
+                INSERT INTO review_readers(
+                    cycle_id, concern, status, finding_ids_json, reader, updated_at
+                ) VALUES (?, ?, ?, '[]', 'automated', ?)
+                """,
+                (cycle_id, concern.value, ReaderStatus.PENDING.value, timestamp),
+            )
+        return cycle_id
 
     def snapshot(self, pull_request_id: str) -> ReviewSnapshot:
         return self.store.current_snapshot(
