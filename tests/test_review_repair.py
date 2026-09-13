@@ -17,8 +17,10 @@ from beehaiive.review import (
     PullRequestTarget,
     ReaderStatus,
     ReviewConcern,
+    ReviewCycleStatus,
     ReviewError,
     ReviewRepairStatus,
+    ReviewRepairTransitionStatus,
     ReviewService,
     ReviewStore,
 )
@@ -175,6 +177,22 @@ class CommitAgent:
         self.cancel_calls += 1
 
 
+class FailingAgent(CommitAgent):
+    def execute_scoped_repair(
+        self,
+        problem_id: str,
+        worktree: Path,
+        prompt: str,
+        model: str,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> ModelExecution:
+        del problem_id, worktree, prompt, model, cancelled
+        self.calls += 1
+        return ModelExecution(
+            AttemptOutcome.FAILURE, failure_context="Selected repair failed"
+        )
+
+
 class BlockingAgent(CommitAgent):
     def __init__(self) -> None:
         super().__init__()
@@ -306,6 +324,43 @@ def _harness(
     )
 
 
+def _record_pushed_repair(
+    harness: RepairHarness, *, push: bool = True
+) -> tuple[str, str]:
+    attempt, created = harness.reviews.create_repair_attempt(
+        harness.cycle_id, (harness.selected_id,), "operator"
+    )
+    assert created is True
+    repaired_file = harness.repository / "manual-repair.txt"
+    repaired_file.write_text("fixed\n", encoding="utf-8")
+    _git(harness.repository, "add", "manual-repair.txt")
+    _git(harness.repository, "commit", "-m", "manual repair")
+    commit_sha = _git(harness.repository, "rev-parse", "HEAD")
+    if push:
+        _git(
+            harness.repository,
+            "push",
+            "origin",
+            f"{commit_sha}:refs/heads/feature",
+        )
+    evidence = {
+        "repository": "owner/repo",
+        "pull_request_number": 1,
+        "source_branch": "feature",
+        "expected_head": harness.source_head,
+        "pushed_head": commit_sha,
+    }
+    completed = harness.review_store.finish_repair_attempt(
+        attempt.attempt_id,
+        ReviewRepairStatus.SUCCEEDED,
+        commit_sha=commit_sha,
+        push_evidence=evidence,
+        result="repair committed and pushed",
+    )
+    assert completed.review_transition_status is ReviewRepairTransitionStatus.PENDING
+    return attempt.attempt_id, commit_sha
+
+
 def test_selected_repair_pushes_one_committed_change_without_touching_checkout(
     tmp_path: Path,
 ) -> None:
@@ -320,8 +375,13 @@ def test_selected_repair_pushes_one_committed_change_without_touching_checkout(
             harness.cycle_id, (harness.selected_id,), "operator"
         )
         remote_head = _git(harness.remote, "rev-parse", "refs/heads/feature")
+        current_review = harness.reviews.snapshot("owner/repo#1")
 
         assert completed.status is ReviewRepairStatus.SUCCEEDED
+        assert completed.review_transition_status is (
+            ReviewRepairTransitionStatus.COMPLETED
+        )
+        assert completed.review_transition_cycle_id == current_review.cycle.cycle_id
         assert completed.finding_ids == (harness.selected_id,)
         assert completed.head_sha == harness.source_head
         assert completed.actor == "operator"
@@ -333,6 +393,24 @@ def test_selected_repair_pushes_one_committed_change_without_touching_checkout(
         assert "unselected issue" not in harness.agent.prompt
         assert repeated.attempt_id == completed.attempt_id
         assert repeated.status is ReviewRepairStatus.SUCCEEDED
+        assert (
+            repeated.review_transition_cycle_id == completed.review_transition_cycle_id
+        )
+        assert current_review.cycle.cycle_number == 2
+        assert current_review.cycle.head_sha == remote_head
+        assert current_review.cycle.status is ReviewCycleStatus.ACTIVE
+        assert all(
+            reader.status is ReaderStatus.PENDING for reader in current_review.readers
+        )
+        assert harness.review_store.snapshot(harness.cycle_id).cycle.status is (
+            ReviewCycleStatus.SUPERSEDED
+        )
+        assert current_review.merge_allowed is False
+        assert current_review.as_dict()["repair"]["review_transition"] == {
+            "status": "completed",
+            "cycle_id": current_review.cycle.cycle_id,
+            "required_action": None,
+        }
         assert harness.provider.update_calls == 1
         assert _git(harness.repository, "branch", "--show-current") == "feature"
         assert _git(harness.repository, "rev-parse", "HEAD") == harness.source_head
@@ -410,6 +488,9 @@ def test_selected_repair_cancellation_stops_before_push(tmp_path: Path) -> None:
 
         assert completed.status is ReviewRepairStatus.CANCELLED
         assert completed.cancellation_requested is True
+        assert harness.reviews.snapshot("owner/repo#1").cycle.cycle_id == (
+            harness.cycle_id
+        )
         assert harness.provider.update_calls == 0
         assert _git(harness.remote, "rev-parse", "refs/heads/feature") == (
             harness.source_head
@@ -586,6 +667,206 @@ def test_review_repair_recovers_a_queued_attempt_after_restart(
         assert repeated.attempt_id == attempt.attempt_id
         assert harness.agent.calls == 1
     finally:
+        harness.close()
+
+
+def test_review_transition_recovers_after_restart_and_concurrent_delivery(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path, CommitAgent())
+    try:
+        attempt_id, _ = _record_pushed_repair(harness)
+        harness.review_store.close()
+        reopened_store = ReviewStore(tmp_path / "reviews.db")
+        harness.review_store = reopened_store
+        harness.reviews = ReviewService(
+            reopened_store, provider=FixtureReviewProvider(harness.provider)
+        )
+        restarted = ReviewRepairService(
+            harness.reviews,
+            harness.workflow,
+            harness.provider,  # type: ignore[arg-type]
+            ModelRouter(harness.routing_store),
+            harness.agent,  # type: ignore[arg-type]
+            tmp_path / "repair-worktrees",
+        )
+        barrier = Barrier(2)
+
+        def deliver():
+            barrier.wait(timeout=5)
+            return restarted.get(attempt_id)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = tuple(
+                future.result(timeout=10)
+                for future in (executor.submit(deliver), executor.submit(deliver))
+            )
+
+        current = harness.reviews.snapshot("owner/repo#1")
+        old = reopened_store.snapshot(harness.cycle_id)
+        cycles = reopened_store._connection.execute(
+            "SELECT COUNT(*) AS total FROM review_cycles WHERE pull_request_id = ?",
+            ("owner/repo#1",),
+        ).fetchone()
+        assert all(
+            result.review_transition_status is ReviewRepairTransitionStatus.COMPLETED
+            for result in results
+        )
+        assert {result.review_transition_cycle_id for result in results} == {
+            current.cycle.cycle_id
+        }
+        assert current.cycle.cycle_number == 2
+        assert current.cycle.status is ReviewCycleStatus.ACTIVE
+        assert old.cycle.status is ReviewCycleStatus.SUPERSEDED
+        assert cycles is not None and int(cycles["total"]) == 2
+        restarted.recover()
+        assert (
+            reopened_store._connection.execute(
+                "SELECT COUNT(*) FROM review_cycles WHERE pull_request_id = ?",
+                ("owner/repo#1",),
+            ).fetchone()[0]
+            == 2
+        )
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize(
+    "case", ["missing_evidence", "provider_mismatch", "stale_cycle"]
+)
+def test_review_transition_requires_current_pushed_evidence(
+    tmp_path: Path, case: str
+) -> None:
+    harness = _harness(tmp_path, CommitAgent())
+    try:
+        if case == "missing_evidence":
+            attempt, created = harness.reviews.create_repair_attempt(
+                harness.cycle_id, (harness.selected_id,), "operator"
+            )
+            assert created is True
+            attempt_id = harness.review_store.finish_repair_attempt(
+                attempt.attempt_id, ReviewRepairStatus.SUCCEEDED
+            ).attempt_id
+            expected_cycles = 1
+        else:
+            attempt_id, _ = _record_pushed_repair(
+                harness, push=case != "provider_mismatch"
+            )
+            expected_cycles = 1
+            if case == "stale_cycle":
+                harness.reviews._start_cycle(
+                    "owner/repo#1",
+                    "newer-head",
+                    expected_cycle_id=harness.cycle_id,
+                )
+                expected_cycles = 2
+
+        result = harness.service.get(attempt_id)
+        current = harness.reviews.snapshot("owner/repo#1")
+        assert result.review_transition_status is (
+            ReviewRepairTransitionStatus.HUMAN_ACTION_REQUIRED
+        )
+        assert result.review_transition_required_action
+        assert len(result.review_transition_required_action) <= 1_000
+        assert current.as_dict()["repair"]["review_transition"]["status"] == (
+            "human_action_required"
+        )
+        count = harness.review_store._connection.execute(
+            "SELECT COUNT(*) FROM review_cycles WHERE pull_request_id = ?",
+            ("owner/repo#1",),
+        ).fetchone()[0]
+        assert count == expected_cycles
+    finally:
+        harness.close()
+
+
+def test_review_transition_retries_provider_read_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _harness(tmp_path, CommitAgent())
+    try:
+        attempt_id, _ = _record_pushed_repair(harness)
+        original_get = harness.provider.get_pull_request
+        calls = 0
+
+        def fail_once(repository: str, number: int) -> PullRequestSnapshot:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("temporary provider failure")
+            return original_get(repository, number)
+
+        monkeypatch.setattr(harness.provider, "get_pull_request", fail_once)
+        first = harness.service.get(attempt_id)
+        assert first.review_transition_status is (
+            ReviewRepairTransitionStatus.RETRY_REQUIRED
+        )
+        assert len(first.review_transition_required_action or "") <= 1_000
+        assert harness.reviews.snapshot("owner/repo#1").cycle.cycle_number == 1
+
+        retried = harness.service.get(attempt_id)
+
+        assert (
+            retried.review_transition_status is ReviewRepairTransitionStatus.COMPLETED
+        )
+        assert retried.review_transition_cycle_id is not None
+        assert harness.reviews.snapshot("owner/repo#1").cycle.cycle_number == 2
+    finally:
+        harness.close()
+
+
+def test_failed_repair_does_not_start_a_review_cycle(tmp_path: Path) -> None:
+    harness = _harness(tmp_path, FailingAgent())
+    try:
+        attempt = harness.service.dispatch(
+            harness.cycle_id, (harness.selected_id,), "operator"
+        )
+        completed = harness.service.wait(attempt.attempt_id, timeout=10)
+
+        assert completed.status is ReviewRepairStatus.FAILED
+        assert completed.review_transition_status is (
+            ReviewRepairTransitionStatus.NOT_REQUIRED
+        )
+        assert harness.reviews.snapshot("owner/repo#1").cycle.cycle_id == (
+            harness.cycle_id
+        )
+    finally:
+        harness.close()
+
+
+def test_repair_api_authorizes_before_recovering_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _harness(tmp_path, CommitAgent())
+    state = OrchestratorStore(":memory:")
+    routing = RoutingStore(":memory:")
+    try:
+        attempt_id, _ = _record_pushed_repair(harness)
+        monkeypatch.setattr(harness.service, "recover", lambda: None)
+        with TestClient(
+            create_app(
+                store=state,
+                routing_store=routing,
+                review_service=harness.reviews,
+                review_repair_service=harness.service,
+                api_key="test-key",
+                review_actor="intruder",
+            )
+        ) as client:
+            denied = client.get(
+                f"/reviews/repairs/{attempt_id}",
+                headers={"X-API-Key": "test-key"},
+            )
+
+        assert denied.status_code == 409
+        assert (
+            harness.review_store.repair_attempt(attempt_id).review_transition_status
+            is ReviewRepairTransitionStatus.PENDING
+        )
+        assert harness.reviews.snapshot("owner/repo#1").cycle.cycle_number == 1
+    finally:
+        state.close()
+        routing.close()
         harness.close()
 
 

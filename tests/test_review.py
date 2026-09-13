@@ -20,6 +20,8 @@ from beehaiive.review import (
     ReviewConcern,
     ReviewCycleStatus,
     ReviewError,
+    ReviewRepairStatus,
+    ReviewRepairTransitionStatus,
     ReviewService,
     ReviewStore,
 )
@@ -990,6 +992,15 @@ def test_review_store_migrates_approval_and_reader_claim_columns(
             status TEXT NOT NULL, resolution TEXT, created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE review_repair_attempts(
+            attempt_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL UNIQUE,
+            pull_request_id TEXT NOT NULL, head_sha TEXT NOT NULL,
+            finding_ids_json TEXT NOT NULL, actor TEXT NOT NULL,
+            status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            lease_id TEXT, commit_sha TEXT, push_evidence_json TEXT, result TEXT,
+            required_action TEXT, cancellation_requested INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(cycle_id) REFERENCES review_cycles(cycle_id)
+        );
         INSERT INTO review_cycles(
             cycle_id, pull_request_id, head_sha, cycle_number, status,
             human_approval, required_action, created_at, updated_at
@@ -1003,6 +1014,14 @@ def test_review_store_migrates_approval_and_reader_claim_columns(
         ) VALUES (
             'legacy-finding', 'owner/repo#1', 'legacy-cycle', 'security',
             'Legacy finding', 'open', NULL,
+            '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
+        );
+        INSERT INTO review_repair_attempts(
+            attempt_id, cycle_id, pull_request_id, head_sha, finding_ids_json,
+            actor, status, created_at, updated_at
+        ) VALUES (
+            'legacy-attempt', 'legacy-cycle', 'owner/repo#1', 'legacy-head',
+            '[]', 'operator', 'succeeded',
             '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
         );
         """
@@ -1019,8 +1038,24 @@ def test_review_store_migrates_approval_and_reader_claim_columns(
             str(row["name"])
             for row in store._connection.execute("PRAGMA table_info(review_readers)")
         }
+        repair_columns = {
+            str(row["name"])
+            for row in store._connection.execute(
+                "PRAGMA table_info(review_repair_attempts)"
+            )
+        }
         assert {"approval_actor", "approval_reason", "approval_at"} <= cycle_columns
         assert {"claim_token", "claim_expires_at"} <= reader_columns
+        assert {
+            "review_transition_status",
+            "review_transition_cycle_id",
+            "review_transition_required_action",
+        } <= repair_columns
+        legacy_attempt = store.repair_attempt("legacy-attempt")
+        assert legacy_attempt.status is ReviewRepairStatus.SUCCEEDED
+        assert legacy_attempt.review_transition_status is (
+            ReviewRepairTransitionStatus.NOT_REQUIRED
+        )
         finding = store.finding_for_id("legacy-finding")
         assert finding.head_sha == "legacy-head"
         assert finding.fingerprint

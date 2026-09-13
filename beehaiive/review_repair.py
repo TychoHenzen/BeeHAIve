@@ -19,6 +19,7 @@ from .review import (
     ReviewError,
     ReviewRepairAttempt,
     ReviewRepairStatus,
+    ReviewRepairTransitionStatus,
     ReviewService,
 )
 from .routing import (
@@ -159,6 +160,16 @@ class ReviewRepairService:
         if attempt.status is ReviewRepairStatus.QUEUED:
             self._start_worker(attempt.attempt_id)
             return
+        if (
+            attempt.status is ReviewRepairStatus.SUCCEEDED
+            and attempt.review_transition_status
+            in {
+                ReviewRepairTransitionStatus.PENDING,
+                ReviewRepairTransitionStatus.RETRY_REQUIRED,
+            }
+        ):
+            self._start_review_transition(attempt)
+            return
         if attempt.status not in {
             ReviewRepairStatus.RUNNING,
             ReviewRepairStatus.PUSHING,
@@ -198,20 +209,11 @@ class ReviewRepairService:
 
     def _recover_push(self, attempt: ReviewRepairAttempt) -> None:
         evidence = attempt.push_evidence
-        repository = None if evidence is None else evidence.get("repository")
-        number = None if evidence is None else evidence.get("pull_request_number")
-        branch = None if evidence is None else evidence.get("source_branch")
+        identity = self._push_evidence_identity(attempt)
         confirmed = False
         detail: str | None = None
-        if (
-            attempt.commit_sha
-            and isinstance(repository, str)
-            and isinstance(number, int)
-            and isinstance(branch, str)
-            and evidence is not None
-            and evidence.get("expected_head") == attempt.head_sha
-            and evidence.get("pushed_head") == attempt.commit_sha
-        ):
+        if identity is not None:
+            repository, number, branch = identity
             try:
                 current = self.provider.get_pull_request(repository, number)
                 review_target = self.review_provider.get_pull_request(
@@ -231,13 +233,14 @@ class ReviewRepairService:
             except Exception as exc:
                 detail = self._safe_text(str(exc), 500)
         if confirmed:
-            self.reviews.store.finish_repair_attempt(
+            completed = self.reviews.store.finish_repair_attempt(
                 attempt.attempt_id,
                 ReviewRepairStatus.SUCCEEDED,
                 commit_sha=attempt.commit_sha,
                 push_evidence=evidence,
                 result="Push confirmed during restart recovery",
             )
+            self._recover_attempt(completed)
             return
         required_action = (
             "The push outcome could not be confirmed after the worker stopped. "
@@ -264,6 +267,7 @@ class ReviewRepairService:
         heartbeat_errors: list[Exception] = []
         heartbeat: Thread | None = None
         claimed = False
+        finished_attempt: ReviewRepairAttempt | None = None
         source_ref = f"refs/beehaiive/review-repair/{attempt_id}/source"
         try:
             attempt = self.reviews.repair_attempt(attempt_id)
@@ -452,7 +456,7 @@ class ReviewRepairService:
                     )
             if claimed:
                 self.workflow.worktrees.remove_ref(source_ref)
-                self.reviews.store.finish_repair_attempt(
+                finished_attempt = self.reviews.store.finish_repair_attempt(
                     attempt_id,
                     status,
                     commit_sha=commit_sha,
@@ -463,6 +467,98 @@ class ReviewRepairService:
             with self._lock:
                 self._threads.pop(attempt_id, None)
                 self._cancel_events.pop(attempt_id, None)
+            if (
+                finished_attempt is not None
+                and finished_attempt.status is ReviewRepairStatus.SUCCEEDED
+            ):
+                self._start_review_transition(finished_attempt)
+
+    @staticmethod
+    def _push_evidence_identity(
+        attempt: ReviewRepairAttempt,
+    ) -> tuple[str, int, str] | None:
+        evidence = attempt.push_evidence
+        if (
+            evidence is None
+            or attempt.commit_sha is None
+            or attempt.commit_sha == attempt.head_sha
+            or evidence.get("expected_head") != attempt.head_sha
+            or evidence.get("pushed_head") != attempt.commit_sha
+        ):
+            return None
+        repository = evidence.get("repository")
+        number = evidence.get("pull_request_number")
+        branch = evidence.get("source_branch")
+        if (
+            not isinstance(repository, str)
+            or not repository
+            or type(number) is not int
+            or number <= 0
+            or not isinstance(branch, str)
+            or not branch
+        ):
+            return None
+        try:
+            expected_repository, expected_number = (
+                ReviewRepairService._pull_request_parts(attempt.pull_request_id)
+            )
+        except ReviewError:
+            return None
+        if (
+            repository.casefold() != expected_repository.casefold()
+            or number != expected_number
+        ):
+            return None
+        return repository, number, branch
+
+    def _start_review_transition(self, attempt: ReviewRepairAttempt) -> None:
+        identity = self._push_evidence_identity(attempt)
+        if identity is None:
+            self.reviews.store.fail_repair_transition(
+                attempt.attempt_id,
+                ReviewRepairTransitionStatus.HUMAN_ACTION_REQUIRED,
+                "Verify the repair commit and pushed pull-request evidence before "
+                "starting a fresh review cycle.",
+            )
+            return
+        repository, number, branch = identity
+        try:
+            current = self.provider.get_pull_request(repository, number)
+            target = self.review_provider.get_pull_request(attempt.pull_request_id)
+        except Exception:
+            self.reviews.store.fail_repair_transition(
+                attempt.attempt_id,
+                ReviewRepairTransitionStatus.RETRY_REQUIRED,
+                "Provider readback failed. Retry the fresh review cycle transition.",
+            )
+            return
+        if (
+            current.repository.casefold() != repository.casefold()
+            or current.number != number
+            or current.source_branch != branch
+            or current.source_head != attempt.commit_sha
+            or current.state != "OPEN"
+            or current.merged
+            or target.pull_request_id != attempt.pull_request_id
+            or target.head_sha != attempt.commit_sha
+            or not target.ready
+        ):
+            self.reviews.store.fail_repair_transition(
+                attempt.attempt_id,
+                ReviewRepairTransitionStatus.HUMAN_ACTION_REQUIRED,
+                "The current pull-request identity or head no longer matches the "
+                "pushed repair. Verify the head and start a fresh review cycle "
+                "manually.",
+            )
+            return
+        try:
+            self.reviews.start_repair_followup_cycle(attempt.attempt_id, target)
+        except Exception:
+            self.reviews.store.fail_repair_transition(
+                attempt.attempt_id,
+                ReviewRepairTransitionStatus.RETRY_REQUIRED,
+                "The fresh review cycle could not be recorded. Retry the transition.",
+            )
 
     def _prompt(self, attempt: ReviewRepairAttempt) -> str:
         findings = [

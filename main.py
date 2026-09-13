@@ -741,9 +741,9 @@ def create_app(
         actor: str = Depends(require_review_access),
     ) -> dict[str, object]:
         def operation() -> dict[str, object]:
-            attempt = require_review_repair_service().get(attempt_id)
+            attempt = review_service.repair_attempt(attempt_id)
             review_service.authorize(attempt.pull_request_id, actor, ReviewAction.READ)
-            return attempt.as_dict()
+            return require_review_repair_service().get(attempt_id).as_dict()
 
         return _handle_review_error(operation)
 
