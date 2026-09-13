@@ -255,7 +255,8 @@ def _start_windows_gate_process(
             ("PeakJobMemoryUsed", ctypes.c_size_t),
         ]
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    windows_ctypes = cast(Any, ctypes)
+    kernel32 = windows_ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
     kernel32.CreateJobObjectW.restype = wintypes.HANDLE
     kernel32.SetInformationJobObject.argtypes = (
@@ -274,7 +275,7 @@ def _start_windows_gate_process(
 
     job_handle = kernel32.CreateJobObjectW(None, None)
     if not job_handle:
-        raise ctypes.WinError(ctypes.get_last_error())
+        raise windows_ctypes.WinError(windows_ctypes.get_last_error())
     process: subprocess.Popen[bytes] | None = None
     try:
         limits = ExtendedLimitInformation()
@@ -285,7 +286,7 @@ def _start_windows_gate_process(
             ctypes.byref(limits),
             ctypes.sizeof(limits),
         ):
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise windows_ctypes.WinError(windows_ctypes.get_last_error())
         process = subprocess.Popen(
             [sys.executable, "-I", "-S", "-c", _WINDOWS_GATE_RUNNER],
             cwd=workspace,
@@ -299,10 +300,10 @@ def _start_windows_gate_process(
             _PROCESS_TERMINATE | _PROCESS_SET_QUOTA, False, process.pid
         )
         if not process_handle:
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise windows_ctypes.WinError(windows_ctypes.get_last_error())
         try:
             if not kernel32.AssignProcessToJobObject(job_handle, process_handle):
-                raise ctypes.WinError(ctypes.get_last_error())
+                raise windows_ctypes.WinError(windows_ctypes.get_last_error())
         finally:
             kernel32.CloseHandle(process_handle)
 
@@ -314,7 +315,7 @@ def _start_windows_gate_process(
                 handle = owned_job_handle
                 owned_job_handle = None
                 if not kernel32.CloseHandle(handle):
-                    raise ctypes.WinError(ctypes.get_last_error())
+                    raise windows_ctypes.WinError(windows_ctypes.get_last_error())
 
         cast(Any, process)._beehaiive_job_close = close_job
         job_handle = None

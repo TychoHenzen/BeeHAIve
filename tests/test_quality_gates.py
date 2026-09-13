@@ -14,6 +14,7 @@ from beehaiive.agent import (
     CodexExecModelExecutor,
     _gate_summary,
     redact_worker_text,
+    safe_worker_environment,
 )
 from beehaiive.quality_gates import MANIFEST_NAME, RepositoryGateSuite
 from beehaiive.storage import MAX_AGENT_DIAGNOSTIC_LENGTH
@@ -89,10 +90,6 @@ def test_repository_gate_suite_reports_bounded_redacted_outcomes(
             ),
             _gate("missing", ["beehaiive-test-executable-not-installed"]),
             _gate(
-                "redaction",
-                [sys.executable, "-c", f"print('GITHUB_TOKEN={secret}')"],
-            ),
-            _gate(
                 "environment",
                 [
                     sys.executable,
@@ -119,7 +116,6 @@ def test_repository_gate_suite_reports_bounded_redacted_outcomes(
         "failure",
         "timeout",
         "missing",
-        "redaction",
         "environment",
         "large-output",
         "codeql",
@@ -130,7 +126,6 @@ def test_repository_gate_suite_reports_bounded_redacted_outcomes(
     assert by_name["timeout"].status == "timed_out"
     assert by_name["timeout"].exit_code is not None
     assert by_name["missing"].status == "unavailable"
-    assert by_name["redaction"].stdout.strip() == "GITHUB_TOKEN=[redacted]"
     assert by_name["environment"].stdout.strip() == "not-present"
     assert by_name["large-output"].stdout.startswith("x")
     assert len(by_name["large-output"].stdout) <= 4_000
@@ -138,6 +133,38 @@ def test_repository_gate_suite_reports_bounded_redacted_outcomes(
     assert by_name["codeql"].passed is False
     assert by_name["codeql"].required is False
     assert secret not in json.dumps([result.as_dict() for result in results])
+
+
+def test_repository_gate_suite_redacts_secret_child_output(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = tmp_path / "checkout"
+    workspace.mkdir()
+    secret = "gate-secret-for-redaction"
+    monkeypatch.setenv("GITHUB_TOKEN", secret)
+    original_environment = safe_worker_environment()
+    monkeypatch.setattr(
+        "beehaiive.quality_gates.safe_worker_environment",
+        lambda: {**original_environment, "GITHUB_TOKEN": secret},
+    )
+    _write_manifest(
+        workspace,
+        [
+            _gate(
+                "redaction",
+                [
+                    sys.executable,
+                    "-c",
+                    "import os; print('GITHUB_TOKEN=' + os.environ['GITHUB_TOKEN'])",
+                ],
+            )
+        ],
+    )
+
+    assert secret not in (workspace / MANIFEST_NAME).read_text(encoding="utf-8")
+    result = RepositoryGateSuite().run(workspace)[0]
+
+    assert result.stdout.strip() == "GITHUB_TOKEN=[redacted]"
 
 
 def test_invalid_or_missing_manifest_runs_no_declared_command(tmp_path: Path) -> None:
