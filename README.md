@@ -86,6 +86,25 @@ Open `http://127.0.0.1:8000/dashboard?project=<owner>:<number>` and
 Before clicking an action such as **Start writer**, enter the value of
 `BEEHAIIVE_API_KEY` from `.env` in the dashboard API-key field.
 
+## Create a PBI through the API
+
+Send an authenticated request for a repository linked to the configured
+Project. Existing repository labels are optional.
+
+```powershell
+curl.exe -X POST "http://127.0.0.1:8000/projects/<project-id>/pbis" `
+  -H "X-API-Key: <api-key>" -H "Idempotency-Key: <request-id>" `
+  -H "Content-Type: application/json" `
+  -d '{"repository":"<owner>/<repo>","title":"<title>","body":"<body>","labels":[]}'
+```
+
+The API preserves the supplied title and body. It returns `201` after the issue,
+labels, Project membership, and Backlog status read back. It returns `202` for
+an incomplete operation. Reuse the same key only for the same request. A key
+with changed content returns `409`. If GitHub may have created the issue but
+BeeHAIve did not save its identity, the result is `outcome_unknown`; BeeHAIve
+will not create another issue for that key, and an operator must reconcile it.
+
 ## Run the live demo
 
 1. Confirm the dashboard shows the expected project and linked repositories.

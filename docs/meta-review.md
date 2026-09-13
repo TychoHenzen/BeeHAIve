@@ -37,5 +37,6 @@ review updates the evidence and keeps the operator decision. The analyzer is
 deterministic in this version. It proposes workflow outcomes from routing
 failures, missing routing evidence, or a completed handoff.
 
-The API never creates GitHub issues, changes Project items, or mutates provider
-state. An operator must inspect and decide each suggestion through the API.
+The meta-review API never creates GitHub issues, changes Project items, or
+mutates provider state. An operator must inspect and decide each suggestion
+through the API.

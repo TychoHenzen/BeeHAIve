@@ -4,6 +4,7 @@ import json
 import sqlite3
 import subprocess
 from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -185,6 +186,27 @@ def test_urllib_graphql_client_validates_transport_and_payloads(
     with pytest.raises(ProviderError, match="invalid JSON") as unicode_error:
         client.execute("query", {})
     assert isinstance(unicode_error.value, GitHubOutcomeUnknownError)
+
+
+def test_urllib_rest_client_marks_http_408_as_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = UrllibGraphQLClient("token", "https://example.test/graphql")
+
+    def raise_timeout(request: object, timeout: float) -> object:
+        raise HTTPError(
+            "https://example.test/repos/owner/api/issues",
+            408,
+            "request timeout",
+            {},
+            BytesIO(b'{"message":"request timeout"}'),
+        )
+
+    monkeypatch.setattr(provider_module, "urlopen", raise_timeout)
+    with pytest.raises(GitHubOutcomeUnknownError) as timeout_error:
+        client.request_rest("POST", "/repos/owner/api/issues", {"title": "A PBI"})
+
+    assert timeout_error.value.status_code == 408
 
 
 def test_urllib_graphql_client_honors_primary_and_secondary_rate_limits(
