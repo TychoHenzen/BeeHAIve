@@ -125,6 +125,13 @@ class HandoffMutationAudit(Protocol):
 
         ...
 
+    def handoff_mutation_action(
+        self, request: HandoffRequest, mutation: str, operation_key: str
+    ) -> dict[str, object] | None:
+        """Return the latest durable record for one operation."""
+
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class HandoffIntent:
@@ -164,6 +171,9 @@ class PullRequestSnapshot:
     mergeable: str | None
     merge_state: str | None
     evidence_error: str | None = None
+    is_draft: bool | None = None
+    merge_commit_oid: str | None = None
+    source_repository: str | None = None
 
     @property
     def conflict_state(self) -> str:

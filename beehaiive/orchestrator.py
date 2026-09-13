@@ -121,6 +121,30 @@ class Orchestrator:
     def renew_lease(self, run_id: str, lease_token: str) -> RunState:
         return self.store.renew_lease(run_id, lease_token)
 
+    def complete_approved_handoff(
+        self,
+        pull_request_id: str,
+        expected_head: str,
+        authorization: Mapping[str, object] | None,
+    ) -> Mapping[str, object]:
+        repository, separator, number_text = pull_request_id.partition("#")
+        if not separator or repository.count("/") != 1 or not number_text.isdecimal():
+            raise StoreError("Pull-request id must use owner/repository#number")
+        number = int(number_text)
+        if number <= 0 or number > 2_147_483_647:
+            raise StoreError("Pull-request number is outside the supported range")
+        with self._handoff_locks.acquire(f"complete:{repository}#{number}"):
+            request, pull_request_url = self.store.handoff_for_pull_request(
+                repository, number
+            )
+            return self.provider.complete_approved_handoff(
+                request,
+                number,
+                pull_request_url,
+                expected_head,
+                authorization,
+            )
+
     def run_implementation_attempt(
         self, run_id: str, lease_token: str
     ) -> RoutingResult:

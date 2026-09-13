@@ -148,8 +148,11 @@ def test_urllib_graphql_client_validates_transport_and_payloads(
         raise HTTPError("https://example.test", 503, "unavailable", {}, None)
 
     monkeypatch.setattr(provider_module, "urlopen", raise_server_error)
-    with pytest.raises(GitHubOutcomeUnknownError, match="request failed"):
+    with pytest.raises(
+        GitHubOutcomeUnknownError, match="request failed"
+    ) as server_error:
         client.execute("mutation", {})
+    assert server_error.value.status_code == 503
 
     for payload, message in (
         ([], "non-object"),

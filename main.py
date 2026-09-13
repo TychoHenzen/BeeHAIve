@@ -779,9 +779,34 @@ def create_app(
     ) -> dict[str, object]:
         def operation() -> dict[str, object]:
             review_service.authorize(pull_request_id, actor, ReviewAction.HANDOFF)
-            return review_service.merge_handoff(
-                pull_request_id, request.head_sha
-            ).as_dict()
+            try:
+                authorization = review_service.merge_handoff(
+                    pull_request_id, request.head_sha
+                )
+            except ReviewError as authorization_error:
+                try:
+                    completion = orchestrator.complete_approved_handoff(
+                        pull_request_id, request.head_sha, None
+                    )
+                except StoreError:
+                    raise authorization_error from None
+                if completion.get("reason") == "current_review_authorization_required":
+                    raise authorization_error
+                return {
+                    "pull_request_id": pull_request_id,
+                    "head_sha": request.head_sha,
+                    "status": "completion_resume",
+                    "completion": dict(completion),
+                }
+            try:
+                completion = orchestrator.complete_approved_handoff(
+                    pull_request_id,
+                    request.head_sha,
+                    authorization.as_dict(),
+                )
+            except StoreError as exc:
+                raise ReviewError(str(exc)) from exc
+            return {**authorization.as_dict(), "completion": dict(completion)}
 
         return _handle_review_error(operation)
 

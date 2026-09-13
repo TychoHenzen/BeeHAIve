@@ -1074,6 +1074,52 @@ class OrchestratorStore:
             )
             return self._run_for_id(connection, run_id) or row
 
+    def handoff_for_pull_request(
+        self, repository: str, number: int
+    ) -> tuple[HandoffRequest, str]:
+        """Return the unique persisted PBI handoff for a pull request."""
+
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT h.project_id, h.repository_name, h.pbi_number, h.branch,
+                       h.pull_request_url, h.pull_request_number, h.run_id,
+                       p.title, p.handoff_base_branch, p.handoff_body,
+                       p.handoff_head_sha, p.handoff_verification_evidence
+                FROM handoffs AS h
+                JOIN pbis AS p
+                  ON p.project_id = h.project_id
+                 AND p.repository_name = h.repository_name
+                 AND p.number = h.pbi_number
+                WHERE h.repository_name = ? AND h.pull_request_number = ?
+                """,
+                (repository, number),
+            ).fetchall()
+            if len(rows) != 1:
+                raise StoreError(
+                    f"Expected one persisted handoff for {repository}#{number}, "
+                    f"found {len(rows)}"
+                )
+            row = rows[0]
+            return (
+                HandoffRequest(
+                    project_id=str(row["project_id"]),
+                    repository=str(row["repository_name"]),
+                    pbi_number=int(row["pbi_number"]),
+                    title=str(row["title"]),
+                    branch=str(row["branch"]),
+                    base_branch=row["handoff_base_branch"],
+                    body=str(row["handoff_body"] or ""),
+                    run_id=str(row["run_id"]),
+                    head_sha=row["handoff_head_sha"],
+                    verification_evidence=str(
+                        row["handoff_verification_evidence"] or ""
+                    ),
+                    mutation_audit=self,
+                ),
+                str(row["pull_request_url"]),
+            )
+
     def prepare_handoff(
         self,
         run_id: str,
@@ -1981,11 +2027,37 @@ class OrchestratorStore:
     ) -> str:
         """Record a safe GitHub mutation intent before its provider call."""
 
-        if mutation not in {"create_ref", "create_pull_request"}:
+        if mutation not in {
+            "create_ref",
+            "create_pull_request",
+            "merge_pull_request",
+            "close_issue",
+            "delete_ref",
+            "update_project_status",
+        }:
             raise StoreError("Unsupported GitHub handoff mutation")
         if not operation_key.strip() or not request.run_id.strip():
             raise StoreError("A handoff mutation identity is required")
-        allowed_target_fields = {"branch", "base_branch", "base_sha", "head_sha"}
+        allowed_target_fields = {
+            "branch",
+            "base_branch",
+            "base_sha",
+            "head_sha",
+            "pull_request_number",
+            "pull_request_url",
+            "review_cycle_id",
+            "approved_by_human",
+            "approval_actor",
+            "approval_reason",
+            "approval_at",
+            "issue_number",
+            "issue_id",
+            "ref_id",
+            "project_item_id",
+            "field_id",
+            "option_id",
+            "status",
+        }
         if any(
             key not in allowed_target_fields or not isinstance(value, str)
             for key, value in target.items()
@@ -2021,6 +2093,18 @@ class OrchestratorStore:
                 if type(prior_attempt) is int:
                     attempt = max(attempt, prior_attempt + 1)
 
+            if (
+                mutation
+                in {
+                    "merge_pull_request",
+                    "close_issue",
+                    "delete_ref",
+                    "update_project_status",
+                }
+                and attempt > 2
+            ):
+                raise StoreError("The one-retry limit for this handoff step is spent")
+
             action_id = str(uuid4())
             now = _now()
             safe_request = {
@@ -2048,6 +2132,37 @@ class OrchestratorStore:
                 ),
             )
             return action_id
+
+    def handoff_mutation_action(
+        self, request: HandoffRequest, mutation: str, operation_key: str
+    ) -> dict[str, object] | None:
+        """Return the latest audit record for one stable handoff operation."""
+
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM actions
+                WHERE project_id = ? AND repository_name = ? AND pbi_number = ?
+                    AND run_id = ? AND kind = ?
+                ORDER BY created_at DESC, rowid DESC
+                """,
+                (
+                    request.project_id,
+                    request.repository,
+                    request.pbi_number,
+                    request.run_id,
+                    f"github.{mutation}",
+                ),
+            ).fetchall()
+            matching = [
+                row
+                for row in rows
+                if _json_mapping(row["request_json"]).get("operation_key")
+                == operation_key
+            ]
+            if not matching:
+                return None
+            return self._action_from_row(matching[0])
 
     def finish_handoff_mutation(
         self,
@@ -2082,7 +2197,14 @@ class OrchestratorStore:
     ) -> None:
         """Resolve only unfinished attempts for the same stable operation."""
 
-        if mutation not in {"create_ref", "create_pull_request"}:
+        if mutation not in {
+            "create_ref",
+            "create_pull_request",
+            "merge_pull_request",
+            "close_issue",
+            "delete_ref",
+            "update_project_status",
+        }:
             raise StoreError("Unsupported GitHub handoff mutation")
         if status not in {"succeeded", "failed", "uncertain"}:
             raise StoreError(f"Invalid handoff mutation status: {status}")

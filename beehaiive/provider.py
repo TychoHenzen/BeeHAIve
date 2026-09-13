@@ -10,11 +10,12 @@ import os
 import re
 import subprocess
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from threading import Lock
 from typing import Any, Protocol, cast
 from urllib.error import HTTPError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from .checks import aggregate_check_verdict, normalize_check_rollup
@@ -40,6 +41,10 @@ class ProviderError(RuntimeError):
 
 class GitHubOutcomeUnknownError(ProviderError):
     """Raised when a request may have reached GitHub without a usable reply."""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class GitHubRateLimitError(ProviderError):
@@ -267,7 +272,7 @@ class UrllibGraphQLClient:
                 raise rate_error from exc
             message = f"GitHub GraphQL request failed: {exc}"
             if 500 <= exc.code < 600:
-                raise GitHubOutcomeUnknownError(message) from exc
+                raise GitHubOutcomeUnknownError(message, status_code=exc.code) from exc
             raise ProviderError(message) from exc
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise GitHubOutcomeUnknownError(
@@ -292,6 +297,64 @@ class UrllibGraphQLClient:
         if not isinstance(data, dict):
             raise ProviderError("GitHub GraphQL response did not contain data")
         return cast(dict[str, Any], data)
+
+    def request_rest(
+        self,
+        method: str,
+        path: str,
+        payload: Mapping[str, object] | None = None,
+    ) -> tuple[int, Mapping[str, Any]]:
+        """Call a GitHub REST endpoint without hiding its response status."""
+
+        request = Request(
+            f"{self._endpoint.rsplit('/graphql', 1)[0]}{path}",
+            data=(
+                json.dumps(dict(payload)).encode("utf-8")
+                if payload is not None
+                else None
+            ),
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {self._token}",
+                "Content-Type": "application/json",
+            },
+            method=method,
+        )
+        response_headers: object | None = None
+        try:
+            with urlopen(request, timeout=PROVIDER_REQUEST_TIMEOUT) as response:
+                response_headers = response
+                status = int(getattr(response, "status", 200))
+                raw_payload = response.read()
+        except HTTPError as exc:
+            rate_error = self._rate_limit_error(exc, status_code=exc.code)
+            if rate_error is not None:
+                raise rate_error from exc
+            status = exc.code
+            response_headers = exc
+            raw_payload = exc.read()
+            if status >= 500:
+                raise GitHubOutcomeUnknownError(
+                    f"GitHub REST request failed with HTTP {status}",
+                    status_code=status,
+                ) from exc
+        except OSError as exc:
+            raise GitHubOutcomeUnknownError(
+                f"GitHub REST request failed: {exc}"
+            ) from exc
+
+        try:
+            decoded: object = json.loads(raw_payload)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise GitHubOutcomeUnknownError(
+                "GitHub REST returned invalid JSON", status_code=status
+            ) from exc
+        if not isinstance(decoded, Mapping):
+            raise GitHubOutcomeUnknownError(
+                "GitHub REST returned a non-object response", status_code=status
+            )
+        self._record_exhausted_headers(response_headers)
+        return status, cast(Mapping[str, Any], decoded)
 
 
 class ProjectProvider(Protocol):
@@ -321,6 +384,18 @@ class ProjectProvider(Protocol):
 
     def get_pull_request(self, repository: str, number: int) -> PullRequestSnapshot:
         """Return current pull-request identity and mergeability evidence."""
+
+        ...
+
+    def complete_approved_handoff(
+        self,
+        request: HandoffRequest,
+        pull_request_number: int,
+        pull_request_url: str,
+        expected_head: str,
+        authorization: Mapping[str, object] | None,
+    ) -> Mapping[str, object]:
+        """Merge one authorized PR and reconcile its persisted completion."""
 
         ...
 
@@ -593,12 +668,87 @@ query($owner: String!, $name: String!, $number: Int!) {
       state
       merged
       headRefName
+      headRepository { nameWithOwner }
       headRef { name target { oid } }
       baseRefName
       baseRef { name target { oid } }
       mergeable
       mergeStateStatus
+      isDraft
+      mergeCommit { oid }
     }
+  }
+}
+"""
+
+ISSUE_COMPLETION_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) { id number state }
+  }
+}
+"""
+
+CLOSE_ISSUE_MUTATION = """
+mutation($input: CloseIssueInput!) {
+  closeIssue(input: $input) { issue { id number state } }
+}
+"""
+
+BRANCH_REF_QUERY = """
+query($owner: String!, $name: String!, $qualifiedName: String!) {
+  repository(owner: $owner, name: $name) {
+    id
+    ref(qualifiedName: $qualifiedName) { id name target { oid } }
+  }
+}
+"""
+
+UPDATE_REFS_MUTATION = """
+mutation($input: UpdateRefsInput!) {
+  updateRefs(input: $input) { clientMutationId }
+}
+"""
+
+COMPLETION_PROJECT_QUERY = """
+query($owner: String!, $number: Int!, $cursor: String) {
+  user(login: $owner) {
+    projectV2(number: $number) {
+      id
+      fields(first: 100) {
+        nodes {
+          ... on ProjectV2SingleSelectField {
+            id name options { id name }
+          }
+        }
+      }
+      items(first: 100, after: $cursor) {
+        nodes {
+          id
+          content {
+            __typename
+            ... on Issue { number repository { nameWithOwner } }
+          }
+          fieldValues(first: 100) {
+            nodes {
+              ... on ProjectV2ItemFieldSingleSelectValue {
+                name optionId
+                field { ... on ProjectV2FieldCommon { id name } }
+              }
+            }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+
+UPDATE_PROJECT_STATUS_MUTATION = """
+mutation($input: UpdateProjectV2ItemFieldValueInput!) {
+  updateProjectV2ItemFieldValue(input: $input) {
+    projectV2Item { id }
   }
 }
 """
@@ -733,6 +883,23 @@ def _pull_request_snapshot(
         or not isinstance(merged, bool)
     ):
         raise ProviderError("GitHub returned incomplete pull-request identity")
+    is_draft_value = pull_request.get("isDraft")
+    is_draft = is_draft_value if isinstance(is_draft_value, bool) else None
+    raw_head_repository = pull_request.get("headRepository")
+    source_repository = (
+        _required_text(
+            cast(Mapping[str, Any], raw_head_repository).get("nameWithOwner"),
+            "source repository",
+        )
+        if isinstance(raw_head_repository, Mapping)
+        else None
+    )
+    raw_merge_commit = pull_request.get("mergeCommit")
+    merge_commit_oid = (
+        _commit_oid(cast(Mapping[str, Any], raw_merge_commit).get("oid"))
+        if isinstance(raw_merge_commit, Mapping)
+        else None
+    )
 
     head_ref = pull_request.get("headRef")
     base_ref = pull_request.get("baseRef")
@@ -774,6 +941,9 @@ def _pull_request_snapshot(
             _required_text(pull_request.get("mergeable"), "mergeability"),
             _required_text(pull_request.get("mergeStateStatus"), "merge state"),
             "GitHub returned contradictory pull-request branch identity",
+            is_draft,
+            merge_commit_oid,
+            source_repository,
         )
     mergeable = _required_text(pull_request.get("mergeable"), "mergeability")
     merge_state = _required_text(pull_request.get("mergeStateStatus"), "merge state")
@@ -790,6 +960,10 @@ def _pull_request_snapshot(
         target_head,
         mergeable.upper() if mergeable else None,
         merge_state.upper() if merge_state else None,
+        None,
+        is_draft,
+        merge_commit_oid,
+        source_repository,
     )
 
 
@@ -1717,6 +1891,1305 @@ class GitHubProjectProvider:
             raise ProviderError(f"Pull request not found: {repository}#{number}")
         return _pull_request_snapshot(repository, number, pull_request)
 
+    @staticmethod
+    def _audit_action_parts(
+        action: Mapping[str, object] | None,
+    ) -> tuple[Mapping[str, object], Mapping[str, object]]:
+        if action is None:
+            return {}, {}
+        empty: Mapping[str, object] = {}
+        raw_request = action.get("request")
+        request_record = (
+            cast(Mapping[str, object], raw_request)
+            if isinstance(raw_request, Mapping)
+            else empty
+        )
+        raw_target = request_record.get("target")
+        raw_result = action.get("result")
+        target = (
+            cast(Mapping[str, object], raw_target)
+            if isinstance(raw_target, Mapping)
+            else empty
+        )
+        result = (
+            cast(Mapping[str, object], raw_result)
+            if isinstance(raw_result, Mapping)
+            else empty
+        )
+        return target, result
+
+    def _execute_completion_mutation(
+        self, query: str, variables: Mapping[str, object]
+    ) -> None:
+        self._client.execute(query, variables)
+
+    @staticmethod
+    def _merge_details(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        details = payload.get("details")
+        return (
+            cast(Mapping[str, Any], details)
+            if isinstance(details, Mapping)
+            else payload
+        )
+
+    @staticmethod
+    def _confirmed_merge_result(
+        request: HandoffRequest,
+        pull_request_number: int,
+        expected_head: str,
+        snapshot: PullRequestSnapshot,
+    ) -> dict[str, object]:
+        return {
+            "status": "merged",
+            "pull_request_id": f"{request.repository}#{pull_request_number}",
+            "merge_action": "default",
+            "head_sha": expected_head,
+            "merge_commit_sha": snapshot.merge_commit_oid,
+        }
+
+    @staticmethod
+    def _merge_snapshot_matches_handoff(
+        request: HandoffRequest,
+        pull_request_number: int,
+        pull_request_url: str,
+        expected_head: str,
+        snapshot: PullRequestSnapshot,
+    ) -> bool:
+        return (
+            snapshot.repository == request.repository
+            and snapshot.number == pull_request_number
+            and snapshot.url == pull_request_url
+            and snapshot.merged
+            and snapshot.source_repository == request.repository
+            and snapshot.source_branch == request.branch
+            and snapshot.target_branch == request.base_branch
+            and snapshot.source_head in {None, expected_head}
+            and snapshot.merge_commit_oid is not None
+        )
+
+    @staticmethod
+    def _merge_target_matches_handoff(
+        target: Mapping[str, object],
+        request: HandoffRequest,
+        pull_request_number: int,
+        pull_request_url: str,
+        expected_head: str,
+    ) -> bool:
+        return (
+            target.get("pull_request_number") == str(pull_request_number)
+            and target.get("pull_request_url") == pull_request_url
+            and target.get("head_sha") == expected_head
+            and target.get("branch") == request.branch
+            and target.get("base_branch") == request.base_branch
+        )
+
+    @staticmethod
+    def _retry_delay(error: Exception) -> float | None:
+        if isinstance(error, GitHubRateLimitError):
+            if error.retry_after is not None and error.retry_after >= 0:
+                return error.retry_after
+            if error.reset_at is not None:
+                return max(0.0, error.reset_at - time.time())
+        if isinstance(error, GitHubOutcomeUnknownError) and error.status_code in {
+            500,
+            502,
+            503,
+            504,
+        }:
+            return 0.0
+        return None
+
+    @staticmethod
+    def _provider_failure_status(error: ProviderError) -> str:
+        return (
+            "deferred"
+            if isinstance(error, (GitHubRateLimitError, GitHubOutcomeUnknownError))
+            else "operator_required"
+        )
+
+    def _handoff_action(
+        self, request: HandoffRequest, mutation: str, operation_key: str
+    ) -> dict[str, object] | None:
+        if request.mutation_audit is None:
+            return None
+        return request.mutation_audit.handoff_mutation_action(
+            request, mutation, operation_key
+        )
+
+    def _rest_request(
+        self,
+        method: str,
+        path: str,
+        payload: Mapping[str, object] | None = None,
+    ) -> tuple[int, Mapping[str, Any]]:
+        request_rest = getattr(self._client, "request_rest", None)
+        if not callable(request_rest):
+            raise ProviderError("GitHub REST mutations are not configured")
+        return cast(tuple[int, Mapping[str, Any]], request_rest(method, path, payload))
+
+    def _issue_completion_state(self, request: HandoffRequest) -> Mapping[str, object]:
+        owner, name = self._repository_parts(request.repository)
+        data = self._client.execute(
+            ISSUE_COMPLETION_QUERY,
+            {"owner": owner, "name": name, "number": request.pbi_number},
+        )
+        raw_issue = _mapping(data.get("repository")).get("issue")
+        if raw_issue is None:
+            return {"valid": False, "error": "The linked issue no longer exists"}
+        issue = _mapping(raw_issue)
+        issue_id = issue.get("id")
+        number = issue.get("number")
+        state = issue.get("state")
+        valid = (
+            isinstance(issue_id, str)
+            and bool(issue_id)
+            and type(number) is int
+            and number == request.pbi_number
+            and state in {"OPEN", "CLOSED"}
+        )
+        return {
+            "valid": valid,
+            "error": "GitHub returned conflicting issue identity or state",
+            "issue_id": issue_id if isinstance(issue_id, str) else "",
+            "state": state if isinstance(state, str) else "",
+        }
+
+    def _source_ref_completion_state(
+        self, request: HandoffRequest, expected_head: str
+    ) -> Mapping[str, object]:
+        owner, name = self._repository_parts(request.repository)
+        qualified_name = f"refs/heads/{request.branch}"
+        data = self._client.execute(
+            BRANCH_REF_QUERY,
+            {"owner": owner, "name": name, "qualifiedName": qualified_name},
+        )
+        repository = _mapping(data.get("repository"))
+        repository_id = repository.get("id")
+        if not isinstance(repository_id, str) or not repository_id:
+            return {
+                "valid": False,
+                "error": "GitHub omitted source repository identity",
+            }
+        if "ref" not in repository:
+            return {"valid": False, "error": "GitHub omitted the source ref"}
+        raw_ref = repository.get("ref")
+        if raw_ref is None:
+            return {"valid": True, "exists": False, "repository_id": repository_id}
+        ref = _mapping(raw_ref)
+        ref_id = ref.get("id")
+        ref_name = ref.get("name")
+        oid = _commit_oid(_mapping(ref.get("target")).get("oid"))
+        if (
+            not isinstance(ref_id, str)
+            or not ref_id
+            or ref_name != qualified_name
+            or oid is None
+        ):
+            return {
+                "valid": False,
+                "error": "GitHub returned conflicting source ref identity",
+            }
+        return {
+            "valid": True,
+            "exists": True,
+            "repository_id": repository_id,
+            "ref_id": ref_id,
+            "ref_name": qualified_name,
+            "head_sha": oid,
+            "expected_head": expected_head,
+        }
+
+    def _project_completion_state(
+        self, request: HandoffRequest
+    ) -> Mapping[str, object]:
+        if request.project_id != self.project_id:
+            return {"valid": False, "error": "The handoff belongs to another Project"}
+        cursor: str | None = None
+        matching_items: list[Mapping[str, object]] = []
+        status_field: Mapping[str, object] | None = None
+        done_option_id: str | None = None
+        project_id: str | None = None
+        while True:
+            data = self._client.execute(
+                _owner_query(COMPLETION_PROJECT_QUERY, self.owner_type),
+                {"owner": self.owner, "number": self.project_number, "cursor": cursor},
+            )
+            project = _project(data, self.owner_type)
+            current_project_id = project.get("id")
+            if not isinstance(current_project_id, str) or not current_project_id:
+                return {"valid": False, "error": "GitHub omitted Project identity"}
+            if project_id is not None and current_project_id != project_id:
+                return {
+                    "valid": False,
+                    "error": "GitHub returned conflicting Project identity",
+                }
+            project_id = current_project_id
+
+            fields = [
+                field
+                for field in _nodes(project.get("fields", {}))
+                if field.get("name") == "Status"
+            ]
+            if len(fields) != 1:
+                return {"valid": False, "error": "Project must have one Status field"}
+            status_field = fields[0]
+            field_id = status_field.get("id")
+            options = status_field.get("options")
+            if not isinstance(field_id, str) or not isinstance(options, list):
+                return {"valid": False, "error": "Project Status field is incomplete"}
+            done_option_ids: list[str] = []
+            for option in cast(list[object], options):
+                if not isinstance(option, Mapping):
+                    continue
+                option_record = cast(Mapping[str, object], option)
+                option_id = option_record.get("id")
+                if option_record.get("name") == "Done" and isinstance(option_id, str):
+                    done_option_ids.append(option_id)
+            if len(done_option_ids) != 1:
+                return {
+                    "valid": False,
+                    "error": "Project Status has no unique Done option",
+                }
+            done_option_id = done_option_ids[0]
+
+            items = _mapping(project.get("items"))
+            for raw_item in _nodes(items):
+                content = _mapping(raw_item.get("content"))
+                repository = _mapping(content.get("repository"))
+                if (
+                    content.get("__typename") == "Issue"
+                    and type(content.get("number")) is int
+                    and content.get("number") == request.pbi_number
+                    and repository.get("nameWithOwner") == request.repository
+                ):
+                    values = [
+                        value
+                        for value in _nodes(raw_item.get("fieldValues", {}))
+                        if _mapping(value.get("field")).get("id") == field_id
+                    ]
+                    if len(values) != 1:
+                        matching_items.append({"valid": False})
+                    else:
+                        value = values[0]
+                        matching_items.append(
+                            {
+                                "valid": True,
+                                "item_id": raw_item.get("id"),
+                                "status": value.get("name"),
+                                "option_id": value.get("optionId"),
+                            }
+                        )
+            has_next, cursor = _next_cursor(items)
+            if not has_next:
+                break
+
+        if len(matching_items) != 1:
+            return {"valid": False, "error": "Expected one exact Project issue item"}
+        item = matching_items[0]
+        item_id = item.get("item_id")
+        field_id = status_field.get("id")
+        if (
+            item.get("valid") is not True
+            or not isinstance(item_id, str)
+            or not item_id
+            or not isinstance(field_id, str)
+        ):
+            return {
+                "valid": False,
+                "error": "Project item Status evidence is incomplete",
+            }
+        return {
+            "valid": True,
+            "project_id": project_id or "",
+            "item_id": item_id,
+            "field_id": field_id,
+            "status": item.get("status") if isinstance(item.get("status"), str) else "",
+            "option_id": item.get("option_id")
+            if isinstance(item.get("option_id"), str)
+            else "",
+            "done_option_id": done_option_id,
+        }
+
+    def _ensure_completion_step(
+        self,
+        request: HandoffRequest,
+        mutation: str,
+        operation_key: str,
+        target: Mapping[str, object],
+        inspect_state: Callable[[], Mapping[str, object]],
+        is_complete: Callable[[Mapping[str, object]], bool],
+        can_apply: Callable[[Mapping[str, object]], bool],
+        apply: Callable[[Mapping[str, object]], None],
+    ) -> dict[str, object]:
+        for _ in range(2):
+            try:
+                state = inspect_state()
+            except ProviderError as exc:
+                return {
+                    "status": self._provider_failure_status(exc),
+                    "error_class": type(exc).__name__,
+                }
+            if state.get("valid") is not True:
+                return {
+                    "status": "operator_required",
+                    "reason": state.get("error", "Completion identity is unproven"),
+                }
+
+            action = self._handoff_action(request, mutation, operation_key)
+            if is_complete(state):
+                if action is None:
+                    action_id = _begin_handoff_mutation(
+                        request, mutation, operation_key, target
+                    )
+                    _finish_handoff_mutation(
+                        request,
+                        action_id,
+                        "succeeded",
+                        {"reconciliation": "readback_present"},
+                    )
+                elif isinstance(action.get("id"), str):
+                    _finish_handoff_mutation(
+                        request,
+                        cast(str, action["id"]),
+                        "succeeded",
+                        {"reconciliation": "readback_present"},
+                    )
+                return {"status": "completed", "reconciliation": "readback_present"}
+
+            if not can_apply(state):
+                return {
+                    "status": "operator_required",
+                    "reason": "Remote completion state changed unexpectedly",
+                }
+
+            if action is not None:
+                action_target, action_result = self._audit_action_parts(action)
+                action_status = action.get("status")
+                request_record = action.get("request")
+                attempt = (
+                    cast(Mapping[str, object], request_record).get("attempt")
+                    if isinstance(request_record, Mapping)
+                    else None
+                )
+                if action_status in {"pending", "uncertain"}:
+                    return {"status": "deferred", "reason": "prior_write_unresolved"}
+                if action_status == "succeeded":
+                    return {
+                        "status": "operator_required",
+                        "reason": "previous_write_readback_conflicts",
+                    }
+                if (
+                    action_status != "failed"
+                    or action_result.get("retryable") is not True
+                ):
+                    return {
+                        "status": "operator_required",
+                        "reason": "previous_write_not_retryable",
+                    }
+                retry_at = action_result.get("retry_after_at")
+                if isinstance(retry_at, (int, float)) and time.time() < retry_at:
+                    return {
+                        "status": "deferred",
+                        "retry_after_at": retry_at,
+                    }
+                if type(attempt) is int and attempt >= 2:
+                    return {"status": "deferred", "reason": "retry_limit_reached"}
+                if any(
+                    action_target.get(key) != value for key, value in target.items()
+                ):
+                    return {
+                        "status": "operator_required",
+                        "reason": "prior_write_target_changed",
+                    }
+
+            action_id = _begin_handoff_mutation(
+                request, mutation, operation_key, target
+            )
+            try:
+                apply(state)
+            except ProviderError as exc:
+                try:
+                    observed = inspect_state()
+                except ProviderError as read_error:
+                    _finish_handoff_mutation(
+                        request,
+                        action_id,
+                        "uncertain",
+                        {
+                            "reconciliation": "readback_unavailable",
+                            "error_class": type(read_error).__name__,
+                        },
+                    )
+                    return {
+                        "status": self._provider_failure_status(read_error),
+                        "error_class": type(read_error).__name__,
+                    }
+                if observed.get("valid") is True and is_complete(observed):
+                    _finish_handoff_mutation(
+                        request,
+                        action_id,
+                        "succeeded",
+                        {"reconciliation": "readback_present"},
+                    )
+                    return {"status": "completed", "reconciliation": "readback_present"}
+                delay = self._retry_delay(exc)
+                attempt = 1
+                latest = self._handoff_action(request, mutation, operation_key)
+                if latest is not None:
+                    attempt_record = latest.get("request")
+                    if isinstance(attempt_record, Mapping):
+                        raw_attempt = cast(Mapping[str, object], attempt_record).get(
+                            "attempt"
+                        )
+                        if type(raw_attempt) is int:
+                            attempt = raw_attempt
+                retry_at = time.time() + delay if delay is not None else None
+                _finish_handoff_mutation(
+                    request,
+                    action_id,
+                    "failed",
+                    {
+                        "reconciliation": "readback_absent",
+                        "error_class": type(exc).__name__,
+                        "retryable": delay is not None,
+                        **(
+                            {"retry_after_at": retry_at} if retry_at is not None else {}
+                        ),
+                    },
+                )
+                if delay is not None and attempt == 1:
+                    if delay > 1.0:
+                        return {"status": "deferred", "retry_after_at": retry_at}
+                    if delay > 0:
+                        time.sleep(delay)
+                    continue
+                return {
+                    "status": "deferred" if delay is not None else "operator_required",
+                    "error_class": type(exc).__name__,
+                    **({"reason": "retry_limit_reached"} if delay is not None else {}),
+                }
+
+            try:
+                observed = inspect_state()
+            except ProviderError as exc:
+                _finish_handoff_mutation(
+                    request,
+                    action_id,
+                    "uncertain",
+                    {
+                        "reconciliation": "readback_unavailable",
+                        "error_class": type(exc).__name__,
+                    },
+                )
+                return {
+                    "status": self._provider_failure_status(exc),
+                    "error_class": type(exc).__name__,
+                }
+            if observed.get("valid") is True and is_complete(observed):
+                _finish_handoff_mutation(
+                    request,
+                    action_id,
+                    "succeeded",
+                    {"reconciliation": "readback_present"},
+                )
+                return {"status": "completed", "reconciliation": "readback_present"}
+            _finish_handoff_mutation(
+                request,
+                action_id,
+                "uncertain",
+                {"reconciliation": "write_not_confirmed"},
+            )
+            return {"status": "deferred", "reason": "write_not_confirmed"}
+        return {"status": "deferred", "reason": "retry_limit_reached"}
+
+    def _merge_handoff(
+        self,
+        request: HandoffRequest,
+        pull_request_number: int,
+        pull_request_url: str,
+        expected_head: str,
+        authorization: Mapping[str, object] | None,
+    ) -> dict[str, object]:
+        operation_key = f"{request.repository}#{pull_request_number}:{expected_head}"
+        authorization_was_supplied = authorization is not None
+        action = self._handoff_action(request, "merge_pull_request", operation_key)
+        snapshot = self.get_pull_request(request.repository, pull_request_number)
+        if (
+            snapshot.repository != request.repository
+            or snapshot.url != pull_request_url
+        ):
+            return {
+                "status": "operator_required",
+                "reason": "pull_request_identity_mismatch",
+            }
+        target, result = self._audit_action_parts(action)
+        if snapshot.merged:
+            if (
+                action is None
+                or action.get("status") not in {"pending", "uncertain", "succeeded"}
+                or not self._merge_target_matches_handoff(
+                    target,
+                    request,
+                    pull_request_number,
+                    pull_request_url,
+                    expected_head,
+                )
+                or not isinstance(target.get("review_cycle_id"), str)
+                or not self._merge_snapshot_matches_handoff(
+                    request,
+                    pull_request_number,
+                    pull_request_url,
+                    expected_head,
+                    snapshot,
+                )
+            ):
+                return {
+                    "status": "operator_required",
+                    "reason": "merged_without_matching_authorization_audit",
+                }
+            audited_merge_sha = result.get("merge_commit_sha")
+            if audited_merge_sha is not None and (
+                not isinstance(audited_merge_sha, str)
+                or audited_merge_sha.lower() != snapshot.merge_commit_oid
+            ):
+                return {
+                    "status": "operator_required",
+                    "reason": "merged_commit_audit_conflicts_with_readback",
+                }
+            if audited_merge_sha is not None and (
+                result.get("status") != "merged"
+                or result.get("pull_request_id")
+                != f"{request.repository}#{pull_request_number}"
+                or result.get("merge_action") != "default"
+                or result.get("head_sha") != expected_head
+            ):
+                return {
+                    "status": "operator_required",
+                    "reason": "merged_result_audit_identity_mismatch",
+                }
+            if audited_merge_sha is None:
+                merge_uuid = result.get("merge_request_id")
+                if isinstance(merge_uuid, str) and isinstance(action.get("id"), str):
+                    return self._poll_merge_handoff(
+                        request,
+                        pull_request_number,
+                        pull_request_url,
+                        expected_head,
+                        cast(str, action["id"]),
+                        merge_uuid,
+                    )
+                if action.get("status") not in {"pending", "uncertain"}:
+                    return {
+                        "status": "operator_required",
+                        "reason": "merged_commit_audit_missing",
+                    }
+            merge_result = self._confirmed_merge_result(
+                request, pull_request_number, expected_head, snapshot
+            )
+            if audited_merge_sha is None:
+                _finish_handoff_mutation(
+                    request,
+                    cast(str, action["id"]),
+                    "succeeded",
+                    {"reconciliation": "merged_readback", **merge_result},
+                )
+            return merge_result
+
+        if snapshot.is_draft is not False or snapshot.source_repository is None:
+            return {
+                "status": "operator_required",
+                "reason": "pull_request_draft_or_source_repository_unproven",
+            }
+        if snapshot.source_repository != request.repository:
+            return {
+                "status": "operator_required",
+                "reason": "pull_request_source_repository_mismatch",
+            }
+
+        if (
+            authorization is None
+            and action is not None
+            and action.get("status") in {"pending", "uncertain", "succeeded"}
+            and self._merge_target_matches_handoff(
+                target,
+                request,
+                pull_request_number,
+                pull_request_url,
+                expected_head,
+            )
+            and isinstance(target.get("review_cycle_id"), str)
+        ):
+            authorization = {
+                "pull_request_id": f"{request.repository}#{pull_request_number}",
+                "head_sha": expected_head,
+                "cycle_id": target["review_cycle_id"],
+                "approved_by_human": target.get("approved_by_human") == "true",
+                "approval_actor": target.get("approval_actor"),
+                "approval_reason": target.get("approval_reason"),
+                "approval_at": target.get("approval_at"),
+            }
+        if authorization is None:
+            return {
+                "status": "operator_required",
+                "reason": "current_review_authorization_required",
+            }
+        if (
+            authorization.get("pull_request_id")
+            != f"{request.repository}#{pull_request_number}"
+            or authorization.get("head_sha") != expected_head
+            or not isinstance(authorization.get("cycle_id"), str)
+        ):
+            return {
+                "status": "operator_required",
+                "reason": "review_authorization_identity_mismatch",
+            }
+        if (
+            snapshot.state != "OPEN"
+            or snapshot.source_branch != request.branch
+            or snapshot.source_head != expected_head
+            or snapshot.target_branch != request.base_branch
+        ):
+            return {
+                "status": "operator_required",
+                "reason": "pull_request_head_or_branch_changed",
+            }
+        recover_missing_uuid = False
+        if action is not None:
+            action_status = action.get("status")
+            merge_uuid = result.get("merge_request_id")
+            if not self._merge_target_matches_handoff(
+                target,
+                request,
+                pull_request_number,
+                pull_request_url,
+                expected_head,
+            ) or target.get("review_cycle_id") != authorization.get("cycle_id"):
+                return {
+                    "status": "operator_required",
+                    "reason": "previous_merge_target_changed",
+                }
+            if isinstance(merge_uuid, str) and action_status in {
+                "pending",
+                "uncertain",
+                "succeeded",
+            }:
+                return self._poll_merge_handoff(
+                    request,
+                    pull_request_number,
+                    pull_request_url,
+                    expected_head,
+                    cast(str, action["id"]),
+                    merge_uuid,
+                )
+            if action_status in {"pending", "uncertain"}:
+                action_request = action.get("request")
+                attempt = (
+                    cast(Mapping[str, object], action_request).get("attempt")
+                    if isinstance(action_request, Mapping)
+                    else None
+                )
+                if type(attempt) is not int:
+                    return {
+                        "status": "operator_required",
+                        "reason": "merge_request_retry_count_unproven",
+                    }
+                if attempt >= 2:
+                    return {"status": "deferred", "reason": "retry_limit_reached"}
+                recover_missing_uuid = True
+            if action_status == "succeeded":
+                return {
+                    "status": "operator_required",
+                    "reason": "merge_readback_conflicts_with_audit",
+                }
+            if action_status == "failed":
+                if result.get("retryable") is not True:
+                    return {
+                        "status": "operator_required",
+                        "reason": "previous_merge_failure_not_retryable",
+                    }
+                action_request = action.get("request")
+                attempt = (
+                    cast(Mapping[str, object], action_request).get("attempt")
+                    if isinstance(action_request, Mapping)
+                    else None
+                )
+                retry_at = result.get("retry_after_at")
+                if isinstance(retry_at, (int, float)) and time.time() < retry_at:
+                    return {"status": "deferred", "retry_after_at": retry_at}
+                if type(attempt) is int and attempt >= 2:
+                    return {"status": "deferred", "reason": "retry_limit_reached"}
+        if snapshot.conflict_state != "clean":
+            return {
+                "status": "operator_required",
+                "reason": "pull_request_conflict_state_unproven",
+            }
+        checks = self._complete_pull_request_checks(
+            *self._repository_parts(request.repository),
+            pull_request_number,
+            snapshot.source_head,
+        )
+        if (
+            checks.get("head_sha") != expected_head
+            or checks.get("verdict") != "passing"
+        ):
+            return {
+                "status": "operator_required",
+                "reason": "current_head_checks_not_passing",
+            }
+
+        merge_target = {
+            "pull_request_number": str(pull_request_number),
+            "pull_request_url": pull_request_url,
+            "head_sha": expected_head,
+            "branch": request.branch,
+            "base_branch": cast(str, request.base_branch),
+            "review_cycle_id": cast(str, authorization["cycle_id"]),
+            "approved_by_human": str(
+                authorization.get("approved_by_human", False)
+            ).lower(),
+        }
+        for source, destination in (
+            ("approval_actor", "approval_actor"),
+            ("approval_reason", "approval_reason"),
+            ("approval_at", "approval_at"),
+        ):
+            value = authorization.get(source)
+            if isinstance(value, str):
+                merge_target[destination] = value
+        if recover_missing_uuid and not authorization_was_supplied:
+            return {
+                "status": "operator_required",
+                "reason": "current_review_authorization_required",
+            }
+        if recover_missing_uuid and action is not None:
+            prior_action_id = action.get("id")
+            if not isinstance(prior_action_id, str):
+                return {
+                    "status": "operator_required",
+                    "reason": "merge_audit_id_missing",
+                }
+            _finish_handoff_mutation(
+                request,
+                prior_action_id,
+                "failed",
+                {
+                    "reconciliation": "merge_request_uuid_recovery_retry",
+                    "retryable": True,
+                },
+            )
+        action_id = _begin_handoff_mutation(
+            request, "merge_pull_request", operation_key, merge_target
+        )
+        if not isinstance(action_id, str):
+            return {"status": "operator_required", "reason": "merge_audit_id_missing"}
+        owner, name = self._repository_parts(request.repository)
+        rest_repo = f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}"
+        try:
+            status, payload = self._rest_request(
+                "PUT",
+                f"{rest_repo}/pulls/{pull_request_number}/merge-async",
+                {"sha": expected_head, "merge_action": "default"},
+            )
+        except ProviderError as exc:
+            try:
+                observed = self.get_pull_request(
+                    request.repository, pull_request_number
+                )
+            except ProviderError as read_error:
+                _finish_handoff_mutation(
+                    request,
+                    action_id,
+                    "uncertain",
+                    {
+                        "reconciliation": "readback_unavailable",
+                        "error_class": type(read_error).__name__,
+                    },
+                )
+                return {
+                    "status": self._provider_failure_status(read_error),
+                    "error_class": type(read_error).__name__,
+                }
+            if self._merge_snapshot_matches_handoff(
+                request,
+                pull_request_number,
+                pull_request_url,
+                expected_head,
+                observed,
+            ):
+                merge_result = self._confirmed_merge_result(
+                    request, pull_request_number, expected_head, observed
+                )
+                _finish_handoff_mutation(
+                    request,
+                    action_id,
+                    "succeeded",
+                    {"reconciliation": "merged_readback", **merge_result},
+                )
+                return merge_result
+            if observed.merged:
+                _finish_handoff_mutation(
+                    request,
+                    action_id,
+                    "uncertain",
+                    {"reconciliation": "merged_readback_conflicts"},
+                )
+                return {
+                    "status": "operator_required",
+                    "reason": "merged_readback_conflicts",
+                }
+            delay = self._retry_delay(exc)
+            latest = self._handoff_action(request, "merge_pull_request", operation_key)
+            attempt_number = 1
+            if latest is not None:
+                attempt_record = latest.get("request")
+                if isinstance(attempt_record, Mapping):
+                    raw_attempt = cast(Mapping[str, object], attempt_record).get(
+                        "attempt"
+                    )
+                    if type(raw_attempt) is int:
+                        attempt_number = raw_attempt
+            retry_at = time.time() + delay if delay is not None else None
+            _finish_handoff_mutation(
+                request,
+                action_id,
+                "failed" if delay is not None else "uncertain",
+                {
+                    "reconciliation": "pull_request_not_merged",
+                    "error_class": type(exc).__name__,
+                    "retryable": delay is not None,
+                    **({"retry_after_at": retry_at} if retry_at is not None else {}),
+                },
+            )
+            if delay is not None and attempt_number == 1 and delay <= 1.0:
+                if delay > 0:
+                    time.sleep(delay)
+                return self._merge_handoff(
+                    request,
+                    pull_request_number,
+                    pull_request_url,
+                    expected_head,
+                    authorization,
+                )
+            return {
+                "status": (
+                    "deferred"
+                    if delay is not None
+                    or isinstance(
+                        exc, (GitHubRateLimitError, GitHubOutcomeUnknownError)
+                    )
+                    else "operator_required"
+                ),
+                "error_class": type(exc).__name__,
+                **({"retry_after_at": retry_at} if retry_at is not None else {}),
+            }
+
+        details = self._merge_details(payload)
+        merge_uuid = details.get("uuid", payload.get("uuid"))
+        merge_status = payload.get("status")
+        if status == 200 and merge_status == "merged":
+            observed = self.get_pull_request(request.repository, pull_request_number)
+            response_sha = details.get("sha")
+            if (
+                not self._merge_snapshot_matches_handoff(
+                    request,
+                    pull_request_number,
+                    pull_request_url,
+                    expected_head,
+                    observed,
+                )
+                or not isinstance(response_sha, str)
+                or response_sha.lower() != observed.merge_commit_oid
+            ):
+                _finish_handoff_mutation(
+                    request,
+                    action_id,
+                    "uncertain",
+                    {"reconciliation": "merge_response_not_confirmed"},
+                )
+                return {
+                    "status": "operator_required" if observed.merged else "deferred",
+                    "reason": "merge_readback_incomplete",
+                }
+            merge_result = self._confirmed_merge_result(
+                request, pull_request_number, expected_head, observed
+            )
+            _finish_handoff_mutation(
+                request,
+                action_id,
+                "succeeded",
+                {"reconciliation": "merged_readback", **merge_result},
+            )
+            return merge_result
+        if (
+            status in {200, 202, 409}
+            and merge_status in {None, "pending"}
+            and isinstance(merge_uuid, str)
+        ):
+            merge_action = details.get("merge_action")
+            expected_head_sha = details.get("expected_head_sha")
+            if (
+                details.get("uuid", payload.get("uuid")) != merge_uuid
+                or merge_action != "default"
+                or expected_head_sha != expected_head
+            ):
+                _finish_handoff_mutation(
+                    request,
+                    action_id,
+                    "failed",
+                    {
+                        "reconciliation": "merge_request_policy_mismatch",
+                        "retryable": False,
+                    },
+                )
+                return {
+                    "status": "operator_required",
+                    "reason": "merge_request_policy_or_head_mismatch",
+                }
+            _finish_handoff_mutation(
+                request,
+                action_id,
+                "succeeded",
+                {
+                    "merge_request_id": merge_uuid,
+                    "status": "pending",
+                    "merge_action": "default",
+                    **(
+                        {"merge_method": details["merge_method"]}
+                        if isinstance(details.get("merge_method"), str)
+                        else {}
+                    ),
+                },
+            )
+            return self._poll_merge_handoff(
+                request,
+                pull_request_number,
+                pull_request_url,
+                expected_head,
+                action_id,
+                merge_uuid,
+            )
+        if status in {200, 202, 409}:
+            if merge_status == "failed":
+                _finish_handoff_mutation(
+                    request,
+                    action_id,
+                    "failed",
+                    {
+                        "reconciliation": "merge_request_failed",
+                        "retryable": False,
+                    },
+                )
+                return {
+                    "status": "operator_required",
+                    "reason": "asynchronous_merge_not_confirmed",
+                }
+            _finish_handoff_mutation(
+                request,
+                action_id,
+                "uncertain",
+                {"reconciliation": "merge_request_identity_missing"},
+            )
+            return {"status": "deferred", "reason": "merge_request_identity_missing"}
+        else:
+            _finish_handoff_mutation(
+                request,
+                action_id,
+                "failed" if status < 500 else "uncertain",
+                {
+                    "reconciliation": "merge_request_rejected",
+                    "http_status": status,
+                    "retryable": False,
+                },
+            )
+            return {
+                "status": "operator_required",
+                "reason": "merge_request_rejected",
+                "http_status": status,
+            }
+
+    def _poll_merge_handoff(
+        self,
+        request: HandoffRequest,
+        pull_request_number: int,
+        pull_request_url: str,
+        expected_head: str,
+        action_id: str,
+        merge_uuid: str,
+    ) -> dict[str, object]:
+        if not re.fullmatch(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+            r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            merge_uuid,
+        ):
+            return {"status": "operator_required", "reason": "invalid_merge_request_id"}
+        owner, name = self._repository_parts(request.repository)
+        rest_repo = f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}"
+        try:
+            status, payload = self._rest_request(
+                "GET",
+                f"{rest_repo}/pulls/{pull_request_number}/merge-async/{merge_uuid}",
+            )
+        except ProviderError as exc:
+            return {
+                "status": self._provider_failure_status(exc),
+                "error_class": type(exc).__name__,
+            }
+        details = self._merge_details(payload)
+        merge_state = payload.get("status")
+        if (
+            details.get("uuid") not in (None, merge_uuid)
+            or details.get("expected_head_sha") not in (None, expected_head)
+            or details.get("merge_action") not in (None, "default")
+        ):
+            return {
+                "status": "operator_required",
+                "reason": "merge_queue_identity_or_policy_mismatch",
+            }
+        if status == 200 and merge_state == "pending":
+            if (
+                details.get("uuid", payload.get("uuid")) != merge_uuid
+                or details.get("expected_head_sha") != expected_head
+                or details.get("merge_action") != "default"
+            ):
+                return {
+                    "status": "operator_required",
+                    "reason": "merge_queue_identity_or_policy_mismatch",
+                }
+            return {
+                "status": "pending",
+                "pull_request_id": f"{request.repository}#{pull_request_number}",
+                "merge_request_id": merge_uuid,
+                "merge_action": "default",
+                **(
+                    {"merge_method": details["merge_method"]}
+                    if isinstance(details.get("merge_method"), str)
+                    else {}
+                ),
+            }
+        if status != 200 or merge_state != "merged":
+            if status != 200 or merge_state != "failed":
+                return {
+                    "status": "operator_required",
+                    "reason": "asynchronous_merge_result_unproven",
+                }
+            _finish_handoff_mutation(
+                request,
+                action_id,
+                "failed",
+                {
+                    "reconciliation": "merge_request_failed",
+                    "reason": details.get("message", "merge_request_failed"),
+                    "retryable": False,
+                },
+            )
+            return {
+                "status": "operator_required",
+                "reason": "asynchronous_merge_not_confirmed",
+            }
+        try:
+            snapshot = self.get_pull_request(request.repository, pull_request_number)
+        except ProviderError as exc:
+            _finish_handoff_mutation(
+                request,
+                action_id,
+                "uncertain",
+                {
+                    "reconciliation": "merge_readback_unavailable",
+                    "error_class": type(exc).__name__,
+                },
+            )
+            return {
+                "status": self._provider_failure_status(exc),
+                "error_class": type(exc).__name__,
+            }
+        response_sha = details.get("sha")
+        if (
+            not self._merge_snapshot_matches_handoff(
+                request,
+                pull_request_number,
+                pull_request_url,
+                expected_head,
+                snapshot,
+            )
+            or details.get("uuid", payload.get("uuid")) != merge_uuid
+            or details.get("expected_head_sha") != expected_head
+            or details.get("merge_action") != "default"
+            or not isinstance(response_sha, str)
+            or response_sha.lower() != snapshot.merge_commit_oid
+        ):
+            _finish_handoff_mutation(
+                request,
+                action_id,
+                "uncertain",
+                {"reconciliation": "merge_response_conflicts_with_readback"},
+            )
+            return {
+                "status": "operator_required",
+                "reason": "merge_response_conflicts_with_readback",
+            }
+        merge_result = self._confirmed_merge_result(
+            request, pull_request_number, expected_head, snapshot
+        )
+        _finish_handoff_mutation(
+            request,
+            action_id,
+            "succeeded",
+            {"reconciliation": "merged_readback", **merge_result},
+        )
+        return merge_result
+
+    def complete_approved_handoff(
+        self,
+        request: HandoffRequest,
+        pull_request_number: int,
+        pull_request_url: str,
+        expected_head: str,
+        authorization: Mapping[str, object] | None,
+    ) -> dict[str, object]:
+        """Merge only an authorized head, then reconcile issue, ref, and Project."""
+
+        expected_head = expected_head.strip().lower()
+        if (
+            pull_request_number <= 0
+            or not expected_head
+            or not pull_request_url.strip()
+            or request.base_branch is None
+            or request.head_sha is None
+            or expected_head != request.head_sha.strip().lower()
+        ):
+            return {
+                "status": "operator_required",
+                "reason": "persisted_handoff_identity_incomplete",
+            }
+        try:
+            merge = self._merge_handoff(
+                request,
+                pull_request_number,
+                pull_request_url,
+                expected_head,
+                authorization,
+            )
+        except ProviderError as exc:
+            return {
+                "status": self._provider_failure_status(exc),
+                "step": "merge",
+                "error_class": type(exc).__name__,
+            }
+        if merge.get("status") != "merged":
+            return {**merge, "step": "merge"}
+
+        prefix = f"{request.repository}#{request.pbi_number}"
+        steps: dict[str, object] = {}
+        issue_target = {"issue_number": str(request.pbi_number)}
+        issue_state = self._ensure_completion_step(
+            request,
+            "close_issue",
+            prefix,
+            issue_target,
+            lambda: self._issue_completion_state(request),
+            lambda state: state.get("state") == "CLOSED",
+            lambda state: state.get("state") == "OPEN",
+            lambda state: self._execute_completion_mutation(
+                CLOSE_ISSUE_MUTATION,
+                {"input": {"issueId": state["issue_id"]}},
+            ),
+        )
+        steps["issue"] = issue_state
+        if issue_state.get("status") != "completed":
+            return {
+                "status": issue_state.get("status"),
+                "step": "issue",
+                "steps": steps,
+            }
+
+        expected_head = expected_head.strip().lower()
+        ref_state = self._ensure_completion_step(
+            request,
+            "delete_ref",
+            f"{request.repository}:{request.branch}:{expected_head}",
+            {
+                "branch": request.branch,
+                "head_sha": expected_head,
+            },
+            lambda: self._source_ref_completion_state(request, expected_head),
+            lambda state: state.get("exists") is False,
+            lambda state: (
+                state.get("exists") is True and state.get("head_sha") == expected_head
+            ),
+            lambda state: self._execute_completion_mutation(
+                UPDATE_REFS_MUTATION,
+                {
+                    "input": {
+                        "repositoryId": state["repository_id"],
+                        "refUpdates": [
+                            {
+                                "name": state["ref_name"],
+                                "beforeOid": expected_head,
+                                "afterOid": "0" * 40,
+                            }
+                        ],
+                    }
+                },
+            ),
+        )
+        steps["source_ref"] = ref_state
+        if ref_state.get("status") != "completed":
+            return {
+                "status": ref_state.get("status"),
+                "step": "source_ref",
+                "steps": steps,
+            }
+
+        project_state = self._project_completion_state(request)
+        if project_state.get("valid") is not True:
+            return {
+                "status": "operator_required",
+                "step": "project_status",
+                "reason": project_state.get("error", "Project state is unproven"),
+                "steps": steps,
+            }
+        project_target = {
+            "project_item_id": cast(str, project_state["item_id"]),
+            "field_id": cast(str, project_state["field_id"]),
+            "option_id": cast(str, project_state["done_option_id"]),
+            "status": "Done",
+        }
+        project_result = self._ensure_completion_step(
+            request,
+            "update_project_status",
+            prefix,
+            project_target,
+            lambda: self._project_completion_state(request),
+            lambda state: state.get("status") == "Done",
+            lambda state: state.get("status") == "In Progress",
+            lambda state: self._execute_completion_mutation(
+                UPDATE_PROJECT_STATUS_MUTATION,
+                {
+                    "input": {
+                        "projectId": state["project_id"],
+                        "itemId": state["item_id"],
+                        "fieldId": state["field_id"],
+                        "value": {"singleSelectOptionId": state["done_option_id"]},
+                    }
+                },
+            ),
+        )
+        steps["project_status"] = project_result
+        if project_result.get("status") != "completed":
+            return {
+                "status": project_result.get("status"),
+                "step": "project_status",
+                "steps": steps,
+            }
+        return {
+            **merge,
+            "status": "completed",
+            "merged": True,
+            "pull_request_url": pull_request_url,
+            "head_sha": expected_head,
+            "steps": steps,
+        }
+
     def update_source_branch(
         self,
         snapshot: PullRequestSnapshot,
@@ -2526,6 +3999,22 @@ class EnvironmentGitHubProvider:
 
     def get_pull_request(self, repository: str, number: int) -> PullRequestSnapshot:
         return self._configured_provider().get_pull_request(repository, number)
+
+    def complete_approved_handoff(
+        self,
+        request: HandoffRequest,
+        pull_request_number: int,
+        pull_request_url: str,
+        expected_head: str,
+        authorization: Mapping[str, object] | None,
+    ) -> Mapping[str, object]:
+        return self._configured_provider().complete_approved_handoff(
+            request,
+            pull_request_number,
+            pull_request_url,
+            expected_head,
+            authorization,
+        )
 
     def update_source_branch(
         self,
