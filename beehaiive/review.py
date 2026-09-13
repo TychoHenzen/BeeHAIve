@@ -14,6 +14,9 @@ from threading import RLock
 from typing import Protocol, cast
 from uuid import uuid4
 
+MAX_REVIEW_EVIDENCE_BYTES = 1_000_000
+MAX_REVIEW_EVIDENCE_REFS = 100
+
 
 class ReviewError(RuntimeError):
     """Raised when a review cycle cannot accept a state transition."""
@@ -47,6 +50,7 @@ class PullRequestTarget:
     pull_request_id: str
     head_sha: str
     ready: bool = True
+    evidence_json: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +59,7 @@ class ReaderExecution:
 
     status: ReaderStatus | str
     findings: tuple[str, ...] = ()
+    evidence_refs: tuple[str, ...] = ()
 
 
 class PullRequestReviewProvider(Protocol):
@@ -201,6 +206,66 @@ def _json_list(value: str) -> tuple[str, ...]:
     return tuple(cast(list[str], items))
 
 
+def _json_object(value: str) -> dict[str, object]:
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ReviewError("Stored GitHub review evidence is invalid") from exc
+    if not isinstance(decoded, dict):
+        raise ReviewError("Stored GitHub review evidence is invalid")
+    return cast(dict[str, object], decoded)
+
+
+def github_pull_request_evidence_ref(evidence_json: str | None) -> str | None:
+    if evidence_json is None:
+        return None
+    evidence = _json_object(evidence_json)
+    pull_request = evidence.get("pull_request")
+    if not isinstance(pull_request, dict):
+        return None
+    identifier = cast(dict[str, object], pull_request).get("id")
+    return identifier if isinstance(identifier, str) and identifier else None
+
+
+def _evidence_refs(values: Iterable[str]) -> tuple[str, ...]:
+    refs = tuple(
+        dict.fromkeys(_required(value, "evidence reference", 500) for value in values)
+    )
+    if len(refs) > MAX_REVIEW_EVIDENCE_REFS:
+        raise ReviewError(
+            f"A finding can reference at most {MAX_REVIEW_EVIDENCE_REFS} evidence items"
+        )
+    return refs
+
+
+def _validate_evidence_refs(
+    evidence_json: str | None, refs: tuple[str, ...], *, required: bool
+) -> None:
+    if evidence_json is None:
+        if refs:
+            raise ReviewError("GitHub evidence references require a provider snapshot")
+        return
+    if required and not refs:
+        raise ReviewError("A GitHub-backed result must reference its evidence")
+    source_ids: set[str] = set()
+
+    def collect_ids(value: object) -> None:
+        if isinstance(value, Mapping):
+            mapping = cast(Mapping[str, object], value)
+            identifier = mapping.get("id")
+            if isinstance(identifier, str) and identifier:
+                source_ids.add(identifier)
+            for nested in mapping.values():
+                collect_ids(nested)
+        elif isinstance(value, list):
+            for nested in cast(list[object], value):
+                collect_ids(nested)
+
+    collect_ids(_json_object(evidence_json))
+    if any(ref not in source_ids for ref in refs):
+        raise ReviewError("GitHub evidence reference is not in the provider snapshot")
+
+
 @dataclass(frozen=True, slots=True)
 class ReviewCycle:
     cycle_id: str
@@ -215,9 +280,10 @@ class ReviewCycle:
     approval_actor: str | None = None
     approval_reason: str | None = None
     approval_at: str | None = None
+    github_evidence_json: str | None = None
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "cycle_id": self.cycle_id,
             "pull_request_id": self.pull_request_id,
             "head_sha": self.head_sha,
@@ -231,6 +297,9 @@ class ReviewCycle:
             "approval_reason": self.approval_reason,
             "approval_at": self.approval_at,
         }
+        if self.github_evidence_json is not None:
+            result["github_evidence"] = _json_object(self.github_evidence_json)
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,9 +310,10 @@ class ReaderResult:
     finding_ids: tuple[str, ...]
     reader: str
     updated_at: str
+    evidence_refs: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "cycle_id": self.cycle_id,
             "concern": self.concern.value,
             "status": self.status.value,
@@ -251,6 +321,9 @@ class ReaderResult:
             "reader": self.reader,
             "updated_at": self.updated_at,
         }
+        if self.evidence_refs:
+            result["evidence_refs"] = list(self.evidence_refs)
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,9 +337,10 @@ class ReviewFinding:
     resolution: str | None
     created_at: str
     updated_at: str
+    evidence_refs: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "finding_id": self.finding_id,
             "pull_request_id": self.pull_request_id,
             "cycle_id": self.cycle_id,
@@ -277,6 +351,9 @@ class ReviewFinding:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
+        if self.evidence_refs:
+            result["evidence_refs"] = list(self.evidence_refs)
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,6 +446,7 @@ class ReviewStore:
                     approval_actor TEXT,
                     approval_reason TEXT,
                     approval_at TEXT,
+                    github_evidence_json TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE(pull_request_id, cycle_number)
@@ -382,6 +460,7 @@ class ReviewStore:
                     updated_at TEXT NOT NULL,
                     claim_token TEXT,
                     claim_expires_at TEXT,
+                    evidence_refs_json TEXT NOT NULL DEFAULT '[]',
                     PRIMARY KEY(cycle_id, concern),
                     FOREIGN KEY(cycle_id) REFERENCES review_cycles(cycle_id)
                 );
@@ -395,6 +474,7 @@ class ReviewStore:
                     resolution TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
+                    evidence_refs_json TEXT NOT NULL DEFAULT '[]',
                     FOREIGN KEY(cycle_id) REFERENCES review_cycles(cycle_id)
                 );
                 CREATE INDEX IF NOT EXISTS review_cycles_by_pull_request
@@ -409,7 +489,12 @@ class ReviewStore:
                     "PRAGMA table_info(review_cycles)"
                 ).fetchall()
             }
-            for column in ("approval_actor", "approval_reason", "approval_at"):
+            for column in (
+                "approval_actor",
+                "approval_reason",
+                "approval_at",
+                "github_evidence_json",
+            ):
                 if column not in cycle_columns:
                     self._connection.execute(
                         f"ALTER TABLE review_cycles ADD COLUMN {column} TEXT"
@@ -425,6 +510,22 @@ class ReviewStore:
                     self._connection.execute(
                         f"ALTER TABLE review_readers ADD COLUMN {column} TEXT"
                     )
+            if "evidence_refs_json" not in reader_columns:
+                self._connection.execute(
+                    "ALTER TABLE review_readers ADD COLUMN "
+                    "evidence_refs_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            finding_columns = {
+                str(row["name"])
+                for row in self._connection.execute(
+                    "PRAGMA table_info(review_findings)"
+                ).fetchall()
+            }
+            if "evidence_refs_json" not in finding_columns:
+                self._connection.execute(
+                    "ALTER TABLE review_findings ADD COLUMN "
+                    "evidence_refs_json TEXT NOT NULL DEFAULT '[]'"
+                )
 
     def _cycle_from_row(self, row: sqlite3.Row) -> ReviewCycle:
         return ReviewCycle(
@@ -440,6 +541,7 @@ class ReviewStore:
             approval_actor=row["approval_actor"],
             approval_reason=row["approval_reason"],
             approval_at=row["approval_at"],
+            github_evidence_json=row["github_evidence_json"],
         )
 
     def _reader_from_row(self, row: sqlite3.Row) -> ReaderResult:
@@ -450,6 +552,7 @@ class ReviewStore:
             finding_ids=_json_list(str(row["finding_ids_json"])),
             reader=str(row["reader"]),
             updated_at=str(row["updated_at"]),
+            evidence_refs=_json_list(str(row["evidence_refs_json"])),
         )
 
     def _finding_from_row(self, row: sqlite3.Row) -> ReviewFinding:
@@ -463,6 +566,7 @@ class ReviewStore:
             resolution=row["resolution"],
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
+            evidence_refs=_json_list(str(row["evidence_refs_json"])),
         )
 
     def cycle_row(
@@ -648,10 +752,25 @@ class ReviewService:
             raise ReviewError("Pull-request provider returned the wrong pull request")
         if not target.ready:
             raise ReviewError("Pull request is not ready for review")
+        raw_evidence_json: object = getattr(target, "evidence_json", None)
+        if raw_evidence_json is None:
+            evidence_json = None
+        elif isinstance(raw_evidence_json, str):
+            evidence_json = raw_evidence_json
+            if len(evidence_json.encode("utf-8")) > MAX_REVIEW_EVIDENCE_BYTES:
+                raise ReviewError("GitHub review evidence exceeds the storage limit")
+            _json_object(evidence_json)
+            if github_pull_request_evidence_ref(evidence_json) is None:
+                raise ReviewError(
+                    "Provider evidence omitted the GitHub pull-request id"
+                )
+        else:
+            raise ReviewError("Provider returned invalid GitHub review evidence")
         return PullRequestTarget(
             target.pull_request_id,
             _head_sha(target.head_sha, "Provider head SHA"),
             target.ready,
+            evidence_json,
         )
 
     def run_ready_review(self, pull_request_id: str) -> ReviewSnapshot:
@@ -666,7 +785,10 @@ class ReviewService:
         if missing:
             raise ReviewError(f"No reader is configured for {', '.join(missing)}")
         cycle = self._start_cycle(
-            pull_request_id, target.head_sha, expected_cycle_id=expected_cycle_id
+            pull_request_id,
+            target.head_sha,
+            expected_cycle_id=expected_cycle_id,
+            github_evidence_json=target.evidence_json,
         )
         for concern in REQUIRED_CONCERNS:
             reader = self.readers[concern]
@@ -680,10 +802,12 @@ class ReviewService:
                 continue
             try:
                 execution = reader.review(target)
-            except Exception as exc:
+            except Exception:
+                evidence_ref = github_pull_request_evidence_ref(target.evidence_json)
                 execution = ReaderExecution(
                     ReaderStatus.FAIL,
-                    (f"{concern.value} reader failed: {exc}",),
+                    (f"{concern.value} reader failed",),
+                    (evidence_ref,) if evidence_ref is not None else (),
                 )
             cycle = self.record_reader(
                 cycle.cycle.cycle_id,
@@ -692,6 +816,7 @@ class ReviewService:
                 execution.findings,
                 reader=concern.value,
                 claim_token=claim_token,
+                evidence_refs=execution.evidence_refs,
             )
         return cycle
 
@@ -699,12 +824,17 @@ class ReviewService:
         pull_request_id = _required(pull_request_id, "pull request id")
         head_sha = _head_sha(head_sha)
         expected_cycle_id = self.store.current_cycle_id(pull_request_id)
+        evidence_json = None
         if self.provider is not None:
             target = self._validated_provider_target(pull_request_id)
             if target.head_sha != head_sha:
                 raise ReviewError("Review head does not match the current pull request")
+            evidence_json = target.evidence_json
         return self._start_cycle(
-            pull_request_id, head_sha, expected_cycle_id=expected_cycle_id
+            pull_request_id,
+            head_sha,
+            expected_cycle_id=expected_cycle_id,
+            github_evidence_json=evidence_json,
         )
 
     def _start_cycle(
@@ -713,6 +843,7 @@ class ReviewService:
         head_sha: str,
         *,
         expected_cycle_id: str | None,
+        github_evidence_json: str | None = None,
     ) -> ReviewSnapshot:
         with self.store.transaction() as connection:
             current = self.store.current_cycle_row(connection, pull_request_id)
@@ -757,8 +888,9 @@ class ReviewService:
                 """
                 INSERT INTO review_cycles(
                     cycle_id, pull_request_id, head_sha, cycle_number, status,
-                    human_approval, required_action, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
+                    human_approval, required_action, github_evidence_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
                 """,
                 (
                     cycle_id,
@@ -767,6 +899,7 @@ class ReviewService:
                     cycle_number,
                     ReviewCycleStatus.ACTIVE.value,
                     "Awaiting four specialized review readers",
+                    github_evidence_json,
                     timestamp,
                     timestamp,
                 ),
@@ -795,6 +928,7 @@ class ReviewService:
         findings: Iterable[str] = (),
         reader: str = "automated",
         claim_token: str | None = None,
+        evidence_refs: Iterable[str] = (),
     ) -> ReviewSnapshot:
         concern = _enum(concern, ReviewConcern, "review concern")
         status = _enum(status, ReaderStatus, "reader status")
@@ -802,6 +936,7 @@ class ReviewService:
         summaries = tuple(
             _required(summary, "finding summary", 1_000) for summary in findings
         )
+        refs = _evidence_refs(evidence_refs)
         if status is ReaderStatus.FAIL and not summaries:
             raise ReviewError("A failed reader must provide findings")
         if status is not ReaderStatus.FAIL and summaries:
@@ -810,6 +945,14 @@ class ReviewService:
             cycle = self.store.cycle_row(connection, cycle_id)
             if cycle is None:
                 raise ReviewError(f"Unknown review cycle: {cycle_id}")
+            _validate_evidence_refs(
+                cycle["github_evidence_json"],
+                refs,
+                required=(
+                    cycle["github_evidence_json"] is not None
+                    and status in {ReaderStatus.PASS, ReaderStatus.FAIL}
+                ),
+            )
             current = self.store.current_cycle_row(
                 connection, str(cycle["pull_request_id"])
             )
@@ -842,8 +985,8 @@ class ReviewService:
                     """
                     INSERT INTO review_findings(
                         finding_id, pull_request_id, cycle_id, concern, summary,
-                        status, resolution, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                        status, resolution, created_at, updated_at, evidence_refs_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
                     """,
                     (
                         finding_id,
@@ -854,12 +997,14 @@ class ReviewService:
                         FindingStatus.OPEN.value,
                         timestamp,
                         timestamp,
+                        json.dumps(refs),
                     ),
                 )
             connection.execute(
                 """
                 UPDATE review_readers
                 SET status = ?, finding_ids_json = ?, reader = ?, updated_at = ?,
+                    evidence_refs_json = ?,
                     claim_token = NULL, claim_expires_at = NULL
                 WHERE cycle_id = ? AND concern = ?
                 """,
@@ -868,6 +1013,7 @@ class ReviewService:
                     json.dumps(finding_ids),
                     reader,
                     timestamp,
+                    json.dumps(refs),
                     cycle_id,
                     concern.value,
                 ),
@@ -880,13 +1026,20 @@ class ReviewService:
         cycle_id: str,
         concern: ReviewConcern | str,
         summary: str,
+        evidence_refs: Iterable[str] = (),
     ) -> ReviewSnapshot:
         concern = _enum(concern, ReviewConcern, "review concern")
         summary = _required(summary, "finding summary", 1_000)
+        refs = _evidence_refs(evidence_refs)
         with self.store.transaction() as connection:
             cycle = self.store.cycle_row(connection, cycle_id)
             if cycle is None:
                 raise ReviewError(f"Unknown review cycle: {cycle_id}")
+            _validate_evidence_refs(
+                cycle["github_evidence_json"],
+                refs,
+                required=cycle["github_evidence_json"] is not None,
+            )
             current = self.store.current_cycle_row(
                 connection, str(cycle["pull_request_id"])
             )
@@ -899,7 +1052,7 @@ class ReviewService:
                 raise ReviewError("Review cycle is no longer accepting findings")
             reader = connection.execute(
                 """
-                SELECT finding_ids_json FROM review_readers
+                SELECT finding_ids_json, evidence_refs_json FROM review_readers
                 WHERE cycle_id = ? AND concern = ?
                 """,
                 (cycle_id, concern.value),
@@ -912,8 +1065,8 @@ class ReviewService:
                 """
                 INSERT INTO review_findings(
                     finding_id, pull_request_id, cycle_id, concern, summary,
-                    status, resolution, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                    status, resolution, created_at, updated_at, evidence_refs_json
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
                 """,
                 (
                     finding_id,
@@ -924,19 +1077,25 @@ class ReviewService:
                     FindingStatus.OPEN.value,
                     timestamp,
                     timestamp,
+                    json.dumps(refs),
                 ),
             )
             finding_ids = list(_json_list(str(reader["finding_ids_json"])))
             finding_ids.append(finding_id)
+            reader_refs = _evidence_refs(
+                (*_json_list(str(reader["evidence_refs_json"])), *refs)
+            )
             connection.execute(
                 """
                 UPDATE review_readers
-                SET status = ?, finding_ids_json = ?, updated_at = ?
+                SET status = ?, finding_ids_json = ?, evidence_refs_json = ?,
+                    updated_at = ?
                 WHERE cycle_id = ? AND concern = ?
                 """,
                 (
                     ReaderStatus.FAIL.value,
                     json.dumps(finding_ids),
+                    json.dumps(reader_refs),
                     timestamp,
                     cycle_id,
                     concern.value,

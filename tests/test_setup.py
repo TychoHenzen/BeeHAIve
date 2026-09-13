@@ -17,6 +17,7 @@ def test_readme_documents_the_clean_device_demo_path() -> None:
         "GITHUB_PROJECT_OWNER",
         "BEEHAIIVE_ALLOWED_PROJECTS",
         "BEEHAIIVE_API_KEY",
+        "BEEHAIIVE_REVIEW_ACTOR",
         "BEEHAIIVE_AGENT_REPOSITORY",
         "BEEHAIIVE_AGENT_REPOSITORY_NAME",
         "/dashboard?project=<owner>:<number>",
@@ -50,6 +51,7 @@ def test_batch_launcher_is_rooted_and_actionable() -> None:
     assert "GITHUB_PROJECT_OWNER" in launcher
     assert "GITHUB_PROJECT_NUMBER" in launcher
     assert "BEEHAIIVE_API_KEY" in launcher
+    assert "BEEHAIIVE_REVIEW_ACTOR" in launcher
     assert "BEEHAIIVE_AGENT_REPOSITORY_NAME" in launcher
     assert "uv run uvicorn main:app --reload" in launcher
 
@@ -65,6 +67,7 @@ def test_batch_launcher_loads_dotenv_values(tmp_path: Path) -> None:
                 "GITHUB_PROJECT_OWNER=dotenv-owner",
                 "GITHUB_PROJECT_NUMBER=42",
                 "BEEHAIIVE_API_KEY=dotenv-api-key",
+                "BEEHAIIVE_REVIEW_ACTOR=dotenv-review-actor",
                 "BEEHAIIVE_AGENT_REPOSITORY_NAME=dotenv-owner/api",
                 "BEEHAIIVE_CODEX_EXECUTABLE=custom-codex",
             )
@@ -79,7 +82,8 @@ def test_batch_launcher_loads_dotenv_values(tmp_path: Path) -> None:
         "echo token=%GITHUB_TOKEN%\n"
         "echo owner=%GITHUB_PROJECT_OWNER%\n"
         "echo number=%GITHUB_PROJECT_NUMBER%\n"
-        "echo api-key=%BEEHAIIVE_API_KEY%\n",
+        "echo api-key=%BEEHAIIVE_API_KEY%\n"
+        "echo review-actor=%BEEHAIIVE_REVIEW_ACTOR%\n",
         encoding="utf-8",
     )
     (command_dir / "custom-codex.cmd").write_text("@echo off\n", encoding="utf-8")
@@ -93,6 +97,7 @@ def test_batch_launcher_loads_dotenv_values(tmp_path: Path) -> None:
         "GITHUB_PROJECT_OWNER",
         "GITHUB_PROJECT_NUMBER",
         "BEEHAIIVE_API_KEY",
+        "BEEHAIIVE_REVIEW_ACTOR",
         "BEEHAIIVE_AGENT_REPOSITORY_NAME",
         "BEEHAIIVE_CODEX_EXECUTABLE",
     ):
@@ -114,3 +119,4 @@ def test_batch_launcher_loads_dotenv_values(tmp_path: Path) -> None:
     assert "owner=dotenv-owner" in result.stdout
     assert "number=42" in result.stdout
     assert "api-key=dotenv-api-key" in result.stdout
+    assert "review-actor=dotenv-review-actor" in result.stdout
