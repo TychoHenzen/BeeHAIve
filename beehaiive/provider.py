@@ -2507,7 +2507,8 @@ class GitHubProjectProvider:
             }
 
         if (
-            action is not None
+            authorization is None
+            and action is not None
             and action.get("status") in {"pending", "uncertain", "succeeded"}
             and self._merge_target_matches_handoff(
                 target,

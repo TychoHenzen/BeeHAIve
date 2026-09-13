@@ -384,6 +384,15 @@ def test_interrupted_merge_request_recovers_missing_uuid_once() -> None:
         assert no_authorization["reason"] == "current_review_authorization_required"
         assert len(client.rest_calls) == 1
 
+        changed_cycle = _authorization()
+        changed_cycle["cycle_id"] = "review-cycle-2"
+        stale_authorization = provider.complete_approved_handoff(
+            request, 8, PULL_REQUEST_URL, HEAD, changed_cycle
+        )
+        assert stale_authorization["status"] == "operator_required"
+        assert stale_authorization["reason"] == "previous_merge_target_changed"
+        assert len(client.rest_calls) == 1
+
         client.queue_ready = True
         completed = provider.complete_approved_handoff(
             request, 8, PULL_REQUEST_URL, HEAD, _authorization()
