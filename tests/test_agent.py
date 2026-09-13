@@ -477,7 +477,16 @@ def test_codex_executor_repair_writes_only_the_leased_worktree(
         tmp_path, model="repair-model", repository_name="owner/api"
     )._repair_command("prompt", worktree)
     assert "workspace-write" in command
+    assert "--strict-config" in command
+    assert "sandbox_workspace_write.network_access=false" in command
+    assert "sandbox_workspace_write.exclude_slash_tmp=true" in command
+    assert "sandbox_workspace_write.exclude_tmpdir_env_var=true" in command
+    assert "agents.enabled=false" in command
     assert str(worktree) in command
+    routed_command = CodexExecModelExecutor(tmp_path)._repair_command(
+        "prompt", worktree, "routed-model"
+    )
+    assert routed_command[routed_command.index("--model") + 1] == "routed-model"
 
 
 def test_codex_executor_repair_handles_invalid_launch_failure_and_empty_result(
