@@ -120,7 +120,7 @@ def _lease_is_expired(expires_at: object) -> bool:
         return True
 
 
-def _repository_identity(remote: str) -> str | None:
+def repository_identity(remote: str) -> str | None:
     normalized = remote.replace("\\", "/")
     match = re.search(r"([^/:\s]+/[^/\s]+?)(?:\.git)?$", normalized)
     return None if match is None else match.group(1)
@@ -1775,7 +1775,7 @@ class WorkflowService:
                 if (
                     len(remote_urls) != 1
                     or remote_urls != self.worktrees.origin_push_urls
-                    or (_repository_identity(remote_urls[0]) or "").casefold()
+                    or (repository_identity(remote_urls[0]) or "").casefold()
                     != expected_repository.casefold()
                 ):
                     return (

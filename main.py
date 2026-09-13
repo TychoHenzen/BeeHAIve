@@ -36,6 +36,7 @@ from beehaiive.review import (
     ReviewStore,
 )
 from beehaiive.review_github import GitHubReviewProvider, github_review_readers
+from beehaiive.review_repair import ReviewRepairService, SelectedRepairAgent
 from beehaiive.routing import (
     ModelExecutor,
     ModelRouter,
@@ -164,6 +165,10 @@ class ReviewResolutionRequest(BaseModel):
     resolution: str = Field(min_length=1, max_length=1_000)
 
 
+class ReviewRepairRequest(BaseModel):
+    finding_ids: list[str] = Field(min_length=1, max_length=20)
+
+
 class ReviewApprovalRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=1_000)
 
@@ -257,6 +262,7 @@ def create_app(
     workflow_service: WorkflowService | None = None,
     workflow_actor: WorkflowRole | str | None = None,
     conflict_repair_service: ConflictRepairService | None = None,
+    review_repair_service: ReviewRepairService | None = None,
 ) -> FastAPI:
     owns_orchestrator = orchestrator is None
     if orchestrator is not None and orchestrator.model_router is not None:
@@ -380,6 +386,28 @@ def create_app(
             readers=review_readers,
             authorizer=review_authorizer,
         )
+    if (
+        review_repair_service is not None
+        and review_repair_service.reviews is not review_service
+    ):
+        raise ValueError("The review repair service must share one review service")
+    if (
+        review_repair_service is None
+        and review_operations_enabled
+        and workflow_service is not None
+        and review_service.provider is not None
+        and callable(getattr(orchestrator.provider, "get_pull_request", None))
+        and callable(getattr(orchestrator.provider, "update_source_branch", None))
+        and callable(getattr(effective_executor, "execute_scoped_repair", None))
+        and callable(getattr(effective_executor, "cancel", None))
+    ):
+        review_repair_service = ReviewRepairService(
+            review_service,
+            workflow_service,
+            orchestrator.provider,
+            routing_service,
+            cast(SelectedRepairAgent, effective_executor),
+        )
 
     configured_projects = _configured_project_ids(allowed_project_ids)
     scheduler_config = SchedulerConfig.from_environment()
@@ -424,6 +452,12 @@ def create_app(
             )
             if callable(validate_configuration):
                 validate_configuration()
+
+    if review_repair_service is not None:
+
+        @app.on_event("startup")  # pyright: ignore[reportDeprecated]
+        async def recover_review_repairs() -> None:  # pyright: ignore[reportUnusedFunction]
+            review_repair_service.recover()
 
     if agent_worker is not None:
 
@@ -474,6 +508,14 @@ def create_app(
                 status_code=503, detail="Review actor is not configured"
             )
         return configured_review_actor
+
+    def require_review_repair_service() -> ReviewRepairService:
+        if review_repair_service is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Review repair dispatch is not configured",
+            )
+        return review_repair_service
 
     @app.post("/reviews/ready")
     def run_ready_review(  # pyright: ignore[reportUnusedFunction]
@@ -678,6 +720,41 @@ def create_app(
             return review_service.publish_finding(finding_id).as_dict()
 
         return _handle_review_error(operation)
+
+    @app.post("/reviews/cycles/{cycle_id}/repair")
+    def dispatch_review_repair(  # pyright: ignore[reportUnusedFunction]
+        cycle_id: str,
+        request: ReviewRepairRequest,
+        actor: str = Depends(require_review_access),
+    ) -> dict[str, object]:
+        return _handle_review_error(
+            lambda: (
+                require_review_repair_service()
+                .dispatch(cycle_id, tuple(request.finding_ids), actor)
+                .as_dict()
+            )
+        )
+
+    @app.get("/reviews/repairs/{attempt_id}")
+    def review_repair_state(  # pyright: ignore[reportUnusedFunction]
+        attempt_id: str,
+        actor: str = Depends(require_review_access),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            attempt = require_review_repair_service().get(attempt_id)
+            review_service.authorize(attempt.pull_request_id, actor, ReviewAction.READ)
+            return attempt.as_dict()
+
+        return _handle_review_error(operation)
+
+    @app.post("/reviews/repairs/{attempt_id}/cancel")
+    def cancel_review_repair(  # pyright: ignore[reportUnusedFunction]
+        attempt_id: str,
+        actor: str = Depends(require_review_access),
+    ) -> dict[str, object]:
+        return _handle_review_error(
+            lambda: require_review_repair_service().cancel(attempt_id, actor).as_dict()
+        )
 
     @app.post("/reviews/cycles/{cycle_id}/approve")
     def approve_review_cycle(  # pyright: ignore[reportUnusedFunction]

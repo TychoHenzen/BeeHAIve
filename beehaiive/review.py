@@ -17,6 +17,7 @@ from uuid import uuid4
 
 MAX_REVIEW_EVIDENCE_BYTES = 1_000_000
 MAX_REVIEW_EVIDENCE_REFS = 100
+MAX_REVIEW_REPAIR_FINDINGS = 20
 
 
 class ReviewError(RuntimeError):
@@ -85,6 +86,7 @@ class ReviewAction(StrEnum):
     PUBLISH = "publish"
     APPROVE = "approve"
     HANDOFF = "handoff"
+    REPAIR = "repair"
 
 
 class ReviewAuthorizer(Protocol):
@@ -129,6 +131,7 @@ class AllowListReviewAuthorizer:
             ReviewAction.PUBLISH: self._writer_actors,
             ReviewAction.APPROVE: self._human_actors,
             ReviewAction.HANDOFF: self._human_actors,
+            ReviewAction.REPAIR: self._human_actors,
         }
         return normalized_actor in allowed_actors[resolved_action]
 
@@ -172,6 +175,16 @@ class FindingPublicationState(StrEnum):
 class FindingPublicationChannel(StrEnum):
     REVIEW_BODY = "review_body"
     REVIEW_THREAD = "review_thread"
+
+
+class ReviewRepairStatus(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    PUSHING = "pushing"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    HUMAN_ACTION_REQUIRED = "human_action_required"
 
 
 def _now() -> str:
@@ -543,6 +556,44 @@ class MergeHandoff:
 
 
 @dataclass(frozen=True, slots=True)
+class ReviewRepairAttempt:
+    attempt_id: str
+    cycle_id: str
+    pull_request_id: str
+    head_sha: str
+    finding_ids: tuple[str, ...]
+    actor: str
+    status: ReviewRepairStatus
+    created_at: str
+    updated_at: str
+    lease_id: str | None = None
+    commit_sha: str | None = None
+    push_evidence: dict[str, object] | None = None
+    result: str | None = None
+    required_action: str | None = None
+    cancellation_requested: bool = False
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "attempt_id": self.attempt_id,
+            "cycle_id": self.cycle_id,
+            "pull_request_id": self.pull_request_id,
+            "head_sha": self.head_sha,
+            "finding_ids": list(self.finding_ids),
+            "actor": self.actor,
+            "status": self.status.value,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "lease_id": self.lease_id,
+            "commit_sha": self.commit_sha,
+            "push_evidence": self.push_evidence,
+            "result": self.result,
+            "required_action": self.required_action,
+            "cancellation_requested": self.cancellation_requested,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class PublicationOutcome:
     state: FindingPublicationState
     channel: FindingPublicationChannel | None = None
@@ -660,6 +711,24 @@ class ReviewStore:
                     publication_retry_evidence_json TEXT,
                     publication_claim_token TEXT,
                     publication_claim_expires_at TEXT,
+                    FOREIGN KEY(cycle_id) REFERENCES review_cycles(cycle_id)
+                );
+                CREATE TABLE IF NOT EXISTS review_repair_attempts (
+                    attempt_id TEXT PRIMARY KEY,
+                    cycle_id TEXT NOT NULL UNIQUE,
+                    pull_request_id TEXT NOT NULL,
+                    head_sha TEXT NOT NULL,
+                    finding_ids_json TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    lease_id TEXT,
+                    commit_sha TEXT,
+                    push_evidence_json TEXT,
+                    result TEXT,
+                    required_action TEXT,
+                    cancellation_requested INTEGER NOT NULL DEFAULT 0,
                     FOREIGN KEY(cycle_id) REFERENCES review_cycles(cycle_id)
                 );
                 CREATE INDEX IF NOT EXISTS review_cycles_by_pull_request
@@ -845,6 +914,28 @@ class ReviewStore:
             ),
         )
 
+    def _repair_attempt_from_row(self, row: sqlite3.Row) -> ReviewRepairAttempt:
+        push_evidence = row["push_evidence_json"]
+        return ReviewRepairAttempt(
+            attempt_id=str(row["attempt_id"]),
+            cycle_id=str(row["cycle_id"]),
+            pull_request_id=str(row["pull_request_id"]),
+            head_sha=str(row["head_sha"]),
+            finding_ids=_json_list(str(row["finding_ids_json"])),
+            actor=str(row["actor"]),
+            status=ReviewRepairStatus(str(row["status"])),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+            lease_id=row["lease_id"],
+            commit_sha=row["commit_sha"],
+            push_evidence=(
+                None if push_evidence is None else _json_object(str(push_evidence))
+            ),
+            result=row["result"],
+            required_action=row["required_action"],
+            cancellation_requested=bool(row["cancellation_requested"]),
+        )
+
     def cycle_row(
         self, connection: sqlite3.Connection, cycle_id: str
     ) -> sqlite3.Row | None:
@@ -993,6 +1084,279 @@ class ReviewStore:
             raise ReviewError(f"Unknown review finding: {finding_id}")
         return self._finding_from_row(row)
 
+    def create_repair_attempt(
+        self, cycle_id: str, finding_ids: Iterable[str], actor: str
+    ) -> tuple[ReviewRepairAttempt, bool]:
+        cycle_id = _required(cycle_id, "review cycle id")
+        actor = _required(actor, "review actor", 100)
+        raw_ids = tuple(finding_ids)
+        if not 1 <= len(raw_ids) <= MAX_REVIEW_REPAIR_FINDINGS:
+            raise ReviewError(
+                f"Select between 1 and {MAX_REVIEW_REPAIR_FINDINGS} findings"
+            )
+        selected = tuple(
+            _required(finding_id, "finding id", 200) for finding_id in raw_ids
+        )
+        if len(set(selected)) != len(selected):
+            raise ReviewError("Duplicate finding identifiers are not allowed")
+
+        with self.transaction() as connection:
+            cycle = self.cycle_row(connection, cycle_id)
+            if cycle is None:
+                raise ReviewError(f"Unknown review cycle: {cycle_id}")
+            pull_request_id = str(cycle["pull_request_id"])
+            current = self.current_cycle_row(connection, pull_request_id)
+            if current is None or str(current["cycle_id"]) != cycle_id:
+                raise ReviewError("Findings must be selected from the current cycle")
+
+            existing = connection.execute(
+                "SELECT * FROM review_repair_attempts WHERE cycle_id = ?",
+                (cycle_id,),
+            ).fetchone()
+            if existing is not None:
+                attempt = self._repair_attempt_from_row(existing)
+                if attempt.finding_ids != selected:
+                    raise ReviewError(
+                        "A different repair selection already claimed this cycle"
+                    )
+                return attempt, False
+
+            readers = self._readers(connection, cycle_id)
+            cycle_finding_ids = {
+                finding_id for reader in readers for finding_id in reader.finding_ids
+            }
+            placeholders = ",".join("?" for _ in selected)
+            rows = connection.execute(
+                f"SELECT * FROM review_findings WHERE finding_id IN ({placeholders})",
+                selected,
+            ).fetchall()
+            findings = {str(row["finding_id"]): row for row in rows}
+            if len(findings) != len(selected):
+                raise ReviewError("Selection contains an unknown review finding")
+            for finding_id in selected:
+                finding = findings[finding_id]
+                if (
+                    finding_id not in cycle_finding_ids
+                    or str(finding["pull_request_id"]) != pull_request_id
+                ):
+                    raise ReviewError("Findings must belong to the current cycle")
+                if bool(finding["stale"]) or str(finding["head_sha"] or "") != str(
+                    cycle["head_sha"]
+                ):
+                    raise ReviewError("Stale findings cannot be selected")
+                if str(finding["status"]) != FindingStatus.OPEN.value:
+                    raise ReviewError("Only open findings can be selected")
+                if (
+                    str(finding["publication_state"])
+                    != FindingPublicationState.PUBLISHED.value
+                    or finding["duplicate_target"] is not None
+                ):
+                    raise ReviewError(
+                        "Only published, non-duplicate findings can be selected"
+                    )
+
+            timestamp = _now()
+            attempt_id = str(uuid4())
+            connection.execute(
+                """
+                INSERT INTO review_repair_attempts(
+                    attempt_id, cycle_id, pull_request_id, head_sha,
+                    finding_ids_json, actor, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attempt_id,
+                    cycle_id,
+                    pull_request_id,
+                    str(cycle["head_sha"]),
+                    json.dumps(selected, separators=(",", ":")),
+                    actor,
+                    ReviewRepairStatus.QUEUED.value,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM review_repair_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            assert row is not None
+            return self._repair_attempt_from_row(row), True
+
+    def repair_attempt(self, attempt_id: str) -> ReviewRepairAttempt:
+        attempt_id = _required(attempt_id, "repair attempt id", 100)
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM review_repair_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+        if row is None:
+            raise ReviewError(f"Unknown repair attempt: {attempt_id}")
+        return self._repair_attempt_from_row(row)
+
+    def pending_repair_attempts(self) -> tuple[ReviewRepairAttempt, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM review_repair_attempts WHERE status IN (?, ?, ?)",
+                (
+                    ReviewRepairStatus.QUEUED.value,
+                    ReviewRepairStatus.RUNNING.value,
+                    ReviewRepairStatus.PUSHING.value,
+                ),
+            ).fetchall()
+        return tuple(self._repair_attempt_from_row(row) for row in rows)
+
+    def claim_repair_attempt(self, attempt_id: str) -> bool:
+        with self.transaction() as connection:
+            updated = connection.execute(
+                """
+                UPDATE review_repair_attempts
+                SET status = ?, updated_at = ?
+                WHERE attempt_id = ? AND status = ? AND cancellation_requested = 0
+                """,
+                (
+                    ReviewRepairStatus.RUNNING.value,
+                    _now(),
+                    _required(attempt_id, "repair attempt id", 100),
+                    ReviewRepairStatus.QUEUED.value,
+                ),
+            )
+            return updated.rowcount == 1
+
+    def attach_repair_lease(self, attempt_id: str, lease_id: str) -> bool:
+        with self.transaction() as connection:
+            updated = connection.execute(
+                """
+                UPDATE review_repair_attempts
+                SET lease_id = ?, updated_at = ?
+                WHERE attempt_id = ? AND status = ? AND lease_id IS NULL
+                    AND cancellation_requested = 0
+                """,
+                (
+                    _required(lease_id, "workspace lease id", 100),
+                    _now(),
+                    _required(attempt_id, "repair attempt id", 100),
+                    ReviewRepairStatus.RUNNING.value,
+                ),
+            )
+            return updated.rowcount == 1
+
+    def begin_repair_push(
+        self,
+        attempt_id: str,
+        lease_id: str,
+        commit_sha: str,
+        push_evidence: Mapping[str, object],
+    ) -> bool:
+        evidence_json = json.dumps(dict(push_evidence), separators=(",", ":"))
+        if len(evidence_json) > 4_000:
+            raise ReviewError("Repair push evidence exceeds the storage limit")
+        with self.transaction() as connection:
+            updated = connection.execute(
+                """
+                UPDATE review_repair_attempts
+                SET status = ?, commit_sha = ?, push_evidence_json = ?, updated_at = ?
+                WHERE attempt_id = ? AND status = ? AND lease_id = ?
+                    AND cancellation_requested = 0
+                """,
+                (
+                    ReviewRepairStatus.PUSHING.value,
+                    _required(commit_sha, "repair commit sha", 100),
+                    evidence_json,
+                    _now(),
+                    _required(attempt_id, "repair attempt id", 100),
+                    ReviewRepairStatus.RUNNING.value,
+                    _required(lease_id, "workspace lease id", 100),
+                ),
+            )
+            return updated.rowcount == 1
+
+    def request_repair_cancellation(self, attempt_id: str) -> ReviewRepairAttempt:
+        attempt_id = _required(attempt_id, "repair attempt id", 100)
+        with self.transaction() as connection:
+            updated = connection.execute(
+                """
+                UPDATE review_repair_attempts
+                SET status = CASE WHEN status = ? THEN ? ELSE status END,
+                    cancellation_requested = 1, updated_at = ?
+                WHERE attempt_id = ? AND status IN (?, ?)
+                """,
+                (
+                    ReviewRepairStatus.QUEUED.value,
+                    ReviewRepairStatus.CANCELLED.value,
+                    _now(),
+                    attempt_id,
+                    ReviewRepairStatus.QUEUED.value,
+                    ReviewRepairStatus.RUNNING.value,
+                ),
+            )
+            if updated.rowcount == 0:
+                row = connection.execute(
+                    "SELECT attempt_id FROM review_repair_attempts "
+                    "WHERE attempt_id = ?",
+                    (attempt_id,),
+                ).fetchone()
+                if row is None:
+                    raise ReviewError(f"Unknown repair attempt: {attempt_id}")
+        return self.repair_attempt(attempt_id)
+
+    def finish_repair_attempt(
+        self,
+        attempt_id: str,
+        status: ReviewRepairStatus,
+        *,
+        commit_sha: str | None = None,
+        push_evidence: Mapping[str, object] | None = None,
+        result: str | None = None,
+        required_action: str | None = None,
+    ) -> ReviewRepairAttempt:
+        if status not in {
+            ReviewRepairStatus.SUCCEEDED,
+            ReviewRepairStatus.FAILED,
+            ReviewRepairStatus.CANCELLED,
+            ReviewRepairStatus.HUMAN_ACTION_REQUIRED,
+        }:
+            raise ReviewError("Repair attempt must finish in a terminal state")
+        evidence_json = (
+            None
+            if push_evidence is None
+            else json.dumps(dict(push_evidence), separators=(",", ":"))
+        )
+        if evidence_json is not None and len(evidence_json) > 4_000:
+            raise ReviewError("Repair push evidence exceeds the storage limit")
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT status FROM review_repair_attempts WHERE attempt_id = ?",
+                (_required(attempt_id, "repair attempt id", 100),),
+            ).fetchone()
+            if row is None:
+                raise ReviewError(f"Unknown repair attempt: {attempt_id}")
+            if str(row["status"]) in {
+                ReviewRepairStatus.SUCCEEDED.value,
+                ReviewRepairStatus.FAILED.value,
+                ReviewRepairStatus.CANCELLED.value,
+                ReviewRepairStatus.HUMAN_ACTION_REQUIRED.value,
+            }:
+                return self.repair_attempt(attempt_id)
+            connection.execute(
+                """
+                UPDATE review_repair_attempts
+                SET status = ?, commit_sha = ?, push_evidence_json = ?, result = ?,
+                    required_action = ?, updated_at = ?
+                WHERE attempt_id = ?
+                """,
+                (
+                    status.value,
+                    commit_sha,
+                    evidence_json,
+                    None if result is None else result[:4_000],
+                    None if required_action is None else required_action[:1_000],
+                    _now(),
+                    attempt_id,
+                ),
+            )
+        return self.repair_attempt(attempt_id)
+
     def claim_finding_publication(
         self, finding_id: str
     ) -> tuple[str, ReviewFinding] | None:
@@ -1132,6 +1496,30 @@ class ReviewService:
         action = _enum(action, ReviewAction, "review action")
         if not self.authorizer.authorize(pull_request_id, actor, action):
             raise ReviewError("Review actor is not authorized for this action")
+
+    def create_repair_attempt(
+        self, cycle_id: str, finding_ids: Iterable[str], actor: str
+    ) -> tuple[ReviewRepairAttempt, bool]:
+        pull_request_id = self.pull_request_id_for_cycle(cycle_id)
+        self.authorize(pull_request_id, actor, ReviewAction.REPAIR)
+        return self.store.create_repair_attempt(cycle_id, finding_ids, actor)
+
+    def repair_attempt(self, attempt_id: str) -> ReviewRepairAttempt:
+        return self.store.repair_attempt(attempt_id)
+
+    def cancel_repair_attempt(self, attempt_id: str, actor: str) -> ReviewRepairAttempt:
+        attempt = self.store.repair_attempt(attempt_id)
+        self.authorize(attempt.pull_request_id, actor, ReviewAction.REPAIR)
+        if attempt.status is ReviewRepairStatus.PUSHING:
+            raise ReviewError(
+                "Review repair can no longer be cancelled after push starts"
+            )
+        requested = self.store.request_repair_cancellation(attempt_id)
+        if requested.status is ReviewRepairStatus.PUSHING:
+            raise ReviewError(
+                "Review repair can no longer be cancelled after push starts"
+            )
+        return requested
 
     def pull_request_id_for_cycle(self, cycle_id: str) -> str:
         return self.store.pull_request_id_for_cycle(cycle_id)

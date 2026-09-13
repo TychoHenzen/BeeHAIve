@@ -1210,6 +1210,91 @@ def test_review_store_reports_unknown_cycles_and_missing_current_cycle(
         service.resolve_finding(finding_id, "resolution")
 
 
+def test_review_repair_selection_is_authorized_current_and_idempotent(
+    review_store: ReviewStore,
+) -> None:
+    service = ReviewService(review_store)
+    cycle = service.start_cycle("PR-REPAIR", "head-1")
+    first = service.record_reader(
+        cycle.cycle.cycle_id,
+        ReviewConcern.SECURITY,
+        ReaderStatus.FAIL,
+        ("selected issue",),
+    ).findings[-1]
+    second = service.record_reader(
+        cycle.cycle.cycle_id,
+        ReviewConcern.PERFORMANCE,
+        ReaderStatus.FAIL,
+        ("unselected issue",),
+    ).findings[-1]
+    with review_store.transaction() as connection:
+        connection.executemany(
+            "UPDATE review_findings SET publication_state = ? WHERE finding_id = ?",
+            (
+                (FindingPublicationState.PUBLISHED.value, first.finding_id),
+                (FindingPublicationState.PUBLISHED.value, second.finding_id),
+            ),
+        )
+
+    attempt, created = service.create_repair_attempt(
+        cycle.cycle.cycle_id, (first.finding_id,), "operator"
+    )
+    retry, retry_created = service.create_repair_attempt(
+        cycle.cycle.cycle_id, (first.finding_id,), "operator"
+    )
+
+    assert created is True
+    assert retry_created is False
+    assert retry.attempt_id == attempt.attempt_id
+    assert attempt.finding_ids == (first.finding_id,)
+    assert attempt.actor == "operator"
+    assert attempt.head_sha == "head-1"
+    assert review_store.finding_for_id(second.finding_id).status is FindingStatus.OPEN
+    with pytest.raises(ReviewError, match="already claimed"):
+        service.create_repair_attempt(
+            cycle.cycle.cycle_id, (second.finding_id,), "operator"
+        )
+    with pytest.raises(ReviewError, match="not authorized"):
+        service.create_repair_attempt(
+            cycle.cycle.cycle_id, (second.finding_id,), "writer"
+        )
+
+
+def test_review_repair_selection_rejects_duplicates_stale_and_unpublished(
+    review_store: ReviewStore,
+) -> None:
+    service = ReviewService(review_store)
+    cycle = service.start_cycle("PR-REPAIR-GUARDS", "head-1")
+    finding = service.record_reader(
+        cycle.cycle.cycle_id,
+        ReviewConcern.SECURITY,
+        ReaderStatus.FAIL,
+        ("selected issue",),
+    ).findings[-1]
+
+    with pytest.raises(ReviewError, match="Duplicate finding identifiers"):
+        service.create_repair_attempt(
+            cycle.cycle.cycle_id,
+            (finding.finding_id, finding.finding_id),
+            "operator",
+        )
+    with pytest.raises(ReviewError, match="published"):
+        service.create_repair_attempt(
+            cycle.cycle.cycle_id, (finding.finding_id,), "operator"
+        )
+
+    with review_store.transaction() as connection:
+        connection.execute(
+            "UPDATE review_findings SET publication_state = ?, stale = 1 "
+            "WHERE finding_id = ?",
+            (FindingPublicationState.PUBLISHED.value, finding.finding_id),
+        )
+    with pytest.raises(ReviewError, match="Stale findings"):
+        service.create_repair_attempt(
+            cycle.cycle.cycle_id, (finding.finding_id,), "operator"
+        )
+
+
 def test_create_app_rejects_conflicting_review_store() -> None:
     service_store = ReviewStore()
     api_store = ReviewStore()
