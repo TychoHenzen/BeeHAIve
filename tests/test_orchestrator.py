@@ -1915,16 +1915,16 @@ def test_github_provider_audits_rate_limit_failure_without_raw_error() -> None:
 
 def test_github_provider_reconciles_timed_out_pr_before_retrying_create() -> None:
     class LatePullRequestClient(HandoffGraphQLClient):
-        hide_next_read = False
+        hidden_reads = 0
 
         def execute(self, query: str, variables: dict[str, object]) -> dict[str, Any]:
             if "CreatePullRequestInput" in query:
                 super().execute(query, variables)
-                self.hide_next_read = True
+                self.hidden_reads = 2
                 raise GitHubOutcomeUnknownError("request outcome is unknown")
             response = super().execute(query, variables)
-            if "pullRequestCursor" in variables and self.hide_next_read:
-                self.hide_next_read = False
+            if "pullRequestCursor" in variables and self.hidden_reads:
+                self.hidden_reads -= 1
                 repository = response.get("repository")
                 if isinstance(repository, dict):
                     pull_requests = repository.get("pullRequests")
@@ -1957,6 +1957,17 @@ def test_github_provider_reconciles_timed_out_pr_before_retrying_create() -> Non
     )
     assert pr_action["status"] == "uncertain"
     assert pr_action["result"]["reconciliation"] == "readback_absent"
+
+    with pytest.raises(StoreError, match="remains unresolved"):
+        provider.create_handoff(request)
+
+    still_uncertain = next(
+        action
+        for action in store.actions_for_project("owner:7")
+        if action["id"] == pr_action["id"]
+    )
+    assert still_uncertain["status"] == "uncertain"
+    assert client.pull_request_creations == 1
 
     provider.create_handoff(request)
 

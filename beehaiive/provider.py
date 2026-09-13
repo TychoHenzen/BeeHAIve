@@ -265,7 +265,10 @@ class UrllibGraphQLClient:
             rate_error = self._rate_limit_error(exc, status_code=exc.code)
             if rate_error is not None:
                 raise rate_error from exc
-            raise ProviderError(f"GitHub GraphQL request failed: {exc}") from exc
+            message = f"GitHub GraphQL request failed: {exc}"
+            if 500 <= exc.code < 600:
+                raise GitHubOutcomeUnknownError(message) from exc
+            raise ProviderError(message) from exc
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise GitHubOutcomeUnknownError(
                 f"GitHub GraphQL returned invalid JSON: {exc}"
@@ -1856,13 +1859,14 @@ class GitHubProjectProvider:
             observed_branch_oid = cast(Mapping[str, object], target_ref).get("oid")
         if isinstance(observed_branch_oid, str):
             branch_result["head_sha"] = observed_branch_oid
-        _reconcile_handoff_mutation(
-            request,
-            "create_ref",
-            identity_marker,
-            "succeeded" if branch_matches else "failed",
-            branch_result,
-        )
+        if branch_ref is not None:
+            _reconcile_handoff_mutation(
+                request,
+                "create_ref",
+                identity_marker,
+                "succeeded" if branch_matches else "failed",
+                branch_result,
+            )
 
         if head_sha is not None:
             if not branch_matches:
@@ -2046,25 +2050,24 @@ class GitHubProjectProvider:
             legacy_body=legacy_body,
             initial_repository=repository,
         )
-        existing_matches = existing is not None and _pull_request_matches(
-            existing,
-            request.branch,
-            base_branch,
-            identity_marker,
-            legacy_marker,
-            legacy_body,
-        )
-        _reconcile_handoff_mutation(
-            request,
-            "create_pull_request",
-            identity_marker,
-            "succeeded" if existing_matches else "failed",
-            _pull_request_audit_result(
-                existing or {},
-                "present" if existing_matches else "conflict" if existing else "absent",
-            ),
-        )
         if existing is not None:
+            existing_matches = _pull_request_matches(
+                existing,
+                request.branch,
+                base_branch,
+                identity_marker,
+                legacy_marker,
+                legacy_body,
+            )
+            _reconcile_handoff_mutation(
+                request,
+                "create_pull_request",
+                identity_marker,
+                "succeeded" if existing_matches else "failed",
+                _pull_request_audit_result(
+                    existing, "present" if existing_matches else "conflict"
+                ),
+            )
             return self._update_matching_pull_request(
                 existing,
                 owner,

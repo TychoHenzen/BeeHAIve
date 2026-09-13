@@ -1996,7 +1996,7 @@ class OrchestratorStore:
         with self._transaction() as connection:
             rows = connection.execute(
                 """
-                SELECT request_json FROM actions
+                SELECT request_json, status FROM actions
                 WHERE project_id = ? AND repository_name = ? AND pbi_number = ?
                     AND run_id = ? AND kind = ?
                 """,
@@ -2011,11 +2011,14 @@ class OrchestratorStore:
             attempt = 1
             for row in rows:
                 prior_request = _json_mapping(row["request_json"])
+                if prior_request.get("operation_key") != operation_key:
+                    continue
+                if row["status"] in {"pending", "uncertain"}:
+                    raise StoreError(
+                        "A prior GitHub handoff mutation remains unresolved"
+                    )
                 prior_attempt = prior_request.get("attempt")
-                if (
-                    prior_request.get("operation_key") == operation_key
-                    and type(prior_attempt) is int
-                ):
+                if type(prior_attempt) is int:
                     attempt = max(attempt, prior_attempt + 1)
 
             action_id = str(uuid4())

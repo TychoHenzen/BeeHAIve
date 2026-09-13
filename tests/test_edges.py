@@ -125,7 +125,7 @@ def test_urllib_graphql_client_validates_transport_and_payloads(
     assert client.execute("query", {}) == {"ok": True}
 
     for error in (
-        HTTPError("https://example.test", 500, "failed", {}, None),
+        HTTPError("https://example.test", 400, "failed", {}, None),
         URLError("offline"),
         TimeoutError("timeout"),
         OSError("reset"),
@@ -143,6 +143,13 @@ def test_urllib_graphql_client_validates_transport_and_payloads(
             assert not isinstance(request_error.value, GitHubOutcomeUnknownError)
         else:
             assert isinstance(request_error.value, GitHubOutcomeUnknownError)
+
+    def raise_server_error(request: object, timeout: float) -> object:
+        raise HTTPError("https://example.test", 503, "unavailable", {}, None)
+
+    monkeypatch.setattr(provider_module, "urlopen", raise_server_error)
+    with pytest.raises(GitHubOutcomeUnknownError, match="request failed"):
+        client.execute("mutation", {})
 
     for payload, message in (
         ([], "non-object"),
