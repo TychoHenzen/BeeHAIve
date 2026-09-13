@@ -12,6 +12,8 @@ from typing import cast
 from uuid import uuid4
 
 from .agent import redact_worker_text
+from .models import RunState
+from .pbi_creation import PbiCreationRequest
 from .routing import RoutingStore
 from .storage import (
     MAX_META_REVIEW_ATTEMPTS,
@@ -31,6 +33,7 @@ class MetaReviewError(StoreError):
 
 
 Analyzer = Callable[[Sequence[Mapping[str, object]]], Sequence[object]]
+PbiCreator = Callable[[PbiCreationRequest, str], dict[str, object]]
 
 
 class MetaReviewService:
@@ -123,14 +126,31 @@ class MetaReviewService:
         return self.store.meta_review_suggestions(project_id.strip(), status)
 
     def decide(
-        self, project_id: str, suggestion_id: str, decision: str
+        self,
+        project_id: str,
+        suggestion_id: str,
+        decision: str,
+        *,
+        pbi_creator: PbiCreator | None = None,
     ) -> dict[str, object]:
         status = {"accept": "accepted", "reject": "rejected"}.get(decision)
         if status is None:
             raise MetaReviewError("Decision must be accept or reject")
-        return self.store.decide_meta_review_suggestion(
-            project_id.strip(), suggestion_id.strip(), status
+        project_id = project_id.strip()
+        suggestion_id = suggestion_id.strip()
+        if status == "accepted" and pbi_creator is None:
+            raise MetaReviewError("PBI creation service is unavailable")
+        suggestion = self.store.decide_meta_review_suggestion(
+            project_id, suggestion_id, status
         )
+        result: dict[str, object] = {"suggestion": suggestion}
+        if status == "accepted":
+            request = _pbi_creation_request(self.store, project_id, suggestion)
+            key = f"meta-review:{project_id}:{suggestion_id}"
+            if pbi_creator is None:  # pragma: no cover - guarded above
+                raise MetaReviewError("PBI creation service is unavailable")
+            result["pbi_creation"] = pbi_creator(request, key)
+        return result
 
     @staticmethod
     def _validate_limits(
@@ -368,6 +388,98 @@ def _safe_text(value: object, limit: int = MAX_META_REVIEW_TEXT_LENGTH) -> str:
         return ""
     text = value if isinstance(value, str) else str(value)
     return redact_worker_text(text)[:limit]
+
+
+def _pbi_creation_request(
+    store: OrchestratorStore,
+    project_id: str,
+    suggestion: Mapping[str, object],
+) -> PbiCreationRequest:
+    suggestion_id = suggestion.get("suggestion_id")
+    outcome = suggestion.get("proposed_outcome")
+    rationale = suggestion.get("rationale")
+    evidence_refs = suggestion.get("evidence_refs")
+    if (
+        not isinstance(suggestion_id, str)
+        or not isinstance(outcome, str)
+        or not outcome.strip()
+        or not isinstance(rationale, str)
+        or not rationale.strip()
+        or not isinstance(evidence_refs, list)
+    ):
+        raise MetaReviewError("Accepted suggestion is incomplete")
+
+    raw_refs = cast(list[object], evidence_refs)
+    if not raw_refs or len(raw_refs) > MAX_META_REVIEW_EVIDENCE_REFS:
+        raise MetaReviewError("Accepted suggestion is incomplete")
+    refs: list[str] = []
+    run_ids: list[str] = []
+    for raw_ref in raw_refs:
+        if not isinstance(raw_ref, str) or not raw_ref.strip():
+            raise MetaReviewError("Accepted suggestion evidence is invalid")
+        refs.append(raw_ref)
+        run_id = _source_run_id(raw_ref)
+        if run_id is not None and run_id not in run_ids:
+            run_ids.append(run_id)
+    if not run_ids:
+        raise MetaReviewError("Accepted suggestion has no source run evidence")
+
+    runs: list[RunState] = []
+    for run_id in run_ids:
+        run = store.get_run(run_id)
+        if run is None:
+            raise MetaReviewError("Accepted suggestion source run is unavailable")
+        if run.project_id != project_id:
+            raise MetaReviewError(
+                "Accepted suggestion source run belongs to another Project"
+            )
+        runs.append(run)
+
+    repositories = {run.repository.casefold() for run in runs}
+    if len(repositories) != 1:
+        raise MetaReviewError(
+            "Accepted suggestion source runs use different repositories"
+        )
+
+    evidence = "\n".join(
+        f"- {reference.replace(chr(13), ' ').replace(chr(10), ' ')}"
+        for reference in refs
+    )
+    body = "\n".join(
+        (
+            "## Proposed outcome",
+            "",
+            outcome,
+            "",
+            "## Rationale",
+            "",
+            rationale,
+            "",
+            "## Evidence references",
+            evidence,
+            "",
+            f"Project ID: {project_id}",
+            f"Suggestion ID: {suggestion_id}",
+        )
+    )
+    return PbiCreationRequest(
+        project_id=project_id,
+        repository=runs[0].repository,
+        title=outcome,
+        body=body,
+        labels=(),
+    )
+
+
+def _source_run_id(reference: str) -> str | None:
+    if not reference.startswith("run:"):
+        return None
+    parts = reference.split(":")
+    if len(parts) == 2 and parts[1]:
+        return parts[1]
+    if len(parts) == 4 and parts[2] in {"event", "attempt"} and parts[1] and parts[3]:
+        return parts[1]
+    raise MetaReviewError("Accepted suggestion contains an invalid run reference")
 
 
 def _safe_json(value: object) -> str:
