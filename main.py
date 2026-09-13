@@ -154,6 +154,10 @@ class ReviewFindingRequest(BaseModel):
     concern: ReviewConcern
     summary: str = Field(min_length=1, max_length=1_000)
     evidence_refs: list[str] = Field(default_factory=list, max_length=100)
+    file_path: str | None = Field(default=None, max_length=500)
+    start_line: int | None = Field(default=None, gt=0, le=2_147_483_647)
+    end_line: int | None = Field(default=None, gt=0, le=2_147_483_647)
+    duplicate_target: str | None = Field(default=None, max_length=200)
 
 
 class ReviewResolutionRequest(BaseModel):
@@ -640,6 +644,10 @@ def create_app(
                 request.concern,
                 request.summary,
                 evidence_refs=request.evidence_refs,
+                file_path=request.file_path,
+                start_line=request.start_line,
+                end_line=request.end_line,
+                duplicate_target=request.duplicate_target,
             ).as_dict()
 
         return _handle_review_error(operation)
@@ -654,8 +662,20 @@ def create_app(
             pull_request_id = review_service.pull_request_id_for_finding(finding_id)
             review_service.authorize(pull_request_id, actor, ReviewAction.WRITER)
             return review_service.resolve_finding(
-                finding_id, request.resolution
+                finding_id, request.resolution, actor=actor
             ).as_dict()
+
+        return _handle_review_error(operation)
+
+    @app.post("/reviews/findings/{finding_id}/publish")
+    def publish_review_finding(  # pyright: ignore[reportUnusedFunction]
+        finding_id: str,
+        actor: str = Depends(require_review_access),
+    ) -> dict[str, object]:
+        def operation() -> dict[str, object]:
+            pull_request_id = review_service.pull_request_id_for_finding(finding_id)
+            review_service.authorize(pull_request_id, actor, ReviewAction.PUBLISH)
+            return review_service.publish_finding(finding_id).as_dict()
 
         return _handle_review_error(operation)
 

@@ -16,10 +16,14 @@ from .provider import (
 )
 from .review import (
     MAX_REVIEW_EVIDENCE_BYTES,
+    FindingPublicationChannel,
+    FindingPublicationState,
+    PublicationOutcome,
     PullRequestTarget,
     ReaderExecution,
     ReaderStatus,
     ReviewConcern,
+    finding_publication_marker,
 )
 
 PULL_REQUEST_REVIEW_SNAPSHOT_QUERY = """
@@ -179,6 +183,14 @@ query($threadId: ID!, $cursor: String) {
 }
 """
 
+PUBLISH_PULL_REQUEST_REVIEW_MUTATION = """
+mutation($input: AddPullRequestReviewInput!) {
+  addPullRequestReview(input: $input) {
+    pullRequestReview { id url }
+  }
+}
+"""
+
 _PULL_REQUEST_ID = re.compile(
     r"(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)/"
     r"(?P<repository>[A-Za-z0-9_.-]{1,100})#(?P<number>[1-9][0-9]{0,9})"
@@ -210,8 +222,112 @@ def _optional_mapping(value: object) -> Mapping[str, Any]:
     return cast(Mapping[str, Any], value)
 
 
+def _review_evidence(evidence_json: str | None) -> Mapping[str, Any]:
+    if evidence_json is None:
+        raise ProviderError("GitHub pull request omitted review evidence")
+    try:
+        evidence = json.loads(evidence_json)
+    except json.JSONDecodeError as exc:
+        raise ProviderError("GitHub review evidence is invalid") from exc
+    if not isinstance(evidence, Mapping):
+        raise ProviderError("GitHub review evidence is invalid")
+    return cast(Mapping[str, Any], evidence)
+
+
+def _pull_request_node_id(evidence_json: str | None) -> str:
+    pull_request = _optional_mapping(
+        _review_evidence(evidence_json).get("pull_request")
+    )
+    identifier = pull_request.get("id")
+    if not isinstance(identifier, str) or not identifier:
+        raise ProviderError("GitHub review evidence omitted its pull-request id")
+    return identifier
+
+
+def _publication_from_evidence(
+    evidence_json: str | None,
+    marker: str,
+    expected_channel: FindingPublicationChannel,
+    remote_id: str | None,
+    remote_url: str | None,
+) -> PublicationOutcome | None:
+    evidence = _review_evidence(evidence_json)
+    matches: list[tuple[FindingPublicationChannel, str, str]] = []
+    for raw_review in evidence.get("reviews", []):
+        if not isinstance(raw_review, Mapping):
+            continue
+        review = cast(Mapping[str, Any], raw_review)
+        identifier, url, body = review.get("id"), review.get("url"), review.get("body")
+        if (
+            isinstance(identifier, str)
+            and isinstance(url, str)
+            and isinstance(body, str)
+            and marker in body
+        ):
+            matches.append((FindingPublicationChannel.REVIEW_BODY, identifier, url))
+
+    for raw_thread in evidence.get("review_threads", []):
+        if not isinstance(raw_thread, Mapping):
+            continue
+        thread = cast(Mapping[str, Any], raw_thread)
+        thread_id = thread.get("id")
+        comments = thread.get("comments", [])
+        if not isinstance(thread_id, str) or not isinstance(comments, list):
+            continue
+        for raw_comment in cast(list[object], comments):
+            if not isinstance(raw_comment, Mapping):
+                continue
+            comment = cast(Mapping[str, Any], raw_comment)
+            body, url = comment.get("body"), comment.get("url")
+            if isinstance(body, str) and marker in body:
+                matches.append(
+                    (
+                        FindingPublicationChannel.REVIEW_THREAD,
+                        thread_id,
+                        url if isinstance(url, str) else "",
+                    )
+                )
+
+    if len(matches) > 1:
+        return PublicationOutcome(
+            FindingPublicationState.DUPLICATE_REMOTE,
+            expected_channel,
+            remote_id,
+            remote_url,
+            {
+                "reason": "multiple_remote_markers",
+                "remote_ids": [match[1] for match in matches[:5]],
+            },
+        )
+    if matches:
+        actual_channel, actual_id, actual_url = matches[0]
+        if actual_channel is not expected_channel:
+            return PublicationOutcome(
+                FindingPublicationState.DUPLICATE_REMOTE,
+                actual_channel,
+                actual_id,
+                actual_url,
+                {"reason": "remote_marker_channel_mismatch"},
+            )
+        return PublicationOutcome(
+            FindingPublicationState.PUBLISHED,
+            actual_channel,
+            actual_id,
+            actual_url,
+        )
+    if remote_id is not None:
+        return PublicationOutcome(
+            FindingPublicationState.REMOTE_MISSING,
+            expected_channel,
+            remote_id,
+            remote_url,
+            {"reason": "remote_content_missing"},
+        )
+    return None
+
+
 class GitHubReviewProvider:
-    """Read a complete, bounded GitHub review snapshot without GitHub writes."""
+    """Read review snapshots and publish findings through GitHub's review API."""
 
     def __init__(
         self,
@@ -430,6 +546,125 @@ class GitHubReviewProvider:
             head_sha,
             evidence_json=serialized,
         )
+
+    def publish_finding(
+        self,
+        pull_request_id: str,
+        *,
+        expected_head_sha: str,
+        fingerprint: str,
+        concern: ReviewConcern | str,
+        summary: str,
+        file_path: str | None = None,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        remote_id: str | None = None,
+        remote_url: str | None = None,
+    ) -> PublicationOutcome:
+        try:
+            resolved_concern = ReviewConcern(concern)
+        except ValueError as exc:
+            raise ProviderError("Review finding has an invalid concern") from exc
+        if not summary.strip() or len(summary) > 1_000:
+            raise ProviderError("Review finding summary is invalid")
+        if file_path is None:
+            if start_line is not None or end_line is not None:
+                raise ProviderError("Review finding anchor is incomplete")
+        elif (
+            not file_path.strip()
+            or file_path.startswith("/")
+            or "\\" in file_path
+            or any(part in {"", ".", ".."} for part in file_path.split("/"))
+            or type(start_line) is not int
+            or type(end_line) is not int
+            or start_line < 1
+            or end_line < start_line
+        ):
+            raise ProviderError("Review finding anchor is invalid")
+
+        expected_head_sha = expected_head_sha.strip()
+        marker = finding_publication_marker(
+            pull_request_id, expected_head_sha, fingerprint
+        )
+        channel = (
+            FindingPublicationChannel.REVIEW_THREAD
+            if file_path is not None
+            else FindingPublicationChannel.REVIEW_BODY
+        )
+        target = self.get_pull_request(pull_request_id)
+        if not target.ready or target.head_sha != expected_head_sha:
+            return PublicationOutcome(
+                FindingPublicationState.STALE,
+                channel,
+                remote_id,
+                remote_url,
+                {"reason": "current_head_mismatch"},
+            )
+
+        existing = _publication_from_evidence(
+            target.evidence_json, marker, channel, remote_id, remote_url
+        )
+        if existing is not None:
+            return existing
+
+        redacted_summary = self._redact(summary.strip())
+        if not isinstance(redacted_summary, str):
+            raise ProviderError("Review finding summary could not be redacted")
+        review_text = f"[{resolved_concern.value}] {redacted_summary}\n\n{marker}"
+        review_input: dict[str, object] = {
+            "pullRequestId": _pull_request_node_id(target.evidence_json),
+            "commitOID": expected_head_sha,
+            "event": "COMMENT",
+        }
+        if channel is FindingPublicationChannel.REVIEW_BODY:
+            review_input["body"] = review_text
+        else:
+            assert (
+                file_path is not None
+                and start_line is not None
+                and end_line is not None
+            )
+            thread: dict[str, object] = {
+                "body": review_text,
+                "path": file_path,
+                "line": end_line,
+                "side": "RIGHT",
+            }
+            if start_line != end_line:
+                thread["startLine"] = start_line
+                thread["startSide"] = "RIGHT"
+            review_input["threads"] = [thread]
+
+        data = self._configured_client().execute(
+            PUBLISH_PULL_REQUEST_REVIEW_MUTATION, {"input": review_input}
+        )
+        mutation = _optional_mapping(data.get("addPullRequestReview"))
+        review = _optional_mapping(mutation.get("pullRequestReview"))
+        created_id = review.get("id")
+        created_url = review.get("url")
+        if not isinstance(created_id, str) or not created_id:
+            raise ProviderError("GitHub review mutation omitted its review id")
+        if not isinstance(created_url, str) or not created_url:
+            raise ProviderError("GitHub review mutation omitted its review URL")
+
+        confirmed = self.get_pull_request(pull_request_id)
+        reconciled = _publication_from_evidence(
+            confirmed.evidence_json, marker, channel, created_id, created_url
+        )
+        if not confirmed.ready or confirmed.head_sha != expected_head_sha:
+            return PublicationOutcome(
+                FindingPublicationState.STALE,
+                channel,
+                None if reconciled is None else reconciled.remote_id,
+                created_url if reconciled is None else reconciled.remote_url,
+                {"reason": "current_head_changed_after_publication"},
+            )
+        if (
+            reconciled is None
+            or reconciled.state is not FindingPublicationState.PUBLISHED
+        ):
+            raise ProviderError("GitHub did not confirm the published finding")
+        return reconciled
 
 
 class GitHubEvidenceReviewReader:

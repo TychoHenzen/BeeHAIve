@@ -11,9 +11,12 @@ from fastapi.testclient import TestClient
 from beehaiive.provider import ProviderError
 from beehaiive.review import (
     REQUIRED_CONCERNS,
+    FindingPublicationChannel,
+    FindingPublicationState,
     ReviewCycleStatus,
     ReviewService,
     ReviewStore,
+    finding_publication_marker,
 )
 from beehaiive.review_github import (
     PULL_REQUEST_REVIEW_REQUESTS_PAGE_QUERY,
@@ -80,6 +83,78 @@ def _thread(identifier: str, comments: dict[str, Any]) -> dict[str, Any]:
         "isOutdated": identifier == "THREAD-1",
         "comments": comments,
     }
+
+
+class PublishingGraphQLClient:
+    def __init__(self, head_sha: str = "head-7") -> None:
+        self.head_sha = head_sha
+        self.reviews: list[dict[str, Any]] = []
+        self.threads: list[dict[str, Any]] = []
+        self.mutations: list[dict[str, Any]] = []
+
+    def execute(self, query: str, variables: Mapping[str, object]) -> dict[str, Any]:
+        if "mutation" in query.lower():
+            raw_input = variables["input"]
+            assert isinstance(raw_input, Mapping)
+            mutation_input = dict(raw_input)
+            self.mutations.append(mutation_input)
+            review_number = len(self.mutations)
+            review_id = f"REVIEW-PUBLISHED-{review_number}"
+            review_url = f"https://github.com/owner/repo/pull/7#pullrequestreview-{review_number}"
+            review = _review(review_id, "User", "COMMENTED")
+            review["body"] = mutation_input.get("body") or ""
+            review["url"] = review_url
+            self.reviews.append(review)
+            raw_threads = mutation_input.get("threads", [])
+            assert isinstance(raw_threads, list)
+            for index, raw_thread_input in enumerate(raw_threads, start=1):
+                assert isinstance(raw_thread_input, Mapping)
+                thread_input = dict(raw_thread_input)
+                thread_id = f"THREAD-PUBLISHED-{review_number}-{index}"
+                comment = _comment(
+                    f"COMMENT-PUBLISHED-{review_number}-{index}",
+                    "User",
+                    str(thread_input["body"]),
+                )
+                comment["url"] = (
+                    f"https://github.com/owner/repo/pull/7#discussion-{thread_id}"
+                )
+                thread = _thread(thread_id, _connection([comment]))
+                thread.update(
+                    {
+                        "path": thread_input["path"],
+                        "line": thread_input["line"],
+                        "originalLine": thread_input["line"],
+                        "startLine": thread_input.get("startLine"),
+                        "originalStartLine": thread_input.get("startLine"),
+                        "diffSide": thread_input["side"],
+                        "startDiffSide": thread_input.get("startSide"),
+                    }
+                )
+                self.threads.append(thread)
+            return {
+                "addPullRequestReview": {
+                    "pullRequestReview": {"id": review_id, "url": review_url}
+                }
+            }
+        if query == PULL_REQUEST_REVIEW_SNAPSHOT_QUERY:
+            return {
+                "repository": {
+                    "pullRequest": {
+                        "id": "PULL_REQUEST_NODE",
+                        "number": 7,
+                        "url": "https://github.com/owner/repo/pull/7",
+                        "state": "OPEN",
+                        "merged": False,
+                        "isDraft": False,
+                        "headRef": {"target": {"oid": self.head_sha}},
+                        "reviews": _connection(self.reviews),
+                        "reviewRequests": _connection([]),
+                        "reviewThreads": _connection(self.threads),
+                    }
+                }
+            }
+        raise AssertionError("Unexpected GitHub query")
 
 
 class ReviewGraphQLClient:
@@ -242,6 +317,120 @@ def test_github_review_provider_reads_and_retains_every_review_page() -> None:
     assert threads[0]["comments"][0]["body"] == "Bearer [redacted]"
     assert len(client.calls) == 5
     assert all("mutation" not in query.lower() for query, _ in client.calls)
+
+
+def test_github_review_provider_publishes_anchored_finding_idempotently() -> None:
+    client = PublishingGraphQLClient()
+    provider = GitHubReviewProvider(token="unit-secret", client=client)
+    fingerprint = "a" * 64
+    marker = finding_publication_marker("owner/repo#7", "head-7", fingerprint)
+
+    published = provider.publish_finding(
+        "owner/repo#7",
+        expected_head_sha="head-7",
+        fingerprint=fingerprint,
+        concern="security",
+        summary="Validate the untrusted path.",
+        file_path="src/app.py",
+        start_line=18,
+        end_line=20,
+        remote_id=None,
+    )
+    retried = provider.publish_finding(
+        "owner/repo#7",
+        expected_head_sha="head-7",
+        fingerprint=fingerprint,
+        concern="security",
+        summary="Validate the untrusted path.",
+        file_path="src/app.py",
+        start_line=18,
+        end_line=20,
+        remote_id=published.remote_id,
+    )
+
+    assert published.state is FindingPublicationState.PUBLISHED
+    assert published.channel is FindingPublicationChannel.REVIEW_THREAD
+    assert published.remote_id == "THREAD-PUBLISHED-1-1"
+    assert published.remote_url.endswith("#discussion-THREAD-PUBLISHED-1-1")
+    assert retried.remote_id == published.remote_id
+    assert len(client.mutations) == 1
+    review_input = client.mutations[0]
+    assert review_input["event"] == "COMMENT"
+    assert review_input["commitOID"] == "head-7"
+    assert review_input["threads"] == [
+        {
+            "body": f"[security] Validate the untrusted path.\n\n{marker}",
+            "path": "src/app.py",
+            "line": 20,
+            "side": "RIGHT",
+            "startLine": 18,
+            "startSide": "RIGHT",
+        }
+    ]
+
+
+def test_github_review_provider_publishes_unanchored_finding_in_review_body() -> None:
+    client = PublishingGraphQLClient()
+    provider = GitHubReviewProvider(token="unit-secret", client=client)
+    fingerprint = "b" * 64
+    marker = finding_publication_marker("owner/repo#7", "head-7", fingerprint)
+
+    published = provider.publish_finding(
+        "owner/repo#7",
+        expected_head_sha="head-7",
+        fingerprint=fingerprint,
+        concern="clean_code",
+        summary="Simplify the conditional. unit-secret",
+        remote_id=None,
+    )
+
+    assert published.state is FindingPublicationState.PUBLISHED
+    assert published.channel is FindingPublicationChannel.REVIEW_BODY
+    assert published.remote_id == "REVIEW-PUBLISHED-1"
+    assert marker in client.mutations[0]["body"]
+    assert "[clean_code] Simplify the conditional." in client.mutations[0]["body"]
+    assert "unit-secret" not in client.mutations[0]["body"]
+    assert "threads" not in client.mutations[0]
+
+
+def test_github_review_provider_does_not_publish_on_a_stale_head() -> None:
+    client = PublishingGraphQLClient(head_sha="head-new")
+    provider = GitHubReviewProvider(token="unit-secret", client=client)
+
+    result = provider.publish_finding(
+        "owner/repo#7",
+        expected_head_sha="head-7",
+        fingerprint="c" * 64,
+        concern="security",
+        summary="Check the current head.",
+        remote_id=None,
+    )
+
+    assert result.state is FindingPublicationState.STALE
+    assert client.mutations == []
+
+
+def test_github_provider_preserves_findings_with_missing_remote_content() -> None:
+    client = PublishingGraphQLClient()
+    provider = GitHubReviewProvider(token="unit-secret", client=client)
+
+    result = provider.publish_finding(
+        "owner/repo#7",
+        expected_head_sha="head-7",
+        fingerprint="d" * 64,
+        concern="security",
+        summary="Do not dismiss removed remote content.",
+        remote_id="DELETED-THREAD",
+        remote_url="https://github.com/owner/repo/pull/7#discussion-deleted",
+        file_path="src/app.py",
+        start_line=22,
+        end_line=22,
+    )
+
+    assert result.state is FindingPublicationState.REMOTE_MISSING
+    assert result.remote_id == "DELETED-THREAD"
+    assert result.remote_url.endswith("#discussion-deleted")
+    assert client.mutations == []
 
 
 @pytest.mark.parametrize(

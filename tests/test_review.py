@@ -10,7 +10,10 @@ from fastapi.testclient import TestClient
 from beehaiive.review import (
     REQUIRED_CONCERNS,
     AllowListReviewAuthorizer,
+    FindingPublicationChannel,
+    FindingPublicationState,
     FindingStatus,
+    PublicationOutcome,
     PullRequestTarget,
     ReaderExecution,
     ReaderStatus,
@@ -95,6 +98,53 @@ class LockInspectingProvider(FixtureProvider):
         return super().get_pull_request(pull_request_id)
 
 
+class PublishingFixtureProvider(FixtureProvider):
+    def __init__(
+        self,
+        store: ReviewStore,
+        targets: dict[str, PullRequestTarget],
+        *,
+        fail_once: bool = False,
+    ) -> None:
+        super().__init__(targets)
+        self.store = store
+        self.fail_once = fail_once
+        self.publication_state = FindingPublicationState.PUBLISHED
+        self.publish_calls = 0
+        self.remote_ids: list[str | None] = []
+        self.in_transaction_during_publish: bool | None = None
+
+    def publish_finding(
+        self,
+        pull_request_id: str,
+        *,
+        expected_head_sha: str,
+        fingerprint: str,
+        concern: ReviewConcern,
+        summary: str,
+        file_path: str | None = None,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        remote_id: str | None = None,
+        remote_url: str | None = None,
+    ) -> PublicationOutcome:
+        del expected_head_sha, fingerprint, concern, summary, file_path
+        del start_line, end_line, remote_url
+        self.publish_calls += 1
+        self.remote_ids.append(remote_id)
+        self.in_transaction_during_publish = self.store._connection.in_transaction
+        if self.fail_once:
+            self.fail_once = False
+            raise RuntimeError("secret provider response")
+        assert pull_request_id in self.targets
+        return PublicationOutcome(
+            self.publication_state,
+            FindingPublicationChannel.REVIEW_BODY,
+            "REMOTE-REVIEW-1",
+            "https://github.com/owner/repo/pull/1#pullrequestreview-1",
+        )
+
+
 def _reader_doubles(
     status: ReaderStatus = ReaderStatus.PASS,
 ) -> dict[ReviewConcern, ReaderDouble]:
@@ -121,6 +171,126 @@ def test_cycle_starts_with_four_pending_readers_and_is_idempotent(
     assert all(reader.status is ReaderStatus.PENDING for reader in started.readers)
     assert repeated.cycle.cycle_id == started.cycle.cycle_id
     assert repeated.merge_allowed is False
+
+
+def test_structured_findings_keep_identity_anchor_staleness_and_resolution_evidence(
+    review_store: ReviewStore,
+) -> None:
+    service = ReviewService(review_store)
+    first_cycle = service.start_cycle("PR-STRUCTURED", "head-1")
+    first_snapshot = service.add_finding(
+        first_cycle.cycle.cycle_id,
+        ReviewConcern.SECURITY,
+        "Validate the supplied path.",
+        file_path="src/app.py",
+        start_line=12,
+        end_line=14,
+    )
+    first = first_snapshot.findings[0]
+    repeated = service.add_finding(
+        first_cycle.cycle.cycle_id,
+        ReviewConcern.SECURITY,
+        "Validate the supplied path.",
+        file_path="src/app.py",
+        start_line=12,
+        end_line=14,
+    )
+    assert len(repeated.findings) == 1
+    assert repeated.findings[0].finding_id == first.finding_id
+
+    next_cycle = service.start_cycle("PR-STRUCTURED", "head-2")
+    second_snapshot = service.add_finding(
+        next_cycle.cycle.cycle_id,
+        ReviewConcern.SECURITY,
+        "Validate the supplied path.",
+        file_path="src/app.py",
+        start_line=12,
+        end_line=14,
+    )
+    old = next(
+        item for item in second_snapshot.findings if item.finding_id == first.finding_id
+    )
+    second = next(
+        item for item in second_snapshot.findings if item.finding_id != first.finding_id
+    )
+    resolved = service.resolve_finding(first.finding_id, "Addressed", actor="operator")
+    dismissed = next(
+        item for item in resolved.findings if item.finding_id == first.finding_id
+    )
+
+    assert old.stale is True
+    assert second.fingerprint == first.fingerprint
+    assert second.head_sha == "head-2"
+    assert second.first_seen_cycle_id == first_cycle.cycle.cycle_id
+    assert second.file_path == "src/app.py"
+    assert (second.start_line, second.end_line) == (12, 14)
+    assert dismissed.resolution_actor == "operator"
+    assert dismissed.resolution_at is not None
+    with pytest.raises(ReviewError, match="Resolved findings cannot be published"):
+        service.publish_finding(first.finding_id)
+
+
+def test_finding_publication_retries_safely_and_deduplicates(
+    review_store: ReviewStore,
+) -> None:
+    target = PullRequestTarget("owner/repo#1", "publish-head")
+    provider = PublishingFixtureProvider(
+        review_store, {target.pull_request_id: target}, fail_once=True
+    )
+    service = ReviewService(review_store, provider=provider)
+    cycle = service.start_cycle(target.pull_request_id, target.head_sha)
+    first_snapshot = service.add_finding(
+        cycle.cycle.cycle_id, ReviewConcern.SECURITY, "Unsafe URL redirect."
+    )
+    first = first_snapshot.findings[0]
+
+    retry = service.publish_finding(first.finding_id)
+    retried_finding = next(
+        item for item in retry.findings if item.finding_id == first.finding_id
+    )
+    assert retried_finding.publication_state is FindingPublicationState.RETRYABLE
+    assert retried_finding.publication_retry_evidence == {"error_type": "RuntimeError"}
+
+    published = service.publish_finding(first.finding_id)
+    duplicate = service.add_finding(
+        cycle.cycle.cycle_id,
+        ReviewConcern.SECURITY,
+        "Same issue reported by another reader.",
+        duplicate_target=first.finding_id,
+    )
+    duplicate_finding = next(
+        item for item in duplicate.findings if item.duplicate_target == first.finding_id
+    )
+    reconciled = service.publish_finding(duplicate_finding.finding_id)
+    service.publish_finding(first.finding_id)
+    canonical = next(
+        item for item in reconciled.findings if item.finding_id == first.finding_id
+    )
+    duplicate_result = next(
+        item
+        for item in reconciled.findings
+        if item.finding_id == duplicate_finding.finding_id
+    )
+
+    assert provider.publish_calls == 3
+    assert provider.remote_ids == [None, None, "REMOTE-REVIEW-1"]
+    assert provider.in_transaction_during_publish is False
+    assert canonical.remote_id == "REMOTE-REVIEW-1"
+    assert duplicate_result.publication_state is FindingPublicationState.DUPLICATE
+    assert duplicate_result.remote_id == canonical.remote_id
+    assert published.merge_allowed is False
+
+    provider.publication_state = FindingPublicationState.REMOTE_MISSING
+    missing = service.publish_finding(first.finding_id)
+    missing_finding = next(
+        item for item in missing.findings if item.finding_id == first.finding_id
+    )
+    assert provider.publish_calls == 4
+    assert provider.remote_ids[-1] == "REMOTE-REVIEW-1"
+    assert missing_finding.status is FindingStatus.OPEN
+    assert missing_finding.resolution is None
+    assert missing_finding.publication_state is FindingPublicationState.REMOTE_MISSING
+    assert missing_finding.remote_id == "REMOTE-REVIEW-1"
 
 
 def test_review_authorization_uses_a_closed_action_policy(
@@ -461,10 +631,32 @@ def test_review_api_runs_reader_cycle_finding_and_handoff_paths(
     assert pending.json()["readers"][1]["status"] == "pending"
     added = writer_client.post(
         f"/reviews/cycles/{cycle_id}/findings",
-        json={"concern": "clean_code", "summary": "Nested responsibility"},
+        json={
+            "concern": "clean_code",
+            "summary": "Nested responsibility",
+            "file_path": "src/review.py",
+            "start_line": 4,
+            "end_line": 6,
+        },
         headers=api_headers,
     )
     assert added.status_code == 200
+    assert added.json()["findings"][-1]["file_path"] == "src/review.py"
+    assert added.json()["findings"][-1]["start_line"] == 4
+    denied_publish = reader_client.post(
+        f"/reviews/findings/{finding_id}/publish", headers=api_headers
+    )
+    assert denied_publish.status_code == 409
+    retryable_publish = writer_client.post(
+        f"/reviews/findings/{finding_id}/publish", headers=api_headers
+    )
+    assert retryable_publish.status_code == 200
+    published_finding = next(
+        item
+        for item in retryable_publish.json()["findings"]
+        if item["finding_id"] == finding_id
+    )
+    assert published_finding["publication"]["state"] == "retryable"
     resolved = writer_client.post(
         f"/reviews/findings/{finding_id}/resolve",
         json={"resolution": "Validated redirect target"},
@@ -798,6 +990,21 @@ def test_review_store_migrates_approval_and_reader_claim_columns(
             status TEXT NOT NULL, resolution TEXT, created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        INSERT INTO review_cycles(
+            cycle_id, pull_request_id, head_sha, cycle_number, status,
+            human_approval, required_action, created_at, updated_at
+        ) VALUES (
+            'legacy-cycle', 'owner/repo#1', 'legacy-head', 1, 'failed',
+            0, NULL, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
+        );
+        INSERT INTO review_findings(
+            finding_id, pull_request_id, cycle_id, concern, summary, status,
+            resolution, created_at, updated_at
+        ) VALUES (
+            'legacy-finding', 'owner/repo#1', 'legacy-cycle', 'security',
+            'Legacy finding', 'open', NULL,
+            '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
+        );
         """
     )
     connection.close()
@@ -814,6 +1021,11 @@ def test_review_store_migrates_approval_and_reader_claim_columns(
         }
         assert {"approval_actor", "approval_reason", "approval_at"} <= cycle_columns
         assert {"claim_token", "claim_expires_at"} <= reader_columns
+        finding = store.finding_for_id("legacy-finding")
+        assert finding.head_sha == "legacy-head"
+        assert finding.fingerprint
+        assert finding.first_seen_cycle_id == "legacy-cycle"
+        assert finding.publication_state is FindingPublicationState.UNPUBLISHED
     finally:
         store.close()
 
