@@ -85,7 +85,10 @@ class RepairScriptExecutor(CodexExecModelExecutor):
         )
         self.script = script
 
-    def _repair_command(self, prompt: str, repository: Path) -> list[str]:
+    def _repair_command(
+        self, prompt: str, repository: Path, model: str | None = None
+    ) -> list[str]:
+        del model
         return [sys.executable, str(self.script), "--cd", str(repository), prompt]
 
 

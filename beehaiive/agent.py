@@ -418,24 +418,57 @@ class CodexExecModelExecutor:
             "resolved files and create one normal merge commit. Return a concise "
             "plain-text result after the commit succeeds."
         )
+        return self.execute_scoped_repair(problem_id, worktree, prompt, self.model)
+
+    def execute_scoped_repair(
+        self,
+        problem_id: str,
+        worktree: Path,
+        prompt: str,
+        model: str | None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> ModelExecution:
+        """Run a bounded repair prompt in the exact leased worktree."""
+
+        if not worktree.is_dir():
+            return ModelExecution(
+                AttemptOutcome.FAILURE,
+                failure_context="Repair worktree does not exist",
+            )
+        prompt = redact_worker_text(prompt, self._secret_values, max_length=None)
+        if len(prompt.encode("utf-8")) > MAX_AGENT_OUTPUT_BYTES:
+            return ModelExecution(
+                AttemptOutcome.FAILURE,
+                failure_context="Repair prompt exceeds the size limit",
+            )
+
+        def cancellation_requested() -> bool:
+            with self._lock:
+                active_cancel = problem_id in self._cancelled
+            return active_cancel or (cancelled is not None and cancelled())
+
         with self._lock:
-            self._active_attempts.add(problem_id)
-            if problem_id in self._cancelled:
+            if problem_id in self._cancelled or (cancelled is not None and cancelled()):
                 self._cancelled.discard(problem_id)
                 self._active_attempts.discard(problem_id)
                 return ModelExecution(
                     AttemptOutcome.FAILURE,
                     failure_context="Agent stopped by operator",
                 )
+            if problem_id in self._active_attempts:
+                return ModelExecution(
+                    AttemptOutcome.FAILURE,
+                    failure_context="Repair attempt is already active",
+                )
+            self._active_attempts.add(problem_id)
         process: subprocess.Popen[str] | None = None
         try:
             process = self._start_process(
-                self._repair_command(prompt, worktree), self._safe_environment()
+                self._repair_command(prompt, worktree, model), self._safe_environment()
             )
             with self._lock:
                 self._processes[problem_id] = process
-                cancelled = problem_id in self._cancelled
-            if cancelled:
+            if cancellation_requested():
                 self._terminate_process(process)
             try:
                 stdout, stderr, timed_out = self._communicate_bounded(
@@ -451,9 +484,7 @@ class CodexExecModelExecutor:
                         f"Repair agent timed out after {self.timeout_seconds:g} seconds"
                     ),
                 )
-            with self._lock:
-                was_cancelled = problem_id in self._cancelled
-            if was_cancelled:
+            if cancellation_requested():
                 return ModelExecution(
                     AttemptOutcome.FAILURE,
                     failure_context="Agent stopped by operator",
@@ -700,8 +731,10 @@ class CodexExecModelExecutor:
             self, prompt, model, repository, workspace_write=True
         )
 
-    def _repair_command(self, prompt: str, repository: Path) -> list[str]:
-        selected_model = self.model
+    def _repair_command(
+        self, prompt: str, repository: Path, model: str | None = None
+    ) -> list[str]:
+        selected_model = self.model if model is None else model
         command = [
             self.executable,
             "--approve-for-me",
