@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from collections.abc import Generator, Iterable, Mapping
@@ -81,6 +82,7 @@ class ReviewAction(StrEnum):
     READ = "read"
     READER = "reader"
     WRITER = "writer"
+    PUBLISH = "publish"
     APPROVE = "approve"
     HANDOFF = "handoff"
 
@@ -124,6 +126,7 @@ class AllowListReviewAuthorizer:
             | self._writer_actors,
             ReviewAction.READER: self._reader_actors,
             ReviewAction.WRITER: self._writer_actors,
+            ReviewAction.PUBLISH: self._writer_actors,
             ReviewAction.APPROVE: self._human_actors,
             ReviewAction.HANDOFF: self._human_actors,
         }
@@ -153,6 +156,22 @@ class FindingStatus(StrEnum):
 
     OPEN = "open"
     RESOLVED = "resolved"
+
+
+class FindingPublicationState(StrEnum):
+    UNPUBLISHED = "unpublished"
+    PUBLISHING = "publishing"
+    PUBLISHED = "published"
+    RETRYABLE = "retryable"
+    STALE = "stale"
+    REMOTE_MISSING = "remote_missing"
+    DUPLICATE = "duplicate"
+    DUPLICATE_REMOTE = "duplicate_remote"
+
+
+class FindingPublicationChannel(StrEnum):
+    REVIEW_BODY = "review_body"
+    REVIEW_THREAD = "review_thread"
 
 
 def _now() -> str:
@@ -186,6 +205,67 @@ def _head_sha(value: str, label: str = "head SHA") -> str:
     return normalized
 
 
+def finding_publication_marker(
+    pull_request_id: str, head_sha: str, fingerprint: str
+) -> str:
+    identity = "\0".join(
+        (
+            _required(pull_request_id, "pull request id"),
+            _head_sha(head_sha),
+            _required(fingerprint, "finding fingerprint", 128),
+        )
+    )
+    marker_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return f"<!-- beehaiive-finding:v1:{marker_id} -->"
+
+
+def _finding_anchor(
+    file_path: str | None, start_line: int | None, end_line: int | None
+) -> tuple[str | None, int | None, int | None]:
+    if file_path is None:
+        if start_line is not None or end_line is not None:
+            raise ReviewError("Finding anchor requires a file path and line range")
+        return None, None, None
+    path = file_path.strip()
+    if (
+        not path
+        or len(path) > 500
+        or path.startswith("/")
+        or "\\" in path
+        or any(ord(character) < 32 for character in path)
+        or any(part in {"", ".", ".."} for part in path.split("/"))
+        or type(start_line) is not int
+        or type(end_line) is not int
+        or start_line < 1
+        or end_line < start_line
+        or end_line > 2_147_483_647
+    ):
+        raise ReviewError("Finding anchor is invalid")
+    return path, start_line, end_line
+
+
+def _finding_fingerprint(
+    concern: ReviewConcern,
+    summary: str,
+    file_path: str | None,
+    start_line: int | None,
+    end_line: int | None,
+) -> str:
+    identity = json.dumps(
+        {
+            "concern": concern.value,
+            "summary": summary,
+            "file_path": file_path,
+            "start_line": start_line,
+            "end_line": end_line,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
 def _enum[T: StrEnum](value: T | str, enum_type: type[T], label: str) -> T:
     try:
         return enum_type(value)
@@ -214,6 +294,29 @@ def _json_object(value: str) -> dict[str, object]:
     if not isinstance(decoded, dict):
         raise ReviewError("Stored GitHub review evidence is invalid")
     return cast(dict[str, object], decoded)
+
+
+def _safe_publication_evidence(
+    evidence: Mapping[str, object] | None,
+) -> dict[str, object] | None:
+    if evidence is None:
+        return None
+    safe: dict[str, object] = {}
+    for key in ("reason", "error_type"):
+        value: object = evidence.get(key)
+        if isinstance(value, str):
+            safe[key] = value[:120]
+    remote_ids: object = evidence.get("remote_ids")
+    if isinstance(remote_ids, list):
+        safe["remote_ids"] = [
+            value[:200]
+            for value in cast(list[object], remote_ids[:5])
+            if isinstance(value, str)
+        ]
+    retry_after: object = evidence.get("retry_after")
+    if type(retry_after) is int and 0 <= retry_after <= 86_400:
+        safe["retry_after"] = retry_after
+    return safe or None
 
 
 def github_pull_request_evidence_ref(evidence_json: str | None) -> str | None:
@@ -338,6 +441,22 @@ class ReviewFinding:
     created_at: str
     updated_at: str
     evidence_refs: tuple[str, ...] = ()
+    head_sha: str = ""
+    fingerprint: str = ""
+    file_path: str | None = None
+    start_line: int | None = None
+    end_line: int | None = None
+    duplicate_target: str | None = None
+    first_seen_cycle_id: str = ""
+    stale: bool = False
+    resolution_actor: str | None = None
+    resolution_at: str | None = None
+    publication_state: FindingPublicationState = FindingPublicationState.UNPUBLISHED
+    publication_channel: FindingPublicationChannel | None = None
+    remote_id: str | None = None
+    remote_url: str | None = None
+    publication_attempts: int = 0
+    publication_retry_evidence: dict[str, object] | None = None
 
     def as_dict(self) -> dict[str, object]:
         result: dict[str, object] = {
@@ -350,6 +469,28 @@ class ReviewFinding:
             "resolution": self.resolution,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "head_sha": self.head_sha,
+            "fingerprint": self.fingerprint,
+            "file_path": self.file_path,
+            "start_line": self.start_line,
+            "end_line": self.end_line,
+            "duplicate_target": self.duplicate_target,
+            "first_seen_cycle_id": self.first_seen_cycle_id,
+            "stale": self.stale,
+            "resolution_actor": self.resolution_actor,
+            "resolution_at": self.resolution_at,
+            "publication": {
+                "state": self.publication_state.value,
+                "channel": (
+                    None
+                    if self.publication_channel is None
+                    else self.publication_channel.value
+                ),
+                "remote_id": self.remote_id,
+                "remote_url": self.remote_url,
+                "attempts": self.publication_attempts,
+                "retry_evidence": self.publication_retry_evidence,
+            },
         }
         if self.evidence_refs:
             result["evidence_refs"] = list(self.evidence_refs)
@@ -399,6 +540,32 @@ class MergeHandoff:
             "approval_at": self.approval_at,
             "status": "merge_handoff",
         }
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationOutcome:
+    state: FindingPublicationState
+    channel: FindingPublicationChannel | None = None
+    remote_id: str | None = None
+    remote_url: str | None = None
+    retry_evidence: dict[str, object] | None = None
+
+
+class FindingPublisher(Protocol):
+    def publish_finding(
+        self,
+        pull_request_id: str,
+        *,
+        expected_head_sha: str,
+        fingerprint: str,
+        concern: ReviewConcern,
+        summary: str,
+        file_path: str | None = None,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        remote_id: str | None = None,
+        remote_url: str | None = None,
+    ) -> PublicationOutcome: ...
 
 
 class ReviewStore:
@@ -475,6 +642,24 @@ class ReviewStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+                    head_sha TEXT,
+                    fingerprint TEXT,
+                    file_path TEXT,
+                    start_line INTEGER,
+                    end_line INTEGER,
+                    duplicate_target TEXT,
+                    first_seen_cycle_id TEXT,
+                    stale INTEGER NOT NULL DEFAULT 0,
+                    resolution_actor TEXT,
+                    resolution_at TEXT,
+                    publication_state TEXT NOT NULL DEFAULT 'unpublished',
+                    publication_channel TEXT,
+                    remote_id TEXT,
+                    remote_url TEXT,
+                    publication_attempts INTEGER NOT NULL DEFAULT 0,
+                    publication_retry_evidence_json TEXT,
+                    publication_claim_token TEXT,
+                    publication_claim_expires_at TEXT,
                     FOREIGN KEY(cycle_id) REFERENCES review_cycles(cycle_id)
                 );
                 CREATE INDEX IF NOT EXISTS review_cycles_by_pull_request
@@ -526,6 +711,74 @@ class ReviewStore:
                     "ALTER TABLE review_findings ADD COLUMN "
                     "evidence_refs_json TEXT NOT NULL DEFAULT '[]'"
                 )
+            new_finding_columns = (
+                ("head_sha", "TEXT"),
+                ("fingerprint", "TEXT"),
+                ("file_path", "TEXT"),
+                ("start_line", "INTEGER"),
+                ("end_line", "INTEGER"),
+                ("duplicate_target", "TEXT"),
+                ("first_seen_cycle_id", "TEXT"),
+                ("stale", "INTEGER NOT NULL DEFAULT 0"),
+                ("resolution_actor", "TEXT"),
+                ("resolution_at", "TEXT"),
+                (
+                    "publication_state",
+                    "TEXT NOT NULL DEFAULT 'unpublished'",
+                ),
+                ("publication_channel", "TEXT"),
+                ("remote_id", "TEXT"),
+                ("remote_url", "TEXT"),
+                ("publication_attempts", "INTEGER NOT NULL DEFAULT 0"),
+                ("publication_retry_evidence_json", "TEXT"),
+                ("publication_claim_token", "TEXT"),
+                ("publication_claim_expires_at", "TEXT"),
+            )
+            for column, definition in new_finding_columns:
+                if column not in finding_columns:
+                    self._connection.execute(
+                        f"ALTER TABLE review_findings ADD COLUMN {column} {definition}"
+                    )
+            rows = self._connection.execute(
+                """
+                SELECT finding.finding_id, finding.cycle_id, finding.concern,
+                       finding.summary, finding.file_path, finding.start_line,
+                       finding.end_line, finding.head_sha, finding.fingerprint,
+                       finding.first_seen_cycle_id, cycle.head_sha AS cycle_head_sha
+                FROM review_findings AS finding
+                JOIN review_cycles AS cycle ON cycle.cycle_id = finding.cycle_id
+                WHERE finding.head_sha IS NULL OR finding.fingerprint IS NULL
+                   OR finding.first_seen_cycle_id IS NULL
+                """
+            ).fetchall()
+            for row in rows:
+                concern = ReviewConcern(str(row["concern"]))
+                fingerprint = row["fingerprint"] or _finding_fingerprint(
+                    concern,
+                    str(row["summary"]),
+                    row["file_path"],
+                    row["start_line"],
+                    row["end_line"],
+                )
+                self._connection.execute(
+                    """
+                    UPDATE review_findings
+                    SET head_sha = COALESCE(head_sha, ?),
+                        fingerprint = COALESCE(fingerprint, ?),
+                        first_seen_cycle_id = COALESCE(first_seen_cycle_id, ?)
+                    WHERE finding_id = ?
+                    """,
+                    (
+                        row["cycle_head_sha"],
+                        fingerprint,
+                        row["cycle_id"],
+                        row["finding_id"],
+                    ),
+                )
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS review_findings_by_identity "
+                "ON review_findings(pull_request_id, head_sha, fingerprint)"
+            )
 
     def _cycle_from_row(self, row: sqlite3.Row) -> ReviewCycle:
         return ReviewCycle(
@@ -556,6 +809,7 @@ class ReviewStore:
         )
 
     def _finding_from_row(self, row: sqlite3.Row) -> ReviewFinding:
+        retry_evidence = row["publication_retry_evidence_json"]
         return ReviewFinding(
             finding_id=str(row["finding_id"]),
             pull_request_id=str(row["pull_request_id"]),
@@ -567,6 +821,28 @@ class ReviewStore:
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
             evidence_refs=_json_list(str(row["evidence_refs_json"])),
+            head_sha=str(row["head_sha"] or ""),
+            fingerprint=str(row["fingerprint"] or ""),
+            file_path=row["file_path"],
+            start_line=row["start_line"],
+            end_line=row["end_line"],
+            duplicate_target=row["duplicate_target"],
+            first_seen_cycle_id=str(row["first_seen_cycle_id"] or ""),
+            stale=bool(row["stale"]),
+            resolution_actor=row["resolution_actor"],
+            resolution_at=row["resolution_at"],
+            publication_state=FindingPublicationState(str(row["publication_state"])),
+            publication_channel=(
+                None
+                if row["publication_channel"] is None
+                else FindingPublicationChannel(str(row["publication_channel"]))
+            ),
+            remote_id=row["remote_id"],
+            remote_url=row["remote_url"],
+            publication_attempts=int(row["publication_attempts"]),
+            publication_retry_evidence=(
+                None if retry_evidence is None else _json_object(str(retry_evidence))
+            ),
         )
 
     def cycle_row(
@@ -707,6 +983,130 @@ class ReviewStore:
         if row is None:
             raise ReviewError(f"Unknown review finding: {finding_id}")
         return str(row["pull_request_id"])
+
+    def finding_for_id(self, finding_id: str) -> ReviewFinding:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM review_findings WHERE finding_id = ?", (finding_id,)
+            ).fetchone()
+        if row is None:
+            raise ReviewError(f"Unknown review finding: {finding_id}")
+        return self._finding_from_row(row)
+
+    def claim_finding_publication(
+        self, finding_id: str
+    ) -> tuple[str, ReviewFinding] | None:
+        token = str(uuid4())
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM review_findings WHERE finding_id = ?", (finding_id,)
+            ).fetchone()
+            if row is None:
+                raise ReviewError(f"Unknown review finding: {finding_id}")
+            if FindingStatus(str(row["status"])) is FindingStatus.RESOLVED:
+                raise ReviewError("Resolved findings cannot be published")
+            current = self.current_cycle_row(connection, str(row["pull_request_id"]))
+            if (
+                bool(row["stale"])
+                or current is None
+                or str(current["head_sha"]) != str(row["head_sha"])
+            ):
+                connection.execute(
+                    """
+                    UPDATE review_findings
+                    SET stale = 1, publication_state = ?,
+                        publication_claim_token = NULL,
+                        publication_claim_expires_at = NULL, updated_at = ?
+                    WHERE finding_id = ?
+                    """,
+                    (FindingPublicationState.STALE.value, _now(), finding_id),
+                )
+                return None
+            state = FindingPublicationState(str(row["publication_state"]))
+            if state in {
+                FindingPublicationState.STALE,
+                FindingPublicationState.DUPLICATE,
+                FindingPublicationState.DUPLICATE_REMOTE,
+            } or _claim_is_active(row["publication_claim_expires_at"]):
+                return None
+            expires_at = (datetime.now(UTC) + timedelta(minutes=5)).isoformat()
+            connection.execute(
+                """
+                UPDATE review_findings
+                SET publication_state = ?,
+                    publication_attempts = publication_attempts + 1,
+                    publication_claim_token = ?, publication_claim_expires_at = ?,
+                    updated_at = ?
+                WHERE finding_id = ?
+                """,
+                (
+                    FindingPublicationState.PUBLISHING.value,
+                    token,
+                    expires_at,
+                    _now(),
+                    finding_id,
+                ),
+            )
+            updated = connection.execute(
+                "SELECT * FROM review_findings WHERE finding_id = ?", (finding_id,)
+            ).fetchone()
+            assert updated is not None
+            return token, self._finding_from_row(updated)
+
+    def finish_finding_publication(
+        self,
+        finding_id: str,
+        claim_token: str,
+        outcome: PublicationOutcome,
+    ) -> bool:
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM review_findings WHERE finding_id = ?", (finding_id,)
+            ).fetchone()
+            if row is None:
+                raise ReviewError(f"Unknown review finding: {finding_id}")
+            if row["publication_claim_token"] != claim_token:
+                return False
+            current = self.current_cycle_row(connection, str(row["pull_request_id"]))
+            stale = (
+                outcome.state is FindingPublicationState.STALE
+                or current is None
+                or str(current["head_sha"]) != str(row["head_sha"])
+            )
+            state = FindingPublicationState.STALE if stale else outcome.state
+            retry_evidence = _safe_publication_evidence(outcome.retry_evidence)
+            if stale and outcome.state is not FindingPublicationState.STALE:
+                retry_evidence = {"reason": "finding_head_changed_during_publish"}
+            connection.execute(
+                """
+                UPDATE review_findings
+                SET publication_state = ?, publication_channel = ?, remote_id = ?,
+                    remote_url = ?, publication_retry_evidence_json = ?, stale = ?,
+                    publication_claim_token = NULL,
+                    publication_claim_expires_at = NULL, updated_at = ?
+                WHERE finding_id = ? AND publication_claim_token = ?
+                """,
+                (
+                    state.value,
+                    (
+                        row["publication_channel"]
+                        if outcome.channel is None
+                        else outcome.channel.value
+                    ),
+                    outcome.remote_id or row["remote_id"],
+                    outcome.remote_url or row["remote_url"],
+                    (
+                        None
+                        if retry_evidence is None
+                        else json.dumps(retry_evidence, separators=(",", ":"))
+                    ),
+                    int(stale),
+                    _now(),
+                    finding_id,
+                    claim_token,
+                ),
+            )
+            return True
 
 
 class ReviewService:
@@ -886,6 +1286,14 @@ class ReviewService:
             timestamp = _now()
             connection.execute(
                 """
+                UPDATE review_findings
+                SET stale = 1, updated_at = ?
+                WHERE pull_request_id = ? AND head_sha != ? AND stale = 0
+                """,
+                (timestamp, pull_request_id, head_sha),
+            )
+            connection.execute(
+                """
                 INSERT INTO review_cycles(
                     cycle_id, pull_request_id, head_sha, cycle_number, status,
                     human_approval, required_action, github_evidence_json,
@@ -919,6 +1327,114 @@ class ReviewService:
         return self.store.current_snapshot(
             _required(pull_request_id, "pull request id")
         )
+
+    def _insert_finding(
+        self,
+        connection: sqlite3.Connection,
+        cycle: sqlite3.Row,
+        concern: ReviewConcern,
+        summary: str,
+        evidence_refs: tuple[str, ...],
+        *,
+        file_path: str | None = None,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        duplicate_target: str | None = None,
+    ) -> str:
+        file_path, start_line, end_line = _finding_anchor(
+            file_path, start_line, end_line
+        )
+        pull_request_id = str(cycle["pull_request_id"])
+        if duplicate_target is not None:
+            duplicate_target = _required(duplicate_target, "duplicate target", 200)
+            target = connection.execute(
+                """
+                SELECT pull_request_id, duplicate_target
+                FROM review_findings WHERE finding_id = ?
+                """,
+                (duplicate_target,),
+            ).fetchone()
+            if target is None or str(target["pull_request_id"]) != pull_request_id:
+                raise ReviewError(
+                    "Duplicate target must belong to the same pull request"
+                )
+            duplicate_target = target["duplicate_target"] or duplicate_target
+        fingerprint = _finding_fingerprint(
+            concern, summary, file_path, start_line, end_line
+        )
+        if duplicate_target is None:
+            existing = connection.execute(
+                """
+                SELECT finding_id, evidence_refs_json FROM review_findings
+                WHERE pull_request_id = ? AND head_sha = ? AND fingerprint = ?
+                  AND status = ? AND duplicate_target IS NULL
+                ORDER BY created_at, finding_id LIMIT 1
+                """,
+                (
+                    pull_request_id,
+                    str(cycle["head_sha"]),
+                    fingerprint,
+                    FindingStatus.OPEN.value,
+                ),
+            ).fetchone()
+            if existing is not None:
+                finding_id = str(existing["finding_id"])
+                refs = _evidence_refs(
+                    (*_json_list(str(existing["evidence_refs_json"])), *evidence_refs)
+                )
+                connection.execute(
+                    """
+                    UPDATE review_findings
+                    SET evidence_refs_json = ?, updated_at = ?
+                    WHERE finding_id = ?
+                    """,
+                    (json.dumps(refs), _now(), finding_id),
+                )
+                return finding_id
+        first_seen = connection.execute(
+            """
+            SELECT first_seen_cycle_id FROM review_findings
+            WHERE pull_request_id = ? AND fingerprint = ?
+            ORDER BY created_at, finding_id LIMIT 1
+            """,
+            (pull_request_id, fingerprint),
+        ).fetchone()
+        first_seen_cycle_id = (
+            str(first_seen["first_seen_cycle_id"])
+            if first_seen is not None and first_seen["first_seen_cycle_id"]
+            else str(cycle["cycle_id"])
+        )
+        finding_id = str(uuid4())
+        timestamp = _now()
+        connection.execute(
+            """
+            INSERT INTO review_findings(
+                finding_id, pull_request_id, cycle_id, concern, summary,
+                status, resolution, created_at, updated_at, evidence_refs_json,
+                head_sha, fingerprint, file_path, start_line, end_line,
+                duplicate_target, first_seen_cycle_id
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                finding_id,
+                pull_request_id,
+                str(cycle["cycle_id"]),
+                concern.value,
+                summary,
+                FindingStatus.OPEN.value,
+                timestamp,
+                timestamp,
+                json.dumps(evidence_refs),
+                str(cycle["head_sha"]),
+                fingerprint,
+                file_path,
+                start_line,
+                end_line,
+                duplicate_target,
+                first_seen_cycle_id,
+            ),
+        )
+        return finding_id
 
     def record_reader(
         self,
@@ -979,27 +1495,11 @@ class ReviewService:
             finding_ids: list[str] = []
             timestamp = _now()
             for summary in summaries:
-                finding_id = str(uuid4())
-                finding_ids.append(finding_id)
-                connection.execute(
-                    """
-                    INSERT INTO review_findings(
-                        finding_id, pull_request_id, cycle_id, concern, summary,
-                        status, resolution, created_at, updated_at, evidence_refs_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
-                    """,
-                    (
-                        finding_id,
-                        str(cycle["pull_request_id"]),
-                        cycle_id,
-                        concern.value,
-                        summary,
-                        FindingStatus.OPEN.value,
-                        timestamp,
-                        timestamp,
-                        json.dumps(refs),
-                    ),
+                finding_id = self._insert_finding(
+                    connection, cycle, concern, summary, refs
                 )
+                if finding_id not in finding_ids:
+                    finding_ids.append(finding_id)
             connection.execute(
                 """
                 UPDATE review_readers
@@ -1027,6 +1527,11 @@ class ReviewService:
         concern: ReviewConcern | str,
         summary: str,
         evidence_refs: Iterable[str] = (),
+        *,
+        file_path: str | None = None,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        duplicate_target: str | None = None,
     ) -> ReviewSnapshot:
         concern = _enum(concern, ReviewConcern, "review concern")
         summary = _required(summary, "finding summary", 1_000)
@@ -1059,29 +1564,21 @@ class ReviewService:
             ).fetchone()
             if reader is None:
                 raise ReviewError(f"No reader is configured for {concern.value}")
-            finding_id = str(uuid4())
-            timestamp = _now()
-            connection.execute(
-                """
-                INSERT INTO review_findings(
-                    finding_id, pull_request_id, cycle_id, concern, summary,
-                    status, resolution, created_at, updated_at, evidence_refs_json
-                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
-                """,
-                (
-                    finding_id,
-                    str(cycle["pull_request_id"]),
-                    cycle_id,
-                    concern.value,
-                    summary,
-                    FindingStatus.OPEN.value,
-                    timestamp,
-                    timestamp,
-                    json.dumps(refs),
-                ),
+            finding_id = self._insert_finding(
+                connection,
+                cycle,
+                concern,
+                summary,
+                refs,
+                file_path=file_path,
+                start_line=start_line,
+                end_line=end_line,
+                duplicate_target=duplicate_target,
             )
+            timestamp = _now()
             finding_ids = list(_json_list(str(reader["finding_ids_json"])))
-            finding_ids.append(finding_id)
+            if finding_id not in finding_ids:
+                finding_ids.append(finding_id)
             reader_refs = _evidence_refs(
                 (*_json_list(str(reader["evidence_refs_json"])), *refs)
             )
@@ -1104,25 +1601,33 @@ class ReviewService:
             self._set_failed(connection, cycle_id)
         return self.store.snapshot(cycle_id)
 
-    def resolve_finding(self, finding_id: str, resolution: str) -> ReviewSnapshot:
+    def resolve_finding(
+        self, finding_id: str, resolution: str, *, actor: str | None = None
+    ) -> ReviewSnapshot:
         finding_id = _required(finding_id, "finding id")
         resolution = _required(resolution, "resolution", 1_000)
+        if actor is not None:
+            actor = _required(actor, "resolution actor", 100)
         with self.store.transaction() as connection:
             finding = connection.execute(
                 "SELECT * FROM review_findings WHERE finding_id = ?", (finding_id,)
             ).fetchone()
             if finding is None:
                 raise ReviewError(f"Unknown review finding: {finding_id}")
+            timestamp = _now()
             connection.execute(
                 """
                 UPDATE review_findings
-                SET status = ?, resolution = ?, updated_at = ?
+                SET status = ?, resolution = ?, resolution_actor = ?,
+                    resolution_at = ?, updated_at = ?
                 WHERE finding_id = ?
                 """,
                 (
                     FindingStatus.RESOLVED.value,
                     resolution,
-                    _now(),
+                    actor,
+                    timestamp,
+                    timestamp,
                     finding_id,
                 ),
             )
@@ -1133,6 +1638,67 @@ class ReviewService:
                 raise ReviewError("No current review cycle exists for finding")
             cycle_id = str(current["cycle_id"])
         return self.store.snapshot(cycle_id)
+
+    def publish_finding(self, finding_id: str) -> ReviewSnapshot:
+        finding_id = _required(finding_id, "finding id")
+        initial = self.store.finding_for_id(finding_id)
+        if initial.status is FindingStatus.RESOLVED:
+            raise ReviewError("Resolved findings cannot be published")
+        claim = self.store.claim_finding_publication(finding_id)
+        if claim is None:
+            return self.store.current_snapshot(initial.pull_request_id)
+        claim_token, finding = claim
+        if finding.duplicate_target is not None:
+            duplicate = self.store.finding_for_id(finding.duplicate_target)
+            if (
+                duplicate.pull_request_id == finding.pull_request_id
+                and duplicate.publication_state
+                in {
+                    FindingPublicationState.PUBLISHED,
+                    FindingPublicationState.DUPLICATE,
+                }
+                and duplicate.remote_id is not None
+            ):
+                outcome = PublicationOutcome(
+                    FindingPublicationState.DUPLICATE,
+                    duplicate.publication_channel,
+                    duplicate.remote_id,
+                    duplicate.remote_url,
+                )
+            else:
+                outcome = PublicationOutcome(
+                    FindingPublicationState.RETRYABLE,
+                    retry_evidence={"reason": "duplicate_target_not_published"},
+                )
+        elif self.provider is None or not hasattr(self.provider, "publish_finding"):
+            outcome = PublicationOutcome(
+                FindingPublicationState.RETRYABLE,
+                retry_evidence={"error_type": "FindingPublisherUnavailable"},
+            )
+        else:
+            try:
+                outcome = cast(FindingPublisher, self.provider).publish_finding(
+                    finding.pull_request_id,
+                    expected_head_sha=finding.head_sha,
+                    fingerprint=finding.fingerprint,
+                    concern=finding.concern,
+                    summary=finding.summary,
+                    file_path=finding.file_path,
+                    start_line=finding.start_line,
+                    end_line=finding.end_line,
+                    remote_id=finding.remote_id,
+                    remote_url=finding.remote_url,
+                )
+            except Exception as exc:
+                outcome = PublicationOutcome(
+                    FindingPublicationState.RETRYABLE,
+                    finding.publication_channel,
+                    finding.remote_id,
+                    finding.remote_url,
+                    {"error_type": type(exc).__name__},
+                )
+        self.store.finish_finding_publication(finding_id, claim_token, outcome)
+        return self.store.current_snapshot(finding.pull_request_id)
 
     def approve_for_merge(
         self, cycle_id: str, reason: str, actor: str = "operator"
