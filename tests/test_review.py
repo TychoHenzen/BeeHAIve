@@ -694,9 +694,8 @@ def test_review_api_runs_reader_cycle_finding_and_handoff_paths(
     assert approved.json()["cycle"]["approval_reason"] == (
         "Human accepted the remaining findings"
     )
-    assert handoff.status_code == 200
-    assert handoff.json()["approved_by_human"] is True
-    assert handoff.json()["approval_actor"] == "operator"
+    assert handoff.status_code == 409
+    assert "owner/repository#number" in handoff.json()["detail"]
 
 
 def test_ready_review_runs_all_injected_readers_and_requires_all_readers(
