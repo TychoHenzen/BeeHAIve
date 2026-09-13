@@ -344,7 +344,7 @@ class UrllibGraphQLClient:
             status = exc.code
             response_headers = exc
             raw_payload = exc.read()
-            if status >= 500:
+            if status == 408 or status >= 500:
                 raise GitHubOutcomeUnknownError(
                     f"GitHub REST request failed with HTTP {status}",
                     status_code=status,
