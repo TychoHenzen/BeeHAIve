@@ -25,6 +25,7 @@ from beehaiive.models import (
 )
 from beehaiive.orchestrator import Orchestrator
 from beehaiive.provider import (
+    GitHubOutcomeUnknownError,
     GitHubProjectProvider,
     GitHubRateLimitError,
     ProviderError,
@@ -136,8 +137,12 @@ def test_urllib_graphql_client_validates_transport_and_payloads(
             raise error
 
         monkeypatch.setattr(provider_module, "urlopen", raise_error)
-        with pytest.raises(ProviderError, match="request failed"):
+        with pytest.raises(ProviderError, match="request failed") as request_error:
             client.execute("query", {})
+        if isinstance(error, HTTPError):
+            assert not isinstance(request_error.value, GitHubOutcomeUnknownError)
+        else:
+            assert isinstance(request_error.value, GitHubOutcomeUnknownError)
 
     for payload, message in (
         ([], "non-object"),
@@ -158,16 +163,18 @@ def test_urllib_graphql_client_validates_transport_and_payloads(
         "urlopen",
         lambda request, timeout: FakeResponse(b"not-json"),
     )
-    with pytest.raises(ProviderError, match="invalid JSON"):
+    with pytest.raises(ProviderError, match="invalid JSON") as json_error:
         client.execute("query", {})
+    assert isinstance(json_error.value, GitHubOutcomeUnknownError)
 
     monkeypatch.setattr(
         provider_module,
         "urlopen",
         lambda request, timeout: FakeResponse(b"\xff"),
     )
-    with pytest.raises(ProviderError, match="invalid JSON"):
+    with pytest.raises(ProviderError, match="invalid JSON") as unicode_error:
         client.execute("query", {})
+    assert isinstance(unicode_error.value, GitHubOutcomeUnknownError)
 
 
 def test_urllib_graphql_client_honors_primary_and_secondary_rate_limits(
