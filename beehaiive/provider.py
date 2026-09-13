@@ -788,6 +788,12 @@ def _mapping(value: object) -> Mapping[str, Any]:
     return cast(Mapping[str, Any], value)
 
 
+def require_graphql_mapping(value: object) -> Mapping[str, Any]:
+    """Validate and narrow an object returned by the GitHub GraphQL API."""
+
+    return _mapping(value)
+
+
 def _nodes(value: object) -> list[Mapping[str, Any]]:
     container = _mapping(value)
     raw_nodes: object = container.get("nodes", [])
@@ -830,22 +836,66 @@ def _complete_connection(
     query: str,
     variables: Mapping[str, object],
     response_path: tuple[str, ...],
+    *,
+    strict: bool = False,
 ) -> dict[str, Any]:
-    connection = _mapping(initial)
+    def validated_connection(value: object) -> Mapping[str, Any]:
+        connection = _mapping(value)
+        if strict:
+            nodes_value = connection.get("nodes")
+            if not isinstance(nodes_value, list):
+                raise ProviderError("GitHub review connection returned invalid nodes")
+            nodes = cast(list[object], nodes_value)
+            if not all(isinstance(node, Mapping) for node in nodes):
+                raise ProviderError("GitHub review connection returned invalid nodes")
+            page_info_value = connection.get("pageInfo")
+            if not isinstance(page_info_value, Mapping):
+                raise ProviderError("GitHub review connection omitted pagination state")
+            page_info = cast(Mapping[str, Any], page_info_value)
+            if not isinstance(page_info.get("hasNextPage"), bool):
+                raise ProviderError("GitHub review connection omitted pagination state")
+            has_next, cursor = _next_cursor(connection)
+            if has_next and not cursor:
+                raise ProviderError("GitHub review connection returned an empty cursor")
+        return connection
+
+    connection = validated_connection(initial)
     nodes = list(_nodes(connection))
     has_next, cursor = _next_cursor(connection)
+    seen_cursors: set[str] = set()
     while has_next:
+        if strict:
+            assert cursor is not None
+            if cursor in seen_cursors:
+                raise ProviderError("GitHub review pagination repeated a cursor")
+            seen_cursors.add(cursor)
         page_data = client.execute(
             query,
             {**variables, "cursor": cursor},
         )
-        page = _connection_at(page_data, response_path)
+        page = validated_connection(_connection_at(page_data, response_path))
         nodes.extend(_nodes(page))
         has_next, cursor = _next_cursor(page)
     completed = dict(connection)
     completed["nodes"] = nodes
     completed["pageInfo"] = {"hasNextPage": False, "endCursor": None}
     return completed
+
+
+def complete_graphql_connection(
+    client: GraphQLClient,
+    initial: object,
+    query: str,
+    variables: Mapping[str, object],
+    response_path: tuple[str, ...],
+    *,
+    strict: bool = False,
+) -> dict[str, Any]:
+    """Complete a GraphQL connection, optionally rejecting incomplete pages."""
+
+    return _complete_connection(
+        client, initial, query, variables, response_path, strict=strict
+    )
 
 
 def _stage_from_status(status: str | None) -> Stage | None:

@@ -11,7 +11,7 @@ The dashboard worker can write only inside its leased worktree. Its plain-text
 result is shown on the completed PBI card.
 
 This delivery does not claim autonomous swarms, multi-device coordination,
-production pull-request review adapters, or automatic pull-request creation.
+automated production review verdicts, or automatic pull-request creation.
 
 ## Clean Windows setup
 
@@ -40,6 +40,8 @@ GITHUB_PROJECT_OWNER_TYPE=user
 BEEHAIIVE_ALLOWED_PROJECTS=<owner>:<number>
 BEEHAIIVE_API_KEY=<operator-key>
 BEEHAIIVE_REVIEW_MODE=demo
+# Set this to operator or writer when BEEHAIIVE_REVIEW_MODE=production.
+BEEHAIIVE_REVIEW_ACTOR=operator
 # BEEHAIIVE_AGENT_REPOSITORY=<path-to-BeeHAIve>
 BEEHAIIVE_AGENT_REPOSITORY_NAME=<owner>/<repository>
 # BEEHAIIVE_AGENT_TIMEOUT_SECONDS=120
@@ -57,6 +59,12 @@ seconds. Project discovery is cached for 10 minutes by default, so the
 dashboard's five-second polling does not repeat the full GraphQL discovery.
 Set `BEEHAIIVE_GITHUB_DISCOVERY_CACHE_SECONDS` to a finite non-negative number
 to change that interval. Do not commit `.env` or place its values in screenshots.
+Production review reads use `GITHUB_TOKEN` or `GH_TOKEN` with repository
+Pull requests read access. Set `BEEHAIIVE_REVIEW_MODE=production` and
+`BEEHAIIVE_REVIEW_ACTOR` to `operator` or `writer` to enable review requests.
+The current concern adapters retain the GitHub evidence and leave verdicts
+pending until concern-specific analysis is configured. They do not write GitHub
+reviews or comments.
 The continuous scheduler is off by default. Enable it with
 `BEEHAIIVE_SCHEDULER_ENABLED=true`; it polls only `BEEHAIIVE_ALLOWED_PROJECTS`,
 uses the configured dashboard worker, and shares its process-wide worker limit

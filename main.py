@@ -35,6 +35,7 @@ from beehaiive.review import (
     ReviewService,
     ReviewStore,
 )
+from beehaiive.review_github import GitHubReviewProvider, github_review_readers
 from beehaiive.routing import (
     ModelExecutor,
     ModelRouter,
@@ -145,12 +146,14 @@ class ReviewReaderRequest(BaseModel):
     concern: ReviewConcern
     status: ReaderStatus
     findings: list[str] = Field(default_factory=list, max_length=20)
+    evidence_refs: list[str] = Field(default_factory=list, max_length=100)
     reader: str = Field(default="automated", min_length=1, max_length=100)
 
 
 class ReviewFindingRequest(BaseModel):
     concern: ReviewConcern
     summary: str = Field(min_length=1, max_length=1_000)
+    evidence_refs: list[str] = Field(default_factory=list, max_length=100)
 
 
 class ReviewResolutionRequest(BaseModel):
@@ -356,6 +359,15 @@ def create_app(
     review_operations_enabled = (
         os.environ.get("BEEHAIIVE_REVIEW_MODE", "").strip().lower() != "demo"
     )
+    if (
+        review_service is None
+        and require_review_adapters
+        and review_operations_enabled
+        and review_provider is None
+        and review_readers is None
+    ):
+        review_provider = GitHubReviewProvider()
+        review_readers = github_review_readers()
     if review_service is None:
         review_database = os.environ.get("BEEHAIIVE_REVIEW_DB", ".beehaiive/reviews.db")
         review_service = ReviewService(
@@ -403,6 +415,11 @@ def create_app(
                 raise RuntimeError(
                     f"Production review adapters are not configured: {configured}"
                 )
+            validate_configuration = getattr(
+                review_service.provider, "validate_configuration", None
+            )
+            if callable(validate_configuration):
+                validate_configuration()
 
     if agent_worker is not None:
 
@@ -578,7 +595,7 @@ def create_app(
 
         return _handle_review_error(operation)
 
-    @app.get("/reviews/pull-requests/{pull_request_id}")
+    @app.get("/reviews/pull-requests/{pull_request_id:path}")
     def review_state(  # pyright: ignore[reportUnusedFunction]
         pull_request_id: str,
         actor: str = Depends(require_review_access),
@@ -604,6 +621,7 @@ def create_app(
                 request.status,
                 request.findings,
                 request.reader,
+                evidence_refs=request.evidence_refs,
             ).as_dict()
 
         return _handle_review_error(operation)
@@ -618,7 +636,10 @@ def create_app(
             pull_request_id = review_service.pull_request_id_for_cycle(cycle_id)
             review_service.authorize(pull_request_id, actor, ReviewAction.WRITER)
             return review_service.add_finding(
-                cycle_id, request.concern, request.summary
+                cycle_id,
+                request.concern,
+                request.summary,
+                evidence_refs=request.evidence_refs,
             ).as_dict()
 
         return _handle_review_error(operation)
