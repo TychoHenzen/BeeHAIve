@@ -497,6 +497,8 @@ def test_codex_executor_repair_handles_invalid_launch_failure_and_empty_result(
     )
     assert failed.outcome is AttemptOutcome.FAILURE
     assert "Bounded repair agent failed" in failed.failure_context
+    assert "visible-secret" not in failed.failure_context
+    assert "token=[redacted]" in failed.failure_context
 
     empty_script = tmp_path / "repair-empty.py"
     empty_script.write_text("pass\n")

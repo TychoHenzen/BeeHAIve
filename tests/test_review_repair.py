@@ -3,9 +3,10 @@ from __future__ import annotations
 import subprocess
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Event
+from threading import Barrier, Event
 
 import pytest
 from fastapi.testclient import TestClient
@@ -152,6 +153,7 @@ class CommitAgent:
         self.calls = 0
         self.prompt = ""
         self.cancel_calls = 0
+        self._secret_values: tuple[str, ...] = ()
 
     def execute_scoped_repair(
         self,
@@ -339,6 +341,58 @@ def test_selected_repair_pushes_one_committed_change_without_touching_checkout(
             harness.reviews.store.finding_for_id(harness.unselected_id).status.value
             == "open"
         )
+    finally:
+        harness.close()
+
+
+def test_selected_repair_redacts_secret_finding_context(tmp_path: Path) -> None:
+    agent = CommitAgent()
+    agent._secret_values = ("repair-secret",)
+    harness = _harness(tmp_path, agent)
+    try:
+        with harness.review_store.transaction() as connection:
+            connection.execute(
+                "UPDATE review_findings SET summary = ? WHERE finding_id = ?",
+                ("selected token=repair-secret", harness.selected_id),
+            )
+        attempt = harness.service.dispatch(
+            harness.cycle_id, (harness.selected_id,), "operator"
+        )
+        completed = harness.service.wait(attempt.attempt_id, timeout=10)
+
+        assert completed.status is ReviewRepairStatus.SUCCEEDED
+        assert "repair-secret" not in agent.prompt
+        assert "token=[redacted]" in agent.prompt
+        assert "unselected issue" not in agent.prompt
+    finally:
+        harness.close()
+
+
+def test_concurrent_repair_dispatch_starts_one_worker(tmp_path: Path) -> None:
+    agent = BlockingAgent()
+    harness = _harness(tmp_path, agent)
+    barrier = Barrier(2)
+
+    def dispatch():
+        barrier.wait(timeout=5)
+        return harness.service.dispatch(
+            harness.cycle_id, (harness.selected_id,), "operator"
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            attempts = tuple(
+                future.result(timeout=5)
+                for future in (executor.submit(dispatch), executor.submit(dispatch))
+            )
+        assert attempts[0].attempt_id == attempts[1].attempt_id
+        assert agent.started.wait(timeout=5)
+        harness.service.cancel(attempts[0].attempt_id, "operator")
+        completed = harness.service.wait(attempts[0].attempt_id, timeout=5)
+
+        assert completed.status is ReviewRepairStatus.CANCELLED
+        assert agent.calls == 1
+        assert harness.provider.update_calls == 0
     finally:
         harness.close()
 
