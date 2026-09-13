@@ -21,7 +21,9 @@ from beehaiive.models import (
 )
 from beehaiive.orchestrator import Orchestrator
 from beehaiive.provider import (
+    GitHubOutcomeUnknownError,
     GitHubProjectProvider,
+    GitHubRateLimitError,
     GraphQLClient,
     ProviderError,
     _handoff_marker,
@@ -1789,6 +1791,194 @@ def test_github_provider_reuses_existing_branch_and_pull_request() -> None:
     assert client.pull_request_creations == 1
     assert client.pull_request_updates == 1
     assert client.pull_request_bases == ["main"]
+
+
+def test_github_provider_audits_redacted_mutations_and_recovers_pending_attempts() -> (
+    None
+):
+    store = OrchestratorStore()
+    client = HandoffGraphQLClient()
+    provider = GitHubProjectProvider("owner", 7, "token", client=client)
+    request = HandoffRequest(
+        project_id="owner:7",
+        repository="owner/api",
+        pbi_number=1,
+        title="API one",
+        branch="codex/api-1",
+        base_branch=None,
+        body="Closes #1",
+        run_id="run-1",
+        mutation_audit=store,
+    )
+
+    provider.create_handoff(request)
+
+    actions = store.actions_for_project("owner:7")
+    actions_by_kind = {str(action["kind"]): action for action in actions}
+    assert set(actions_by_kind) == {
+        "github.create_ref",
+        "github.create_pull_request",
+    }
+    assert all(action["status"] == "succeeded" for action in actions)
+    ref_request = actions_by_kind["github.create_ref"]["request"]
+    pr_request = actions_by_kind["github.create_pull_request"]["request"]
+    assert isinstance(ref_request, dict)
+    assert isinstance(pr_request, dict)
+    assert ref_request["operation_key"] == _handoff_marker(request, "main")
+    assert ref_request["attempt"] == pr_request["attempt"] == 1
+    assert set(ref_request) == {"operation_key", "attempt", "target"}
+    assert "title" not in ref_request and "title" not in pr_request
+    assert "body" not in ref_request and "body" not in pr_request
+    assert "API one" not in repr(actions) and "Closes #1" not in repr(actions)
+
+    ref_action = store.begin_handoff_mutation(
+        request,
+        "create_ref",
+        _handoff_marker(request, "main"),
+        {"branch": request.branch, "base_branch": "main", "base_sha": "base-oid"},
+    )
+    pr_action = store.begin_handoff_mutation(
+        request,
+        "create_pull_request",
+        _handoff_marker(request, "main"),
+        {"branch": request.branch, "base_branch": "main"},
+    )
+    ref_creations = client.ref_creations
+    pr_creations = client.pull_request_creations
+
+    provider.create_handoff(request)
+
+    recovered = {
+        str(action["id"]): action for action in store.actions_for_project("owner:7")
+    }
+    assert recovered[ref_action]["status"] == "succeeded"
+    assert recovered[pr_action]["status"] == "succeeded"
+    assert client.ref_creations == ref_creations
+    assert client.pull_request_creations == pr_creations
+
+
+def test_github_provider_audits_rate_limit_failure_without_raw_error() -> None:
+    class RateLimitedRefClient(HandoffGraphQLClient):
+        fail_ref_once = True
+
+        def execute(self, query: str, variables: dict[str, object]) -> dict[str, Any]:
+            if "CreateRefInput" in query and self.fail_ref_once:
+                self.fail_ref_once = False
+                raise GitHubRateLimitError(
+                    "private provider detail",
+                    primary=True,
+                    retry_after=15,
+                    reset_at=1_800_000_000,
+                )
+            return super().execute(query, variables)
+
+    store = OrchestratorStore()
+    client = RateLimitedRefClient()
+    provider = GitHubProjectProvider("owner", 7, "token", client=client)
+    request = HandoffRequest(
+        project_id="owner:7",
+        repository="owner/api",
+        pbi_number=1,
+        title="API one",
+        branch="codex/api-1",
+        base_branch=None,
+        body="Closes #1",
+        run_id="run-1",
+        mutation_audit=store,
+    )
+
+    with pytest.raises(GitHubRateLimitError):
+        provider.create_handoff(request)
+
+    failed = store.actions_for_project("owner:7")[0]
+    failed_result = failed["result"]
+    assert failed["status"] == "failed"
+    assert failed["error"] == "GitHubRateLimitError"
+    assert isinstance(failed_result, dict)
+    assert failed_result["reconciliation"] == "readback_absent"
+    assert failed_result["rate_limit"] == {
+        "classification": "primary",
+        "reset_at": 1_800_000_000,
+        "retry_after": 15,
+    }
+    assert "private provider detail" not in repr(failed)
+
+    provider.create_handoff(request)
+
+    ref_attempts = [
+        action["request"]["attempt"]
+        for action in store.actions_for_project("owner:7")
+        if action["kind"] == "github.create_ref"
+    ]
+    assert ref_attempts == [2, 1]
+
+
+def test_github_provider_reconciles_timed_out_pr_before_retrying_create() -> None:
+    class LatePullRequestClient(HandoffGraphQLClient):
+        hidden_reads = 0
+
+        def execute(self, query: str, variables: dict[str, object]) -> dict[str, Any]:
+            if "CreatePullRequestInput" in query:
+                super().execute(query, variables)
+                self.hidden_reads = 2
+                raise GitHubOutcomeUnknownError("request outcome is unknown")
+            response = super().execute(query, variables)
+            if "pullRequestCursor" in variables and self.hidden_reads:
+                self.hidden_reads -= 1
+                repository = response.get("repository")
+                if isinstance(repository, dict):
+                    pull_requests = repository.get("pullRequests")
+                    if isinstance(pull_requests, dict):
+                        pull_requests["nodes"] = []
+            return response
+
+    store = OrchestratorStore()
+    client = LatePullRequestClient()
+    provider = GitHubProjectProvider("owner", 7, "token", client=client)
+    request = HandoffRequest(
+        project_id="owner:7",
+        repository="owner/api",
+        pbi_number=1,
+        title="API one",
+        branch="codex/api-1",
+        base_branch=None,
+        body="Closes #1",
+        run_id="run-1",
+        mutation_audit=store,
+    )
+
+    with pytest.raises(GitHubOutcomeUnknownError):
+        provider.create_handoff(request)
+
+    pr_action = next(
+        action
+        for action in store.actions_for_project("owner:7")
+        if action["kind"] == "github.create_pull_request"
+    )
+    assert pr_action["status"] == "uncertain"
+    assert pr_action["result"]["reconciliation"] == "readback_absent"
+
+    with pytest.raises(StoreError, match="remains unresolved"):
+        provider.create_handoff(request)
+
+    still_uncertain = next(
+        action
+        for action in store.actions_for_project("owner:7")
+        if action["id"] == pr_action["id"]
+    )
+    assert still_uncertain["status"] == "uncertain"
+    assert client.pull_request_creations == 1
+
+    provider.create_handoff(request)
+
+    reconciled = next(
+        action
+        for action in store.actions_for_project("owner:7")
+        if action["id"] == pr_action["id"]
+    )
+    assert reconciled["status"] == "succeeded"
+    assert reconciled["result"]["reconciliation"] == "present"
+    assert client.pull_request_creations == 1
 
 
 def test_github_provider_concurrent_calls_converge_on_one_artifact() -> None:

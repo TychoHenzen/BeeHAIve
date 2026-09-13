@@ -326,6 +326,7 @@ class Orchestrator:
                 run_id=intent.run.run_id,
                 head_sha=intent.head_sha,
                 verification_evidence=intent.verification_evidence,
+                mutation_audit=self.store,
             )
         )
         self._complete_routing_problem(run_id)

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Protocol
 
 
 class Stage(StrEnum):
@@ -85,6 +86,44 @@ class HandoffRequest:
     run_id: str
     head_sha: str | None = None
     verification_evidence: str = ""
+    mutation_audit: HandoffMutationAudit | None = None
+
+
+class HandoffMutationAudit(Protocol):
+    """Persistence boundary for external handoff mutations."""
+
+    def begin_handoff_mutation(
+        self,
+        request: HandoffRequest,
+        mutation: str,
+        operation_key: str,
+        target: Mapping[str, object],
+    ) -> str:
+        """Persist a redacted attempt before sending it to GitHub."""
+
+        ...
+
+    def finish_handoff_mutation(
+        self,
+        action_id: str,
+        status: str,
+        result: Mapping[str, object],
+    ) -> None:
+        """Persist the attempt outcome without provider request data."""
+
+        ...
+
+    def reconcile_handoff_mutation(
+        self,
+        request: HandoffRequest,
+        mutation: str,
+        operation_key: str,
+        status: str,
+        result: Mapping[str, object],
+    ) -> None:
+        """Resolve unfinished attempts after reading the provider state."""
+
+        ...
 
 
 @dataclass(frozen=True, slots=True)

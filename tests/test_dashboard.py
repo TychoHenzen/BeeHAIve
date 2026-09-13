@@ -12,6 +12,7 @@ from beehaiive.agent import AgentWorkerManager, CodexExecModelExecutor
 from beehaiive.contracts import TaskContract, TaskOutcome, TaskResult
 from beehaiive.dashboard import build_dashboard_state
 from beehaiive.models import (
+    HandoffRequest,
     PbiSnapshot,
     ProjectSnapshot,
     RepositorySnapshot,
@@ -21,7 +22,12 @@ from beehaiive.models import (
 from beehaiive.orchestrator import Orchestrator
 from beehaiive.provider import ProviderError
 from beehaiive.routing import AttemptOutcome, ModelExecution, ModelRouter, RoutingStore
-from beehaiive.storage import OrchestratorStore, StoreError, _json_mapping
+from beehaiive.storage import (
+    DEFAULT_ACTION_LIMIT,
+    OrchestratorStore,
+    StoreError,
+    _json_mapping,
+)
 from beehaiive.workflow import (
     CheckResult,
     Constitution,
@@ -843,6 +849,64 @@ def test_action_store_records_lifecycle_and_validates_limits(
     assert _json_mapping("") == {}
     assert _json_mapping("not-json") == {}
     assert _json_mapping("[]") == {}
+
+
+def test_github_mutation_audit_is_visible_through_bounded_actions_api() -> None:
+    store = OrchestratorStore()
+    service = Orchestrator(store, FakeProvider(dashboard_snapshot()))
+    client = TestClient(
+        main_module.create_app(
+            orchestrator=service,
+            api_key="test-key",
+            allowed_project_ids={"project-1"},
+        )
+    )
+    oldest_id = str(store.begin_action("project-1", "operator", {"sequence": 0})["id"])
+    for number in range(DEFAULT_ACTION_LIMIT - 2):
+        store.begin_action("project-1", "operator", {"sequence": number + 1})
+    request = HandoffRequest(
+        project_id="project-1",
+        repository="owner/api",
+        pbi_number=1,
+        title="private audit title",
+        branch="codex/audit",
+        base_branch="main",
+        body="private audit body",
+        run_id="run-audit",
+    )
+    audit_id = store.begin_handoff_mutation(
+        request,
+        "create_ref",
+        "stable-operation-key",
+        {"branch": request.branch, "base_branch": "main", "base_sha": "base-sha"},
+    )
+    store.finish_handoff_mutation(
+        audit_id,
+        "succeeded",
+        {"reconciliation": "mutation_response", "branch": request.branch},
+    )
+    newest_id = str(
+        store.begin_action("project-1", "operator", {"sequence": "newest"})["id"]
+    )
+    foreign_id = str(
+        store.begin_action("other-project", "operator", {"sequence": "foreign"})["id"]
+    )
+
+    response = client.get(
+        "/projects/project-1/actions", headers={"X-API-Key": "test-key"}
+    )
+
+    actions = response.json()["actions"]
+    action_ids = {str(action["id"]) for action in actions}
+    audit_action = next(action for action in actions if action["id"] == audit_id)
+    assert response.status_code == 200
+    assert len(actions) == DEFAULT_ACTION_LIMIT
+    assert audit_id in action_ids and newest_id in action_ids
+    assert oldest_id not in action_ids and foreign_id not in action_ids
+    assert audit_action["request"]["operation_key"] == "stable-operation-key"
+    assert audit_action["result"]["reconciliation"] == "mutation_response"
+    assert "private audit title" not in repr(actions)
+    assert "private audit body" not in repr(actions)
 
 
 def test_dashboard_runtime_assets_are_served_without_sample_data() -> None:
