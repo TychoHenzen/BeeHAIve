@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Annotated, Literal, cast
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from beehaiive import EnvironmentGitHubProvider, Orchestrator, OrchestratorStore, Stage
@@ -21,6 +21,12 @@ from beehaiive.conflict_repair import ConflictRepairAgent, ConflictRepairService
 from beehaiive.dashboard import build_dashboard_state
 from beehaiive.meta_review import MetaReviewError, MetaReviewService
 from beehaiive.models import RunState, RunStatus
+from beehaiive.pbi_creation import (
+    PbiCreationError,
+    PbiCreationProvider,
+    PbiCreationRequest,
+    PbiCreationService,
+)
 from beehaiive.provider import ProviderError
 from beehaiive.quality_gates import RepositoryGateSuite
 from beehaiive.review import (
@@ -71,6 +77,13 @@ class HandoffRequest(BaseModel):
     branch: str
     base_branch: str | None = None
     body: str = ""
+
+
+class PbiCreationBody(BaseModel):
+    repository: str = Field(min_length=3, max_length=300)
+    title: str = Field(min_length=1, max_length=256)
+    body: str = Field(min_length=1, max_length=65_536)
+    labels: list[str] = Field(default_factory=list, max_length=20)
 
 
 class FailureRequest(BaseModel):
@@ -1121,6 +1134,35 @@ def create_app(
         return _handle_store_error(
             lambda: orchestrator.synchronize(project_id, force_refresh=True)
         )
+
+    @app.post("/projects/{project_id}/pbis")
+    def create_project_pbi(  # pyright: ignore[reportUnusedFunction]
+        project_id: str,
+        request: PbiCreationBody,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key", min_length=1, max_length=200
+        ),
+        _auth: None = Depends(require_mutation_access),
+    ) -> JSONResponse:
+        creation_request = PbiCreationRequest(
+            project_id=project_id,
+            repository=request.repository,
+            title=request.title,
+            body=request.body,
+            labels=tuple(request.labels),
+        )
+        service = PbiCreationService(
+            orchestrator.store,
+            cast(PbiCreationProvider, orchestrator.provider),
+        )
+        try:
+            result = service.create(creation_request, idempotency_key)
+        except PbiCreationError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        except StoreError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        status_code = 201 if result.get("status") == "complete" else 202
+        return JSONResponse(status_code=status_code, content=result)
 
     @app.get("/projects/{project_id}")
     def project_state(  # pyright: ignore[reportUnusedFunction]

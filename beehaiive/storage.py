@@ -34,6 +34,7 @@ class StoreError(RuntimeError):
 MAX_AGENT_SESSION_EVENTS = 100
 MAX_AGENT_SESSION_EVENT_LENGTH = 4_000
 MAX_AGENT_SESSION_TEXT_BYTES = 64_000
+PBI_CREATION_LEASE_SECONDS = 300
 
 
 def _task_claimability_state(
@@ -341,6 +342,30 @@ class OrchestratorStore:
                     error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS pbi_creations (
+                    project_id TEXT NOT NULL,
+                    key_hash TEXT NOT NULL,
+                    request_hash TEXT NOT NULL,
+                    repository_name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    issue_create_started INTEGER NOT NULL DEFAULT 0,
+                    issue_id TEXT,
+                    issue_number INTEGER,
+                    issue_url TEXT,
+                    project_item_id TEXT,
+                    completed_steps_json TEXT NOT NULL DEFAULT '[]',
+                    current_step TEXT,
+                    failed_step TEXT,
+                    failure_code TEXT,
+                    failure_class TEXT,
+                    lease_owner TEXT,
+                    lease_expires_at TEXT,
+                    result_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (project_id, key_hash)
                 );
 
                 CREATE TABLE IF NOT EXISTS routing_failure_outbox (
@@ -2019,6 +2044,277 @@ class OrchestratorStore:
                 raise StoreError(f"Unknown action: {action_id}")
             return self._action_from_row(row)
 
+    def get_pbi_creation(
+        self, project_id: str, key_hash: str
+    ) -> dict[str, object] | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM pbi_creations
+                WHERE project_id = ? AND key_hash = ?
+                """,
+                (project_id, key_hash),
+            ).fetchone()
+        return self._pbi_creation_from_row(row) if row is not None else None
+
+    def begin_pbi_creation(
+        self,
+        project_id: str,
+        key_hash: str,
+        request_hash: str,
+        repository: str,
+        lease_owner: str,
+    ) -> tuple[dict[str, object], bool]:
+        """Reserve one key and claim its durable attempt when no lease is active."""
+
+        now = _now()
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO pbi_creations(
+                    project_id, key_hash, request_hash, repository_name,
+                    status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (project_id, key_hash, request_hash, repository, now, now),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM pbi_creations
+                WHERE project_id = ? AND key_hash = ?
+                """,
+                (project_id, key_hash),
+            ).fetchone()
+            if row is None:
+                raise StoreError("Could not reserve PBI creation key")
+            if row["request_hash"] != request_hash:
+                return self._pbi_creation_from_row(row), False
+            if row["status"] in {"complete", "outcome_unknown"}:
+                return self._pbi_creation_from_row(row), False
+            if _lease_is_active(row["lease_expires_at"]):
+                return self._pbi_creation_from_row(row), False
+            if row["issue_create_started"] and row["issue_id"] is None:
+                connection.execute(
+                    """
+                    UPDATE pbi_creations
+                    SET status = 'outcome_unknown',
+                        failed_step = COALESCE(current_step, 'create_issue'),
+                        failure_code = 'outcome_unknown',
+                        failure_class = 'ProcessInterrupted',
+                        lease_owner = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = ?
+                    WHERE project_id = ? AND key_hash = ?
+                    """,
+                    (now, project_id, key_hash),
+                )
+                row = connection.execute(
+                    """
+                    SELECT * FROM pbi_creations
+                    WHERE project_id = ? AND key_hash = ?
+                    """,
+                    (project_id, key_hash),
+                ).fetchone()
+                if row is None:
+                    raise StoreError("PBI creation disappeared during recovery")
+                return self._pbi_creation_from_row(row), False
+
+            lease_expires_at = (
+                datetime.now(UTC) + timedelta(seconds=PBI_CREATION_LEASE_SECONDS)
+            ).isoformat()
+            connection.execute(
+                """
+                UPDATE pbi_creations
+                SET status = 'in_progress', lease_owner = ?, lease_expires_at = ?,
+                    current_step = COALESCE(current_step, 'preflight'),
+                    failed_step = NULL, failure_code = NULL, failure_class = NULL,
+                    updated_at = ?
+                WHERE project_id = ? AND key_hash = ?
+                """,
+                (lease_owner, lease_expires_at, now, project_id, key_hash),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM pbi_creations
+                WHERE project_id = ? AND key_hash = ?
+                """,
+                (project_id, key_hash),
+            ).fetchone()
+            if row is None:
+                raise StoreError("PBI creation disappeared after reservation")
+            return self._pbi_creation_from_row(row), True
+
+    def checkpoint_pbi_creation(
+        self,
+        project_id: str,
+        key_hash: str,
+        lease_owner: str,
+        progress: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Persist one confirmed mutation step before attempting the next."""
+
+        issue_create_started = progress.get("issue_create_started") is True
+        issue_id = progress.get("issue_id")
+        issue_number = progress.get("issue_number")
+        issue_url = progress.get("issue_url")
+        project_item_id = progress.get("project_item_id")
+        current_step = progress.get("current_step")
+        raw_completed_steps: object = progress.get("completed_steps", [])
+        if not isinstance(raw_completed_steps, list) or any(
+            not isinstance(step, str)
+            for step in cast(list[object], raw_completed_steps)
+        ):
+            raise StoreError("PBI creation progress has invalid completed steps")
+        completed_steps = cast(list[str], raw_completed_steps)
+        with self._transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM pbi_creations
+                WHERE project_id = ? AND key_hash = ?
+                """,
+                (project_id, key_hash),
+            ).fetchone()
+            if row is None or row["lease_owner"] != lease_owner:
+                raise StoreError("PBI creation lease is not active")
+            lease_expires_at = (
+                datetime.now(UTC) + timedelta(seconds=PBI_CREATION_LEASE_SECONDS)
+            ).isoformat()
+            connection.execute(
+                """
+                UPDATE pbi_creations
+                SET issue_create_started = ?, issue_id = ?, issue_number = ?,
+                    issue_url = ?, project_item_id = ?, completed_steps_json = ?,
+                    current_step = ?, failed_step = NULL, failure_code = NULL,
+                    failure_class = NULL, lease_expires_at = ?, updated_at = ?
+                WHERE project_id = ? AND key_hash = ? AND lease_owner = ?
+                """,
+                (
+                    int(issue_create_started),
+                    issue_id if isinstance(issue_id, str) else None,
+                    issue_number if type(issue_number) is int else None,
+                    issue_url if isinstance(issue_url, str) else None,
+                    project_item_id if isinstance(project_item_id, str) else None,
+                    json.dumps(completed_steps, sort_keys=True),
+                    current_step if isinstance(current_step, str) else None,
+                    lease_expires_at,
+                    _now(),
+                    project_id,
+                    key_hash,
+                    lease_owner,
+                ),
+            )
+            updated = connection.execute(
+                """
+                SELECT * FROM pbi_creations
+                WHERE project_id = ? AND key_hash = ?
+                """,
+                (project_id, key_hash),
+            ).fetchone()
+            if updated is None:
+                raise StoreError("PBI creation disappeared after checkpoint")
+            return self._pbi_creation_from_row(updated)
+
+    def finish_pbi_creation(
+        self,
+        project_id: str,
+        key_hash: str,
+        lease_owner: str,
+        result: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Record success only after the provider completed remote readback."""
+
+        with self._transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM pbi_creations
+                WHERE project_id = ? AND key_hash = ?
+                """,
+                (project_id, key_hash),
+            ).fetchone()
+            if row is None or row["lease_owner"] != lease_owner:
+                raise StoreError("PBI creation lease is not active")
+            connection.execute(
+                """
+                UPDATE pbi_creations
+                SET status = 'complete', result_json = ?, current_step = NULL,
+                    failed_step = NULL, failure_code = NULL, failure_class = NULL,
+                    lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+                WHERE project_id = ? AND key_hash = ? AND lease_owner = ?
+                """,
+                (
+                    json.dumps(dict(result), sort_keys=True),
+                    _now(),
+                    project_id,
+                    key_hash,
+                    lease_owner,
+                ),
+            )
+            completed = connection.execute(
+                """
+                SELECT * FROM pbi_creations
+                WHERE project_id = ? AND key_hash = ?
+                """,
+                (project_id, key_hash),
+            ).fetchone()
+            if completed is None:
+                raise StoreError("PBI creation disappeared after completion")
+            return self._pbi_creation_from_row(completed)
+
+    def fail_pbi_creation(
+        self,
+        project_id: str,
+        key_hash: str,
+        lease_owner: str,
+        status: str,
+        failed_step: str,
+        failure_code: str,
+        failure_class: str,
+    ) -> dict[str, object]:
+        """Persist a bounded failure classification and release the attempt lease."""
+
+        if status not in {"incomplete", "outcome_unknown"}:
+            raise StoreError(f"Invalid PBI creation status: {status}")
+        with self._transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM pbi_creations
+                WHERE project_id = ? AND key_hash = ?
+                """,
+                (project_id, key_hash),
+            ).fetchone()
+            if row is None or row["lease_owner"] != lease_owner:
+                raise StoreError("PBI creation lease is not active")
+            if status == "outcome_unknown" and row["issue_id"] is not None:
+                raise StoreError("Known issue identity cannot have an unknown outcome")
+            connection.execute(
+                """
+                UPDATE pbi_creations
+                SET status = ?, failed_step = ?, failure_code = ?, failure_class = ?,
+                    lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+                WHERE project_id = ? AND key_hash = ? AND lease_owner = ?
+                """,
+                (
+                    status,
+                    failed_step[:100],
+                    failure_code[:80],
+                    failure_class[:80],
+                    _now(),
+                    project_id,
+                    key_hash,
+                    lease_owner,
+                ),
+            )
+            failed = connection.execute(
+                """
+                SELECT * FROM pbi_creations
+                WHERE project_id = ? AND key_hash = ?
+                """,
+                (project_id, key_hash),
+            ).fetchone()
+            if failed is None:
+                raise StoreError("PBI creation disappeared after failure")
+            return self._pbi_creation_from_row(failed)
+
     def begin_handoff_mutation(
         self,
         request: HandoffRequest,
@@ -2904,6 +3200,35 @@ class OrchestratorStore:
                 "event_limit": event_limit,
                 "repositories": repositories,
             }
+
+    @staticmethod
+    def _pbi_creation_from_row(row: sqlite3.Row) -> dict[str, object]:
+        raw_steps: object = row["completed_steps_json"]
+        completed_steps: list[object] = _json_list(raw_steps)
+        return {
+            "project_id": row["project_id"],
+            "key_hash": row["key_hash"],
+            "request_hash": row["request_hash"],
+            "repository": row["repository_name"],
+            "status": row["status"],
+            "issue_create_started": bool(row["issue_create_started"]),
+            "issue_id": row["issue_id"],
+            "issue_number": row["issue_number"],
+            "issue_url": row["issue_url"],
+            "project_item_id": row["project_item_id"],
+            "completed_steps": [
+                step for step in completed_steps if isinstance(step, str)
+            ],
+            "current_step": row["current_step"],
+            "failed_step": row["failed_step"],
+            "failure_code": row["failure_code"],
+            "failure_class": row["failure_class"],
+            "lease_owner": row["lease_owner"],
+            "lease_expires_at": row["lease_expires_at"],
+            "result": _json_mapping_or_none(row["result_json"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
 
     @staticmethod
     def _action_from_row(row: sqlite3.Row) -> dict[str, object]:

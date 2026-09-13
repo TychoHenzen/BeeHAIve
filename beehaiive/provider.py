@@ -11,6 +11,7 @@ import re
 import subprocess
 import time
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from threading import Lock
 from typing import Any, Protocol, cast
@@ -28,6 +29,16 @@ from .models import (
     RepositorySnapshot,
     Stage,
     project_stage_from_status,
+)
+from .pbi_creation import (
+    PbiCreationError,
+    PbiCreationProgress,
+    PbiCreationProvider,
+    PbiCreationRequest,
+    PbiCreationResult,
+    PbiCreationScopeError,
+    PbiCreationTarget,
+    PbiCreationValidationError,
 )
 
 PROVIDER_REQUEST_TIMEOUT = 30.0
@@ -749,6 +760,100 @@ UPDATE_PROJECT_STATUS_MUTATION = """
 mutation($input: UpdateProjectV2ItemFieldValueInput!) {
   updateProjectV2ItemFieldValue(input: $input) {
     projectV2Item { id }
+  }
+}
+"""
+
+PBI_CREATION_TARGET_QUERY = """
+query($owner: String!, $number: Int!, $cursor: String) {
+  user(login: $owner) {
+    projectV2(number: $number) {
+      id
+      repositories(first: 100, after: $cursor) {
+        nodes { nameWithOwner }
+        pageInfo { hasNextPage endCursor }
+      }
+      fields(first: 100) {
+        nodes {
+          ... on ProjectV2SingleSelectField {
+            id name options { id name }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+PBI_CREATION_LABELS_QUERY = """
+query($owner: String!, $name: String!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    id
+    nameWithOwner
+    labels(first: 100, after: $cursor) {
+      nodes { id name }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}
+"""
+
+PBI_CREATION_ISSUE_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      id number url title body state
+      labels(first: 100) { nodes { name } }
+    }
+  }
+}
+"""
+
+PBI_CREATION_PROJECT_QUERY = """
+query($owner: String!, $number: Int!, $cursor: String) {
+  user(login: $owner) {
+    projectV2(number: $number) {
+      id
+      fields(first: 100) {
+        nodes {
+          ... on ProjectV2SingleSelectField {
+            id name options { id name }
+          }
+        }
+      }
+      items(first: 100, after: $cursor) {
+        nodes {
+          id
+          content {
+            __typename
+            ... on Issue { id number repository { nameWithOwner } }
+          }
+          fieldValues(first: 100) {
+            nodes {
+              ... on ProjectV2ItemFieldSingleSelectValue {
+                name optionId
+                field { ... on ProjectV2FieldCommon { id name } }
+              }
+            }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+
+ADD_PROJECT_ITEM_MUTATION = """
+mutation($input: AddProjectV2ItemByIdInput!) {
+  addProjectV2ItemById(input: $input) { item { id } }
+}
+"""
+
+ADD_ISSUE_LABELS_MUTATION = """
+mutation($input: AddLabelsToLabelableInput!) {
+  addLabelsToLabelable(input: $input) {
+    labelable { ... on Issue { id labels(first: 100) { nodes { name } } } }
   }
 }
 """
@@ -1834,6 +1939,545 @@ class GitHubProjectProvider:
         if not separator or not owner or not name:
             raise ProviderError(f"Repository must use owner/name format: {repository}")
         return owner, name
+
+    def prepare_pbi_creation(self, request: PbiCreationRequest) -> PbiCreationTarget:
+        """Validate the live Project, linked repository, labels, and Backlog option."""
+
+        if request.project_id != self.project_id:
+            raise PbiCreationScopeError("Project is not authorized")
+        repository_owner, repository_name = self._repository_parts(request.repository)
+        cursor: str | None = None
+        project_node_id: str | None = None
+        linked_repositories: set[str] = set()
+        status_field_id: str | None = None
+        backlog_option_id: str | None = None
+        backlog_status: str | None = None
+        while True:
+            data = self._client.execute(
+                _owner_query(PBI_CREATION_TARGET_QUERY, self.owner_type),
+                {
+                    "owner": self.owner,
+                    "number": self.project_number,
+                    "cursor": cursor,
+                },
+            )
+            project = _project(data, self.owner_type)
+            current_project_id = project.get("id")
+            if not isinstance(current_project_id, str) or not current_project_id:
+                raise PbiCreationScopeError("Configured Project is unavailable")
+            if project_node_id is not None and current_project_id != project_node_id:
+                raise ProviderError("GitHub returned conflicting Project identities")
+            project_node_id = current_project_id
+
+            repository_connection = _mapping(project.get("repositories"))
+            for raw_repository in _nodes(repository_connection):
+                name_with_owner = raw_repository.get("nameWithOwner")
+                if isinstance(name_with_owner, str):
+                    linked_repositories.add(name_with_owner.casefold())
+
+            status_fields = [
+                field
+                for field in _nodes(project.get("fields"))
+                if isinstance(field.get("name"), str)
+                and str(field.get("name")).casefold() == "status"
+            ]
+            if len(status_fields) != 1:
+                raise PbiCreationValidationError(
+                    "Configured Project must have one Status field",
+                    code="project_status_unavailable",
+                )
+            status_field = status_fields[0]
+            raw_status_field_id = status_field.get("id")
+            options = status_field.get("options")
+            if not isinstance(raw_status_field_id, str) or not isinstance(
+                options, list
+            ):
+                raise PbiCreationValidationError(
+                    "Configured Project Status field is incomplete",
+                    code="project_status_unavailable",
+                )
+            backlog_options: list[Mapping[str, object]] = []
+            for raw_option in cast(list[object], options):
+                if not isinstance(raw_option, Mapping):
+                    continue
+                option = cast(Mapping[str, object], raw_option)
+                option_name = option.get("name")
+                if isinstance(option_name, str) and option_name.casefold() == "backlog":
+                    backlog_options.append(option)
+            if len(backlog_options) != 1:
+                raise PbiCreationValidationError(
+                    "Configured Project must have one Backlog Status option",
+                    code="project_backlog_unavailable",
+                )
+            raw_backlog_option_id = backlog_options[0].get("id")
+            raw_backlog_status = backlog_options[0].get("name")
+            if not isinstance(raw_backlog_option_id, str) or not isinstance(
+                raw_backlog_status, str
+            ):
+                raise PbiCreationValidationError(
+                    "Configured Project Backlog option is incomplete",
+                    code="project_backlog_unavailable",
+                )
+            if status_field_id is not None and status_field_id != raw_status_field_id:
+                raise ProviderError("GitHub returned conflicting Status fields")
+            if (
+                backlog_option_id is not None
+                and backlog_option_id != raw_backlog_option_id
+            ):
+                raise ProviderError("GitHub returned conflicting Backlog options")
+            status_field_id = raw_status_field_id
+            backlog_option_id = raw_backlog_option_id
+            backlog_status = raw_backlog_status
+
+            has_next, cursor = _next_cursor(repository_connection)
+            if not has_next:
+                break
+
+        if request.repository.casefold() not in linked_repositories:
+            raise PbiCreationScopeError(
+                "Repository is not linked to the configured Project"
+            )
+        label_cursor: str | None = None
+        repository_node_id: str | None = None
+        labels_by_name: dict[str, str] = {}
+        while True:
+            label_data = self._client.execute(
+                PBI_CREATION_LABELS_QUERY,
+                {
+                    "owner": repository_owner,
+                    "name": repository_name,
+                    "cursor": label_cursor,
+                },
+            )
+            repository = _mapping(label_data.get("repository"))
+            current_repository_id = repository.get("id")
+            current_repository_name = repository.get("nameWithOwner")
+            if (
+                not isinstance(current_repository_id, str)
+                or not current_repository_id
+                or not isinstance(current_repository_name, str)
+                or current_repository_name.casefold() != request.repository.casefold()
+            ):
+                raise PbiCreationScopeError("Repository is not available")
+            if (
+                repository_node_id is not None
+                and repository_node_id != current_repository_id
+            ):
+                raise ProviderError("GitHub returned conflicting repository identities")
+            repository_node_id = current_repository_id
+            label_connection = _mapping(repository.get("labels"))
+            for label in _nodes(label_connection):
+                name = label.get("name")
+                label_id = label.get("id")
+                if isinstance(name, str) and isinstance(label_id, str):
+                    labels_by_name[name] = label_id
+            has_next, label_cursor = _next_cursor(label_connection)
+            if not has_next:
+                break
+
+        missing_labels = [name for name in request.labels if name not in labels_by_name]
+        if missing_labels:
+            raise PbiCreationValidationError(
+                "One or more labels do not exist in the target repository",
+                code="unknown_label",
+            )
+        return PbiCreationTarget(
+            project_node_id=project_node_id,
+            repository_node_id=repository_node_id,
+            status_field_id=status_field_id,
+            backlog_option_id=backlog_option_id,
+            backlog_status=backlog_status,
+            label_ids=tuple(labels_by_name[name] for name in request.labels),
+        )
+
+    def create_pbi(
+        self,
+        request: PbiCreationRequest,
+        target: PbiCreationTarget,
+        progress: PbiCreationProgress,
+        checkpoint: Callable[[PbiCreationProgress], None],
+    ) -> PbiCreationResult:
+        """Create once, reconcile known issue state, and verify the Project item."""
+
+        owner, name = self._repository_parts(request.repository)
+        current = progress
+
+        def save_progress(
+            step: str,
+            *,
+            completed: bool = False,
+            **changes: object,
+        ) -> None:
+            nonlocal current
+            completed_steps = list(current.completed_steps)
+            if completed and step not in completed_steps:
+                completed_steps.append(step)
+            current = replace(
+                current,
+                current_step=step,
+                completed_steps=tuple(completed_steps),
+                **changes,
+            )
+            checkpoint(current)
+
+        if current.issue_id is None:
+            if current.issue_create_started:
+                raise PbiCreationError(
+                    "Issue creation outcome is unknown",
+                    code="outcome_unknown",
+                    status_code=202,
+                    unknown_outcome=True,
+                )
+            save_progress("create_issue", issue_create_started=True)
+            status, created = self._rest_request(
+                "POST",
+                f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}/issues",
+                {
+                    "title": request.title,
+                    "body": request.body,
+                    "labels": list(request.labels),
+                },
+            )
+            if status != 201:
+                save_progress("create_issue", issue_create_started=False)
+                raise PbiCreationError(
+                    "GitHub rejected issue creation",
+                    code="issue_create_rejected",
+                    status_code=502,
+                )
+            issue_id = created.get("node_id")
+            issue_number = created.get("number")
+            issue_url = created.get("html_url") or created.get("url")
+            if (
+                not isinstance(issue_id, str)
+                or not issue_id
+                or type(issue_number) is not int
+                or issue_number <= 0
+                or not isinstance(issue_url, str)
+                or not issue_url
+            ):
+                raise PbiCreationError(
+                    "GitHub did not return a durable issue identity",
+                    code="outcome_unknown",
+                    status_code=202,
+                    unknown_outcome=True,
+                )
+            save_progress(
+                "issue_created",
+                completed=True,
+                issue_create_started=False,
+                issue_id=issue_id,
+                issue_number=issue_number,
+                issue_url=issue_url,
+            )
+
+        if current.issue_number is None or current.issue_id is None:
+            raise PbiCreationError(
+                "Saved issue identity is incomplete",
+                code="issue_identity_incomplete",
+                status_code=502,
+            )
+
+        issue = self._pbi_creation_issue_state(owner, name, current.issue_number)
+        self._validate_pbi_creation_issue(request, current, issue)
+        labels = _nodes(issue.get("labels"))
+        present_label_names = {
+            label.get("name") for label in labels if isinstance(label.get("name"), str)
+        }
+        missing_labels = [
+            (label, label_id)
+            for label, label_id in zip(request.labels, target.label_ids, strict=True)
+            if label not in present_label_names
+        ]
+        if missing_labels:
+            save_progress("apply_labels")
+            self._client.execute(
+                ADD_ISSUE_LABELS_MUTATION,
+                {
+                    "input": {
+                        "labelableId": current.issue_id,
+                        "labelIds": [label_id for _, label_id in missing_labels],
+                    }
+                },
+            )
+            issue = self._pbi_creation_issue_state(owner, name, current.issue_number)
+            self._validate_pbi_creation_issue(request, current, issue)
+            labels = _nodes(issue.get("labels"))
+            present_label_names = {
+                label.get("name")
+                for label in labels
+                if isinstance(label.get("name"), str)
+            }
+        if not set(request.labels).issubset(present_label_names):
+            raise PbiCreationError(
+                "Requested labels did not read back",
+                code="labels_unconfirmed",
+                status_code=502,
+            )
+        save_progress("labels_applied", completed=True)
+
+        project_item = self._pbi_creation_project_item(
+            request, target, current.issue_id, current.issue_number
+        )
+        if project_item is None:
+            save_progress("add_to_project")
+            self._client.execute(
+                ADD_PROJECT_ITEM_MUTATION,
+                {
+                    "input": {
+                        "projectId": target.project_node_id,
+                        "contentId": current.issue_id,
+                    }
+                },
+            )
+            project_item = self._pbi_creation_project_item(
+                request, target, current.issue_id, current.issue_number
+            )
+        if project_item is None:
+            raise PbiCreationError(
+                "Project membership did not read back",
+                code="project_membership_unconfirmed",
+                status_code=502,
+            )
+        item_id = project_item.get("item_id")
+        if not isinstance(item_id, str) or not item_id:
+            raise PbiCreationError(
+                "Project item identity is incomplete",
+                code="project_item_identity_incomplete",
+                status_code=502,
+            )
+        if current.project_item_id is not None and current.project_item_id != item_id:
+            raise PbiCreationError(
+                "Project item identity changed during reconciliation",
+                code="project_item_identity_conflict",
+                status_code=409,
+            )
+        save_progress("project_added", completed=True, project_item_id=item_id)
+
+        if project_item.get("status") != target.backlog_status:
+            save_progress("set_backlog")
+            self._client.execute(
+                UPDATE_PROJECT_STATUS_MUTATION,
+                {
+                    "input": {
+                        "projectId": target.project_node_id,
+                        "itemId": item_id,
+                        "fieldId": target.status_field_id,
+                        "value": {"singleSelectOptionId": target.backlog_option_id},
+                    }
+                },
+            )
+            project_item = self._pbi_creation_project_item(
+                request, target, current.issue_id, current.issue_number
+            )
+        if project_item is None or project_item.get("status") != target.backlog_status:
+            raise PbiCreationError(
+                "Project Backlog status did not read back",
+                code="project_status_unconfirmed",
+                status_code=502,
+            )
+        save_progress("status_backlog", completed=True)
+
+        issue = self._pbi_creation_issue_state(owner, name, current.issue_number)
+        self._validate_pbi_creation_issue(request, current, issue)
+        actual_labels = tuple(
+            sorted(
+                {
+                    str(label["name"])
+                    for label in _nodes(issue.get("labels"))
+                    if isinstance(label.get("name"), str)
+                }
+            )
+        )
+        project_item = self._pbi_creation_project_item(
+            request, target, current.issue_id, current.issue_number
+        )
+        if (
+            project_item is None
+            or project_item.get("item_id") != item_id
+            or project_item.get("status") != target.backlog_status
+        ):
+            raise PbiCreationError(
+                "Final Project state did not read back",
+                code="project_state_unconfirmed",
+                status_code=502,
+            )
+        return PbiCreationResult(
+            issue_id=current.issue_id,
+            issue_number=current.issue_number,
+            issue_url=current.issue_url or str(issue.get("url", "")),
+            labels=actual_labels,
+            project_item_id=item_id,
+            project_status=target.backlog_status,
+            completed_steps=current.completed_steps,
+        )
+
+    def _pbi_creation_issue_state(
+        self, owner: str, name: str, issue_number: int
+    ) -> Mapping[str, Any]:
+        data = self._client.execute(
+            PBI_CREATION_ISSUE_QUERY,
+            {"owner": owner, "name": name, "number": issue_number},
+        )
+        issue = _mapping(_mapping(data.get("repository")).get("issue"))
+        if not issue:
+            raise PbiCreationError(
+                "Created issue could not be read back",
+                code="issue_readback_failed",
+                status_code=502,
+            )
+        return issue
+
+    @staticmethod
+    def _validate_pbi_creation_issue(
+        request: PbiCreationRequest,
+        progress: PbiCreationProgress,
+        issue: Mapping[str, Any],
+    ) -> None:
+        if (
+            issue.get("id") != progress.issue_id
+            or issue.get("number") != progress.issue_number
+            or issue.get("title") != request.title
+            or issue.get("body") != request.body
+            or issue.get("state") != "OPEN"
+        ):
+            raise PbiCreationError(
+                "Issue identity or caller content did not read back",
+                code="issue_identity_or_content_conflict",
+                status_code=409,
+            )
+
+    def _pbi_creation_project_item(
+        self,
+        request: PbiCreationRequest,
+        target: PbiCreationTarget,
+        issue_id: str,
+        issue_number: int,
+    ) -> dict[str, object] | None:
+        cursor: str | None = None
+        matching_items: list[dict[str, object]] = []
+        project_id: str | None = None
+        status_field_id: str | None = None
+        backlog_option_id: str | None = None
+        while True:
+            data = self._client.execute(
+                _owner_query(PBI_CREATION_PROJECT_QUERY, self.owner_type),
+                {
+                    "owner": self.owner,
+                    "number": self.project_number,
+                    "cursor": cursor,
+                },
+            )
+            project = _project(data, self.owner_type)
+            current_project_id = project.get("id")
+            if current_project_id != target.project_node_id:
+                raise PbiCreationScopeError("Configured Project identity changed")
+            if project_id is not None and current_project_id != project_id:
+                raise ProviderError("GitHub returned conflicting Project identities")
+            project_id = (
+                current_project_id if isinstance(current_project_id, str) else None
+            )
+
+            fields = [
+                field
+                for field in _nodes(project.get("fields"))
+                if isinstance(field.get("name"), str)
+                and str(field.get("name")).casefold() == "status"
+            ]
+            if len(fields) != 1:
+                raise PbiCreationValidationError(
+                    "Configured Project Status field changed",
+                    code="project_status_unavailable",
+                )
+            field_id = fields[0].get("id")
+            options = fields[0].get("options")
+            if not isinstance(field_id, str) or field_id != target.status_field_id:
+                raise PbiCreationValidationError(
+                    "Configured Project Status field changed",
+                    code="project_status_unavailable",
+                )
+            if not isinstance(options, list):
+                raise PbiCreationValidationError(
+                    "Configured Project Status options are incomplete",
+                    code="project_status_unavailable",
+                )
+            backlog_options: list[Mapping[str, object]] = []
+            for raw_option in cast(list[object], options):
+                if not isinstance(raw_option, Mapping):
+                    continue
+                option = cast(Mapping[str, object], raw_option)
+                option_name = option.get("name")
+                if isinstance(option_name, str) and option_name.casefold() == "backlog":
+                    backlog_options.append(option)
+            if len(backlog_options) != 1:
+                raise PbiCreationValidationError(
+                    "Configured Project Backlog option changed",
+                    code="project_backlog_unavailable",
+                )
+            option_id = backlog_options[0].get("id")
+            if not isinstance(option_id, str) or option_id != target.backlog_option_id:
+                raise PbiCreationValidationError(
+                    "Configured Project Backlog option changed",
+                    code="project_backlog_unavailable",
+                )
+            status_field_id = field_id
+            backlog_option_id = option_id
+
+            items = _mapping(project.get("items"))
+            for raw_item in _nodes(items):
+                raw_content: object = raw_item.get("content")
+                if not isinstance(raw_content, Mapping):
+                    continue
+                content = cast(Mapping[str, Any], raw_content)
+                if content.get("__typename") != "Issue":
+                    continue
+                repository_value: object = content.get("repository")
+                repository_name = (
+                    cast(Mapping[str, Any], repository_value).get("nameWithOwner")
+                    if isinstance(repository_value, Mapping)
+                    else None
+                )
+                matches = content.get("id") == issue_id or (
+                    content.get("number") == issue_number
+                    and isinstance(repository_name, str)
+                    and repository_name.casefold() == request.repository.casefold()
+                )
+                if not matches:
+                    continue
+                status_values: list[Mapping[str, Any]] = []
+                for value in _nodes(raw_item.get("fieldValues")):
+                    raw_field: object = value.get("field")
+                    if not isinstance(raw_field, Mapping):
+                        continue
+                    field = cast(Mapping[str, Any], raw_field)
+                    if field.get("id") == field_id:
+                        status_values.append(value)
+                if len(status_values) > 1:
+                    raise ProviderError("Project item has conflicting Status values")
+                raw_status = status_values[0].get("name") if status_values else None
+                status = raw_status if isinstance(raw_status, str) else None
+                matching_items.append(
+                    {
+                        "item_id": raw_item.get("id"),
+                        "status": status,
+                    }
+                )
+            has_next, cursor = _next_cursor(items)
+            if not has_next:
+                break
+
+        if (
+            status_field_id != target.status_field_id
+            or backlog_option_id != target.backlog_option_id
+        ):
+            raise ProviderError("Project creation configuration changed")
+        if len(matching_items) > 1:
+            raise PbiCreationError(
+                "Issue appears more than once in the configured Project",
+                code="duplicate_project_items",
+                status_code=409,
+            )
+        return matching_items[0] if matching_items else None
 
     def _resolve_custom_base_branch(
         self, owner: str, name: str, requested: str
@@ -3983,6 +4627,20 @@ class EnvironmentGitHubProvider:
         invalidate = getattr(provider, "invalidate_discovery_cache", None)
         if callable(invalidate):
             invalidate()
+
+    def prepare_pbi_creation(self, request: PbiCreationRequest) -> PbiCreationTarget:
+        provider = cast(PbiCreationProvider, self._configured_provider())
+        return provider.prepare_pbi_creation(request)
+
+    def create_pbi(
+        self,
+        request: PbiCreationRequest,
+        target: PbiCreationTarget,
+        progress: PbiCreationProgress,
+        checkpoint: Callable[[PbiCreationProgress], None],
+    ) -> PbiCreationResult:
+        provider = cast(PbiCreationProvider, self._configured_provider())
+        return provider.create_pbi(request, target, progress, checkpoint)
 
     def create_handoff(self, request: HandoffRequest) -> HandoffResult:
         return self._configured_provider().create_handoff(request)
