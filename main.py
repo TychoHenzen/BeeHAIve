@@ -22,6 +22,7 @@ from beehaiive.dashboard import build_dashboard_state
 from beehaiive.meta_review import MetaReviewError, MetaReviewService
 from beehaiive.models import RunState, RunStatus
 from beehaiive.provider import ProviderError
+from beehaiive.quality_gates import RepositoryGateSuite
 from beehaiive.review import (
     REQUIRED_CONCERNS,
     PullRequestReviewProvider,
@@ -53,9 +54,7 @@ from beehaiive.storage import (
     StoreError,
 )
 from beehaiive.workflow import (
-    CommandCheck,
     Constitution,
-    DeterministicCheck,
     LeaseStatus,
     WorkflowError,
     WorkflowRole,
@@ -903,6 +902,16 @@ def create_app(
 
         return _handle_workflow_error(operation)
 
+    @app.get("/workflow/runs/{run_id}/quality-gates")
+    def workflow_quality_gates(  # pyright: ignore[reportUnusedFunction]
+        run_id: str,
+        _auth: None = Depends(require_routing_run_access),
+    ) -> dict[str, object]:
+        quality_gates = _dashboard_quality_gates(require_workflow_service(), run_id)
+        if quality_gates is None:
+            raise HTTPException(status_code=404, detail="Run quality gates not found")
+        return {"run_id": run_id, "quality_gates": quality_gates}
+
     @app.post("/workflow/conflict-repairs")
     def repair_conflict(  # pyright: ignore[reportUnusedFunction]
         request: ConflictRepairRequest,
@@ -1374,15 +1383,81 @@ def create_app(
         lease_token: str | None = Header(default=None, alias="X-Lease-Token"),
         _auth: None = Depends(require_mutation_access),
     ) -> dict[str, object]:
-        routing = _handle_store_error(
-            lambda: orchestrator.run_implementation_attempt(
-                run_id, _required_header(lease_token, "X-Lease-Token")
+        token = _required_header(lease_token, "X-Lease-Token")
+        try:
+            run = orchestrator.store.validate_lease(run_id, token)
+        except StoreError as exc:
+            raise HTTPException(
+                status_code=403, detail="Run is not authorized"
+            ) from exc
+        if run.status is not RunStatus.ACTIVE or run.stage is not Stage.IMPLEMENT:
+            raise HTTPException(
+                status_code=409,
+                detail="Only an active implementation run can execute a model",
             )
+        service = require_workflow_service()
+        workspace = _handle_workflow_error(lambda: service.workspace_for_run(run_id))
+        if workspace is None:
+            raise HTTPException(
+                status_code=409,
+                detail="A leased workspace is required before model execution",
+            )
+        gate = _handle_workflow_error(
+            lambda: service.before_model_call(workspace.lease_id)
         )
-        run = orchestrator.store.get_run(run_id)
-        if run is None:  # pragma: no cover - the service already validated the run
-            raise HTTPException(status_code=404, detail="Run not found")
-        return {"run": _run_dict(run), "routing": routing.as_dict()}
+        if not gate.allowed:
+            raise HTTPException(status_code=409, detail=gate.as_dict())
+        executor = orchestrator.model_executor
+        prepare_run = getattr(executor, "prepare_run", None)
+        release_run = getattr(executor, "release_run", None)
+        if not callable(prepare_run) or not callable(release_run):
+            raise HTTPException(
+                status_code=503,
+                detail="Model executor does not support leased workspace execution",
+            )
+        prepared = False
+        repository = service.worktrees.repository
+        executor_repository = getattr(executor, "repository", repository)
+        if Path(executor_repository).resolve() != Path(repository).resolve():
+            raise HTTPException(
+                status_code=409,
+                detail="Executor and workflow service must use the same repository",
+            )
+        expected_repository = run.repository
+
+        def validate_workspace() -> None:
+            current_run = orchestrator.store.validate_lease(run_id, token)
+            current_workspace = service.store.require_lease_token(
+                workspace.lease_id, workspace.lease_token
+            )
+            if (
+                current_run.status is not RunStatus.ACTIVE
+                or current_run.stage is not Stage.IMPLEMENT
+                or current_run.repository != expected_repository
+                or current_workspace.agent_id != f"dashboard-run:{run_id}"
+                or current_workspace.worktree_path != workspace.worktree_path
+            ):
+                raise WorkflowError("Run or workspace lease changed")
+
+        try:
+            _handle_store_error(
+                lambda: _handle_workflow_error(
+                    lambda: prepare_run(
+                        run_id, expected_repository, workspace, validate_workspace
+                    )
+                )
+            )
+            prepared = True
+            routing = _handle_store_error(
+                lambda: orchestrator.run_implementation_attempt(run_id, token)
+            )
+            run = orchestrator.store.get_run(run_id)
+            if run is None:  # pragma: no cover - the service already validated the run
+                raise HTTPException(status_code=404, detail="Run not found")
+            return {"run": _run_dict(run), "routing": routing.as_dict()}
+        finally:
+            if prepared:
+                release_run(run_id)
 
     @app.post("/runs/{run_id}/question/answer")
     def answer_task_question(  # pyright: ignore[reportUnusedFunction]
@@ -1586,6 +1661,11 @@ def _dashboard_state(
         for pbi in cast(list[dict[str, object]], repository["pbis"]):
             run_id = pbi.get("run_id")
             if isinstance(run_id, str):
+                quality_gates = _dashboard_quality_gate_summary(
+                    workflow_service, run_id
+                )
+                if quality_gates is not None:
+                    pbi["quality_gates"] = quality_gates
                 delivery = _dashboard_delivery(workflow_service, run_id)
                 if delivery is not None:
                     pbi["delivery"] = delivery
@@ -1638,6 +1718,49 @@ def _dashboard_delivery(
         "retry_available": lease.status is LeaseStatus.RETAINED
         and status not in {"pushed", "no_changes"},
     }
+
+
+def _dashboard_quality_gates(
+    workflow_service: WorkflowService, run_id: str
+) -> dict[str, object] | None:
+    lease = workflow_service.workspace_for_run(run_id)
+    if lease is None:
+        return None
+    gates: dict[str, object] = {
+        name: gate.as_dict()
+        for name in ("model_call", "git_delivery")
+        if (gate := workflow_service.store.latest_gate(lease.lease_id, name))
+        is not None
+    }
+    return gates or None
+
+
+def _dashboard_quality_gate_summary(
+    workflow_service: WorkflowService, run_id: str
+) -> dict[str, object] | None:
+    lease = workflow_service.workspace_for_run(run_id)
+    if lease is None:
+        return None
+    gates: dict[str, object] = {}
+    for name in ("model_call", "git_delivery"):
+        gate = workflow_service.store.latest_gate(lease.lease_id, name)
+        if gate is not None:
+            gates[name] = {
+                "gate": gate.gate,
+                "allowed": gate.allowed,
+                "checks": [
+                    {
+                        "name": check.name,
+                        "passed": check.passed,
+                        "status": check.status,
+                        "category": check.category,
+                        "required": check.required,
+                        "exit_code": check.exit_code,
+                    }
+                    for check in gate.checks
+                ],
+            }
+    return gates or None
 
 
 def _dashboard_pbi(
@@ -1777,11 +1900,8 @@ def _production_workflow_service() -> WorkflowService:
         WorkflowStore(database),
         repository,
         Constitution.load(constitution_path),
-        (
-            cast(
-                DeterministicCheck, CommandCheck("tests", ("uv", "run", "pytest", "-q"))
-            ),
-        ),
+        None,
+        check_runner=RepositoryGateSuite(),
     )
 
 

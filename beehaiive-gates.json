@@ -1,0 +1,86 @@
+{
+  "version": 1,
+  "gates": [
+    {
+      "name": "python-tests",
+      "argv": ["uv", "run", "pytest", "-q"],
+      "timeout_seconds": 600,
+      "category": "tests",
+      "required": true,
+      "external_only": false
+    },
+    {
+      "name": "javascript-tests",
+      "argv": ["uv", "run", "node", "--test"],
+      "timeout_seconds": 180,
+      "category": "tests",
+      "required": true,
+      "external_only": false
+    },
+    {
+      "name": "formatting",
+      "argv": ["uv", "run", "ruff", "format", "--check", "."],
+      "timeout_seconds": 90,
+      "category": "quality",
+      "required": true,
+      "external_only": false
+    },
+    {
+      "name": "lint",
+      "argv": ["uv", "run", "ruff", "check", "."],
+      "timeout_seconds": 90,
+      "category": "quality",
+      "required": true,
+      "external_only": false
+    },
+    {
+      "name": "type-check",
+      "argv": ["uv", "run", "pyright"],
+      "timeout_seconds": 180,
+      "category": "quality",
+      "required": true,
+      "external_only": false
+    },
+    {
+      "name": "coverage",
+      "argv": [
+        "uv",
+        "run",
+        "pytest",
+        "-q",
+        "--cov=main",
+        "--cov=beehaiive",
+        "--cov-report=term-missing",
+        "--cov-fail-under=90"
+      ],
+      "timeout_seconds": 600,
+      "category": "tests",
+      "required": true,
+      "external_only": false
+    },
+    {
+      "name": "dependency-audit",
+      "argv": ["uv", "run", "pip-audit", "--progress-spinner", "off"],
+      "timeout_seconds": 180,
+      "category": "security",
+      "required": true,
+      "external_only": false
+    },
+    {
+      "name": "actionlint",
+      "argv": [],
+      "timeout_seconds": 1,
+      "category": "security",
+      "required": false,
+      "external_only": true
+    },
+    {
+      "name": "codeql",
+      "argv": [],
+      "timeout_seconds": 1,
+      "category": "security",
+      "required": false,
+      "external_only": true
+    }
+  ]
+}

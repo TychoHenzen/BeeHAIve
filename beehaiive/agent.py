@@ -28,8 +28,9 @@ from .routing import (
     RoutingDecision,
     RoutingStatus,
 )
-from .storage import StoreError
+from .storage import MAX_AGENT_DIAGNOSTIC_LENGTH, StoreError
 from .workflow import (
+    GateResult,
     GitDeliveryResult,
     GitDeliveryStatus,
     LeaseStatus,
@@ -149,6 +150,50 @@ def redact_worker_text(
         lambda match: f"{match.group(1)}=[redacted]", redacted
     )
     return redacted if max_length is None else redacted[:max_length]
+
+
+def safe_worker_environment() -> dict[str, str]:
+    """Keep only the environment variables allowed in bounded worker processes."""
+
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if name.upper() in _SAFE_ENVIRONMENT_NAMES
+    }
+
+
+def worker_secret_values() -> tuple[str, ...]:
+    """Return secret-like environment values for redacting worker evidence."""
+
+    return tuple(
+        sorted(
+            {
+                value
+                for name, value in os.environ.items()
+                if _SECRET_NAME.search(name) and value
+            },
+            key=len,
+            reverse=True,
+        )
+    )
+
+
+def _gate_summary(result: GateResult) -> dict[str, object]:
+    return {
+        "gate": result.gate,
+        "allowed": result.allowed,
+        "required_action": result.required_action,
+        "checks": [
+            {
+                "name": check.name,
+                "status": check.status or ("passed" if check.passed else "failed"),
+                "category": check.category,
+                "required": check.required,
+                "exit_code": check.exit_code,
+            }
+            for check in result.checks
+        ],
+    }
 
 
 class CodexExecModelExecutor:
@@ -552,6 +597,11 @@ class CodexExecModelExecutor:
                 )
             validate_workspace_lease()
         with self._lock:
+            if (
+                problem_id in self._active_attempts
+                or problem_id in self._workspace_leases
+            ):
+                raise StoreError("An agent execution is already prepared for this run")
             self._active_attempts.add(problem_id)
             if workspace_lease is not None:
                 self._workspace_leases[problem_id] = workspace_lease
@@ -766,11 +816,7 @@ class CodexExecModelExecutor:
         return command
 
     def _safe_environment(self) -> dict[str, str]:
-        return {
-            name: value
-            for name, value in os.environ.items()
-            if name.upper() in _SAFE_ENVIRONMENT_NAMES
-        }
+        return safe_worker_environment()
 
     @contextmanager
     def _safe_checkout(self) -> Generator[Path]:
@@ -909,13 +955,19 @@ class CodexExecModelExecutor:
     def _terminate_process(process: subprocess.Popen[Any]) -> None:
         running = process.poll() is None
         if os.name == "nt":
+            close_job = getattr(process, "_beehaiive_job_close", None)
+            if callable(close_job):
+                close_job()
+                if running:
+                    process.wait(timeout=3)
+                return
             command = ["taskkill", "/PID", str(process.pid), "/T", "/F"]
             subprocess.run(
                 command,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                check=True,
+                check=False,
                 timeout=3,
             )
             if running:
@@ -927,7 +979,7 @@ class CodexExecModelExecutor:
                         stdin=subprocess.DEVNULL,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
-                        check=True,
+                        check=False,
                         timeout=3,
                     )
                     process.wait(timeout=3)
@@ -968,10 +1020,25 @@ class CodexExecModelExecutor:
                     process.wait(timeout=1)
 
     @staticmethod
+    def communicate_bounded(
+        process: subprocess.Popen[Any],
+        timeout: float,
+        *,
+        terminate_descendants: bool = False,
+    ) -> tuple[str, str, bool]:
+        """Capture bounded stdout and stderr while enforcing the process timeout."""
+
+        return CodexExecModelExecutor._communicate_bounded(
+            process, timeout, terminate_descendants=terminate_descendants
+        )
+
+    @staticmethod
     def _communicate_bounded(
         process: subprocess.Popen[Any],
         timeout: float,
         stdout_line_handler: Callable[[str], None] | None = None,
+        *,
+        terminate_descendants: bool = False,
     ) -> tuple[str, str, bool]:
         buffers = [bytearray(), bytearray()]
         streams = [process.stdout, process.stderr]
@@ -1057,6 +1124,7 @@ class CodexExecModelExecutor:
             process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
+        if timed_out or terminate_descendants:
             CodexExecModelExecutor._terminate_process(process)
         for reader, stream in zip(
             readers, (stream for stream in streams if stream is not None), strict=True
@@ -1319,6 +1387,7 @@ class AgentWorkerManager:
             )
             self._threads[run.run_id] = thread
         workspace_lease: WorkspaceLease | None = None
+        executor_prepared = False
         try:
             service_repository = self.workflow_service.worktrees.repository
             executor_repository = getattr(
@@ -1349,6 +1418,7 @@ class AgentWorkerManager:
                 workspace_lease,
                 validate_workspace_lease,
             )
+            executor_prepared = True
             store = self.orchestrator.store
             previous_session = store.get_agent_session(run.run_id)
             task = (
@@ -1403,8 +1473,9 @@ class AgentWorkerManager:
                 self._threads.pop(run.run_id, None)
                 self._workspace_leases.pop(run.run_id, None)
                 self._workspace_validators.pop(run.run_id, None)
-            with suppress(Exception):
-                self.executor.release_run(run.run_id)
+            if executor_prepared:
+                with suppress(Exception):
+                    self.executor.release_run(run.run_id)
             if workspace_lease is not None:
                 try:
                     self.workflow_service.discard_workspace(
@@ -1575,6 +1646,7 @@ class AgentWorkerManager:
             )
             heartbeat_thread.start()
         preserve_workspace = False
+        preflight_gate: GateResult | None = None
         try:
             pending_lookup = getattr(self.orchestrator.store, "pending_handoff", None)
             pending_handoff = (
@@ -1593,6 +1665,25 @@ class AgentWorkerManager:
                     verification_evidence=pending_handoff.verification_evidence,
                 )
                 return
+            if workspace_lease is not None and workflow_service is not None:
+                preflight_gate = workflow_service.before_model_call(
+                    workspace_lease.lease_id
+                )
+                if not preflight_gate.allowed:
+                    failure = json.dumps(
+                        {"quality_gate": _gate_summary(preflight_gate)},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    self.orchestrator.store.fail_agent_run(
+                        run_id,
+                        redact_worker_text(
+                            failure, max_length=MAX_AGENT_DIAGNOSTIC_LENGTH
+                        ),
+                        lease_token,
+                        claimable=False,
+                    )
+                    return
             self.orchestrator.advance(run_id, Stage.IMPLEMENT, lease_token)
             if validate_workspace_lease is not None:
                 validate_workspace_lease()
@@ -1678,11 +1769,29 @@ class AgentWorkerManager:
                             {
                                 "task_result": task_result.as_dict(),
                                 "git_delivery": delivery.as_dict(),
+                                "quality_gates": {
+                                    key: _gate_summary(gate)
+                                    for key, gate in (
+                                        (
+                                            "before_model_call",
+                                            preflight_gate,
+                                        ),
+                                        (
+                                            "git_delivery",
+                                            workflow_service.store.latest_gate(
+                                                workspace_lease.lease_id,
+                                                "git_delivery",
+                                            ),
+                                        ),
+                                    )
+                                    if gate is not None
+                                },
                             },
                             sort_keys=True,
                             separators=(",", ":"),
                         ),
                         secret_values,
+                        max_length=MAX_AGENT_DIAGNOSTIC_LENGTH,
                     )
                     self.orchestrator.handoff(
                         run_id,

@@ -99,6 +99,7 @@ MAX_EVENT_LIMIT = 500
 DEFAULT_ACTION_LIMIT = 50
 MAX_ACTION_LIMIT = 200
 MAX_AGENT_RESULT_LENGTH = 4_000
+MAX_AGENT_DIAGNOSTIC_LENGTH = 16_000
 MAX_META_REVIEW_RECORDS = 25
 MAX_META_REVIEW_INPUT_TOKENS = 8_000
 MAX_META_REVIEW_SUGGESTIONS = 25
@@ -1722,7 +1723,7 @@ class OrchestratorStore:
         normalized_error = error.strip()
         if not normalized_error:
             raise StoreError("A failure reason is required")
-        normalized_error = normalized_error[:MAX_AGENT_RESULT_LENGTH]
+        normalized_error = normalized_error[:MAX_AGENT_DIAGNOSTIC_LENGTH]
         with self._transaction() as connection:
             row = self._run_for_id(connection, run_id)
             if row is None:
@@ -1791,7 +1792,7 @@ class OrchestratorStore:
             raise StoreError("A failure reason is required")
         if not expected_lease_token.strip():
             raise StoreError("A run lease token is required")
-        normalized_error = normalized_error[:MAX_AGENT_RESULT_LENGTH]
+        normalized_error = normalized_error[:MAX_AGENT_DIAGNOSTIC_LENGTH]
         with self._transaction() as connection:
             row = self._run_for_id(connection, run_id)
             if row is None:

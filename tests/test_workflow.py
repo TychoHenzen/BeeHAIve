@@ -208,6 +208,43 @@ def test_commit_and_push_records_exact_commit_for_handoff_and_remote(
     reloaded.close()
 
 
+def test_commit_and_push_quality_gate_blocks_before_staging(tmp_path: Path) -> None:
+    service, store, _repository_path, _remote = _delivery_service(tmp_path)
+    service.checks = DeterministicCheckRunner(
+        [FixtureCheck("coverage", passed=False, evidence="Coverage is 89%")]
+    )
+    worktree = tmp_path / "quality-blocked-worktree"
+    lease = service.acquire_workspace(
+        "dashboard-run:quality-blocked", "codex/quality-blocked", worktree
+    )
+    (worktree / "change.txt").write_text("unverified change\n", encoding="utf-8")
+    base_head = service.worktrees.head(worktree)
+    status_before = _git(worktree, "status", "--porcelain", "--untracked-files=all")
+
+    result = service.commit_and_push(
+        lease.lease_id,
+        lease.lease_token,
+        "dashboard-run:quality-blocked",
+        "owner/api",
+        "deliver unverified change",
+        lambda: None,
+    )
+
+    assert result.status is GitDeliveryStatus.BLOCKED
+    assert "coverage" in result.evidence
+    assert service.worktrees.head(worktree) == base_head
+    assert (
+        _git(worktree, "status", "--porcelain", "--untracked-files=all")
+        == status_before
+    )
+    gate = store.latest_gate(lease.lease_id, "git_delivery")
+    assert gate is not None and gate.allowed is False
+    coverage = next(check for check in gate.checks if check.name == "coverage")
+    assert coverage.status == "failed"
+    assert coverage.required is True
+    store.close()
+
+
 def test_delivery_commits_changes_added_after_a_successful_push(
     tmp_path: Path,
 ) -> None:
