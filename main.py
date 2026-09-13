@@ -318,6 +318,10 @@ def create_app(
         orchestrator.model_router = routing_service
     if orchestrator.model_executor is None:
         orchestrator.model_executor = model_executor
+    pbi_creation_service = PbiCreationService(
+        orchestrator.store,
+        cast(PbiCreationProvider, orchestrator.provider),
+    )
     if (
         conflict_repair_service is None
         and workflow_service is not None
@@ -1151,12 +1155,8 @@ def create_app(
             body=request.body,
             labels=tuple(request.labels),
         )
-        service = PbiCreationService(
-            orchestrator.store,
-            cast(PbiCreationProvider, orchestrator.provider),
-        )
         try:
-            result = service.create(creation_request, idempotency_key)
+            result = pbi_creation_service.create(creation_request, idempotency_key)
         except PbiCreationError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
         except StoreError as exc:
@@ -1243,11 +1243,12 @@ def create_app(
         _auth: None = Depends(require_mutation_access),
     ) -> dict[str, object]:
         return _handle_meta_review_error(
-            lambda: {
-                "suggestion": meta_review_service.decide(
-                    project_id, suggestion_id, request.decision
-                )
-            }
+            lambda: meta_review_service.decide(
+                project_id,
+                suggestion_id,
+                request.decision,
+                pbi_creator=pbi_creation_service.create,
+            )
         )
 
     @app.post("/projects/{project_id}/actions")
@@ -1617,6 +1618,8 @@ def _handle_store_error[T](function: Callable[[], T]) -> T:
 def _handle_meta_review_error[T](function: Callable[[], T]) -> T:
     try:
         return function()
+    except PbiCreationError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     except (MetaReviewError, StoreError):
         raise HTTPException(
             status_code=409, detail="Meta-review request could not be completed"
