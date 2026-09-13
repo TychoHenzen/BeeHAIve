@@ -1,5 +1,6 @@
 import sqlite3
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
@@ -21,6 +22,7 @@ from beehaiive.models import (
     Stage,
 )
 from beehaiive.orchestrator import Orchestrator
+from beehaiive.quality_gates import RepositoryGateSuite
 from beehaiive.routing import (
     AttemptOutcome,
     ModelExecution,
@@ -36,7 +38,51 @@ from beehaiive.routing import (
     RoutingStore,
 )
 from beehaiive.storage import OrchestratorStore, StoreError
+from beehaiive.workflow import (
+    CheckResult,
+    CheckSuite,
+    Constitution,
+    DeterministicCheckRunner,
+    GitWorktreeManager,
+    WorkflowService,
+    WorkflowStore,
+    WorkspaceLease,
+)
 from main import create_app
+
+CONSTITUTION_PATH = Path(__file__).parents[1] / "constitution.json"
+
+
+class _PassingQualityCheck:
+    name = "fixture-pass"
+
+    def run(self, workspace: Path) -> CheckResult:
+        assert workspace.is_dir()
+        return CheckResult(self.name, True, "fixture passed")
+
+
+def _workflow_service_for_attempt(
+    tmp_path: Path, check_runner: CheckSuite
+) -> tuple[WorkflowService, WorkflowStore]:
+    repository = tmp_path / "workflow-repository"
+    repository.mkdir()
+    store = WorkflowStore()
+    worktrees = cast(GitWorktreeManager, SimpleNamespace(repository=repository))
+    service = WorkflowService(
+        store,
+        repository,
+        Constitution.load(CONSTITUTION_PATH),
+        None,
+        worktrees=worktrees,
+        check_runner=check_runner,
+    )
+    return service, store
+
+
+def _attach_run_workspace(store: WorkflowStore, tmp_path: Path, run_id: str) -> None:
+    workspace = tmp_path / f"workspace-{run_id}"
+    workspace.mkdir()
+    store.acquire_lease(f"dashboard-run:{run_id}", f"codex/{run_id}", str(workspace))
 
 
 class RoutingProvider:
@@ -96,6 +142,43 @@ class FakeRoutingModel:
             recursive_spawn_depth=self.recursive_spawn_depth,
             task_result=self.task_result,
         )
+
+
+class LeasedFakeRoutingModel(FakeRoutingModel):
+    def __init__(self) -> None:
+        super().__init__(
+            (AttemptOutcome.SUCCESS,),
+            input_tokens=7,
+            output_tokens=3,
+            task_result=TaskResult(TaskOutcome.PASS, {}),
+        )
+        self.workspace_path: str | None = None
+        self.workspace_validator: Callable[[], None] | None = None
+        self.release_calls = 0
+
+    def prepare_run(
+        self,
+        _problem_id: str,
+        _repository: str,
+        workspace_lease: WorkspaceLease | None = None,
+        validate_workspace_lease: Callable[[], None] | None = None,
+    ) -> None:
+        assert workspace_lease is not None
+        assert validate_workspace_lease is not None
+        self.workspace_path = workspace_lease.worktree_path
+        self.workspace_validator = validate_workspace_lease
+        validate_workspace_lease()
+
+    def release_run(self, _problem_id: str) -> None:
+        self.release_calls += 1
+        self.workspace_path = None
+        self.workspace_validator = None
+
+    def execute(self, spec: ModelSpec, decision: object) -> ModelExecution:
+        assert self.workspace_path is not None
+        assert self.workspace_validator is not None
+        self.workspace_validator()
+        return super().execute(spec, decision)
 
 
 class BlockingRoutingModel:
@@ -693,22 +776,31 @@ def test_implement_advance_api_exposes_the_initial_routing_decision() -> None:
     orchestrator_store.close()
 
 
-def test_run_attempt_api_executes_the_selected_model() -> None:
+@pytest.mark.parametrize("gate_mode", ["allowed", "blocked", "unbound", "unconfigured"])
+def test_run_attempt_api_enforces_quality_gates(tmp_path: Path, gate_mode: str) -> None:
     routing_store = RoutingStore()
     router = ModelRouter(routing_store, _config())
-    model = FakeRoutingModel(
-        (AttemptOutcome.SUCCESS,),
-        input_tokens=7,
-        output_tokens=3,
-        task_result=TaskResult(TaskOutcome.PASS, {}),
-    )
+    model: FakeRoutingModel = LeasedFakeRoutingModel()
+    if gate_mode == "unbound":
+        model = FakeRoutingModel((AttemptOutcome.SUCCESS,))
     orchestrator_store = OrchestratorStore()
     service = Orchestrator(orchestrator_store, RoutingProvider(), router, model)
+    workflow_service = None
+    workflow_store = None
+    if gate_mode in {"allowed", "unbound"}:
+        workflow_service, workflow_store = _workflow_service_for_attempt(
+            tmp_path, DeterministicCheckRunner([_PassingQualityCheck()])
+        )
+    elif gate_mode == "blocked":
+        workflow_service, workflow_store = _workflow_service_for_attempt(
+            tmp_path, RepositoryGateSuite()
+        )
     client = TestClient(
         create_app(
             orchestrator=service,
             api_key="test-key",
             allowed_project_ids={"owner:7"},
+            workflow_service=workflow_service,
         )
     )
     headers = {"X-API-Key": "test-key", "X-Worker-ID": "worker-1"}
@@ -717,6 +809,8 @@ def test_run_attempt_api_executes_the_selected_model() -> None:
         "/projects/owner:7/repositories/owner/api/claim", headers=headers
     )
     run_id = claim.json()["run_id"]
+    if workflow_store is not None:
+        _attach_run_workspace(workflow_store, tmp_path, run_id)
     lease_headers = {
         "X-API-Key": "test-key",
         "X-Lease-Token": claim.json()["lease_token"],
@@ -729,12 +823,61 @@ def test_run_attempt_api_executes_the_selected_model() -> None:
 
     attempted = client.post(f"/runs/{run_id}/attempt", headers=lease_headers)
 
-    assert attempted.status_code == 200
-    assert attempted.json()["routing"]["attempt"]["model"] == "cheap-writer"
-    assert attempted.json()["routing"]["attempt"]["total_tokens"] == 10
-    assert attempted.json()["routing"]["state"]["status"] == "resolved"
-    assert model.models == ["cheap-writer"]
+    if gate_mode == "allowed":
+        assert isinstance(model, LeasedFakeRoutingModel)
+        assert attempted.status_code == 200
+        assert attempted.json()["routing"]["attempt"]["model"] == "cheap-writer"
+        assert attempted.json()["routing"]["attempt"]["total_tokens"] == 10
+        assert attempted.json()["routing"]["state"]["status"] == "resolved"
+        assert model.models == ["cheap-writer"]
+        assert model.workspace_path is None
+        assert model.release_calls == 1
+        diagnostics_url = f"/workflow/runs/{run_id}/quality-gates"
+        assert client.get(diagnostics_url).status_code == 401
+        assert (
+            client.get(
+                diagnostics_url,
+                headers={"X-API-Key": "test-key", "X-Lease-Token": "invalid"},
+            ).status_code
+            == 403
+        )
+        diagnostics = client.get(diagnostics_url, headers=lease_headers)
+        assert diagnostics.status_code == 200
+        gate = diagnostics.json()["quality_gates"]["model_call"]
+        assert gate["allowed"] is True
+        assert "argv" in gate["checks"][0]
+        assert "stdout" in gate["checks"][0]
+        dashboard = client.get("/projects/owner:7/dashboard").json()
+        pbi = next(
+            pbi
+            for repository in dashboard["repositories"]
+            for pbi in repository["pbis"]
+            if pbi["run_id"] == run_id
+        )
+        summary = pbi["quality_gates"]["model_call"]
+        assert summary["checks"][0]["status"] == "passed"
+        assert "stdout" not in summary["checks"][0]
+    elif gate_mode == "blocked":
+        assert workflow_service is not None
+        assert workflow_store is not None
+        assert attempted.status_code == 409
+        gate = attempted.json()["detail"]
+        assert gate["allowed"] is False
+        assert gate["checks"][0]["status"] == "configuration_missing"
+        assert model.models == []
+        lease = workflow_service.workspace_for_run(run_id)
+        assert lease is not None
+        persisted = workflow_store.latest_gate(lease.lease_id, "model_call")
+        assert persisted is not None and persisted.as_dict() == gate
+    elif gate_mode == "unbound":
+        assert attempted.status_code == 503
+        assert model.models == []
+    else:
+        assert attempted.status_code == 503
+        assert model.models == []
 
+    if workflow_store is not None:
+        workflow_store.close()
     routing_store.close()
     orchestrator_store.close()
 

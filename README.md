@@ -163,6 +163,9 @@ uv run pyright
 uv run pytest --cov=beehaiive --cov=main --cov-report=term-missing --cov-fail-under=90
 ```
 
+The worker reads its gate contract from the root `beehaiive-gates.json`.
+Checks available only in CI are reported as `external_only`, not as local passes.
+
 The dashboard details, task contracts, and security boundary are documented in
 [`docs/dashboard.md`](docs/dashboard.md), [`docs/task-contracts.md`](docs/task-contracts.md),
 [`docs/meta-review.md`](docs/meta-review.md), and [`docs/security.md`](docs/security.md).

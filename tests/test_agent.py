@@ -28,6 +28,7 @@ from beehaiive.models import (
     Stage,
 )
 from beehaiive.orchestrator import Orchestrator
+from beehaiive.quality_gates import MANIFEST_NAME, RepositoryGateSuite
 from beehaiive.review import REQUIRED_CONCERNS, ReaderStatus
 from beehaiive.routing import (
     AttemptOutcome,
@@ -759,6 +760,12 @@ def test_prepare_run_rejects_invalid_and_credentialed_workspaces(
         monkeypatch.setattr(executor, "_repository_files", lambda: (Path(".env"),))
         with pytest.raises(StoreError, match="Credential-like tracked files"):
             executor.prepare_run("prepare-test", "owner/api", lease, validate)
+        executor.prepare_run("prepare-test", "owner/api")
+        try:
+            with pytest.raises(StoreError, match="already prepared"):
+                executor.prepare_run("prepare-test", "owner/api")
+        finally:
+            executor.release_run("prepare-test")
     finally:
         workflow_service.discard_workspace(lease.lease_id, "test complete")
         workflow_store.close()
@@ -1178,7 +1185,7 @@ def test_executor_builds_model_command_and_covers_process_helpers(
     windows_process = Process()
     CodexExecModelExecutor._terminate_process(windows_process)
     assert taskkill_calls[0][0] == ["taskkill", "/PID", "2", "/T", "/F"]
-    assert taskkill_calls[0][1]["check"] is True
+    assert taskkill_calls[0][1]["check"] is False
     assert windows_process.waits == 1
 
     class WindowsProcessTimeoutOnce(Process):
@@ -1199,13 +1206,12 @@ def test_executor_builds_model_command_and_covers_process_helpers(
     assert finished_windows_process.waits == 0
 
     def failed_taskkill(command, **kwargs):
-        del kwargs
-        raise subprocess.CalledProcessError(1, command)
+        return SimpleNamespace(returncode=1)
 
     monkeypatch.setattr(agent_module.subprocess, "run", failed_taskkill)
     failed_windows_process = Process()
-    with pytest.raises(subprocess.CalledProcessError):
-        CodexExecModelExecutor._terminate_process(failed_windows_process)
+    CodexExecModelExecutor._terminate_process(failed_windows_process)
+    assert failed_windows_process.waits == 1
     assert not failed_windows_process.killed
 
 
@@ -1501,6 +1507,63 @@ def test_worker_manager_rejects_duplicates_and_shutdowns(
         store.close()
         routing_store.close()
         workflow_store.close()
+
+
+def test_worker_blocks_model_execution_on_required_gate_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = make_git_repository(tmp_path / "repository")
+    executor = ImmediateExecutor(
+        ModelExecution(AttemptOutcome.SUCCESS, result="must not execute"), repository
+    )
+    orchestrator, state_store, routing_store, run = service_with_run(executor)
+    workflow_service, workflow_store = workflow_service_for(tmp_path, repository)
+
+    class FailingSuite:
+        def run(self, workspace: Path) -> tuple[CheckResult, ...]:
+            assert workspace.is_dir()
+            return (
+                CheckResult(
+                    "coverage",
+                    False,
+                    "Coverage is below 90 percent",
+                    status="failed",
+                    category="tests",
+                ),
+            )
+
+    attempted = Event()
+
+    def fail_if_started(*_args: object, **_kwargs: object) -> None:
+        attempted.set()
+        raise AssertionError("The model ran after a required gate failed")
+
+    monkeypatch.setattr(workflow_service, "checks", FailingSuite())
+    monkeypatch.setattr(orchestrator, "run_implementation_attempt", fail_if_started)
+    manager = AgentWorkerManager(orchestrator, executor, workflow_service)
+    try:
+        manager.start(run)
+        deadline = time.monotonic() + 5
+        while run.run_id in manager._threads:
+            if time.monotonic() >= deadline:
+                raise AssertionError("The worker did not stop after the gate failure")
+            time.sleep(0.01)
+
+        failed = state_store.get_run(run.run_id)
+        assert failed is not None and failed.status is RunStatus.FAILED
+        assert '"quality_gate"' in (failed.last_error or "")
+        assert "coverage" in (failed.last_error or "")
+        assert not attempted.is_set()
+        lease = workflow_service.workspace_for_run(run.run_id)
+        assert lease is not None
+        gate = workflow_store.latest_gate(lease.lease_id, "model_call")
+        assert gate is not None and gate.allowed is False
+        assert gate.checks[0].status == "failed"
+    finally:
+        manager.shutdown()
+        workflow_store.close()
+        state_store.close()
+        routing_store.close()
 
 
 def test_worker_manager_uses_run_title_when_executor_task_is_empty(
@@ -2459,6 +2522,39 @@ def test_dashboard_worker_writes_only_in_retained_worktree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repository = make_git_repository(tmp_path / "repository")
+    (repository / MANIFEST_NAME).write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "gates": [
+                    {
+                        "name": "worker-smoke",
+                        "argv": [sys.executable, "-c", "print('ready')"],
+                        "timeout_seconds": 5,
+                        "category": "tests",
+                        "required": True,
+                        "external_only": False,
+                    },
+                    {
+                        "name": "codeql",
+                        "argv": [],
+                        "timeout_seconds": 1,
+                        "category": "security",
+                        "required": False,
+                        "external_only": True,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    subprocess.run(("git", "add", MANIFEST_NAME), cwd=repository, check=True)
+    subprocess.run(
+        ("git", "commit", "-m", "add worker gate contract"),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+    )
     remote = configure_test_remote(repository, tmp_path)
     source_head = subprocess.run(
         ("git", "rev-parse", "HEAD"),
@@ -2494,7 +2590,14 @@ def test_dashboard_worker_writes_only_in_retained_worktree(
     )
     orchestrator, state_store, routing_store, run = service_with_run(executor)
 
-    workflow_service, workflow_store = workflow_service_for(tmp_path, repository)
+    workflow_store = WorkflowStore(tmp_path / "workflow.db")
+    workflow_service = WorkflowService(
+        workflow_store,
+        repository,
+        Constitution.load(Path(__file__).parents[1] / "constitution.json"),
+        None,
+        check_runner=RepositoryGateSuite(),
+    )
     monkeypatch.setenv("GITHUB_TOKEN", "fixture-secret")
     monkeypatch.setenv("BEEHAIIVE_API_KEY", "fixture-api-key")
     provider = orchestrator.provider
@@ -2584,6 +2687,14 @@ def test_dashboard_worker_writes_only_in_retained_worktree(
         assert handoff_evidence is not None
         assert handoff_evidence["handoff_head_sha"] == remote_head
         assert '"outcome":"pass"' in handoff_evidence["handoff_verification_evidence"]
+        assert '"quality_gates":' in handoff_evidence["handoff_verification_evidence"]
+        model_gate = workflow_store.latest_gate(lease.lease_id, "model_call")
+        assert model_gate is not None and model_gate.allowed
+        assert [check.status for check in model_gate.checks] == [
+            "passed",
+            "external_only",
+        ]
+        assert model_gate.checks[1].passed is False
         assert (
             subprocess.run(
                 ("git", "status", "--porcelain"),
@@ -3010,11 +3121,11 @@ def test_agent_run_completion_and_failure_persist_bounded_state() -> None:
             failure_store.fail_agent_run("missing", "error", failure_lease)
         failed = failure_store.fail_agent_run(
             failed_run.run_id,
-            "e" * 5_000,
+            "e" * 20_000,
             failure_lease,
         )
         assert failed.status is RunStatus.FAILED
-        assert failed.last_error == "e" * 4_000
+        assert failed.last_error == "e" * 16_000
         assert failed.lease_token is None
         assert (
             failure_store.fail_agent_run(failed_run.run_id, "ignored", "stale")

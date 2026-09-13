@@ -133,12 +133,32 @@ class CheckResult:
     name: str
     passed: bool
     evidence: str
+    status: str = ""
+    category: str = "workflow"
+    required: bool = True
+    argv: tuple[str, ...] = ()
+    exit_code: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.status:
+            object.__setattr__(self, "status", "passed" if self.passed else "failed")
 
     def as_dict(self) -> dict[str, object]:
         return {
             "name": self.name,
             "passed": self.passed,
             "evidence": self.evidence,
+            "status": self.status,
+            "category": self.category,
+            "required": self.required,
+            "argv": list(self.argv),
+            "exit_code": self.exit_code,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "error": self.error,
         }
 
 
@@ -363,6 +383,12 @@ class DeterministicCheckRunner:
         return tuple(results)
 
 
+class CheckSuite(Protocol):
+    """Run a repository's checks and return one result per check."""
+
+    def run(self, workspace: Path) -> tuple[CheckResult, ...]: ...
+
+
 @dataclass(frozen=True, slots=True)
 class Constitution:
     """Machine-readable shared rules selected by workflow role."""
@@ -487,14 +513,62 @@ def _checks_from_json(value: object) -> tuple[CheckResult, ...]:
         name = mapping.get("name")
         passed = mapping.get("passed")
         evidence = mapping.get("evidence")
+        status = mapping.get("status", "passed" if passed is True else "failed")
+        category = mapping.get("category", "workflow")
+        required = mapping.get("required", True)
+        argv = mapping.get("argv", [])
+        exit_code = mapping.get("exit_code")
+        stdout = mapping.get("stdout", "")
+        stderr = mapping.get("stderr", "")
+        error = mapping.get("error")
+        arguments = cast(list[object], argv) if isinstance(argv, list) else []
         if (
             not isinstance(name, str)
             or not isinstance(passed, bool)
             or not isinstance(evidence, str)
+            or not isinstance(status, str)
+            or status
+            not in {
+                "passed",
+                "failed",
+                "timed_out",
+                "unavailable",
+                "external_only",
+                "invalid_configuration",
+                "configuration_missing",
+            }
+            or passed != (status == "passed")
+            or not isinstance(category, str)
+            or not category
+            or type(required) is not bool
+            or not isinstance(argv, list)
+            or any(not isinstance(argument, str) for argument in arguments)
+            or (exit_code is not None and type(exit_code) is not int)
+            or not isinstance(stdout, str)
+            or not isinstance(stderr, str)
+            or (error is not None and not isinstance(error, str))
         ):
             raise WorkflowError("Stored verification evidence is invalid")
-        checks.append(CheckResult(name, passed, evidence))
+        checks.append(
+            CheckResult(
+                name,
+                passed,
+                evidence,
+                status,
+                category,
+                required,
+                tuple(cast(str, argument) for argument in arguments),
+                exit_code,
+                stdout,
+                stderr,
+                error,
+            )
+        )
     return tuple(checks)
+
+
+def _required_checks_pass(checks: Iterable[CheckResult]) -> bool:
+    return all(check.passed for check in checks if check.required)
 
 
 class WorkflowStore:
@@ -1660,12 +1734,21 @@ class WorkflowService:
         store: WorkflowStore,
         repository: str | Path,
         constitution: Constitution,
-        checks: Iterable[DeterministicCheck],
+        checks: Iterable[DeterministicCheck] | None,
         worktrees: GitWorktreeManager | None = None,
+        check_runner: CheckSuite | None = None,
     ) -> None:
+        if checks is not None and check_runner is not None:
+            raise WorkflowError("Provide checks or a check runner, not both")
+        if check_runner is None:
+            if checks is None:
+                raise WorkflowError(
+                    "A check runner or deterministic checks are required"
+                )
+            check_runner = DeterministicCheckRunner(checks)
         self.store = store
         self.constitution = constitution
-        self.checks = DeterministicCheckRunner(checks)
+        self.checks = check_runner
         self.worktrees = worktrees or GitWorktreeManager(repository, store)
 
     def acquire_workspace(
@@ -1784,6 +1867,8 @@ class WorkflowService:
                     )
             return None
 
+        quality_checks: tuple[CheckResult, ...] = ()
+
         def record(
             status: GitDeliveryStatus,
             delivery_state: str,
@@ -1792,6 +1877,7 @@ class WorkflowService:
         ) -> GitDeliveryResult:
             validate_pair()
             checks = (
+                *quality_checks,
                 CheckResult(
                     "delivery_status",
                     status is not GitDeliveryStatus.BLOCKED,
@@ -1849,12 +1935,38 @@ class WorkflowService:
         )
         previous_state = previous_checks.get("delivery_status")
         previous_sha = previous_checks.get("commit_sha") or None
+        quality_checks = tuple(self.checks.run(Path(lease.worktree_path)))
+        if not _required_checks_pass(quality_checks):
+            if previous_state == GitDeliveryStatus.PUSHED.value and previous_sha:
+                if not dirty and head == previous_sha:
+                    blocked_state, blocked_sha = previous_state, previous_sha
+                elif not dirty:
+                    blocked_state, blocked_sha = "blocked", head
+                else:
+                    blocked_state, blocked_sha = "blocked", None
+            elif (
+                previous_state in {"push_pending", "push_failed", "blocked"}
+                and previous_sha
+            ):
+                blocked_state, blocked_sha = previous_state, previous_sha
+            else:
+                blocked_state, blocked_sha = "blocked", None
+            failed_names = ", ".join(
+                check.name
+                for check in quality_checks
+                if check.required and not check.passed
+            )
+            return record(
+                GitDeliveryStatus.BLOCKED,
+                blocked_state,
+                blocked_sha,
+                "Required quality gates failed before Git delivery: " + failed_names,
+            )
         if previous_state == GitDeliveryStatus.PUSHED.value and previous_sha:
             if not dirty and head == previous_sha:
-                return GitDeliveryResult(
+                return record(
                     GitDeliveryStatus.PUSHED,
-                    lease_id,
-                    lease.branch,
+                    GitDeliveryStatus.PUSHED.value,
                     previous_sha,
                     "The recorded commit was already pushed.",
                 )
@@ -1867,10 +1979,9 @@ class WorkflowService:
                     "deliver the new commit.",
                 )
         if previous_state == GitDeliveryStatus.NO_CHANGES.value and not dirty:
-            return GitDeliveryResult(
+            return record(
                 GitDeliveryStatus.NO_CHANGES,
-                lease_id,
-                lease.branch,
+                GitDeliveryStatus.NO_CHANGES.value,
                 None,
                 "The working tree was clean; no commit or push was needed.",
             )
@@ -2115,7 +2226,7 @@ class WorkflowService:
         checks = self.checks.run(Path(lease.worktree_path))
         latest = self.store.latest_handoff(lease_id)
         handoff_allowed = latest is None or latest.status is HandoffStatus.ACCEPTED
-        failed_checks = not all(check.passed for check in checks)
+        failed_checks = not _required_checks_pass(checks)
         required_action = None
         if not handoff_allowed and latest is not None:
             required_action = (
@@ -2124,7 +2235,7 @@ class WorkflowService:
                 else f"Resolve handoff status: {latest.status.value}"
             )
         elif failed_checks:
-            required_action = "Fix deterministic checks before another model call"
+            required_action = self._failed_action(checks)
         result = GateResult(
             "model_call",
             not failed_checks and handoff_allowed,
@@ -2150,13 +2261,12 @@ class WorkflowService:
             rules,
             _optional(commit_sha, 200),
         )
+        passed = _required_checks_pass(checks)
         result = GateResult(
             "conflict_repair",
-            all(check.passed for check in checks),
+            passed,
             tuple(checks),
-            None
-            if all(check.passed for check in checks)
-            else self._failed_action(checks),
+            None if passed else self._failed_action(checks),
         )
         self.store.record_gate(lease_id, result)
         return result
@@ -2182,7 +2292,7 @@ class WorkflowService:
         normalized_commit = _optional(commit_sha, 200)
         normalized_state = _optional(source_state, 1_000)
         checks = self._handoff_checks(lease, normalized_state, rules, normalized_commit)
-        passed = all(check.passed for check in checks)
+        passed = _required_checks_pass(checks)
         if not passed:
             status = HandoffStatus.BLOCKED
             required_action = self._failed_action(checks)
@@ -2218,7 +2328,7 @@ class WorkflowService:
             handoff.constitution_rules,
             handoff.commit_sha,
         )
-        if not all(check.passed for check in checks):
+        if not _required_checks_pass(checks):
             return self.store.update_handoff(
                 handoff_id,
                 HandoffStatus.BLOCKED,
@@ -2345,5 +2455,7 @@ class WorkflowService:
 
     @staticmethod
     def _failed_action(checks: Sequence[CheckResult]) -> str:
-        failed = ", ".join(check.name for check in checks if not check.passed)
+        failed = ", ".join(
+            check.name for check in checks if check.required and not check.passed
+        )
         return f"Resolve failed or missing evidence: {failed}"
