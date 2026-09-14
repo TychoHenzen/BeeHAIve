@@ -5,7 +5,19 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Annotated, Literal, cast
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+)
+from fastapi import (
+    Path as FastAPIPath,
+)
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
@@ -84,6 +96,44 @@ class PbiCreationBody(BaseModel):
     title: str = Field(min_length=1, max_length=256)
     body: str = Field(min_length=1, max_length=65_536)
     labels: list[str] = Field(default_factory=list, max_length=20)
+
+
+class PbiRefinementQuestionInput(BaseModel):
+    text: str = Field(min_length=1, max_length=1_000)
+    evidence_refs: list[Annotated[str, Field(min_length=1, max_length=512)]] = Field(
+        default_factory=list, max_length=10
+    )
+
+
+class PbiRefinementStartRequest(BaseModel):
+    questions: list[PbiRefinementQuestionInput] = Field(min_length=1, max_length=25)
+
+
+class PbiRefinementAnswerRequest(BaseModel):
+    answer: str = Field(min_length=1, max_length=1_000)
+    expected_revision: int = Field(ge=0)
+    evidence_refs: list[Annotated[str, Field(min_length=1, max_length=512)]] = Field(
+        default_factory=list, max_length=10
+    )
+
+
+class PbiRefinementCompleteRequest(BaseModel):
+    expected_revision: int = Field(ge=0)
+    summary: str = Field(min_length=1, max_length=1_000)
+    evidence_refs: list[Annotated[str, Field(min_length=1, max_length=512)]] = Field(
+        default_factory=list, max_length=10
+    )
+
+
+class PbiRefinementFailureRequest(BaseModel):
+    expected_revision: int = Field(ge=0)
+    reason: str = Field(min_length=1, max_length=500)
+    retryable: bool
+
+
+class PbiRefinementReopenRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=500)
+    questions: list[PbiRefinementQuestionInput] = Field(min_length=1, max_length=25)
 
 
 class FailureRequest(BaseModel):
@@ -439,6 +489,24 @@ def create_app(
 
     app = FastAPI(title="BeeHAIve")
 
+    @app.exception_handler(RequestValidationError)
+    async def handle_request_validation_error(  # pyright: ignore[reportUnusedFunction]
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        route = request.scope.get("route")
+        route_path = getattr(route, "path", "")
+        if isinstance(route_path, str) and "/refinement" in route_path:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "Invalid PBI refinement request"},
+            )
+        return await request_validation_exception_handler(request, exc)
+
+    refinement_path = (
+        "/projects/{project_id}/repositories/{repository:path}/pbis/"
+        "{pbi_number}/refinement"
+    )
+
     if agent_worker is not None:
 
         @app.on_event("shutdown")  # pyright: ignore[reportDeprecated]
@@ -489,6 +557,7 @@ def create_app(
     configured_api_key = (
         api_key if api_key is not None else os.environ.get("BEEHAIIVE_API_KEY")
     )
+    refinement_secret_values = (configured_api_key,) if configured_api_key else ()
     configured_review_actor = (
         review_actor
         if review_actor is not None
@@ -630,6 +699,13 @@ def create_app(
                 detail="Workflow operator approval is required",
             )
         return actor.value
+
+    def require_refinement_operator(
+        request: Request,
+        supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    ) -> str:
+        require_mutation_access(request, supplied_api_key)
+        return require_workflow_operator(supplied_api_key)
 
     def require_handoff_lease_token(
         handoff_id: str,
@@ -1138,6 +1214,134 @@ def create_app(
         return _handle_store_error(
             lambda: orchestrator.synchronize(project_id, force_refresh=True)
         )
+
+    @app.post(refinement_path)
+    def start_pbi_refinement(  # pyright: ignore[reportUnusedFunction]
+        project_id: str,
+        repository: str,
+        pbi_number: Annotated[int, FastAPIPath(gt=0, le=2_147_483_647)],
+        request: PbiRefinementStartRequest,
+        operator_role: str = Depends(require_refinement_operator),
+    ) -> dict[str, object]:
+        attempt = _handle_store_error(
+            lambda: orchestrator.store.create_pbi_refinement_attempt(
+                project_id,
+                repository,
+                pbi_number,
+                [question.model_dump() for question in request.questions],
+                operator_role=operator_role,
+                secret_values=refinement_secret_values,
+            )
+        )
+        return attempt.as_dict()
+
+    @app.get(refinement_path)
+    def get_pbi_refinement(  # pyright: ignore[reportUnusedFunction]
+        project_id: str,
+        repository: str,
+        pbi_number: Annotated[int, FastAPIPath(gt=0, le=2_147_483_647)],
+        operator_role: str = Depends(require_refinement_operator),
+    ) -> dict[str, object]:
+        attempt = _handle_store_error(
+            lambda: orchestrator.store.get_pbi_refinement_attempt(
+                project_id,
+                repository,
+                pbi_number,
+                operator_role=operator_role,
+            )
+        )
+        if attempt is None:
+            raise HTTPException(status_code=404, detail="PBI refinement not found")
+        return attempt.as_dict()
+
+    @app.post(refinement_path + "/questions/{question_id}/answer")
+    def answer_pbi_refinement_question(  # pyright: ignore[reportUnusedFunction]
+        project_id: str,
+        repository: str,
+        pbi_number: Annotated[int, FastAPIPath(gt=0, le=2_147_483_647)],
+        question_id: str,
+        request: PbiRefinementAnswerRequest,
+        operator_role: str = Depends(require_refinement_operator),
+    ) -> dict[str, object]:
+        attempt = _handle_store_error(
+            lambda: orchestrator.store.answer_pbi_refinement_question(
+                project_id,
+                repository,
+                pbi_number,
+                question_id,
+                request.answer,
+                expected_revision=request.expected_revision,
+                evidence_refs=request.evidence_refs,
+                operator_role=operator_role,
+                secret_values=refinement_secret_values,
+            )
+        )
+        return attempt.as_dict()
+
+    @app.post(refinement_path + "/complete")
+    def complete_pbi_refinement(  # pyright: ignore[reportUnusedFunction]
+        project_id: str,
+        repository: str,
+        pbi_number: Annotated[int, FastAPIPath(gt=0, le=2_147_483_647)],
+        request: PbiRefinementCompleteRequest,
+        operator_role: str = Depends(require_refinement_operator),
+    ) -> dict[str, object]:
+        attempt = _handle_store_error(
+            lambda: orchestrator.store.complete_pbi_refinement_attempt(
+                project_id,
+                repository,
+                pbi_number,
+                expected_revision=request.expected_revision,
+                summary=request.summary,
+                evidence_refs=request.evidence_refs,
+                operator_role=operator_role,
+                secret_values=refinement_secret_values,
+            )
+        )
+        return attempt.as_dict()
+
+    @app.post(refinement_path + "/fail")
+    def fail_pbi_refinement(  # pyright: ignore[reportUnusedFunction]
+        project_id: str,
+        repository: str,
+        pbi_number: Annotated[int, FastAPIPath(gt=0, le=2_147_483_647)],
+        request: PbiRefinementFailureRequest,
+        operator_role: str = Depends(require_refinement_operator),
+    ) -> dict[str, object]:
+        attempt = _handle_store_error(
+            lambda: orchestrator.store.fail_pbi_refinement_attempt(
+                project_id,
+                repository,
+                pbi_number,
+                expected_revision=request.expected_revision,
+                reason=request.reason,
+                retryable=request.retryable,
+                operator_role=operator_role,
+                secret_values=refinement_secret_values,
+            )
+        )
+        return attempt.as_dict()
+
+    @app.post(refinement_path + "/reopen")
+    def reopen_pbi_refinement(  # pyright: ignore[reportUnusedFunction]
+        project_id: str,
+        repository: str,
+        pbi_number: Annotated[int, FastAPIPath(gt=0, le=2_147_483_647)],
+        request: PbiRefinementReopenRequest,
+        operator_role: str = Depends(require_refinement_operator),
+    ) -> dict[str, object]:
+        attempt = _handle_store_error(
+            lambda: orchestrator.store.reopen_pbi_refinement_attempt(
+                project_id,
+                repository,
+                pbi_number,
+                reason=request.reason,
+                questions=[question.model_dump() for question in request.questions],
+                operator_role=operator_role,
+                secret_values=refinement_secret_values,
+            )
+        )
+        return attempt.as_dict()
 
     @app.post("/projects/{project_id}/pbis")
     def create_project_pbi(  # pyright: ignore[reportUnusedFunction]

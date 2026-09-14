@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
@@ -10,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import RLock
 from typing import cast
+from urllib.parse import parse_qsl, urlsplit
 from uuid import uuid4
 
 from .contracts import ContractError, TaskContract, TaskOutcome, TaskResult
@@ -18,8 +20,11 @@ from .models import (
     PROJECT_TERMINAL_STATUSES,
     HandoffIntent,
     HandoffRequest,
+    PbiRefinementAttempt,
+    PbiRefinementQuestion,
     PbiSnapshot,
     ProjectSnapshot,
+    RefinementStatus,
     RoutingFailure,
     RunState,
     RunStatus,
@@ -35,6 +40,38 @@ MAX_AGENT_SESSION_EVENTS = 100
 MAX_AGENT_SESSION_EVENT_LENGTH = 4_000
 MAX_AGENT_SESSION_TEXT_BYTES = 64_000
 PBI_CREATION_LEASE_SECONDS = 300
+MAX_PBI_REFINEMENT_QUESTIONS = 25
+MAX_PBI_REFINEMENT_TEXT_LENGTH = 1_000
+MAX_PBI_REFINEMENT_CORRECTIONS = 3
+MAX_PBI_REFINEMENT_EVIDENCE_REFS = 10
+MAX_PBI_REFINEMENT_EVIDENCE_LENGTH = 512
+MAX_PBI_REFINEMENT_REASON_LENGTH = 500
+MAX_PBI_REFINEMENT_GENERATIONS = 3
+_REFINEMENT_URL = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_SENSITIVE_URL_PARTS = frozenset(
+    {
+        "apikey",
+        "assertion",
+        "auth",
+        "authorization",
+        "code",
+        "credential",
+        "key",
+        "jwt",
+        "password",
+        "secret",
+        "se",
+        "session",
+        "sig",
+        "signature",
+        "token",
+    }
+)
+_REFINEMENT_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b(?P<name>access[_-]?token|refresh[_-]?token|id[_-]?token|token|"
+    r"client[_-]?secret|secret|password|api[_-]?key|private[_-]?key)\b\s*"
+    r"[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s&,;]+)"
+)
 
 
 def _task_claimability_state(
@@ -180,6 +217,173 @@ def _json_list(value: object) -> list[object]:
     return cast(list[object], decoded) if isinstance(decoded, list) else []
 
 
+def _contains_signed_url(value: str) -> bool:
+    for match in _REFINEMENT_URL.finditer(value):
+        url = match.group().rstrip(".,);]")
+        try:
+            query = parse_qsl(urlsplit(url).query, keep_blank_values=True)
+        except ValueError:
+            continue
+        for name, _ in query:
+            parts = set(re.split(r"[_\-.]+|(?<=[a-z0-9])(?=[A-Z])", name))
+            if bool({part.lower() for part in parts} & _SENSITIVE_URL_PARTS):
+                return True
+    return False
+
+
+def _refinement_text(
+    value: object,
+    limit: int,
+    label: str,
+    secret_values: Sequence[str] = (),
+    *,
+    required: bool = True,
+) -> str:
+    if not isinstance(value, str) or (required and not value.strip()):
+        raise StoreError(f"{label} is required")
+    if len(value) > limit:
+        raise StoreError(f"{label} must be at most {limit:,} characters")
+    if _contains_signed_url(value):
+        raise StoreError("Signed URLs are not allowed in PBI refinement data")
+    from .agent import redact_worker_text, worker_secret_values
+
+    safe = redact_worker_text(
+        value,
+        (*worker_secret_values(), *(secret for secret in secret_values if secret)),
+        max_length=None,
+    )
+    safe = _REFINEMENT_SECRET_ASSIGNMENT.sub(
+        lambda match: f"{match.group('name')}=[redacted]", safe
+    )
+    if len(safe) > limit:
+        raise StoreError(f"{label} must be at most {limit:,} characters")
+    return safe
+
+
+def _refinement_evidence_refs(
+    value: object, secret_values: Sequence[str] = ()
+) -> list[str]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise StoreError("Evidence references must be a list")
+    references = cast(Sequence[object], value)
+    if len(references) > MAX_PBI_REFINEMENT_EVIDENCE_REFS:
+        raise StoreError("A question may have at most 10 evidence references")
+    return list(
+        dict.fromkeys(
+            _refinement_text(
+                reference,
+                MAX_PBI_REFINEMENT_EVIDENCE_LENGTH,
+                "Evidence reference",
+                secret_values,
+            )
+            for reference in references
+        )
+    )
+
+
+def _new_refinement_questions(
+    value: object, secret_values: Sequence[str] = ()
+) -> list[dict[str, object]]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise StoreError("Questions must be a list")
+    raw_questions = cast(Sequence[object], value)
+    if not 1 <= len(raw_questions) <= MAX_PBI_REFINEMENT_QUESTIONS:
+        raise StoreError("A generation must contain 1 to 25 questions")
+    questions: list[dict[str, object]] = []
+    for raw_question in raw_questions:
+        if not isinstance(raw_question, Mapping):
+            raise StoreError("Each question must be an object")
+        question = cast(Mapping[str, object], raw_question)
+        questions.append(
+            {
+                "question_id": uuid4().hex,
+                "text": _refinement_text(
+                    question.get("text"),
+                    MAX_PBI_REFINEMENT_TEXT_LENGTH,
+                    "Question",
+                    secret_values,
+                ),
+                "answer_history": [],
+                "evidence_refs": _refinement_evidence_refs(
+                    question.get("evidence_refs", ()), secret_values
+                ),
+            }
+        )
+    return questions
+
+
+def _refinement_authorization(operator_role: str) -> dict[str, str]:
+    if operator_role != "operator":
+        raise StoreError("PBI refinement requires the configured operator role")
+    return {
+        "role": operator_role,
+        "method": "X-API-Key",
+        "result": "authorized",
+        "timestamp": _now(),
+    }
+
+
+def _pbi_refinement_attempt_from_row(row: sqlite3.Row) -> PbiRefinementAttempt:
+    try:
+        raw_questions = json.loads(str(row["questions_json"]))
+        raw_history = json.loads(str(row["history_json"]))
+        if not isinstance(raw_questions, list) or not isinstance(raw_history, list):
+            raise ValueError("Invalid refinement history")
+        raw_questions = cast(list[object], raw_questions)
+        raw_history = cast(list[object], raw_history)
+        questions_list: list[PbiRefinementQuestion] = []
+        for raw_question in raw_questions:
+            if not isinstance(raw_question, Mapping):
+                raise ValueError("Invalid refinement question")
+            question = cast(Mapping[str, object], raw_question)
+            raw_answers = question["answer_history"]
+            raw_refs = question["evidence_refs"]
+            if not isinstance(raw_answers, list) or not isinstance(raw_refs, list):
+                raise ValueError("Invalid refinement question history")
+            raw_answers = cast(list[object], raw_answers)
+            raw_refs = cast(list[object], raw_refs)
+            if any(not isinstance(answer, Mapping) for answer in raw_answers):
+                raise ValueError("Invalid refinement answer history")
+            questions_list.append(
+                PbiRefinementQuestion(
+                    question_id=str(question["question_id"]),
+                    text=str(question["text"]),
+                    answer_history=tuple(
+                        cast(Mapping[str, object], answer) for answer in raw_answers
+                    ),
+                    evidence_refs=tuple(str(reference) for reference in raw_refs),
+                )
+            )
+        if any(not isinstance(item, Mapping) for item in raw_history):
+            raise ValueError("Invalid refinement history")
+        decision = _json_mapping_or_none(row["decision_json"])
+        authorization = _json_mapping(row["authorization_json"])
+        return PbiRefinementAttempt(
+            attempt_id=str(row["attempt_id"]),
+            project_id=str(row["project_id"]),
+            repository=str(row["repository_name"]),
+            pbi_number=int(row["pbi_number"]),
+            generation=int(row["generation"]),
+            reopen_count=int(row["reopen_count"]),
+            revision=int(row["revision"]),
+            status=RefinementStatus(str(row["status"])),
+            questions=tuple(questions_list),
+            decision=decision,
+            failure_reason=(
+                str(row["failure_reason"])
+                if row["failure_reason"] is not None
+                else None
+            ),
+            retryable_failure=bool(row["retryable_failure"]),
+            history=tuple(cast(Mapping[str, object], item) for item in raw_history),
+            authorization=cast(Mapping[str, str], authorization),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise StoreError("Stored PBI refinement data is invalid") from exc
+
+
 class OrchestratorStore:
     """Thread-safe SQLite store with one active writer index per repository."""
 
@@ -223,6 +427,31 @@ class OrchestratorStore:
                     PRIMARY KEY (project_id, name),
                     FOREIGN KEY (project_id)
                         REFERENCES projects(project_id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS pbi_refinement_attempts (
+                    attempt_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    repository_name TEXT NOT NULL,
+                    pbi_number INTEGER NOT NULL CHECK (pbi_number > 0),
+                    generation INTEGER NOT NULL CHECK (generation BETWEEN 1 AND 3),
+                    reopen_count INTEGER NOT NULL CHECK (reopen_count BETWEEN 0 AND 2),
+                    revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+                    status TEXT NOT NULL CHECK (status IN (
+                        'awaiting_answers', 'evaluating', 'completed', 'failed'
+                    )),
+                    questions_json TEXT NOT NULL,
+                    decision_json TEXT,
+                    failure_reason TEXT,
+                    retryable_failure INTEGER NOT NULL DEFAULT 0,
+                    history_json TEXT NOT NULL DEFAULT '[]',
+                    authorization_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (project_id, repository_name, pbi_number),
+                    FOREIGN KEY (project_id, repository_name)
+                        REFERENCES repositories(project_id, name)
                         ON DELETE CASCADE
                 );
 
@@ -515,6 +744,490 @@ class OrchestratorStore:
                 raise
             else:
                 self._connection.commit()
+
+    @staticmethod
+    def _validate_pbi_refinement_key(
+        project_id: str, repository: str, pbi_number: int
+    ) -> None:
+        if not project_id.strip() or len(project_id) > 500:
+            raise StoreError("Project id is invalid")
+        if not repository.strip() or len(repository) > 300:
+            raise StoreError("Repository is invalid")
+        if type(pbi_number) is not int or not 1 <= pbi_number <= 2_147_483_647:
+            raise StoreError("PBI number is outside the supported range")
+
+    @staticmethod
+    def _require_active_refinement_repository(
+        connection: sqlite3.Connection, project_id: str, repository: str
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT 1 FROM repositories
+            WHERE project_id = ? AND name = ? AND active = 1
+            """,
+            (project_id, repository),
+        ).fetchone()
+        if row is None:
+            raise StoreError("Repository is not active in the configured Project")
+
+    def create_pbi_refinement_attempt(
+        self,
+        project_id: str,
+        repository: str,
+        pbi_number: int,
+        questions: Sequence[Mapping[str, object]],
+        *,
+        operator_role: str,
+        secret_values: Sequence[str] = (),
+    ) -> PbiRefinementAttempt:
+        self._validate_pbi_refinement_key(project_id, repository, pbi_number)
+        new_questions = _new_refinement_questions(questions, secret_values)
+        authorization = _refinement_authorization(operator_role)
+        now = _now()
+        with self._transaction() as connection:
+            self._require_active_refinement_repository(
+                connection, project_id, repository
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM pbi_refinement_attempts
+                WHERE project_id = ? AND repository_name = ? AND pbi_number = ?
+                """,
+                (project_id, repository, pbi_number),
+            ).fetchone()
+            if row is None:
+                attempt_id = uuid4().hex
+                connection.execute(
+                    """
+                    INSERT INTO pbi_refinement_attempts(
+                        attempt_id, project_id, repository_name, pbi_number,
+                        generation, reopen_count, revision, status, questions_json,
+                        authorization_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 1, 0, 0, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        attempt_id,
+                        project_id,
+                        repository,
+                        pbi_number,
+                        RefinementStatus.AWAITING_ANSWERS.value,
+                        json.dumps(new_questions, sort_keys=True),
+                        json.dumps(authorization, sort_keys=True),
+                        now,
+                        now,
+                    ),
+                )
+                row = connection.execute(
+                    "SELECT * FROM pbi_refinement_attempts WHERE attempt_id = ?",
+                    (attempt_id,),
+                ).fetchone()
+            else:
+                connection.execute(
+                    """
+                    UPDATE pbi_refinement_attempts SET authorization_json = ?
+                    WHERE attempt_id = ?
+                    """,
+                    (json.dumps(authorization, sort_keys=True), row["attempt_id"]),
+                )
+                row = connection.execute(
+                    "SELECT * FROM pbi_refinement_attempts WHERE attempt_id = ?",
+                    (row["attempt_id"],),
+                ).fetchone()
+            if row is None:
+                raise StoreError("PBI refinement attempt could not be loaded")
+            return _pbi_refinement_attempt_from_row(row)
+
+    def get_pbi_refinement_attempt(
+        self,
+        project_id: str,
+        repository: str,
+        pbi_number: int,
+        *,
+        operator_role: str,
+    ) -> PbiRefinementAttempt | None:
+        self._validate_pbi_refinement_key(project_id, repository, pbi_number)
+        authorization = _refinement_authorization(operator_role)
+        with self._transaction() as connection:
+            self._require_active_refinement_repository(
+                connection, project_id, repository
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM pbi_refinement_attempts
+                WHERE project_id = ? AND repository_name = ? AND pbi_number = ?
+                """,
+                (project_id, repository, pbi_number),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                "UPDATE pbi_refinement_attempts SET authorization_json = ? "
+                "WHERE attempt_id = ?",
+                (json.dumps(authorization, sort_keys=True), row["attempt_id"]),
+            )
+            row = connection.execute(
+                "SELECT * FROM pbi_refinement_attempts WHERE attempt_id = ?",
+                (row["attempt_id"],),
+            ).fetchone()
+            return _pbi_refinement_attempt_from_row(row) if row is not None else None
+
+    def answer_pbi_refinement_question(
+        self,
+        project_id: str,
+        repository: str,
+        pbi_number: int,
+        question_id: str,
+        answer: str,
+        *,
+        expected_revision: int,
+        evidence_refs: Sequence[str] = (),
+        operator_role: str,
+        secret_values: Sequence[str] = (),
+    ) -> PbiRefinementAttempt:
+        self._validate_pbi_refinement_key(project_id, repository, pbi_number)
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise StoreError("Answer revision is invalid")
+        if not re.fullmatch(r"[0-9a-f]{32}", question_id):
+            raise StoreError("Question id is invalid")
+        safe_answer = _refinement_text(
+            answer, MAX_PBI_REFINEMENT_TEXT_LENGTH, "Answer", secret_values
+        )
+        new_refs = _refinement_evidence_refs(evidence_refs, secret_values)
+        authorization = _refinement_authorization(operator_role)
+        with self._transaction() as connection:
+            self._require_active_refinement_repository(
+                connection, project_id, repository
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM pbi_refinement_attempts
+                WHERE project_id = ? AND repository_name = ? AND pbi_number = ?
+                """,
+                (project_id, repository, pbi_number),
+            ).fetchone()
+            if row is None:
+                raise StoreError("PBI refinement attempt was not found")
+            if row["status"] not in {
+                RefinementStatus.AWAITING_ANSWERS.value,
+                RefinementStatus.EVALUATING.value,
+            }:
+                raise StoreError("PBI refinement attempt does not accept answers")
+            questions = json.loads(str(row["questions_json"]))
+            if not isinstance(questions, list):
+                raise StoreError("Stored PBI refinement questions are invalid")
+            questions = cast(list[object], questions)
+            question: dict[str, object] | None = None
+            for item in questions:
+                if not isinstance(item, dict):
+                    continue
+                candidate = cast(dict[str, object], item)
+                if candidate.get("question_id") == question_id:
+                    question = candidate
+                    break
+            if question is None:
+                raise StoreError("Question was not found in the active generation")
+            answer_history = question.get("answer_history")
+            question_refs = question.get("evidence_refs")
+            if not isinstance(answer_history, list) or not isinstance(
+                question_refs, list
+            ):
+                raise StoreError("Stored PBI refinement question is invalid")
+            answer_history = cast(list[object], answer_history)
+            question_refs = cast(list[object], question_refs)
+            if any(not isinstance(item, dict) for item in answer_history) or any(
+                not isinstance(reference, str) for reference in question_refs
+            ):
+                raise StoreError("Stored PBI refinement question is invalid")
+            answer_history = cast(list[dict[str, object]], answer_history)
+            question_refs = cast(list[str], question_refs)
+            latest = answer_history[-1] if answer_history else None
+            latest_refs = latest.get("evidence_refs") if latest is not None else None
+            if (
+                latest is not None
+                and latest.get("text") == safe_answer
+                and isinstance(latest_refs, list)
+                and all(
+                    reference in cast(list[object], latest_refs)
+                    for reference in new_refs
+                )
+            ):
+                connection.execute(
+                    "UPDATE pbi_refinement_attempts SET authorization_json = ? "
+                    "WHERE attempt_id = ?",
+                    (json.dumps(authorization, sort_keys=True), row["attempt_id"]),
+                )
+                refreshed = connection.execute(
+                    "SELECT * FROM pbi_refinement_attempts WHERE attempt_id = ?",
+                    (row["attempt_id"],),
+                ).fetchone()
+                if refreshed is None:
+                    raise StoreError("PBI refinement attempt could not be loaded")
+                return _pbi_refinement_attempt_from_row(refreshed)
+            if expected_revision != len(answer_history):
+                raise StoreError("Answer revision does not match the current revision")
+            if len(answer_history) >= MAX_PBI_REFINEMENT_CORRECTIONS + 1:
+                raise StoreError("A question may have at most three corrected answers")
+            combined_refs = list(dict.fromkeys([*question_refs, *new_refs]))
+            if len(combined_refs) > MAX_PBI_REFINEMENT_EVIDENCE_REFS:
+                raise StoreError("A question may have at most 10 evidence references")
+            answer_history.append(
+                {
+                    "revision": len(answer_history) + 1,
+                    "text": safe_answer,
+                    "evidence_refs": new_refs,
+                }
+            )
+            question["evidence_refs"] = combined_refs
+            status = (
+                RefinementStatus.EVALUATING.value
+                if all(
+                    isinstance(item, dict)
+                    and bool(cast(dict[str, object], item).get("answer_history"))
+                    for item in questions
+                )
+                else RefinementStatus.AWAITING_ANSWERS.value
+            )
+            connection.execute(
+                """
+                UPDATE pbi_refinement_attempts
+                SET revision = revision + 1, status = ?, questions_json = ?,
+                    authorization_json = ?, updated_at = ?
+                WHERE attempt_id = ?
+                """,
+                (
+                    status,
+                    json.dumps(questions, sort_keys=True),
+                    json.dumps(authorization, sort_keys=True),
+                    _now(),
+                    row["attempt_id"],
+                ),
+            )
+            updated = connection.execute(
+                "SELECT * FROM pbi_refinement_attempts WHERE attempt_id = ?",
+                (row["attempt_id"],),
+            ).fetchone()
+            if updated is None:
+                raise StoreError("PBI refinement attempt could not be loaded")
+            return _pbi_refinement_attempt_from_row(updated)
+
+    def complete_pbi_refinement_attempt(
+        self,
+        project_id: str,
+        repository: str,
+        pbi_number: int,
+        *,
+        expected_revision: int,
+        summary: str,
+        evidence_refs: Sequence[str] = (),
+        operator_role: str,
+        secret_values: Sequence[str] = (),
+    ) -> PbiRefinementAttempt:
+        self._validate_pbi_refinement_key(project_id, repository, pbi_number)
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise StoreError("Attempt revision is invalid")
+        decision = {
+            "summary": _refinement_text(
+                summary,
+                MAX_PBI_REFINEMENT_TEXT_LENGTH,
+                "Decision summary",
+                secret_values,
+            ),
+            "evidence_refs": _refinement_evidence_refs(evidence_refs, secret_values),
+        }
+        authorization = _refinement_authorization(operator_role)
+        with self._transaction() as connection:
+            self._require_active_refinement_repository(
+                connection, project_id, repository
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM pbi_refinement_attempts
+                WHERE project_id = ? AND repository_name = ? AND pbi_number = ?
+                """,
+                (project_id, repository, pbi_number),
+            ).fetchone()
+            if row is None:
+                raise StoreError("PBI refinement attempt was not found")
+            if row["status"] != RefinementStatus.EVALUATING.value:
+                raise StoreError("Only an evaluating PBI refinement can complete")
+            if expected_revision != row["revision"]:
+                raise StoreError("Attempt revision does not match the current revision")
+            connection.execute(
+                """
+                UPDATE pbi_refinement_attempts
+                SET status = ?, decision_json = ?, failure_reason = NULL,
+                    retryable_failure = 0, authorization_json = ?, updated_at = ?
+                WHERE attempt_id = ?
+                """,
+                (
+                    RefinementStatus.COMPLETED.value,
+                    json.dumps(decision, sort_keys=True),
+                    json.dumps(authorization, sort_keys=True),
+                    _now(),
+                    row["attempt_id"],
+                ),
+            )
+            updated = connection.execute(
+                "SELECT * FROM pbi_refinement_attempts WHERE attempt_id = ?",
+                (row["attempt_id"],),
+            ).fetchone()
+            if updated is None:
+                raise StoreError("PBI refinement attempt could not be loaded")
+            return _pbi_refinement_attempt_from_row(updated)
+
+    def fail_pbi_refinement_attempt(
+        self,
+        project_id: str,
+        repository: str,
+        pbi_number: int,
+        *,
+        expected_revision: int,
+        reason: str,
+        retryable: bool,
+        operator_role: str,
+        secret_values: Sequence[str] = (),
+    ) -> PbiRefinementAttempt:
+        self._validate_pbi_refinement_key(project_id, repository, pbi_number)
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise StoreError("Attempt revision is invalid")
+        if type(retryable) is not bool:
+            raise StoreError("Retryable failure value is invalid")
+        safe_reason = _refinement_text(
+            reason, MAX_PBI_REFINEMENT_REASON_LENGTH, "Failure reason", secret_values
+        )
+        authorization = _refinement_authorization(operator_role)
+        with self._transaction() as connection:
+            self._require_active_refinement_repository(
+                connection, project_id, repository
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM pbi_refinement_attempts
+                WHERE project_id = ? AND repository_name = ? AND pbi_number = ?
+                """,
+                (project_id, repository, pbi_number),
+            ).fetchone()
+            if row is None:
+                raise StoreError("PBI refinement attempt was not found")
+            if row["status"] != RefinementStatus.EVALUATING.value:
+                raise StoreError("Only an evaluating PBI refinement can fail")
+            if expected_revision != row["revision"]:
+                raise StoreError("Attempt revision does not match the current revision")
+            connection.execute(
+                """
+                UPDATE pbi_refinement_attempts
+                SET status = ?, decision_json = NULL, failure_reason = ?,
+                    retryable_failure = ?, authorization_json = ?, updated_at = ?
+                WHERE attempt_id = ?
+                """,
+                (
+                    RefinementStatus.FAILED.value,
+                    safe_reason,
+                    int(retryable),
+                    json.dumps(authorization, sort_keys=True),
+                    _now(),
+                    row["attempt_id"],
+                ),
+            )
+            updated = connection.execute(
+                "SELECT * FROM pbi_refinement_attempts WHERE attempt_id = ?",
+                (row["attempt_id"],),
+            ).fetchone()
+            if updated is None:
+                raise StoreError("PBI refinement attempt could not be loaded")
+            return _pbi_refinement_attempt_from_row(updated)
+
+    def reopen_pbi_refinement_attempt(
+        self,
+        project_id: str,
+        repository: str,
+        pbi_number: int,
+        *,
+        reason: str,
+        questions: Sequence[Mapping[str, object]],
+        operator_role: str,
+        secret_values: Sequence[str] = (),
+    ) -> PbiRefinementAttempt:
+        self._validate_pbi_refinement_key(project_id, repository, pbi_number)
+        safe_reason = _refinement_text(
+            reason, MAX_PBI_REFINEMENT_REASON_LENGTH, "Reopen reason", secret_values
+        )
+        new_questions = _new_refinement_questions(questions, secret_values)
+        authorization = _refinement_authorization(operator_role)
+        with self._transaction() as connection:
+            self._require_active_refinement_repository(
+                connection, project_id, repository
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM pbi_refinement_attempts
+                WHERE project_id = ? AND repository_name = ? AND pbi_number = ?
+                """,
+                (project_id, repository, pbi_number),
+            ).fetchone()
+            if row is None:
+                raise StoreError("PBI refinement attempt was not found")
+            status = str(row["status"])
+            if status != RefinementStatus.COMPLETED.value and not (
+                status == RefinementStatus.FAILED.value
+                and bool(row["retryable_failure"])
+            ):
+                raise StoreError(
+                    "Only a terminal decision or retryable failure can reopen"
+                )
+            reopen_count = int(row["reopen_count"])
+            generation = int(row["generation"])
+            if (
+                reopen_count >= MAX_PBI_REFINEMENT_GENERATIONS - 1
+                or generation >= MAX_PBI_REFINEMENT_GENERATIONS
+            ):
+                raise StoreError(
+                    "A PBI refinement attempt may have at most two reopens"
+                )
+            history = json.loads(str(row["history_json"]))
+            old_questions = json.loads(str(row["questions_json"]))
+            if not isinstance(history, list) or not isinstance(old_questions, list):
+                raise StoreError("Stored PBI refinement history is invalid")
+            history = cast(list[object], history)
+            old_questions = cast(list[object], old_questions)
+            history.append(
+                {
+                    "generation": generation,
+                    "status": status,
+                    "questions": old_questions,
+                    "decision": _json_mapping_or_none(row["decision_json"]),
+                    "failure_reason": row["failure_reason"],
+                    "retryable_failure": bool(row["retryable_failure"]),
+                    "closed_at": _now(),
+                    "reopen_reason": safe_reason,
+                }
+            )
+            connection.execute(
+                """
+                UPDATE pbi_refinement_attempts
+                SET generation = ?, reopen_count = ?, status = ?, questions_json = ?,
+                    decision_json = NULL, failure_reason = NULL, retryable_failure = 0,
+                    history_json = ?, authorization_json = ?, updated_at = ?
+                WHERE attempt_id = ?
+                """,
+                (
+                    generation + 1,
+                    reopen_count + 1,
+                    RefinementStatus.AWAITING_ANSWERS.value,
+                    json.dumps(new_questions, sort_keys=True),
+                    json.dumps(history, sort_keys=True),
+                    json.dumps(authorization, sort_keys=True),
+                    _now(),
+                    row["attempt_id"],
+                ),
+            )
+            updated = connection.execute(
+                "SELECT * FROM pbi_refinement_attempts WHERE attempt_id = ?",
+                (row["attempt_id"],),
+            ).fetchone()
+            if updated is None:
+                raise StoreError("PBI refinement attempt could not be loaded")
+            return _pbi_refinement_attempt_from_row(updated)
 
     def _lease_deadline(self) -> str:
         return (datetime.now(UTC) + timedelta(seconds=self._lease_seconds)).isoformat()
