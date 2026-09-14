@@ -2,6 +2,9 @@ from .advance_request import AdvanceRequest as AdvanceRequest
 from .conflict_repair_request import ConflictRepairRequest as ConflictRepairRequest
 from .dashboard_action_base import DashboardActionBase as DashboardActionBase
 from .dashboard_action_request import DashboardActionRequest as DashboardActionRequest
+from .dashboard_answer_question_request import (
+    DashboardAnswerQuestionRequest as DashboardAnswerQuestionRequest,
+)
 from .dashboard_approve_request import (
     DashboardApproveRequest as DashboardApproveRequest,
 )

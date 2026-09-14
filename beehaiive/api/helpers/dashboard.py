@@ -5,6 +5,9 @@ from fastapi import HTTPException
 from beehaiive import Orchestrator
 from beehaiive.agent import DEFAULT_DEMO_TASK, DEMO_TASK_NAME, AgentWorkerManager
 from beehaiive.api.models import DashboardActionRequest as DashboardActionRequest
+from beehaiive.api.models import (
+    DashboardAnswerQuestionRequest as DashboardAnswerQuestionRequest,
+)
 from beehaiive.api.models import DashboardClarifyRequest as DashboardClarifyRequest
 from beehaiive.api.models import (
     DashboardCommitPushRequest as DashboardCommitPushRequest,
@@ -199,6 +202,34 @@ def _require_active_dashboard_run(
     return run
 
 
+def _require_dashboard_operator_question(
+    orchestrator: Orchestrator,
+    project_id: str,
+    repository: str,
+    pbi_number: int,
+    run_id: str,
+    question_id: str,
+    revision: int,
+) -> None:
+    run = orchestrator.store.get_run(run_id)
+    if (
+        run is None
+        or run.project_id != project_id
+        or run.repository != repository
+        or run.pbi_number != pbi_number
+        or run.status is not RunStatus.AWAITING_OPERATOR
+    ):
+        raise HTTPException(status_code=403, detail="Run is not authorized")
+    question = orchestrator.store.operator_question_for_run(run_id)
+    if (
+        question is None
+        or question.get("question_id") != question_id
+        or question.get("revision") != revision
+        or question.get("status") != "pending"
+    ):
+        raise HTTPException(status_code=409, detail="Operator question is stale")
+
+
 def _require_dashboard_delivery_run(
     orchestrator: Orchestrator,
     project_id: str,
@@ -266,6 +297,22 @@ def _execute_dashboard_action(
                 )
             )
         }
+    if isinstance(request, DashboardAnswerQuestionRequest):
+        run = orchestrator.answer_operator_question(
+            request.run_id,
+            question_id=request.question_id,
+            revision=request.revision,
+            answer=request.answer,
+            authorization_method="X-API-Key",
+            operator_role="operator",
+        )
+        return {
+            "run_id": run.run_id,
+            "run_status": run.status.value,
+            "question_id": request.question_id,
+            "revision": request.revision,
+            "question_status": "answered",
+        }
     if isinstance(request, DashboardClarifyRequest):
         if not request.clarification.strip():
             raise StoreError("A clarification message is required")
@@ -285,6 +332,7 @@ __all__ = [
     "_dashboard_quality_gate_summary",
     "_dashboard_pbi",
     "_require_active_dashboard_run",
+    "_require_dashboard_operator_question",
     "_require_dashboard_delivery_run",
     "_execute_dashboard_action",
 ]

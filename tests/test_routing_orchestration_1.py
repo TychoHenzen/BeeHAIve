@@ -191,9 +191,18 @@ def test_human_handoff_stays_nonclaimable_until_explicit_reset() -> None:
     assert run is not None
     token = run.lease_token or ""
     service.advance(run.run_id, Stage.IMPLEMENT, token)
-    service.fail(run.run_id, "implementation failed", token)
+    failed = service.fail(run.run_id, "implementation failed", token)
     handoff = router.snapshot(run.run_id)
     assert handoff.state.status is RoutingStatus.HUMAN_HANDOFF
+    assert failed.status.value == "awaiting_operator"
+
+    waiting = orchestrator_store.get_run(run.run_id)
+    question = orchestrator_store.operator_question_for_run(run.run_id)
+    assert waiting is not None
+    assert waiting.status.value == "awaiting_operator"
+    assert question is not None
+    assert question["kind"] == "routing_exhausted"
+    assert question["status"] == "pending"
 
     assert service.claim("owner:7", "owner/api", "worker-1") is None
     pbi = orchestrator_store.project_state("owner:7")["repositories"][0]["pbis"][0]

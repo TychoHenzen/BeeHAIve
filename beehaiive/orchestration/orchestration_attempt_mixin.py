@@ -4,6 +4,10 @@ from collections.abc import Mapping
 from threading import Event, Thread
 from typing import Any, cast
 
+from beehaiive.operator_notifications import (
+    dispatch_pending_operator_notifications,
+)
+
 from ..contracts import TaskContract, TaskResult
 from ..models import (
     RunState,
@@ -77,6 +81,29 @@ class OrchestrationAttemptMixin:
                 before_record=validate_execution,
                 persist_task_result=persist_task_result,
             )
+            if routing.state.status is RoutingStatus.HUMAN_HANDOFF:
+                task_result = routing.task_result
+                kind = (
+                    "question"
+                    if task_result is not None
+                    and task_result.outcome.value == "question"
+                    else "routing_exhausted"
+                )
+                question = (
+                    task_result.question
+                    if task_result is not None and task_result.question
+                    else task_result.required_action
+                    if task_result is not None and task_result.required_action
+                    else routing.state.required_action or "Human action is required"
+                )
+                self.store.await_operator(
+                    run_id,
+                    lease_token,
+                    kind=kind,
+                    question=question,
+                    evidence=task_result.evidence if task_result is not None else {},
+                )
+                dispatch_pending_operator_notifications(self.store, run_id=run_id)
             return routing
         except RoutingError as exc:
             raise StoreError(str(exc)) from exc
@@ -92,23 +119,72 @@ class OrchestrationAttemptMixin:
             if isinstance(inputs, Mapping):
                 persisted_answer = cast(Mapping[str, object], inputs).get("answer")
             if persisted_answer == run.task_answer:
-                return TaskContract.from_dict(run.task_contract)
+                contract = TaskContract.from_dict(run.task_contract)
+                return self._task_contract_with_operator_answer(
+                    contract, run.task_answer
+                )
         if self.model_executor is not None:
             builder = getattr(self.model_executor, "build_task_contract", None)
             if callable(builder):
                 contract = builder(run)
                 if isinstance(contract, TaskContract):
-                    return contract
+                    return self._task_contract_with_operator_answer(
+                        contract, run.task_answer
+                    )
                 raise StoreError("Model executor returned an invalid task contract")
-        return TaskContract.inventory(
+        contract = TaskContract.inventory(
             run.repository,
             run.pbi_number,
             run.title,
             answer=run.task_answer,
         )
+        return self._task_contract_with_operator_answer(contract, run.task_answer)
+
+    @staticmethod
+    def _task_contract_with_operator_answer(
+        contract: TaskContract, answer: str | None
+    ) -> TaskContract:
+        if answer is None:
+            return contract
+        contract_data = contract.as_dict()
+        inputs = dict(cast(Mapping[str, object], contract_data["inputs"]))
+        inputs["answer"] = answer
+        contract_data["inputs"] = inputs
+        return TaskContract.from_dict(contract_data)
 
     def answer_task_question(self: Any, run_id: str, answer: str) -> RunState:
         run = self.store.answer_task_question(run_id, answer)
+        return self._resume_answered_question(run_id, run)
+
+    def answer_operator_question(
+        self: Any,
+        run_id: str,
+        *,
+        question_id: str,
+        revision: int,
+        answer: str,
+        authorization_method: str,
+        operator_role: str,
+    ) -> RunState:
+        question = self.store.answer_operator_question(
+            run_id,
+            question_id=question_id,
+            revision=revision,
+            answer=answer,
+            authorization_method=authorization_method,
+            operator_role=operator_role,
+        )
+        run = self.store.get_run(run_id)
+        if run is None:
+            raise StoreError(f"Unknown run: {run_id}")
+        if (
+            question["status"] == "answered"
+            and run.status is not RunStatus.AWAITING_OPERATOR
+        ):
+            return run
+        return self._resume_answered_question(run_id, run)
+
+    def _resume_answered_question(self: Any, run_id: str, run: RunState) -> RunState:
         if self.model_router is not None:
             self._ensure_routing_problem(run_id)
             try:

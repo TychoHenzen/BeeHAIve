@@ -179,6 +179,52 @@ class TaskContractMixin:
             row = self._run_for_id(connection, run_id)
             if row is None:
                 raise StoreError(f"Unknown run: {run_id}")
+            operator_question = connection.execute(
+                """
+                SELECT question_id, status, answer FROM operator_questions
+                WHERE run_id = ? ORDER BY revision DESC LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+            if operator_question is not None:
+                if (
+                    operator_question["status"] != "answered"
+                    or operator_question["answer"] != row.task_answer
+                ):
+                    raise StoreError("Run has no answered task question")
+                previous = connection.execute(
+                    "SELECT task_answer_resumed FROM runs WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                connection.execute(
+                    """
+                    UPDATE runs SET task_answer_resumed = 1, updated_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (_now(), run_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE pbis SET claimable = 1, last_error = NULL
+                    WHERE project_id = ? AND repository_name = ? AND number = ?
+                    """,
+                    (row.project_id, row.repository, row.pbi_number),
+                )
+                if previous is not None and not bool(previous["task_answer_resumed"]):
+                    self._record_event(
+                        connection,
+                        row.project_id,
+                        row.repository,
+                        row.pbi_number,
+                        run_id,
+                        "question_resumed",
+                        row.stage,
+                        row.stage,
+                        {"question_id": operator_question["question_id"]}
+                        if "question_id" in operator_question
+                        else {},
+                    )
+                return self._run_for_id(connection, run_id) or row
             if row.task_contract is None or row.task_result is None:
                 raise StoreError("Run has no answered task question")
             try:

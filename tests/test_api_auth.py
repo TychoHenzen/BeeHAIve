@@ -24,6 +24,8 @@ def test_mutating_routes_require_authentication_and_project_scope(
         "/projects/other:7/sync", headers={"X-API-Key": "test-key"}
     )
     project_client.post("/projects/owner:7/sync", headers={"X-API-Key": "test-key"})
+    allowed_project_read = project_client.get("/projects/owner:7")
+    wrong_project_read = project_client.get("/projects/other:7")
     unauthorized_repository = project_client.post(
         "/projects/owner:7/repositories/owner/other/claim",
         headers={"X-API-Key": "test-key", "X-Worker-ID": "worker-1"},
@@ -49,6 +51,8 @@ def test_mutating_routes_require_authentication_and_project_scope(
 
     assert missing_key.status_code == 401
     assert wrong_project.status_code == 403
+    assert allowed_project_read.status_code == 200
+    assert wrong_project_read.status_code == 403
     assert unauthorized_repository.status_code == 403
     assert missing_worker.status_code == 401
     assert unknown_run.status_code == 403

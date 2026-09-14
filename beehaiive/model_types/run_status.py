@@ -9,5 +9,6 @@ class RunStatus(StrEnum):
     """Durable status of a repository writer run."""
 
     ACTIVE = "active"
+    AWAITING_OPERATOR = "awaiting_operator"
     FAILED = "failed"
     COMPLETED = "completed"

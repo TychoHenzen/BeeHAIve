@@ -98,26 +98,14 @@ class WorkerRunMixin:
                 raise WorkflowError(
                     f"Workflow workspace lease was lost: {heartbeat_errors[0]}"
                 )
-            if validate_workspace_lease is not None:
+            if (
+                validate_workspace_lease is not None
+                and routing.state.status is not RoutingStatus.HUMAN_HANDOFF
+            ):
                 validate_workspace_lease()
             attempt = routing.attempt
             if routing.state.status is RoutingStatus.HUMAN_HANDOFF:
-                task_result = getattr(routing, "task_result", None)
-                failure = (
-                    task_result.question
-                    if isinstance(task_result, TaskResult)
-                    and task_result.outcome is TaskOutcome.QUESTION
-                    else task_result.required_action
-                    if isinstance(task_result, TaskResult)
-                    and task_result.outcome is TaskOutcome.BLOCKED
-                    else routing.state.required_action or "Human action required"
-                )
-                self.orchestrator.store.fail_agent_run(
-                    run_id,
-                    redact_worker_text(failure or "Human action required"),
-                    lease_token,
-                    claimable=False,
-                )
+                return
             elif (
                 attempt is not None
                 and attempt.outcome is AttemptOutcome.SUCCESS

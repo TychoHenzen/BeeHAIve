@@ -31,10 +31,16 @@ def _task_claimability_state(
         and result.answer == answer
         and bool(answer_resumed)
     )
-    paused = result.outcome is TaskOutcome.BLOCKED or (
+    answered_blocker = (
+        result.outcome is TaskOutcome.BLOCKED
+        and isinstance(answer, str)
+        and bool(answer.strip())
+        and bool(answer_resumed)
+    )
+    paused = (result.outcome is TaskOutcome.BLOCKED and not answered_blocker) or (
         result.outcome is TaskOutcome.QUESTION and not answered_question
     )
-    return paused, answered_question
+    return paused, answered_question or answered_blocker
 
 
 def _task_claimability_for_run(

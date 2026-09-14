@@ -79,6 +79,7 @@ def test_dashboard_projection_exposes_optional_run_details() -> None:
         "writers": 1,
         "readers": 2,
         "active_runs": 1,
+        "awaiting_operator_runs": 0,
         "failed_runs": 0,
         "completed_runs": 0,
     }

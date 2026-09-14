@@ -104,6 +104,11 @@ class ProjectReadMixin:
                             pbi_row["task_result_json"]
                         ),
                         "task_answer": pbi_row["task_answer"],
+                        "operator_questions": (
+                            self.operator_questions_for_run(str(pbi_row["run_id"]))
+                            if pbi_row["run_id"]
+                            else []
+                        ),
                         "active": bool(pbi_row["active"]),
                         "archived": bool(pbi_row["archived"]),
                         "planning_status": pbi_row["planning_status"],

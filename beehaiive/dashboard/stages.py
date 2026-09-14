@@ -36,7 +36,7 @@ def display_stage(
     normalized_planning_status = (
         planning_status.strip().lower() if isinstance(planning_status, str) else ""
     )
-    if status not in {"active", "failed", "completed"}:
+    if status not in {"active", "awaiting_operator", "failed", "completed"}:
         if normalized_planning_status in PROJECT_TERMINAL_STATUSES:
             merged = any(
                 mapping(pull_request).get("merged") is True

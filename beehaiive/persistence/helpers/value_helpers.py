@@ -41,7 +41,11 @@ def _json_mapping_or_none(value: object) -> dict[str, object] | None:
 
 
 def _archive_eligible(pbi: PbiSnapshot, run_status: str | None = None) -> bool:
-    if run_status in {RunStatus.ACTIVE.value, RunStatus.FAILED.value}:
+    if run_status in {
+        RunStatus.ACTIVE.value,
+        RunStatus.AWAITING_OPERATOR.value,
+        RunStatus.FAILED.value,
+    }:
         return False
     if (pbi.planning_status or "").strip().lower() not in PROJECT_TERMINAL_STATUSES:
         return False

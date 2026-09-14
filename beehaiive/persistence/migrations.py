@@ -47,6 +47,21 @@ class StorageMigrationMixin:
                 "ALTER TABLE runs ADD COLUMN task_answer_resumed "
                 "INTEGER NOT NULL DEFAULT 0"
             )
+        question_columns = {
+            str(row["name"])
+            for row in self._connection.execute(
+                "PRAGMA table_info(operator_questions)"
+            ).fetchall()
+        }
+        for column, definition in (
+            ("authorization_method", "TEXT NOT NULL DEFAULT 'X-API-Key'"),
+            ("operator_role", "TEXT NOT NULL DEFAULT 'operator'"),
+            ("notification_last_status_code", "INTEGER"),
+        ):
+            if column not in question_columns:
+                self._connection.execute(
+                    f"ALTER TABLE operator_questions ADD COLUMN {column} {definition}"
+                )
         for column in (
             "handoff_base_branch",
             "handoff_body",

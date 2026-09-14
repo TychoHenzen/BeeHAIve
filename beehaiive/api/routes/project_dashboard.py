@@ -16,6 +16,9 @@ from beehaiive.api.helpers.dashboard import (
 from beehaiive.api.helpers.dashboard import (
     _require_dashboard_delivery_run as _require_dashboard_delivery_run,
 )
+from beehaiive.api.helpers.dashboard import (
+    _require_dashboard_operator_question as _require_dashboard_operator_question,
+)
 from beehaiive.api.helpers.http import (
     _handle_meta_review_error as _handle_meta_review_error,
 )
@@ -23,6 +26,9 @@ from beehaiive.api.helpers.http import _handle_store_error as _handle_store_erro
 from beehaiive.api.helpers.http import _required_header as _required_header
 from beehaiive.api.helpers.serialization import _run_dict as _run_dict
 from beehaiive.api.models import DashboardActionRequest as DashboardActionRequest
+from beehaiive.api.models import (
+    DashboardAnswerQuestionRequest as DashboardAnswerQuestionRequest,
+)
 from beehaiive.api.models import DashboardApproveRequest as DashboardApproveRequest
 from beehaiive.api.models import DashboardClarifyRequest as DashboardClarifyRequest
 from beehaiive.api.models import (
@@ -55,6 +61,7 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
             ge=1,
             le=MAX_EVENT_LIMIT,
         ),
+        _access: None = Depends(require_project_access),
     ) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         return _handle_store_error(
             lambda: orchestrator.store.project_state(project_id, event_limit)
@@ -166,6 +173,7 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
             request,
             (
                 DashboardApproveRequest,
+                DashboardAnswerQuestionRequest,
                 DashboardClarifyRequest,
                 DashboardCommitPushRequest,
             ),
@@ -175,7 +183,17 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
             )
             if pbi is None:
                 raise HTTPException(status_code=403, detail="PBI is not authorized")
-            if isinstance(request, DashboardCommitPushRequest):
+            if isinstance(request, DashboardAnswerQuestionRequest):
+                _require_dashboard_operator_question(
+                    orchestrator,
+                    project_id,
+                    request.repository,
+                    request.pbi_number,
+                    request.run_id,
+                    request.question_id,
+                    request.revision,
+                )
+            elif isinstance(request, DashboardCommitPushRequest):
                 _require_dashboard_delivery_run(
                     orchestrator,
                     project_id,
@@ -197,6 +215,7 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
                 request,
                 (
                     DashboardApproveRequest,
+                    DashboardAnswerQuestionRequest,
                     DashboardClarifyRequest,
                     DashboardCommitPushRequest,
                 ),
@@ -210,16 +229,20 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
                 (
                     DashboardStopRequest,
                     DashboardApproveRequest,
+                    DashboardAnswerQuestionRequest,
                     DashboardClarifyRequest,
                     DashboardCommitPushRequest,
                 ),
             )
             else None
         )
+        action_request = request.model_dump(exclude_none=True)
+        if isinstance(request, DashboardAnswerQuestionRequest):
+            action_request["answer"] = "[redacted]"
         action = orchestrator.store.begin_action(
             project_id,
             request.action,
-            request.model_dump(exclude_none=True),
+            action_request,
             request.repository,
             pbi_number,
             run_id,

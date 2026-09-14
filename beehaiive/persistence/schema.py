@@ -103,6 +103,49 @@ class StorageSchemaMixin:
                     ON runs(project_id, repository_name)
                     WHERE status = 'active';
 
+                CREATE TABLE IF NOT EXISTS operator_questions (
+                    question_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    repository_name TEXT NOT NULL,
+                    pbi_number INTEGER NOT NULL,
+                    run_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL CHECK (revision > 0),
+                    kind TEXT NOT NULL CHECK (
+                        kind IN ('question', 'routing_exhausted')
+                    ),
+                    status TEXT NOT NULL CHECK (
+                        status IN ('pending', 'answered', 'closed')
+                    ),
+                    question TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    answer TEXT,
+                    owner_scope TEXT NOT NULL,
+                    authorization_method TEXT NOT NULL DEFAULT 'X-API-Key',
+                    operator_role TEXT NOT NULL DEFAULT 'operator',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    answered_at TEXT,
+                    notification_status TEXT NOT NULL DEFAULT 'pending',
+                    notification_attempts INTEGER NOT NULL DEFAULT 0,
+                    notification_last_attempt_at TEXT,
+                    notification_last_status_code INTEGER,
+                    notification_delivered_at TEXT,
+                    notification_last_error TEXT,
+                    notification_lease_token TEXT,
+                    notification_lease_expires_at TEXT,
+                    UNIQUE (run_id, revision),
+                    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, repository_name, pbi_number)
+                        REFERENCES pbis(project_id, repository_name, number)
+                        ON DELETE CASCADE
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS one_pending_operator_question_per_run
+                    ON operator_questions(run_id) WHERE status = 'pending';
+
+                CREATE INDEX IF NOT EXISTS operator_questions_by_project
+                    ON operator_questions(project_id, status, created_at DESC);
+
                 CREATE TABLE IF NOT EXISTS events (
                     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     project_id TEXT NOT NULL,

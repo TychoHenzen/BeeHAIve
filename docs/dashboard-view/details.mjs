@@ -33,6 +33,49 @@ export function createDetailRenderers(dom) {
     return section;
   }
 
+  function renderOperatorQuestion(question) {
+    const section = element("section");
+    section.append(element("h3", `Operator question: ${question.status || "unknown"}`));
+    section.append(
+      element(
+        "div",
+        question.question || "Question text unavailable",
+        question.status === "pending" ? "status pending" : "muted",
+      ),
+    );
+    const notificationClass =
+      question.notification_status === "delivered"
+        ? "status success"
+        : question.notification_status === "failed"
+          ? "status failure"
+          : ["cancelled", "not_configured"].includes(question.notification_status)
+            ? "muted"
+            : "status pending";
+    section.append(
+      element(
+        "div",
+        `Question ${question.question_id || "unknown"} · revision ${question.revision ?? "?"}`,
+        "mono",
+      ),
+    );
+    if (question.kind) section.append(element("div", `Reason: ${question.kind}`, "muted"));
+    if (question.answer) section.append(element("div", `Answer: ${question.answer}`, "muted"));
+    section.append(
+      element(
+        "div",
+        `Notification: ${question.notification_status || "unknown"} · ${question.notification_attempts || 0} attempts`,
+        notificationClass,
+      ),
+    );
+    if (question.notification_last_error) {
+      section.append(element("div", question.notification_last_error, "status failure"));
+    }
+    if (question.evidence && typeof question.evidence === "object") {
+      section.append(element("div", `Evidence: ${JSON.stringify(question.evidence)}`, "muted"));
+    }
+    return section;
+  }
+
   function renderProgress(progress) {
     const list = element("ol", undefined, "progress");
     progress.forEach((stage) => list.append(element("li", stage.label, stage.status)));
@@ -142,5 +185,5 @@ export function createDetailRenderers(dom) {
     }
     return section;
   }
-  return { renderTaskContract, renderTaskResult, renderProgress, renderChecks, renderSubtask, renderDependencyReadiness, renderReviewers, renderEscalation, renderActivity };
+  return { renderTaskContract, renderTaskResult, renderOperatorQuestion, renderProgress, renderChecks, renderSubtask, renderDependencyReadiness, renderReviewers, renderEscalation, renderActivity };
 }

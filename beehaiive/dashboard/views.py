@@ -92,6 +92,7 @@ def pbi_view(
         "task_contract": mapping(raw_pbi.get("task_contract")) or None,
         "task_result": mapping(raw_pbi.get("task_result")) or None,
         "task_answer": raw_pbi.get("task_answer"),
+        "operator_questions": sequence(raw_pbi.get("operator_questions")),
         "agent_session": mapping(raw_pbi.get("agent_session")) or None,
         "active": bool(raw_pbi.get("active")),
         "archived": bool(raw_pbi.get("archived")),

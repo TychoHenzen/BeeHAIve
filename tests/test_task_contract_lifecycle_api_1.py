@@ -163,10 +163,18 @@ def test_question_answer_api_returns_the_updated_run(tmp_path) -> None:
         "test.contract", 1, "inspect", {}, (), (), tuple(TaskOutcome)
     )
     store.ensure_task_contract(run.run_id, contract, implementation.lease_token or "")
+    question_result = TaskResult(TaskOutcome.QUESTION, {}, question="Which branch?")
     store.record_task_result(
         run.run_id,
-        TaskResult(TaskOutcome.QUESTION, {}, question="Which branch?"),
+        question_result,
         implementation.lease_token or "",
+    )
+    question = store.await_operator(
+        run.run_id,
+        implementation.lease_token or "",
+        kind="question",
+        question=question_result.question or "",
+        evidence=question_result.evidence,
     )
     client = TestClient(
         create_app(
@@ -178,10 +186,15 @@ def test_question_answer_api_returns_the_updated_run(tmp_path) -> None:
 
     response = client.post(
         f"/runs/{run.run_id}/question/answer",
-        json={"answer": "main"},
+        json={
+            "question_id": question["question_id"],
+            "revision": question["revision"],
+            "answer": "main",
+        },
         headers={"X-API-Key": "test-key"},
     )
 
     assert response.status_code == 200
     assert response.json()["task_answer"] == "main"
+    assert response.json()["operator_question"]["status"] == "answered"
     store.close()

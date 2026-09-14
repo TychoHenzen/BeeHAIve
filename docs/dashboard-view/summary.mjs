@@ -10,6 +10,7 @@ export function createSummaryRenderer(dom, summaryOutput) {
       ["Writers", counts.writers],
       ["Readers", counts.readers],
       ["Active runs", counts.active_runs],
+      ["Waiting for operator", counts.awaiting_operator_runs],
       ["Failed runs", counts.failed_runs],
       ["Completed runs", counts.completed_runs],
     ];
