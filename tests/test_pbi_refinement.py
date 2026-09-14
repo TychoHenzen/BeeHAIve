@@ -404,6 +404,16 @@ def test_refinement_api_requires_project_repository_key_and_operator() -> None:
     payload = {"questions": [{"text": "Which behavior is required?"}]}
 
     assert client.post(path, json=payload).status_code == 401
+    signed_url = "https://example.test/file?X-Amz-Signature=private-signature"
+    invalid = client.post(
+        path,
+        headers={"X-API-Key": "test-key"},
+        json={"questions": [{"text": "Question?", "evidence_refs": [signed_url] * 11}]},
+    )
+    assert invalid.status_code == 422
+    assert "private-signature" not in invalid.text
+    assert signed_url not in invalid.text
+
     first = client.post(path, headers={"X-API-Key": "test-key"}, json=payload)
     assert first.status_code == 200
     created = client.post(path, headers={"X-API-Key": "test-key"}, json=payload).json()

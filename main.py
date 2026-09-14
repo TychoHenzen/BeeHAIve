@@ -16,6 +16,8 @@ from fastapi import (
 from fastapi import (
     Path as FastAPIPath,
 )
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
@@ -486,6 +488,20 @@ def create_app(
         )
 
     app = FastAPI(title="BeeHAIve")
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_request_validation_error(  # pyright: ignore[reportUnusedFunction]
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        route = request.scope.get("route")
+        route_path = getattr(route, "path", "")
+        if isinstance(route_path, str) and "/refinement" in route_path:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "Invalid PBI refinement request"},
+            )
+        return await request_validation_exception_handler(request, exc)
+
     refinement_path = (
         "/projects/{project_id}/repositories/{repository:path}/pbis/"
         "{pbi_number}/refinement"
