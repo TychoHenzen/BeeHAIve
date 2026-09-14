@@ -16,9 +16,12 @@ from fastapi import (
 from fastapi import (
     Path as FastAPIPath,
 )
-from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exception_handlers import (
+    http_exception_handler,
+    request_validation_exception_handler,
+)
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from beehaiive import EnvironmentGitHubProvider, Orchestrator, OrchestratorStore, Stage
@@ -38,6 +41,11 @@ from beehaiive.pbi_creation import (
     PbiCreationProvider,
     PbiCreationRequest,
     PbiCreationService,
+)
+from beehaiive.pbi_refinement_mutation import (
+    PbiRefinementMutationError,
+    PbiRefinementUpdateRequest,
+    PbiRefinementUpdateResult,
 )
 from beehaiive.provider import ProviderError
 from beehaiive.quality_gates import RepositoryGateSuite
@@ -134,6 +142,25 @@ class PbiRefinementFailureRequest(BaseModel):
 class PbiRefinementReopenRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=500)
     questions: list[PbiRefinementQuestionInput] = Field(min_length=1, max_length=25)
+
+
+class PbiRefinementApplyRequest(BaseModel):
+    sections: dict[str, str] = Field(min_length=5, max_length=5)
+    priority_label: str = Field(min_length=1, max_length=100)
+    effort_label: str = Field(min_length=1, max_length=100)
+    standard_labels: list[str] = Field(default_factory=list, max_length=20)
+
+
+def _pbi_refinement_failure(
+    code: str, pending_step: str, message: str
+) -> dict[str, object]:
+    return {
+        "status": "partial",
+        "completed_steps": [],
+        "pending_step": pending_step,
+        "failure_code": code,
+        "message": message,
+    }
 
 
 class FailureRequest(BaseModel):
@@ -495,12 +522,41 @@ def create_app(
     ) -> JSONResponse:
         route = request.scope.get("route")
         route_path = getattr(route, "path", "")
+        if isinstance(route_path, str) and route_path.endswith("/refinement/apply"):
+            return JSONResponse(
+                status_code=422,
+                content=_pbi_refinement_failure(
+                    "request_validation",
+                    "validation",
+                    "Invalid PBI refinement request",
+                ),
+            )
         if isinstance(route_path, str) and "/refinement" in route_path:
             return JSONResponse(
                 status_code=422,
                 content={"detail": "Invalid PBI refinement request"},
             )
         return await request_validation_exception_handler(request, exc)
+
+    @app.exception_handler(HTTPException)
+    async def handle_http_exception(  # pyright: ignore[reportUnusedFunction]
+        request: Request, exc: HTTPException
+    ) -> Response:
+        route = request.scope.get("route")
+        route_path = getattr(route, "path", "")
+        if isinstance(route_path, str) and route_path.endswith("/refinement/apply"):
+            unauthorized = exc.status_code in {401, 403}
+            return JSONResponse(
+                status_code=exc.status_code,
+                content=_pbi_refinement_failure(
+                    "authorization_failed" if unauthorized else "request_rejected",
+                    "authorization" if unauthorized else "preflight",
+                    "PBI refinement authorization failed"
+                    if unauthorized
+                    else "PBI refinement could not be applied",
+                ),
+            )
+        return await http_exception_handler(request, exc)
 
     refinement_path = (
         "/projects/{project_id}/repositories/{repository:path}/pbis/"
@@ -1342,6 +1398,51 @@ def create_app(
             )
         )
         return attempt.as_dict()
+
+    @app.post(refinement_path + "/apply")
+    def apply_pbi_refinement(  # pyright: ignore[reportUnusedFunction]
+        project_id: str,
+        repository: str,
+        pbi_number: Annotated[int, FastAPIPath(gt=0, le=2_147_483_647)],
+        request: PbiRefinementApplyRequest,
+        operator_role: str = Depends(require_refinement_operator),
+    ) -> JSONResponse:
+        del operator_role
+        provider_method = getattr(orchestrator.provider, "apply_pbi_refinement", None)
+        if not callable(provider_method):
+            raise HTTPException(
+                status_code=503, detail="PBI refinement mutations are unavailable"
+            )
+        apply_mutation = cast(
+            Callable[[PbiRefinementUpdateRequest], PbiRefinementUpdateResult],
+            provider_method,
+        )
+        mutation_request = PbiRefinementUpdateRequest(
+            project_id=project_id,
+            repository=repository,
+            pbi_number=pbi_number,
+            sections=request.sections,
+            priority_label=request.priority_label,
+            effort_label=request.effort_label,
+            standard_labels=tuple(request.standard_labels),
+        )
+        try:
+            result = apply_mutation(mutation_request)
+        except PbiRefinementMutationError as exc:
+            pending_step = (
+                "validation"
+                if exc.code.startswith("invalid_")
+                or exc.code in {"body_too_large", "duplicate_section_heading"}
+                else "preflight"
+            )
+            return JSONResponse(
+                status_code=exc.status_code,
+                content=_pbi_refinement_failure(
+                    exc.code, pending_step, "PBI refinement could not be applied"
+                ),
+            )
+        status_code = 200 if result.status == "complete" else 202
+        return JSONResponse(status_code=status_code, content=result.as_dict())
 
     @app.post("/projects/{project_id}/pbis")
     def create_project_pbi(  # pyright: ignore[reportUnusedFunction]

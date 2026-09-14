@@ -14,7 +14,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import replace
 from pathlib import Path
 from threading import Lock
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -39,6 +39,15 @@ from .pbi_creation import (
     PbiCreationScopeError,
     PbiCreationTarget,
     PbiCreationValidationError,
+)
+from .pbi_refinement_mutation import (
+    PbiRefinementMutationError,
+    PbiRefinementMutationProvider,
+    PbiRefinementTarget,
+    PbiRefinementUpdateRequest,
+    PbiRefinementUpdateResult,
+    is_pbi_refinement_scale_label,
+    merge_refinement_sections,
 )
 
 PROVIDER_REQUEST_TIMEOUT = 30.0
@@ -859,7 +868,7 @@ query($owner: String!, $name: String!, $cursor: String) {
     id
     nameWithOwner
     labels(first: 100, after: $cursor) {
-      nodes { id name }
+      nodes { id name description }
       pageInfo { hasNextPage endCursor }
     }
   }
@@ -909,6 +918,30 @@ query($owner: String!, $number: Int!, $cursor: String) {
       }
     }
   }
+}
+"""
+
+PBI_REFINEMENT_ISSUE_QUERY = """
+query PbiRefinementIssue($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      id number url body state
+      labels(first: 100) {
+        nodes { name }
+        pageInfo { hasNextPage endCursor }
+      }
+      subIssues(first: 100) {
+        nodes { number title state }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+
+UPDATE_REFINEMENT_ISSUE_MUTATION = """
+mutation UpdatePbiRefinementIssue($input: UpdateIssueInput!) {
+  updateIssue(input: $input) { issue { id } }
 }
 """
 
@@ -1172,12 +1205,32 @@ def _owner_query(query: str, owner_type: str) -> str:
     return query.replace("user(login:", f"{owner_type}(login:")
 
 
-def _next_cursor(connection: Mapping[str, Any]) -> tuple[bool, str | None]:
+def _next_cursor(
+    connection: Mapping[str, Any],
+    seen_cursors: set[str] | None = None,
+    *,
+    strict: bool = False,
+) -> tuple[bool, str | None]:
+    if strict:
+        nodes_value: object = connection.get("nodes")
+        if not isinstance(nodes_value, list) or not all(
+            isinstance(node, Mapping) for node in cast(list[object], nodes_value)
+        ):
+            raise ProviderError("GitHub GraphQL connection returned invalid nodes")
+        page_info_value: object = connection.get("pageInfo")
+        if not isinstance(page_info_value, Mapping) or not isinstance(
+            cast(Mapping[str, Any], page_info_value).get("hasNextPage"), bool
+        ):
+            raise ProviderError("GitHub GraphQL connection omitted pagination state")
     page_info = _mapping(connection.get("pageInfo", {}))
     has_next = page_info.get("hasNextPage") is True
     cursor = page_info.get("endCursor")
-    if has_next and not isinstance(cursor, str):
+    if has_next and (not isinstance(cursor, str) or not cursor):
         raise ProviderError("GitHub GraphQL page did not include an end cursor")
+    if has_next and isinstance(cursor, str) and seen_cursors is not None:
+        if cursor in seen_cursors:
+            raise ProviderError("GitHub GraphQL pagination repeated a cursor")
+        seen_cursors.add(cursor)
     return has_next, cursor if isinstance(cursor, str) else None
 
 
@@ -1200,40 +1253,22 @@ def _complete_connection(
     def validated_connection(value: object) -> Mapping[str, Any]:
         connection = _mapping(value)
         if strict:
-            nodes_value = connection.get("nodes")
-            if not isinstance(nodes_value, list):
-                raise ProviderError("GitHub review connection returned invalid nodes")
-            nodes = cast(list[object], nodes_value)
-            if not all(isinstance(node, Mapping) for node in nodes):
-                raise ProviderError("GitHub review connection returned invalid nodes")
-            page_info_value = connection.get("pageInfo")
-            if not isinstance(page_info_value, Mapping):
-                raise ProviderError("GitHub review connection omitted pagination state")
-            page_info = cast(Mapping[str, Any], page_info_value)
-            if not isinstance(page_info.get("hasNextPage"), bool):
-                raise ProviderError("GitHub review connection omitted pagination state")
-            has_next, cursor = _next_cursor(connection)
-            if has_next and not cursor:
-                raise ProviderError("GitHub review connection returned an empty cursor")
+            _next_cursor(connection, strict=True)
         return connection
 
     connection = validated_connection(initial)
     nodes = list(_nodes(connection))
-    has_next, cursor = _next_cursor(connection)
     seen_cursors: set[str] = set()
+    has_next, cursor = _next_cursor(connection, seen_cursors)
     while has_next:
-        if strict:
-            assert cursor is not None
-            if cursor in seen_cursors:
-                raise ProviderError("GitHub review pagination repeated a cursor")
-            seen_cursors.add(cursor)
+        assert cursor is not None
         page_data = client.execute(
             query,
             {**variables, "cursor": cursor},
         )
         page = validated_connection(_connection_at(page_data, response_path))
         nodes.extend(_nodes(page))
-        has_next, cursor = _next_cursor(page)
+        has_next, cursor = _next_cursor(page, seen_cursors)
     completed = dict(connection)
     completed["nodes"] = nodes
     completed["pageInfo"] = {"hasNextPage": False, "endCursor": None}
@@ -2159,6 +2194,791 @@ class GitHubProjectProvider:
             backlog_status=backlog_status,
             label_ids=tuple(labels_by_name[name] for name in request.labels),
         )
+
+    def _prepare_pbi_refinement_target(
+        self, request: PbiRefinementUpdateRequest
+    ) -> PbiRefinementTarget:
+        if request.project_id != self.project_id:
+            raise PbiRefinementMutationError(
+                "Project is not authorized",
+                code="project_not_authorized",
+                status_code=403,
+            )
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        project_node_id: str | None = None
+        repository_names: set[str] = set()
+        status_field_id: str | None = None
+        status_options: dict[str, tuple[str, str]] = {}
+        while True:
+            data = self._client.execute(
+                _owner_query(PBI_CREATION_TARGET_QUERY, self.owner_type),
+                {"owner": self.owner, "number": self.project_number, "cursor": cursor},
+            )
+            project = _project(data, self.owner_type)
+            current_project_id = project.get("id")
+            if not isinstance(current_project_id, str) or not current_project_id:
+                raise PbiRefinementMutationError(
+                    "Configured Project is unavailable",
+                    code="project_unavailable",
+                    status_code=403,
+                )
+            if project_node_id is not None and current_project_id != project_node_id:
+                raise ProviderError("GitHub returned conflicting Project identities")
+            project_node_id = current_project_id
+
+            repositories = _mapping(project.get("repositories"))
+            for repository in _nodes(repositories):
+                name = repository.get("nameWithOwner")
+                if isinstance(name, str):
+                    repository_names.add(name.casefold())
+
+            fields = [
+                field
+                for field in _nodes(project.get("fields"))
+                if isinstance(field.get("name"), str)
+                and str(field.get("name")).casefold() == "status"
+            ]
+            if len(fields) != 1:
+                raise PbiRefinementMutationError(
+                    "Configured Project must have one Status field",
+                    code="project_status_unavailable",
+                )
+            field_id = fields[0].get("id")
+            options = fields[0].get("options")
+            if not isinstance(field_id, str) or not isinstance(options, list):
+                raise PbiRefinementMutationError(
+                    "Configured Project Status field is incomplete",
+                    code="project_status_unavailable",
+                )
+            if status_field_id is not None and status_field_id != field_id:
+                raise ProviderError("GitHub returned conflicting Status fields")
+            status_field_id = field_id
+
+            found_options: dict[str, list[tuple[str, str]]] = {
+                "backlog": [],
+                "todo": [],
+            }
+            for raw_option in cast(list[object], options):
+                if not isinstance(raw_option, Mapping):
+                    continue
+                option = cast(Mapping[str, object], raw_option)
+                name = option.get("name")
+                option_id = option.get("id")
+                if (
+                    isinstance(name, str)
+                    and name.casefold() in found_options
+                    and isinstance(option_id, str)
+                    and option_id
+                ):
+                    found_options[name.casefold()].append((option_id, name))
+            if any(len(matches) != 1 for matches in found_options.values()):
+                raise PbiRefinementMutationError(
+                    "Configured Project must have unique Backlog and Todo options",
+                    code="project_status_options_unavailable",
+                )
+            page_options = {name: matches[0] for name, matches in found_options.items()}
+            if status_options and status_options != page_options:
+                raise ProviderError("GitHub returned conflicting Status options")
+            status_options = page_options
+
+            has_next, cursor = _next_cursor(repositories, seen_cursors)
+            if not has_next:
+                break
+
+        if request.repository.casefold() not in repository_names:
+            raise PbiRefinementMutationError(
+                "Repository is not linked to the configured Project",
+                code="repository_not_linked",
+                status_code=403,
+            )
+        backlog_id, backlog_name = status_options["backlog"]
+        todo_id, todo_name = status_options["todo"]
+        return PbiRefinementTarget(
+            project_node_id=project_node_id,
+            status_field_id=status_field_id,
+            backlog_option_id=backlog_id,
+            backlog_status=backlog_name,
+            todo_option_id=todo_id,
+            todo_status=todo_name,
+        )
+
+    def _pbi_refinement_repository_labels(
+        self, request: PbiRefinementUpdateRequest
+    ) -> dict[str, list[Mapping[str, Any]]]:
+        owner, name = self._repository_parts(request.repository)
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        repository_id: str | None = None
+        labels: dict[str, list[Mapping[str, Any]]] = {}
+        while True:
+            data = self._client.execute(
+                PBI_CREATION_LABELS_QUERY,
+                {"owner": owner, "name": name, "cursor": cursor},
+            )
+            repository = _mapping(data.get("repository"))
+            current_id = repository.get("id")
+            current_name = repository.get("nameWithOwner")
+            if (
+                not isinstance(current_id, str)
+                or not current_id
+                or not isinstance(current_name, str)
+                or current_name.casefold() != request.repository.casefold()
+            ):
+                raise PbiRefinementMutationError(
+                    "Repository is not available",
+                    code="repository_unavailable",
+                    status_code=403,
+                )
+            if repository_id is not None and repository_id != current_id:
+                raise ProviderError("GitHub returned conflicting repository identities")
+            repository_id = current_id
+            connection = _mapping(repository.get("labels"))
+            for label in _nodes(connection):
+                label_name = label.get("name")
+                if isinstance(label_name, str):
+                    labels.setdefault(label_name.casefold(), []).append(label)
+            has_next, cursor = _next_cursor(connection, seen_cursors)
+            if not has_next:
+                break
+        return labels
+
+    def _pbi_refinement_issue_state(
+        self, request: PbiRefinementUpdateRequest
+    ) -> Mapping[str, Any]:
+        owner, name = self._repository_parts(request.repository)
+        variables = {"owner": owner, "name": name, "number": request.pbi_number}
+        data = self._client.execute(PBI_REFINEMENT_ISSUE_QUERY, variables)
+        issue = _mapping(_mapping(data.get("repository")).get("issue"))
+        if not issue:
+            raise PbiRefinementMutationError(
+                "Issue was not found in the configured repository",
+                code="issue_not_found",
+                status_code=404,
+            )
+        if issue.get("number") != request.pbi_number:
+            raise PbiRefinementMutationError(
+                "GitHub returned a different issue",
+                code="issue_identity_mismatch",
+                status_code=409,
+            )
+        completed = dict(issue)
+        completed["labels"] = _complete_connection(
+            self._client,
+            issue.get("labels"),
+            ISSUE_LABELS_QUERY,
+            variables,
+            ("repository", "issue", "labels"),
+            strict=True,
+        )
+        completed["subIssues"] = _complete_connection(
+            self._client,
+            issue.get("subIssues"),
+            ISSUE_SUB_ISSUES_QUERY,
+            variables,
+            ("repository", "issue", "subIssues"),
+            strict=True,
+        )
+        return completed
+
+    def _pbi_refinement_project_item(
+        self,
+        request: PbiRefinementUpdateRequest,
+        target: PbiRefinementTarget,
+        issue: Mapping[str, Any],
+    ) -> dict[str, object]:
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        matches: list[dict[str, object]] = []
+        while True:
+            data = self._client.execute(
+                _owner_query(PBI_CREATION_PROJECT_QUERY, self.owner_type),
+                {"owner": self.owner, "number": self.project_number, "cursor": cursor},
+            )
+            project = _project(data, self.owner_type)
+            if project.get("id") != target.project_node_id:
+                raise PbiRefinementMutationError(
+                    "Configured Project identity changed",
+                    code="project_identity_changed",
+                    status_code=409,
+                )
+            status_fields = [
+                field
+                for field in _nodes(project.get("fields"))
+                if isinstance(field.get("name"), str)
+                and str(field.get("name")).casefold() == "status"
+            ]
+            if len(status_fields) != 1:
+                raise PbiRefinementMutationError(
+                    "Configured Project Status field changed",
+                    code="project_status_unavailable",
+                    status_code=409,
+                )
+            status_field = status_fields[0]
+            field_id = status_field.get("id")
+            options = status_field.get("options")
+            if field_id != target.status_field_id or not isinstance(options, list):
+                raise PbiRefinementMutationError(
+                    "Configured Project Status field changed",
+                    code="project_status_unavailable",
+                    status_code=409,
+                )
+            status_options: dict[str, list[tuple[str, str]]] = {
+                "backlog": [],
+                "todo": [],
+            }
+            for raw_option in cast(list[object], options):
+                if not isinstance(raw_option, Mapping):
+                    continue
+                option = cast(Mapping[str, object], raw_option)
+                option_name = option.get("name")
+                option_id = option.get("id")
+                if (
+                    isinstance(option_name, str)
+                    and option_name.casefold() in status_options
+                    and isinstance(option_id, str)
+                ):
+                    status_options[option_name.casefold()].append(
+                        (option_id, option_name)
+                    )
+            if (
+                len(status_options["backlog"]) != 1
+                or status_options["backlog"][0]
+                != (target.backlog_option_id, target.backlog_status)
+                or len(status_options["todo"]) != 1
+                or status_options["todo"][0]
+                != (target.todo_option_id, target.todo_status)
+            ):
+                raise PbiRefinementMutationError(
+                    "Configured Project Status options changed",
+                    code="project_status_options_changed",
+                    status_code=409,
+                )
+
+            items = _mapping(project.get("items"))
+            for raw_item in _nodes(items):
+                raw_content = raw_item.get("content")
+                if not isinstance(raw_content, Mapping):
+                    continue
+                content = cast(Mapping[str, Any], raw_content)
+                repository = _mapping(content.get("repository")).get("nameWithOwner")
+                if (
+                    content.get("__typename") != "Issue"
+                    or content.get("number") != request.pbi_number
+                    or not isinstance(repository, str)
+                    or repository.casefold() != request.repository.casefold()
+                    or content.get("id") != issue.get("id")
+                ):
+                    continue
+                values = [
+                    value
+                    for value in _nodes(raw_item.get("fieldValues"))
+                    if _mapping(value.get("field")).get("id") == target.status_field_id
+                ]
+                if len(values) != 1:
+                    raise PbiRefinementMutationError(
+                        "PBI Project Status is missing or ambiguous",
+                        code="project_item_status_unavailable",
+                        status_code=409,
+                    )
+                value = values[0]
+                status = value.get("name")
+                option_id = value.get("optionId")
+                if not isinstance(status, str) or not isinstance(option_id, str):
+                    raise PbiRefinementMutationError(
+                        "PBI Project Status is incomplete",
+                        code="project_item_status_unavailable",
+                        status_code=409,
+                    )
+                expected_ids = {
+                    target.backlog_status: target.backlog_option_id,
+                    target.todo_status: target.todo_option_id,
+                }
+                if expected_ids.get(status) != option_id:
+                    raise PbiRefinementMutationError(
+                        "PBI has an unknown Project Status option",
+                        code="project_item_status_unknown",
+                        status_code=409,
+                    )
+                item_id = raw_item.get("id")
+                if not isinstance(item_id, str) or not item_id:
+                    raise PbiRefinementMutationError(
+                        "PBI Project item identity is incomplete",
+                        code="project_item_identity_unavailable",
+                        status_code=409,
+                    )
+                matches.append({"item_id": item_id, "status": status})
+            has_next, cursor = _next_cursor(items, seen_cursors, strict=True)
+            if not has_next:
+                break
+
+        if len(matches) != 1:
+            raise PbiRefinementMutationError(
+                "PBI must appear exactly once in the configured Project",
+                code="project_membership_unconfirmed",
+                status_code=409,
+            )
+        return matches[0]
+
+    def apply_pbi_refinement(
+        self, request: PbiRefinementUpdateRequest
+    ) -> PbiRefinementUpdateResult:
+        request.validate()
+        try:
+            target = self._prepare_pbi_refinement_target(request)
+            labels_by_name = self._pbi_refinement_repository_labels(request)
+            issue = self._pbi_refinement_issue_state(request)
+            project_item = self._pbi_refinement_project_item(request, target, issue)
+        except PbiRefinementMutationError:
+            raise
+        except Exception as exc:
+            raise PbiRefinementMutationError(
+                "GitHub refinement preflight failed",
+                code="preflight_failed",
+                status_code=502,
+            ) from exc
+
+        if issue.get("state") != "OPEN":
+            raise PbiRefinementMutationError(
+                "Only an open issue can be refined",
+                code="issue_not_open",
+                status_code=409,
+            )
+        issue_url = issue.get("url")
+        issue_id = issue.get("id")
+        if (
+            not isinstance(issue_url, str)
+            or not issue_url
+            or not isinstance(issue_id, str)
+        ):
+            raise PbiRefinementMutationError(
+                "GitHub issue identity is incomplete",
+                code="issue_identity_unavailable",
+                status_code=409,
+            )
+
+        initial_sub_issues = self._pbi_refinement_sub_issues(issue)
+        is_epic = request.effort_label.casefold() == "effort 13 - epic"
+        if is_epic and not initial_sub_issues:
+            raise PbiRefinementMutationError(
+                "Effort 13 Epic requires linked split evidence",
+                code="missing_split_evidence",
+                status_code=409,
+            )
+        desired_status = target.backlog_status if is_epic else target.todo_status
+        allowed_statuses = {
+            target.backlog_status.casefold(),
+            target.todo_status.casefold(),
+        }
+        project_status = project_item.get("status")
+        if not isinstance(project_status, str):
+            raise PbiRefinementMutationError(
+                "PBI Project Status is incomplete",
+                code="project_item_status_unavailable",
+                status_code=409,
+            )
+        if project_status.casefold() not in allowed_statuses:
+            raise PbiRefinementMutationError(
+                "PBI Project Status changed outside Backlog and Todo",
+                code="project_status_conflict",
+                status_code=409,
+            )
+
+        current_body = issue.get("body")
+        if current_body is None:
+            current_body = ""
+        if not isinstance(current_body, str):
+            raise PbiRefinementMutationError(
+                "GitHub issue body is invalid",
+                code="issue_body_unavailable",
+                status_code=409,
+            )
+        try:
+            desired_body = merge_refinement_sections(current_body, request.sections)
+            actual_label_names = self._pbi_refinement_label_names(issue)
+            resolved_labels = [
+                self._resolve_pbi_refinement_label(
+                    labels_by_name, label, require_description=True
+                )
+                for label in (
+                    request.priority_label,
+                    request.effort_label,
+                    *request.standard_labels,
+                )
+            ]
+            preserved_labels = [
+                self._resolve_pbi_refinement_label(
+                    labels_by_name, label, require_description=False
+                )
+                for label in actual_label_names
+                if not is_pbi_refinement_scale_label(label)
+            ]
+        except PbiRefinementMutationError:
+            raise
+        except Exception as exc:
+            raise PbiRefinementMutationError(
+                "Issue labels or body are invalid",
+                code="issue_state_invalid",
+                status_code=409,
+            ) from exc
+
+        expected_labels_by_id = {
+            label_id: label_name
+            for label_id, label_name in (*preserved_labels, *resolved_labels)
+        }
+        expected_label_ids = sorted(expected_labels_by_id)
+        expected_label_names = {
+            name.casefold() for name in expected_labels_by_id.values()
+        }
+        initial_label_names = {name.casefold() for name in actual_label_names}
+        completed_steps: list[str] = []
+
+        def result(
+            status: Literal["complete", "partial"],
+            current_issue: Mapping[str, Any],
+            current_project: Mapping[str, object],
+            *,
+            pending_step: str | None = None,
+            failure_code: str | None = None,
+        ) -> PbiRefinementUpdateResult:
+            try:
+                readback_labels = tuple(
+                    sorted(
+                        self._pbi_refinement_label_names(current_issue),
+                        key=str.casefold,
+                    )
+                )
+            except PbiRefinementMutationError:
+                readback_labels = ()
+            try:
+                linked_sub_issues = self._pbi_refinement_sub_issues(current_issue)
+            except PbiRefinementMutationError:
+                linked_sub_issues = initial_sub_issues
+            return PbiRefinementUpdateResult(
+                status=status,
+                issue_number=request.pbi_number,
+                issue_url=issue_url,
+                labels=readback_labels,
+                project_item_id=str(current_project.get("item_id", "")),
+                project_status=str(current_project.get("status", "")),
+                linked_sub_issues=linked_sub_issues,
+                completed_steps=tuple(completed_steps),
+                pending_step=pending_step,
+                failure_code=failure_code,
+            )
+
+        needs_issue_update = (
+            current_body != desired_body or initial_label_names != expected_label_names
+        )
+        if needs_issue_update:
+            try:
+                current_issue = self._pbi_refinement_issue_state(request)
+            except Exception:
+                return result(
+                    "partial",
+                    issue,
+                    project_item,
+                    pending_step="issue_body_and_labels",
+                    failure_code="issue_prewrite_readback_failed",
+                )
+            current_issue_body = current_issue.get("body")
+            if current_issue_body is None:
+                current_issue_body = ""
+            if (
+                current_issue.get("state") != "OPEN"
+                or current_issue_body != current_body
+                or {
+                    name.casefold()
+                    for name in self._pbi_refinement_label_names(current_issue)
+                }
+                != initial_label_names
+                or self._pbi_refinement_sub_issues(current_issue) != initial_sub_issues
+            ):
+                raise PbiRefinementMutationError(
+                    "Issue changed during refinement validation; "
+                    "retry against live state",
+                    code="issue_changed_before_write",
+                    status_code=409,
+                )
+            try:
+                self._client.execute(
+                    UPDATE_REFINEMENT_ISSUE_MUTATION,
+                    {
+                        "input": {
+                            "id": issue_id,
+                            "body": desired_body,
+                            "labelIds": expected_label_ids,
+                        }
+                    },
+                )
+            except Exception:
+                try:
+                    current_issue = self._pbi_refinement_issue_state(request)
+                except Exception:
+                    return result(
+                        "partial",
+                        issue,
+                        project_item,
+                        pending_step="issue_body_and_labels",
+                        failure_code="issue_update_unconfirmed",
+                    )
+                if not self._pbi_refinement_issue_matches(
+                    current_issue,
+                    desired_body,
+                    expected_label_names,
+                    initial_sub_issues,
+                ):
+                    return result(
+                        "partial",
+                        current_issue,
+                        project_item,
+                        pending_step="issue_body_and_labels",
+                        failure_code="issue_update_unconfirmed",
+                    )
+                issue = current_issue
+            else:
+                try:
+                    issue = self._pbi_refinement_issue_state(request)
+                except Exception:
+                    return result(
+                        "partial",
+                        issue,
+                        project_item,
+                        pending_step="issue_body_and_labels",
+                        failure_code="issue_readback_failed",
+                    )
+                if not self._pbi_refinement_issue_matches(
+                    issue, desired_body, expected_label_names, initial_sub_issues
+                ):
+                    return result(
+                        "partial",
+                        issue,
+                        project_item,
+                        pending_step="issue_body_and_labels",
+                        failure_code="issue_readback_mismatch",
+                    )
+        completed_steps.append("issue_body_and_labels")
+
+        try:
+            current_project = self._pbi_refinement_project_item(request, target, issue)
+            current_issue = self._pbi_refinement_issue_state(request)
+        except Exception:
+            return result(
+                "partial",
+                issue,
+                project_item,
+                pending_step="project_status",
+                failure_code="project_prewrite_readback_failed",
+            )
+        if (
+            current_project.get("item_id") != project_item.get("item_id")
+            or not isinstance(current_project.get("status"), str)
+            or cast(str, current_project.get("status")).casefold()
+            not in allowed_statuses
+            or not self._pbi_refinement_issue_matches(
+                current_issue, desired_body, expected_label_names, initial_sub_issues
+            )
+        ):
+            return result(
+                "partial",
+                current_issue,
+                current_project,
+                pending_step="project_status",
+                failure_code="project_prewrite_state_changed",
+            )
+        issue = current_issue
+        project_item = current_project
+
+        if project_item["status"] != desired_status:
+            target_option_id = (
+                target.backlog_option_id
+                if desired_status == target.backlog_status
+                else target.todo_option_id
+            )
+            try:
+                self._client.execute(
+                    UPDATE_PROJECT_STATUS_MUTATION,
+                    {
+                        "input": {
+                            "projectId": target.project_node_id,
+                            "itemId": project_item["item_id"],
+                            "fieldId": target.status_field_id,
+                            "value": {"singleSelectOptionId": target_option_id},
+                        }
+                    },
+                )
+            except Exception:
+                try:
+                    current_project = self._pbi_refinement_project_item(
+                        request, target, issue
+                    )
+                except Exception:
+                    return result(
+                        "partial",
+                        issue,
+                        project_item,
+                        pending_step="project_status",
+                        failure_code="project_status_unconfirmed",
+                    )
+                if current_project.get("status") != desired_status:
+                    return result(
+                        "partial",
+                        issue,
+                        current_project,
+                        pending_step="project_status",
+                        failure_code="project_status_unconfirmed",
+                    )
+                project_item = current_project
+            else:
+                try:
+                    project_item = self._pbi_refinement_project_item(
+                        request, target, issue
+                    )
+                except Exception:
+                    return result(
+                        "partial",
+                        issue,
+                        current_project,
+                        pending_step="project_status",
+                        failure_code="project_status_readback_failed",
+                    )
+                if project_item.get("status") != desired_status:
+                    return result(
+                        "partial",
+                        issue,
+                        project_item,
+                        pending_step="project_status",
+                        failure_code="project_status_readback_mismatch",
+                    )
+        completed_steps.append("project_status")
+
+        try:
+            issue = self._pbi_refinement_issue_state(request)
+            project_item = self._pbi_refinement_project_item(request, target, issue)
+        except Exception:
+            return result(
+                "partial",
+                issue,
+                project_item,
+                pending_step="final_readback",
+                failure_code="final_readback_failed",
+            )
+        if (
+            issue.get("state") != "OPEN"
+            or not self._pbi_refinement_issue_matches(
+                issue, desired_body, expected_label_names, initial_sub_issues
+            )
+            or project_item.get("item_id") != current_project.get("item_id")
+            or project_item.get("status") != desired_status
+        ):
+            return result(
+                "partial",
+                issue,
+                project_item,
+                pending_step="final_readback",
+                failure_code="final_readback_mismatch",
+            )
+        return result("complete", issue, project_item)
+
+    @staticmethod
+    def _resolve_pbi_refinement_label(
+        labels_by_name: Mapping[str, list[Mapping[str, Any]]],
+        name: str,
+        *,
+        require_description: bool,
+    ) -> tuple[str, str]:
+        matches = labels_by_name.get(name.casefold(), [])
+        if len(matches) != 1:
+            raise PbiRefinementMutationError(
+                "Requested or attached label is missing or ambiguous",
+                code="label_unavailable",
+                status_code=422,
+            )
+        label_id = matches[0].get("id")
+        canonical_name = matches[0].get("name")
+        description = matches[0].get("description")
+        if (
+            not isinstance(label_id, str)
+            or not label_id
+            or not isinstance(canonical_name, str)
+            or (
+                require_description
+                and (not isinstance(description, str) or not description.strip())
+            )
+        ):
+            raise PbiRefinementMutationError(
+                "Requested label or its live description is incomplete",
+                code="label_metadata_unavailable",
+                status_code=422,
+            )
+        return label_id, canonical_name
+
+    @staticmethod
+    def _pbi_refinement_label_names(issue: Mapping[str, Any]) -> tuple[str, ...]:
+        names: list[str] = []
+        seen: set[str] = set()
+        for label in _nodes(issue.get("labels")):
+            name = label.get("name")
+            if not isinstance(name, str) or not name:
+                raise PbiRefinementMutationError(
+                    "GitHub returned an invalid issue label",
+                    code="issue_labels_invalid",
+                    status_code=409,
+                )
+            if name.casefold() in seen:
+                raise PbiRefinementMutationError(
+                    "GitHub returned duplicate issue labels",
+                    code="issue_labels_ambiguous",
+                    status_code=409,
+                )
+            seen.add(name.casefold())
+            names.append(name)
+        return tuple(names)
+
+    @staticmethod
+    def _pbi_refinement_sub_issues(
+        issue: Mapping[str, Any],
+    ) -> tuple[Mapping[str, object], ...]:
+        sub_issues: list[Mapping[str, object]] = []
+        for item in _nodes(issue.get("subIssues")):
+            number = item.get("number")
+            title = item.get("title")
+            state = item.get("state")
+            if (
+                type(number) is not int
+                or number <= 0
+                or not isinstance(title, str)
+                or not isinstance(state, str)
+            ):
+                raise PbiRefinementMutationError(
+                    "GitHub returned invalid linked sub-issue data",
+                    code="sub_issues_invalid",
+                    status_code=409,
+                )
+            sub_issues.append({"number": number, "title": title, "state": state})
+        return tuple(sorted(sub_issues, key=lambda item: cast(int, item["number"])))
+
+    @classmethod
+    def _pbi_refinement_issue_matches(
+        cls,
+        issue: Mapping[str, Any],
+        expected_body: str,
+        expected_labels: set[str],
+        expected_sub_issues: tuple[Mapping[str, object], ...],
+    ) -> bool:
+        body = issue.get("body")
+        if body is None:
+            body = ""
+        try:
+            return (
+                issue.get("state") == "OPEN"
+                and body == expected_body
+                and {name.casefold() for name in cls._pbi_refinement_label_names(issue)}
+                == expected_labels
+                and cls._pbi_refinement_sub_issues(issue) == expected_sub_issues
+            )
+        except PbiRefinementMutationError:
+            return False
 
     def create_pbi(
         self,
@@ -4782,6 +5602,12 @@ class EnvironmentGitHubProvider:
     ) -> PbiCreationResult:
         provider = cast(PbiCreationProvider, self._configured_provider())
         return provider.create_pbi(request, target, progress, checkpoint)
+
+    def apply_pbi_refinement(
+        self, request: PbiRefinementUpdateRequest
+    ) -> PbiRefinementUpdateResult:
+        provider = cast(PbiRefinementMutationProvider, self._configured_provider())
+        return provider.apply_pbi_refinement(request)
 
     def create_handoff(self, request: HandoffRequest) -> HandoffResult:
         return self._configured_provider().create_handoff(request)
