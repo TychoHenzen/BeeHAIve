@@ -2,28 +2,9 @@
 
 from __future__ import annotations
 
-from .review import (
-    REQUIRED_CONCERNS,
-    PullRequestTarget,
-    ReaderExecution,
-    ReaderStatus,
-    ReviewConcern,
-)
-
-
-class DemoReviewProvider:
-    """Return a local synthetic pull request for startup adapter validation."""
-
-    def get_pull_request(self, pull_request_id: str) -> PullRequestTarget:
-        return PullRequestTarget(pull_request_id, "demo-head")
-
-
-class DemoReviewReader:
-    """Pass every concern without inspecting or changing a pull request."""
-
-    def review(self, target: PullRequestTarget) -> ReaderExecution:
-        del target
-        return ReaderExecution(ReaderStatus.PASS)
+from .review import REQUIRED_CONCERNS, ReviewConcern
+from .reviews.demo_review_provider import DemoReviewProvider
+from .reviews.demo_review_reader import DemoReviewReader
 
 
 def demo_review_adapters() -> tuple[

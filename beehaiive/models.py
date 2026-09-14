@@ -1,334 +1,41 @@
-"""Domain models shared by providers, storage, and the HTTP service."""
-
-from __future__ import annotations
-
-from collections.abc import Mapping
-from dataclasses import dataclass, field
-from enum import StrEnum
-from typing import Protocol
-
-
-class Stage(StrEnum):
-    """Stages owned by the project orchestrator."""
-
-    BACKLOG = "backlog"
-    REFINE = "refine"
-    IMPLEMENT = "implement"
-    PULL_REQUEST = "pull_request"
-
-
-def project_stage_from_status(status: str | None) -> Stage | None:
-    normalized = (status or "").strip().lower()
-    return {
-        "backlog": Stage.BACKLOG,
-        "todo": Stage.REFINE,
-        "in progress": Stage.IMPLEMENT,
-    }.get(normalized)
-
-
-class RunStatus(StrEnum):
-    """Durable status of a repository writer run."""
-
-    ACTIVE = "active"
-    FAILED = "failed"
-    COMPLETED = "completed"
-
-
-class RefinementStatus(StrEnum):
-    """Durable state of one PBI refinement attempt."""
-
-    AWAITING_ANSWERS = "awaiting_answers"
-    EVALUATING = "evaluating"
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-
-PROJECT_TERMINAL_STATUSES = frozenset({"done", "completed", "closed", "merged"})
-ARCHIVE_PROJECT_STATUS = "done"
-
-
-def _empty_metadata() -> dict[str, object]:
-    return {}
-
-
-@dataclass(frozen=True, slots=True)
-class PbiSnapshot:
-    """A PBI discovered from a project provider."""
-
-    repository: str
-    number: int
-    title: str
-    stage: Stage | None = Stage.BACKLOG
-    planning_status: str | None = None
-    claimable: bool = True
-    metadata: Mapping[str, object] = field(default_factory=_empty_metadata)
-
-
-@dataclass(frozen=True, slots=True)
-class PbiRefinementQuestion:
-    """A bounded question and its answer revisions within one generation."""
-
-    question_id: str
-    text: str
-    answer_history: tuple[Mapping[str, object], ...] = ()
-    evidence_refs: tuple[str, ...] = ()
-
-    @property
-    def revision(self) -> int:
-        return len(self.answer_history)
-
-    def as_dict(self) -> dict[str, object]:
-        return {
-            "question_id": self.question_id,
-            "text": self.text,
-            "revision": self.revision,
-            "answer": (
-                self.answer_history[-1].get("text") if self.answer_history else None
-            ),
-            "answer_history": [dict(answer) for answer in self.answer_history],
-            "evidence_refs": list(self.evidence_refs),
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class PbiRefinementAttempt:
-    """Restart-safe refinement state for one Project, repository, and PBI."""
-
-    attempt_id: str
-    project_id: str
-    repository: str
-    pbi_number: int
-    generation: int
-    reopen_count: int
-    revision: int
-    status: RefinementStatus
-    questions: tuple[PbiRefinementQuestion, ...]
-    decision: Mapping[str, object] | None
-    failure_reason: str | None
-    retryable_failure: bool
-    history: tuple[Mapping[str, object], ...]
-    authorization: Mapping[str, str]
-    created_at: str
-    updated_at: str
-
-    def as_dict(self) -> dict[str, object]:
-        return {
-            "attempt_id": self.attempt_id,
-            "project_id": self.project_id,
-            "repository": self.repository,
-            "pbi_number": self.pbi_number,
-            "generation": self.generation,
-            "reopen_count": self.reopen_count,
-            "revision": self.revision,
-            "status": self.status.value,
-            "questions": [question.as_dict() for question in self.questions],
-            "decision": dict(self.decision) if self.decision is not None else None,
-            "failure_reason": self.failure_reason,
-            "retryable_failure": self.retryable_failure,
-            "history": [dict(item) for item in self.history],
-            "authorization": dict(self.authorization),
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class RepositorySnapshot:
-    """A linked repository and its discovered PBIs."""
-
-    name: str
-    pbis: tuple[PbiSnapshot, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class ProjectSnapshot:
-    """A selected project with all linked repositories."""
-
-    project_id: str
-    name: str
-    repositories: tuple[RepositorySnapshot, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class HandoffRequest:
-    """Information required to create a branch and pull request."""
-
-    project_id: str
-    repository: str
-    pbi_number: int
-    title: str
-    branch: str
-    base_branch: str | None
-    body: str
-    run_id: str
-    head_sha: str | None = None
-    verification_evidence: str = ""
-    mutation_audit: HandoffMutationAudit | None = None
-
-
-class HandoffMutationAudit(Protocol):
-    """Persistence boundary for external handoff mutations."""
-
-    def begin_handoff_mutation(
-        self,
-        request: HandoffRequest,
-        mutation: str,
-        operation_key: str,
-        target: Mapping[str, object],
-    ) -> str:
-        """Persist a redacted attempt before sending it to GitHub."""
-
-        ...
-
-    def finish_handoff_mutation(
-        self,
-        action_id: str,
-        status: str,
-        result: Mapping[str, object],
-    ) -> None:
-        """Persist the attempt outcome without provider request data."""
-
-        ...
-
-    def reconcile_handoff_mutation(
-        self,
-        request: HandoffRequest,
-        mutation: str,
-        operation_key: str,
-        status: str,
-        result: Mapping[str, object],
-    ) -> None:
-        """Resolve unfinished attempts after reading the provider state."""
-
-        ...
-
-    def handoff_mutation_action(
-        self, request: HandoffRequest, mutation: str, operation_key: str
-    ) -> dict[str, object] | None:
-        """Return the latest durable record for one operation."""
-
-        ...
-
-
-@dataclass(frozen=True, slots=True)
-class HandoffIntent:
-    """Request details persisted before an external handoff begins."""
-
-    run: RunState
-    branch: str
-    base_branch: str | None
-    body: str
-    head_sha: str | None = None
-    verification_evidence: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class HandoffResult:
-    """The provider's durable branch and pull-request identifiers."""
-
-    branch: str
-    pull_request_url: str
-    pull_request_number: int | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class PullRequestSnapshot:
-    """Current pull-request identity and mergeability evidence."""
-
-    repository: str
-    number: int
-    pull_request_id: str
-    url: str
-    state: str
-    merged: bool
-    source_branch: str | None
-    source_head: str | None
-    target_branch: str | None
-    target_head: str | None
-    mergeable: str | None
-    merge_state: str | None
-    evidence_error: str | None = None
-    is_draft: bool | None = None
-    merge_commit_oid: str | None = None
-    source_repository: str | None = None
-
-    @property
-    def conflict_state(self) -> str:
-        """Return conflicting, clean, or unknown without guessing."""
-
-        if self.evidence_error is not None:
-            return "unknown"
-        if (
-            self.state != "OPEN"
-            or self.merged
-            or not self.source_branch
-            or not self.source_head
-            or not self.target_branch
-            or not self.target_head
-        ):
-            return "unknown"
-        if self.mergeable == "CONFLICTING" and self.merge_state == "DIRTY":
-            return "conflicting"
-        if self.mergeable == "MERGEABLE" and self.merge_state in {
-            "BEHIND",
-            "BLOCKED",
-            "CLEAN",
-            "HAS_HOOKS",
-            "UNSTABLE",
-        }:
-            return "clean"
-        return "unknown"
-
-    def as_dict(self) -> dict[str, object]:
-        return {
-            "repository": self.repository,
-            "number": self.number,
-            "pull_request_id": self.pull_request_id,
-            "url": self.url,
-            "state": self.state,
-            "merged": self.merged,
-            "source_branch": self.source_branch,
-            "source_head": self.source_head,
-            "target_branch": self.target_branch,
-            "target_head": self.target_head,
-            "mergeable": self.mergeable,
-            "merge_state": self.merge_state,
-            "conflict_state": self.conflict_state,
-            "evidence_error": self.evidence_error,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class RunState:
-    """A PBI run, including the stage needed for restart recovery."""
-
-    run_id: str
-    project_id: str
-    repository: str
-    pbi_number: int
-    title: str
-    stage: Stage
-    status: RunStatus
-    attempt: int
-    branch: str | None = None
-    pull_request_url: str | None = None
-    last_error: str | None = None
-    owner_id: str | None = None
-    lease_token: str | None = None
-    lease_expires_at: str | None = None
-    last_result: str | None = None
-    task_contract: Mapping[str, object] | None = None
-    task_result: Mapping[str, object] | None = None
-    task_answer: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class RoutingFailure:
-    """A durable routing failure waiting for delivery to the routing store."""
-
-    transition_id: str
-    run_id: str
-    error: str
-    input_tokens: int
-    output_tokens: int
-    recursive_spawn_depth: int
+from .model_types import ARCHIVE_PROJECT_STATUS as ARCHIVE_PROJECT_STATUS
+from .model_types import PROJECT_TERMINAL_STATUSES as PROJECT_TERMINAL_STATUSES
+from .model_types import HandoffIntent as HandoffIntent
+from .model_types import HandoffMutationAudit as HandoffMutationAudit
+from .model_types import HandoffRequest as HandoffRequest
+from .model_types import HandoffResult as HandoffResult
+from .model_types import PbiRefinementAttempt as PbiRefinementAttempt
+from .model_types import PbiRefinementQuestion as PbiRefinementQuestion
+from .model_types import PbiSnapshot as PbiSnapshot
+from .model_types import ProjectSnapshot as ProjectSnapshot
+from .model_types import PullRequestSnapshot as PullRequestSnapshot
+from .model_types import RefinementStatus as RefinementStatus
+from .model_types import RepositorySnapshot as RepositorySnapshot
+from .model_types import RoutingFailure as RoutingFailure
+from .model_types import RunState as RunState
+from .model_types import RunStatus as RunStatus
+from .model_types import Stage as Stage
+from .model_types import _empty_metadata as _empty_metadata
+from .model_types import project_stage_from_status as project_stage_from_status
+
+__all__ = [
+    "HandoffIntent",
+    "HandoffMutationAudit",
+    "HandoffRequest",
+    "HandoffResult",
+    "PbiRefinementAttempt",
+    "PbiRefinementQuestion",
+    "PbiSnapshot",
+    "ProjectSnapshot",
+    "PullRequestSnapshot",
+    "RefinementStatus",
+    "RepositorySnapshot",
+    "RoutingFailure",
+    "RunState",
+    "RunStatus",
+    "Stage",
+    "_empty_metadata",
+    "project_stage_from_status",
+    "PROJECT_TERMINAL_STATUSES",
+    "ARCHIVE_PROJECT_STATUS",
+]
