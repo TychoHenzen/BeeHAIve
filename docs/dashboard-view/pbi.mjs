@@ -1,6 +1,6 @@
 export function createPbiRenderer(dom, details, runAction) {
   const { element, renderEvidenceLink, renderListSection, pullRequestLabel } = dom;
-  const { renderTaskContract, renderTaskResult, renderProgress, renderSubtask, renderDependencyReadiness, renderChecks, renderReviewers, renderEscalation, renderActivity } = details;
+  const { renderTaskContract, renderTaskResult, renderOperatorQuestion, renderProgress, renderSubtask, renderDependencyReadiness, renderChecks, renderReviewers, renderEscalation, renderActivity } = details;
   function renderPbi(repository, pbi) {
     const card = element("article", undefined, "pbi");
     if (!card.dataset) card.dataset = {};
@@ -28,7 +28,32 @@ export function createPbiRenderer(dom, details, runAction) {
     card.append(renderProgress(pbi.stage_progress || []));
     const details = element("div", undefined, "details");
     if (pbi.task_contract) details.append(renderTaskContract(pbi.task_contract));
-    if (pbi.task_result) details.append(renderTaskResult(pbi.task_result));
+    const operatorQuestions = pbi.operator_questions || [];
+    if (operatorQuestions.length > 0) {
+      operatorQuestions.forEach((question) => {
+        const section = renderOperatorQuestion(question);
+        if (question.status === "pending" && pbi.run_id) {
+          const answer = element("button", "Answer operator question", "secondary");
+          answer.type = "button";
+          answer.addEventListener("click", () => {
+            const value = window.prompt(question.question || "Answer this question:");
+            if (value && value.trim()) {
+              runAction({
+                action: "answer_question",
+                repository,
+                pbi_number: pbi.number,
+                run_id: pbi.run_id,
+                question_id: question.question_id,
+                revision: question.revision,
+                answer: value.trim(),
+              });
+            }
+          });
+          section.append(answer);
+        }
+        details.append(section);
+      });
+    } else if (pbi.task_result) details.append(renderTaskResult(pbi.task_result));
     details.append(renderListSection("Subtasks", pbi.subtasks, renderSubtask));
     if (pbi.dependency_readiness || (pbi.subtasks || []).length > 0) {
       details.append(renderDependencyReadiness(pbi.dependency_readiness));

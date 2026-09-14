@@ -4,6 +4,10 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from typing import Any
 
+from beehaiive.operator_notifications import (
+    dispatch_pending_operator_notifications,
+)
+
 from ..models import (
     ProjectSnapshot,
     RoutingFailure,
@@ -77,7 +81,7 @@ class OrchestrationFailureMixin:
             self._ensure_routing_problem(run_id)
             for failure in self.store.pending_routing_failures(run_id):
                 self._record_failure_routing(failure)
-        return failed
+        return self.store.get_run(run_id) or failed
 
     def stop(self: Any, run_id: str, reason: str = "Stopped by operator") -> RunState:
         """Apply an authenticated operator stop without a worker lease."""
@@ -146,7 +150,20 @@ class OrchestrationFailureMixin:
                 transition_id=failure.transition_id,
             )
             if result.state.status is RoutingStatus.HUMAN_HANDOFF:
-                self.store.set_run_claimable(failure.run_id, False)
+                question = (
+                    result.state.required_action
+                    or failure.error
+                    or "Routing is exhausted and requires operator action"
+                )
+                self.store.await_operator_after_failure(
+                    failure.run_id,
+                    kind="routing_exhausted",
+                    question=question,
+                    evidence={},
+                )
+                dispatch_pending_operator_notifications(
+                    self.store, run_id=failure.run_id
+                )
         except RoutingError as exc:
             if self.model_router.store.has_transition(failure.transition_id):
                 self.store.mark_routing_failure_processed(failure.transition_id)

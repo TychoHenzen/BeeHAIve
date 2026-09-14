@@ -18,7 +18,7 @@ from tests.support.agent.immediate_executor import (
 )
 
 
-def test_worker_manager_persists_human_handoff_without_claimability() -> None:
+def test_worker_manager_does_not_convert_human_handoff_to_failure() -> None:
     run = RunState(
         "handoff-run",
         "project-1",
@@ -72,9 +72,4 @@ def test_worker_manager_persists_human_handoff_without_claimability() -> None:
     manager = AgentWorkerManager(orchestrator, executor)
     manager._run(run.run_id, run.lease_token or "")
 
-    assert orchestrator.store.failure == (
-        run.run_id,
-        "Human approval is required",
-        "lease-1",
-        False,
-    )
+    assert orchestrator.store.failure is None

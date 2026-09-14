@@ -143,6 +143,11 @@ class ProjectSyncMixin:
                                 incoming_stage is not None
                                 and merged_stage is not Stage.PULL_REQUEST
                                 and existing["run_status"] != RunStatus.COMPLETED.value
+                                and (
+                                    existing["run_status"]
+                                    != RunStatus.AWAITING_OPERATOR.value
+                                    or bool(existing["task_answer_resumed"])
+                                )
                                 and not task_pause
                             ),
                             current_stage.value,

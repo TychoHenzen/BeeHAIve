@@ -242,6 +242,7 @@ class RunFailureMixin:
                 raise StoreError(f"Unknown run: {run_id}")
             if row.status in {RunStatus.COMPLETED, RunStatus.FAILED}:
                 return row
+            now = _now()
             connection.execute(
                 """
                 UPDATE runs
@@ -250,7 +251,22 @@ class RunFailureMixin:
                     lease_expires_at = NULL, updated_at = ?
                 WHERE run_id = ?
                 """,
-                (reason, _now(), run_id),
+                (reason, now, run_id),
+            )
+            connection.execute(
+                """
+                UPDATE operator_questions
+                SET status = 'closed',
+                    notification_status = CASE
+                        WHEN notification_status IN (
+                            'pending', 'not_configured', 'sending'
+                        )
+                        THEN 'cancelled' ELSE notification_status END,
+                    notification_lease_token = NULL,
+                    notification_lease_expires_at = NULL, updated_at = ?
+                WHERE run_id = ? AND status = 'pending'
+                """,
+                (now, run_id),
             )
             connection.execute(
                 """

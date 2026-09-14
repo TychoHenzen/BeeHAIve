@@ -1,4 +1,5 @@
 from ._common import Annotated, Field
+from .dashboard_answer_question_request import DashboardAnswerQuestionRequest
 from .dashboard_approve_request import DashboardApproveRequest
 from .dashboard_clarify_request import DashboardClarifyRequest
 from .dashboard_commit_push_request import DashboardCommitPushRequest
@@ -9,6 +10,7 @@ __all__ = ["DashboardActionRequest"]
 
 DashboardActionRequest = Annotated[
     DashboardStartRequest
+    | DashboardAnswerQuestionRequest
     | DashboardStopRequest
     | DashboardApproveRequest
     | DashboardClarifyRequest

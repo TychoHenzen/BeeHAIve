@@ -120,7 +120,10 @@ class ProjectClaimMixin:
                   AND p.repository_name = ?
                   AND p.claimable = 1
                   AND p.stage != ?
-                  AND (r.status IS NULL OR r.status = 'failed')
+                  AND (
+                      r.status IS NULL OR r.status = 'failed'
+                      OR (r.status = 'awaiting_operator' AND r.task_answer_resumed = 1)
+                  )
                 ORDER BY p.number
                 LIMIT 1
                 """,

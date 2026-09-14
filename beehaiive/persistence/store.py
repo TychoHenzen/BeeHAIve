@@ -14,6 +14,9 @@ from .handoff_record import HandoffRecordMixin
 from .lease_store import LeaseStoreMixin
 from .meta_review import MetaReviewMixin
 from .migrations import StorageMigrationMixin
+from .operator_notification_delivery import OperatorNotificationDeliveryMixin
+from .operator_question_answers import OperatorQuestionAnswersMixin
+from .operator_questions import OperatorQuestionsMixin
 from .pbi_creation import PbiCreationMixin
 from .pbi_refinement_answer import PbiRefinementAnswerMixin
 from .pbi_refinement_reopen import PbiRefinementReopenMixin
@@ -43,6 +46,9 @@ class OrchestratorStore(
     LeaseStoreMixin,
     ExecutionLeaseMixin,
     TaskContractMixin,
+    OperatorQuestionAnswersMixin,
+    OperatorQuestionsMixin,
+    OperatorNotificationDeliveryMixin,
     RunFailureMixin,
     RunCompletionMixin,
     RoutingFailureMixin,

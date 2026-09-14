@@ -132,11 +132,20 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
         request: TaskQuestionAnswer,
         _auth: None = Depends(require_mutation_access),
     ) -> dict[str, object]:
-        return _run_dict(
-            _handle_store_error(
-                lambda: orchestrator.answer_task_question(run_id, request.answer)
+        run = _handle_store_error(
+            lambda: orchestrator.answer_operator_question(
+                run_id,
+                question_id=request.question_id,
+                revision=request.revision,
+                answer=request.answer,
+                authorization_method="X-API-Key",
+                operator_role="operator",
             )
         )
+        return {
+            **_run_dict(run),
+            "operator_question": orchestrator.store.operator_question_for_run(run_id),
+        }
 
     @app.post("/runs/{run_id}/lease")
     def renew_lease(  # pyright: ignore[reportUnusedFunction]

@@ -28,6 +28,9 @@ def build_dashboard_state(
     )
     subtasks = sum(len(sequence(pbi.get("subtasks"))) for pbi in all_pbis)
     active_runs = sum(1 for pbi in all_pbis if pbi.get("status") == "active")
+    awaiting_operator_runs = sum(
+        1 for pbi in all_pbis if pbi.get("status") == "awaiting_operator"
+    )
     failed_runs = sum(1 for pbi in all_pbis if pbi.get("status") == "failed")
     completed_runs = sum(1 for pbi in all_pbis if pbi.get("status") == "completed")
     active_repositories = sum(
@@ -58,6 +61,7 @@ def build_dashboard_state(
             "writers": active_writers,
             "readers": readers,
             "active_runs": active_runs,
+            "awaiting_operator_runs": awaiting_operator_runs,
             "failed_runs": failed_runs,
             "completed_runs": completed_runs,
         },

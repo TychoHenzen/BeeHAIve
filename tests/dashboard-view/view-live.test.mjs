@@ -200,3 +200,87 @@ test("rendering keeps project and pull-request terminal state visible", () => {
   assert.match(dashboardOutput.textContent, /#11: closed, changes_requested/);
   assert.doesNotMatch(dashboardOutput.textContent, /#9: review pending/);
 });
+
+test("rendering a pending operator question exposes its safe state and answer action", () => {
+  const summaryOutput = new FakeNode("section");
+  const dashboardOutput = new FakeNode("section");
+  const actionLog = new FakeNode("section");
+  const actionsOutput = new FakeNode("div");
+  const actionPayloads = [];
+  const view = createDashboardView({
+    document: new FakeDocument(),
+    summaryOutput,
+    dashboardOutput,
+    actionLog,
+    actionsOutput,
+    runAction: (payload) => actionPayloads.push(payload),
+  });
+
+  view.render({
+    name: "Planning",
+    counts: { awaiting_operator_runs: 1 },
+    repositories: [
+      {
+        name: "owner/api",
+        active: true,
+        writer: { status: "idle" },
+        pbis: [
+          {
+            id: "owner/api#1",
+            number: 1,
+            title: "Blocked API run",
+            status: "awaiting_operator",
+            run_id: "run-1",
+            operator_questions: [
+              {
+                question_id: "question-1",
+                revision: 2,
+                kind: "question",
+                status: "pending",
+                question: "Which branch should be used?",
+                owner_scope: "project-1",
+                notification_status: "pending",
+                notification_attempts: 0,
+                evidence: { check: "branch name" },
+              },
+            ],
+            stage_progress: [],
+            subtasks: [],
+            readers: [],
+            reviewers: {},
+            activity: [],
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.match(summaryOutput.textContent, /Waiting for operator1/);
+  assert.match(dashboardOutput.textContent, /Which branch should be used/);
+  assert.match(dashboardOutput.textContent, /question-1/);
+  assert.match(dashboardOutput.textContent, /Notification: pending/);
+  const originalWindow = globalThis.window;
+  globalThis.window = { prompt: () => "main" };
+  try {
+    const answer = findNode(
+      dashboardOutput,
+      (node) => node.tag === "button" && node._textContent === "Answer operator question",
+    );
+    assert.ok(answer);
+    answer.click();
+  } finally {
+    if (originalWindow === undefined) delete globalThis.window;
+    else globalThis.window = originalWindow;
+  }
+  assert.deepEqual(actionPayloads, [
+    {
+      action: "answer_question",
+      repository: "owner/api",
+      pbi_number: 1,
+      run_id: "run-1",
+      question_id: "question-1",
+      revision: 2,
+      answer: "main",
+    },
+  ]);
+});

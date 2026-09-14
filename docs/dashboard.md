@@ -29,7 +29,8 @@ environment variables used by the service.
 
 Read-only state needs no API key. Operator actions require `BEEHAIIVE_API_KEY`
 and the dashboard API-key field. The dashboard exposes sync, start writer, stop,
-approval, clarification, and retry commit-and-push actions. In documented demo
+approval, clarification, operator-question answers, and retry commit-and-push
+actions. In documented demo
 mode, start writer claims one PBI and runs the bounded repository-inventory
 worker. A completed
 result is shown on the PBI card. Every action is recorded as `pending`,

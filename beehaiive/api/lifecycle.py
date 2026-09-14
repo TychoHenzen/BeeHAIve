@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -10,6 +11,9 @@ from fastapi.responses import JSONResponse, Response
 
 from beehaiive.api.helpers.http import (
     _pbi_refinement_failure as _pbi_refinement_failure,
+)
+from beehaiive.operator_notifications import (
+    dispatch_pending_operator_notifications,
 )
 from beehaiive.review import REQUIRED_CONCERNS
 
@@ -60,11 +64,21 @@ def register_error_handlers(app: FastAPI) -> None:
 
 def register_background_handlers(app: FastAPI, runtime: dict[str, Any]) -> None:
     agent_worker = runtime["agent_worker"]
+    orchestrator = runtime["orchestrator"]
     scheduler = runtime["scheduler"]
     require_review_adapters = runtime["require_review_adapters"]
     review_operations_enabled = runtime["review_operations_enabled"]
     review_service = runtime["review_service"]
     review_repair_service = runtime["review_repair_service"]
+
+    @app.on_event("startup")  # pyright: ignore[reportDeprecated]
+    async def recover_operator_notification_outbox() -> None:  # pyright: ignore[reportUnusedFunction]
+        await asyncio.to_thread(
+            orchestrator.store.recover_interrupted_operator_notifications
+        )
+        await asyncio.to_thread(
+            dispatch_pending_operator_notifications, orchestrator.store
+        )
 
     if agent_worker is not None:
 
