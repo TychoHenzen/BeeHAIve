@@ -14,7 +14,7 @@ REFINEMENT_SECTION_ORDER = (
 )
 MAX_REFINEMENT_BODY_LENGTH = 65_536
 MAX_REFINEMENT_LABELS = 20
-_MANAGED_HEADING = re.compile(r"^ {0,3}##[ \t]+(.+?)[ \t]*#*[ \t]*$")
+_MANAGED_HEADING = re.compile(r"^ {0,3}##[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*$")
 _ANY_LEVEL_TWO_HEADING = re.compile(r"^ {0,3}##(?:[ \t]+|$)")
 _FENCE_START = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _RAW_HTML_TAG_START = re.compile(
@@ -342,7 +342,7 @@ def _markdown_headings(lines: list[str]) -> list[tuple[int, str]]:
         if not _ANY_LEVEL_TWO_HEADING.match(value):
             continue
         heading = _MANAGED_HEADING.match(value)
-        title = heading.group(1).strip().rstrip("# ").strip() if heading else ""
+        title = heading.group(1).strip() if heading else ""
         headings.append((index, title))
     return headings
 

@@ -1437,7 +1437,9 @@ def create_app(
             )
             return JSONResponse(
                 status_code=exc.status_code,
-                content=_pbi_refinement_failure(exc.code, pending_step, str(exc)),
+                content=_pbi_refinement_failure(
+                    exc.code, pending_step, "PBI refinement could not be applied"
+                ),
             )
         status_code = 200 if result.status == "complete" else 202
         return JSONResponse(status_code=status_code, content=result.as_dict())

@@ -70,6 +70,17 @@ def test_refinement_section_merge_ignores_heading_after_comment_closer() -> None
     assert merged.startswith(body)
 
 
+def test_refinement_section_merge_preserves_heading_with_unspaced_trailing_hash() -> (
+    None
+):
+    body = "## Outcome#\nPreserve this text.\n"
+
+    merged = merge_refinement_sections(body, _sections())
+
+    assert merged.startswith(body)
+    assert "## Outcome\nUpdated Outcome." in merged
+
+
 def test_refinement_section_merge_preserves_headings_inside_raw_html_blocks() -> None:
     body = (
         "<div>\n## Outcome\nRaw HTML text stays intact.\n</div>\n\n"

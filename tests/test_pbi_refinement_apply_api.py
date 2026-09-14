@@ -25,11 +25,12 @@ def test_apply_refinement_api_requires_operator_and_returns_partial_result() -> 
     )
     calls = []
     fail_before_write = False
+    failure_message = "internal stack trace details"
 
     def apply(request) -> PbiRefinementUpdateResult:
         if fail_before_write:
             raise PbiRefinementMutationError(
-                "GitHub refinement preflight failed",
+                failure_message,
                 code="preflight_failed",
                 status_code=502,
             )
@@ -93,6 +94,8 @@ def test_apply_refinement_api_requires_operator_and_returns_partial_result() -> 
     assert failed.json()["completed_steps"] == []
     assert failed.json()["pending_step"] == "preflight"
     assert failed.json()["failure_code"] == "preflight_failed"
+    assert failed.json()["message"] == "PBI refinement could not be applied"
+    assert failure_message not in failed.text
 
     response = client.post(path, headers={"X-API-Key": "test-key"}, json=payload)
     assert response.status_code == 202
