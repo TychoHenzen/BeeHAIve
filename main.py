@@ -1564,7 +1564,12 @@ def create_app(
         except PbiRelationError as exc:
             return JSONResponse(
                 status_code=exc.status_code,
-                content={"error": {"code": exc.code, "detail": str(exc)}},
+                content={
+                    "error": {
+                        "code": exc.code,
+                        "detail": "Relation request was rejected",
+                    }
+                },
             )
         status_code = 200 if result.status == "complete" else 202
         return JSONResponse(status_code=status_code, content=result.as_dict())

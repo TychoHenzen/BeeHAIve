@@ -25,6 +25,7 @@ from beehaiive.pbi_relations import (
     PbiRelationIssue,
     PbiRelationRequest,
     PbiRelationSnapshot,
+    PbiRelationValidationError,
 )
 from beehaiive.provider import EnvironmentGitHubProvider, ProviderError
 from beehaiive.review import ReviewStore
@@ -417,6 +418,45 @@ def test_pbi_relations_route_is_authenticated_scoped_and_redacted() -> None:
     ]
     assert "private-token-must-not-appear" not in applied.text
     assert provider.sub_issue_writes == [(1, 102)]
+    store.close()
+
+
+def test_pbi_relations_route_redacts_exception_details() -> None:
+    class ErrorProvider(ApiProvider):
+        def prepare_pbi_relations(self, request: PbiRelationRequest):
+            del request
+            raise PbiRelationValidationError(
+                "private-token-must-not-appear", code="invalid_parent"
+            )
+
+    store = OrchestratorStore()
+    project_client = TestClient(
+        create_app(
+            orchestrator=Orchestrator(store, ErrorProvider()),
+            api_key="test-key",
+            allowed_project_ids={"owner:7"},
+        )
+    )
+    path = "/projects/owner:7/repositories/owner/api/pbis/1/relations"
+    headers = {"X-API-Key": "test-key"}
+    child = {
+        "status": "complete",
+        "repository": "owner/api",
+        "issue": {
+            "id": "node-2",
+            "number": 2,
+            "url": "https://example.test/issues/2",
+        },
+        "project": {"item_id": "child-item", "status": "Backlog"},
+    }
+    project_client.post("/projects/owner:7/sync", headers=headers)
+
+    response = project_client.post(path, headers=headers, json={"children": [child]})
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_parent"
+    assert response.json()["error"]["detail"] == "Relation request was rejected"
+    assert "private-token-must-not-appear" not in response.text
     store.close()
 
 
