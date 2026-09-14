@@ -12,6 +12,7 @@ import subprocess
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
 from typing import Any, Literal, Protocol, cast
@@ -40,6 +41,7 @@ from .pbi_creation import (
     PbiCreationTarget,
     PbiCreationValidationError,
 )
+from .pbi_readiness import project_pbi_readiness
 from .pbi_refinement_mutation import (
     PbiRefinementMutationError,
     PbiRefinementMutationProvider,
@@ -51,6 +53,7 @@ from .pbi_refinement_mutation import (
     merge_refinement_sections,
 )
 from .pbi_relations import (
+    MAX_PBI_RELATION_CHILDREN,
     MAX_PBI_RELATION_GRAPH_ISSUES,
     PbiRelationIssue,
     PbiRelationProvider,
@@ -546,6 +549,8 @@ query($owner: String!, $number: Int!, $cursor: String) {
               number
               title
               url
+              state
+              stateReason
               repository { nameWithOwner }
               # Keep the project-wide query below GitHub's node limit. The
               # provider completes these connections with repository queries.
@@ -558,6 +563,7 @@ query($owner: String!, $number: Int!, $cursor: String) {
                   number
                   title
                   state
+                  stateReason
                   labels(first: 20) {
                     nodes { name }
                     pageInfo { hasNextPage endCursor }
@@ -645,6 +651,7 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
           number
           title
           state
+          stateReason
           labels(first: 100) {
             nodes { name }
             pageInfo { hasNextPage endCursor }
@@ -1342,6 +1349,45 @@ def _stage_from_status(status: str | None) -> Stage | None:
     return project_stage_from_status(status)
 
 
+def _project_item_status_values(item: Mapping[str, Any]) -> list[str]:
+    values: list[str] = []
+    for field_value in _nodes(item.get("fieldValues", {})):
+        raw_field = field_value.get("field")
+        if raw_field is None:
+            continue
+        field = _mapping(raw_field)
+        value = field_value.get("name")
+        if field.get("name") == "Status" and isinstance(value, str):
+            values.append(value)
+    return values
+
+
+def _project_status_index(
+    items: Iterable[Mapping[str, Any]],
+) -> tuple[dict[tuple[str, int], str | None], set[tuple[str, int]]]:
+    statuses: dict[tuple[str, int], str | None] = {}
+    conflicts: set[tuple[str, int]] = set()
+    for item in items:
+        content_value = item.get("content")
+        if content_value is None:
+            continue
+        content = _mapping(content_value)
+        repository_value = content.get("repository")
+        if repository_value is None:
+            continue
+        repository_name = _mapping(repository_value).get("nameWithOwner")
+        number = content.get("number")
+        if not isinstance(repository_name, str) or not isinstance(number, int):
+            continue
+        key = (repository_name.casefold(), number)
+        values = set(_project_item_status_values(item))
+        status = next(iter(values)) if len(values) == 1 else None
+        if len(values) > 1 or (key in statuses and statuses[key] != status):
+            conflicts.add(key)
+        statuses[key] = status
+    return statuses, conflicts
+
+
 def _actor_name(value: object) -> str | None:
     if not isinstance(value, Mapping):
         return None
@@ -1394,6 +1440,15 @@ def _dashboard_metadata(issue: Mapping[str, Any]) -> dict[str, object]:
     source_url = issue.get("url")
     if isinstance(source_url, str):
         metadata["source_url"] = source_url
+    issue_state = issue.get("state")
+    if isinstance(issue_state, str):
+        metadata["issue_state"] = issue_state
+    state_reason = issue.get("stateReason")
+    if isinstance(state_reason, str):
+        metadata["state_reason"] = state_reason
+    project_status = issue.get("projectStatus")
+    if isinstance(project_status, str):
+        metadata["project_status"] = project_status
     labels = _label_names(issue.get("labels", {}))
 
     subtasks: list[dict[str, object]] = []
@@ -1410,12 +1465,48 @@ def _dashboard_metadata(issue: Mapping[str, Any]) -> dict[str, object]:
         state = raw_subtask.get("state")
         if isinstance(state, str):
             subtask["status"] = state.lower()
+            subtask["issue_state"] = state
+        state_reason = raw_subtask.get("stateReason")
+        if isinstance(state_reason, str):
+            subtask["state_reason"] = state_reason
+        child_project_status = raw_subtask.get("projectStatus")
+        if isinstance(child_project_status, str):
+            subtask["project_status"] = child_project_status
+        else:
+            subtask["project_status"] = None
+        subtask["project_status_conflict"] = (
+            raw_subtask.get("projectStatusConflict") is True
+        )
+        subtask["blocked_by"] = raw_subtask.get("blockedBy", [])
+        subtask["dependency_read_complete"] = (
+            raw_subtask.get("dependencyReadComplete") is True
+        )
+        dependency_read_error = raw_subtask.get("dependencyReadError")
+        if isinstance(dependency_read_error, str):
+            subtask["dependency_read_error"] = dependency_read_error
         subtask_labels = _label_names(raw_subtask.get("labels", {}))
         if subtask_labels:
             subtask["labels"] = subtask_labels
         subtasks.append(subtask)
-    if subtasks:
-        metadata["subtasks"] = subtasks
+    readiness_source = _mapping(issue.get("_pbi_readiness_source", {}))
+    is_epic = any(label.casefold() == "effort 13 - epic" for label in labels)
+    if subtasks or is_epic:
+        projected_subtasks, readiness = project_pbi_readiness(
+            subtasks,
+            relation_complete=readiness_source.get("child_relation_complete") is True,
+            relation_error=(
+                readiness_source.get("child_relation_error")
+                if isinstance(readiness_source.get("child_relation_error"), str)
+                else None
+            ),
+            observed_at=(
+                readiness_source.get("observed_at")
+                if isinstance(readiness_source.get("observed_at"), str)
+                else None
+            ),
+        )
+        metadata["subtasks"] = projected_subtasks
+        metadata["dependency_readiness"] = readiness
 
     readers: list[dict[str, object]] = []
     reviewers: dict[str, dict[str, object]] = {}
@@ -1784,7 +1875,12 @@ class GitHubProjectProvider:
         self._discovery_cache: tuple[float, ProjectSnapshot] | None = None
         self._discovery_lock = Lock()
 
-    def _complete_issue_metadata(self, issue: Mapping[str, Any]) -> Mapping[str, Any]:
+    def _complete_issue_metadata(
+        self,
+        issue: Mapping[str, Any],
+        project_statuses: Mapping[tuple[str, int], str | None] | None = None,
+        project_status_conflicts: set[tuple[str, int]] | None = None,
+    ) -> Mapping[str, Any]:
         repository_name = _mapping(issue.get("repository")).get("nameWithOwner")
         issue_number = issue.get("number")
         if not isinstance(repository_name, str) or not isinstance(issue_number, int):
@@ -1803,18 +1899,48 @@ class GitHubProjectProvider:
             variables,
             ("repository", "issue", "labels"),
         )
-        subissues = _complete_connection(
-            self._client,
-            issue.get("subIssues", {}),
-            ISSUE_SUB_ISSUES_QUERY,
-            variables,
-            ("repository", "issue", "subIssues"),
-        )
+        child_relation_complete = True
+        child_relation_error: str | None = None
+        try:
+            subissues = _complete_connection(
+                self._client,
+                issue.get("subIssues", {}),
+                ISSUE_SUB_ISSUES_QUERY,
+                variables,
+                ("repository", "issue", "subIssues"),
+                strict=True,
+            )
+        except (OSError, TypeError, ValueError, ProviderError):
+            subissues = dict(_mapping(issue.get("subIssues", {})))
+            child_relation_complete = False
+            child_relation_error = "child_relation_read_failed"
+        if len(_nodes(subissues)) > MAX_PBI_RELATION_CHILDREN:
+            child_relation_complete = False
+            child_relation_error = "child_limit_exceeded"
         completed_subissues: list[dict[str, Any]] = []
-        for raw_subissue in _nodes(subissues):
+        for index, raw_subissue in enumerate(_nodes(subissues)):
             subissue = dict(raw_subissue)
             subissue_number = subissue.get("number")
-            if isinstance(subissue_number, int):
+            subissue_title = subissue.get("title")
+            if (
+                not isinstance(subissue_number, int)
+                or subissue_number <= 0
+                or not isinstance(subissue_title, str)
+                or not subissue_title.strip()
+            ):
+                child_relation_complete = False
+                child_relation_error = "child_response_incomplete"
+            else:
+                child_key = (repository_name.casefold(), subissue_number)
+                subissue["projectStatus"] = (
+                    project_statuses.get(child_key)
+                    if project_statuses is not None
+                    else None
+                )
+                subissue["projectStatusConflict"] = (
+                    project_status_conflicts is not None
+                    and child_key in project_status_conflicts
+                )
                 subissue["labels"] = _complete_connection(
                     self._client,
                     subissue.get("labels", {}),
@@ -1826,9 +1952,45 @@ class GitHubProjectProvider:
                     },
                     ("repository", "issue", "labels"),
                 )
+                if not child_relation_complete:
+                    subissue["dependencyReadComplete"] = False
+                    subissue["dependencyReadError"] = (
+                        child_relation_error or "child_relation_incomplete"
+                    )
+                elif index >= MAX_PBI_RELATION_CHILDREN:
+                    subissue["dependencyReadComplete"] = False
+                    subissue["dependencyReadError"] = "child_limit_exceeded"
+                else:
+                    try:
+                        blockers = self.list_pbi_blocked_by(
+                            repository_name, subissue_number
+                        )
+                    except PbiRelationProviderError as exc:
+                        subissue["dependencyReadComplete"] = False
+                        subissue["dependencyReadError"] = exc.code
+                    except (OSError, TypeError, ValueError, ProviderError):
+                        subissue["dependencyReadComplete"] = False
+                        subissue["dependencyReadError"] = "dependency_read_failed"
+                    else:
+                        subissue["blockedBy"] = [
+                            {
+                                "number": blocker.number,
+                                "title": blocker.title,
+                                "url": blocker.url,
+                                "state": blocker.state,
+                                "state_reason": blocker.state_reason,
+                            }
+                            for blocker in blockers
+                        ]
+                        subissue["dependencyReadComplete"] = True
             completed_subissues.append(subissue)
         subissues["nodes"] = completed_subissues
         completed_issue["subIssues"] = subissues
+        completed_issue["_pbi_readiness_source"] = {
+            "child_relation_complete": child_relation_complete,
+            "child_relation_error": child_relation_error,
+            "observed_at": datetime.now(UTC).isoformat(),
+        }
         completed_issue["comments"] = _complete_connection(
             self._client,
             issue.get("comments", {}),
@@ -2015,6 +2177,7 @@ class GitHubProjectProvider:
             if not has_next:
                 break
 
+        project_items: list[Mapping[str, Any]] = []
         item_cursor: str | None = None
         while True:
             item_data = self._client.execute(
@@ -2028,50 +2191,56 @@ class GitHubProjectProvider:
             item_connection = _mapping(
                 _project(item_data, self.owner_type).get("items")
             )
-            for item in _nodes(item_connection):
-                content_value = item.get("content")
-                if content_value is None:
-                    continue
-                content = _mapping(content_value)
-                if content.get("__typename") != "Issue":
-                    continue
-                repository = _mapping(content.get("repository"))
-                repository_name = repository.get("nameWithOwner")
-                number = content.get("number")
-                title = content.get("title")
-                if (
-                    not isinstance(repository_name, str)
-                    or not isinstance(number, int)
-                    or not isinstance(title, str)
-                ):
-                    continue
-                content = self._complete_issue_metadata(content)
-                status = None
-                for field_value in _nodes(item.get("fieldValues", {})):
-                    raw_field = field_value.get("field")
-                    if raw_field is None:
-                        continue
-                    field = _mapping(raw_field)
-                    if field.get("name") == "Status" and isinstance(
-                        field_value.get("name"), str
-                    ):
-                        status = field_value["name"]
-                        break
-                stage = _stage_from_status(status)
-                repositories.setdefault(repository_name, []).append(
-                    PbiSnapshot(
-                        repository_name,
-                        number,
-                        title,
-                        stage,
-                        status,
-                        stage is not None,
-                        _dashboard_metadata(content),
-                    )
-                )
+            project_items.extend(_nodes(item_connection))
             has_next, item_cursor = _next_cursor(item_connection)
             if not has_next:
                 break
+
+        project_statuses, project_status_conflicts = _project_status_index(
+            project_items
+        )
+        for item in project_items:
+            content_value = item.get("content")
+            if content_value is None:
+                continue
+            content = _mapping(content_value)
+            if content.get("__typename") != "Issue":
+                continue
+            repository = _mapping(content.get("repository"))
+            repository_name = repository.get("nameWithOwner")
+            number = content.get("number")
+            title = content.get("title")
+            if (
+                not isinstance(repository_name, str)
+                or not isinstance(number, int)
+                or not isinstance(title, str)
+            ):
+                continue
+            key = (repository_name.casefold(), number)
+            status_values = set(_project_item_status_values(item))
+            status = next(iter(status_values)) if len(status_values) == 1 else None
+            content_with_project_status = dict(content)
+            content_with_project_status["projectStatus"] = status
+            content_with_project_status["projectStatusConflict"] = (
+                len(status_values) > 1 or key in project_status_conflicts
+            )
+            completed_content = self._complete_issue_metadata(
+                content_with_project_status,
+                project_statuses,
+                project_status_conflicts,
+            )
+            stage = _stage_from_status(status)
+            repositories.setdefault(repository_name, []).append(
+                PbiSnapshot(
+                    repository_name,
+                    number,
+                    title,
+                    stage,
+                    status,
+                    stage is not None,
+                    _dashboard_metadata(completed_content),
+                )
+            )
 
         repository_snapshots = tuple(
             RepositorySnapshot(
@@ -3603,7 +3772,10 @@ class GitHubProjectProvider:
                 statuses: list[str] = []
                 for raw_value in values:
                     value = _mapping(raw_value)
-                    field = _mapping(value.get("field"))
+                    raw_field = value.get("field")
+                    if raw_field is None:
+                        continue
+                    field = _mapping(raw_field)
                     if field.get("id") == status_field_id:
                         name_value = value.get("name")
                         if not isinstance(name_value, str) or not name_value:
@@ -3710,6 +3882,7 @@ class GitHubProjectProvider:
         url = payload.get("html_url") or payload.get("url")
         title = payload.get("title")
         state = payload.get("state")
+        state_reason = payload.get("state_reason")
         if (
             type(issue_id) is not int
             or issue_id <= 0
@@ -3721,9 +3894,18 @@ class GitHubProjectProvider:
             or not url
             or not isinstance(title, str)
             or not isinstance(state, str)
+            or (state_reason is not None and not isinstance(state_reason, str))
         ):
             raise PbiRelationProviderError("issue_response_incomplete")
-        return PbiRelationIssue(issue_id, node_id, number, url, title, state.upper())
+        return PbiRelationIssue(
+            issue_id,
+            node_id,
+            number,
+            url,
+            title,
+            state.upper(),
+            state_reason,
+        )
 
     def _pbi_relation_parent_number(
         self, repository: str, issue_number: int
@@ -3827,6 +4009,11 @@ class GitHubProjectProvider:
         return self._pbi_relation_list_issues(
             repository, parent_issue_number, "sub_issues"
         )
+
+    def get_pbi_parent_issue_number(
+        self, repository: str, child_issue_number: int
+    ) -> int | None:
+        return self._pbi_relation_parent_number(repository, child_issue_number)
 
     def list_pbi_blocked_by(
         self, repository: str, issue_number: int
@@ -6111,6 +6298,12 @@ class EnvironmentGitHubProvider:
     ) -> tuple[PbiRelationIssue, ...]:
         provider = cast(PbiRelationProvider, self._configured_provider())
         return provider.list_pbi_sub_issues(repository, parent_issue_number)
+
+    def get_pbi_parent_issue_number(
+        self, repository: str, child_issue_number: int
+    ) -> int | None:
+        provider = cast(PbiRelationProvider, self._configured_provider())
+        return provider.get_pbi_parent_issue_number(repository, child_issue_number)
 
     def list_pbi_blocked_by(
         self, repository: str, issue_number: int

@@ -154,13 +154,17 @@ class PbiRelationIssue:
     url: str
     title: str
     state: str
+    state_reason: str | None = None
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "number": self.number,
             "url": self.url,
             "state": self.state,
         }
+        if self.state_reason is not None:
+            result["state_reason"] = self.state_reason
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +183,10 @@ class PbiRelationProvider(Protocol):
     def list_pbi_sub_issues(
         self, repository: str, parent_issue_number: int
     ) -> tuple[PbiRelationIssue, ...]: ...
+
+    def get_pbi_parent_issue_number(
+        self, repository: str, child_issue_number: int
+    ) -> int | None: ...
 
     def list_pbi_blocked_by(
         self, repository: str, issue_number: int
@@ -266,7 +274,6 @@ class PbiRelationService:
         request.validate()
         requested_children = tuple(child.number for child in request.children)
         requested_dependencies = request.dependencies
-        empty_children: tuple[int, ...] = ()
         empty_dependencies: tuple[PbiRelationDependency, ...] = ()
         try:
             snapshot = self._provider.prepare_pbi_relations(request)
@@ -361,21 +368,36 @@ class PbiRelationService:
                 break
         if any(child.number not in preexisting_children for child in request.children):
             completed_steps.append("sub_issue_write")
+        sub_issue_readback_complete = True
+        observed_children: set[int]
         try:
-            observed_children = self._provider.list_pbi_sub_issues(
-                request.repository, snapshot.parent.number
-            )
-            confirmed_children = tuple(
-                number
-                for number in requested_children
-                if number in {issue.number for issue in observed_children}
-            )
-            sub_issue_readback_complete = True
-            completed_steps.append("sub_issue_readback")
+            observed_children = {
+                issue.number
+                for issue in self._provider.list_pbi_sub_issues(
+                    request.repository, snapshot.parent.number
+                )
+            }
         except Exception as exc:
-            confirmed_children = empty_children
+            observed_children = set()
             sub_issue_readback_complete = False
             write_error = write_error or _failure_code(exc)
+        observed_parents: dict[int, int | None] = {}
+        for number in requested_children:
+            try:
+                observed_parents[number] = self._provider.get_pbi_parent_issue_number(
+                    request.repository, number
+                )
+            except Exception as exc:
+                sub_issue_readback_complete = False
+                write_error = write_error or _failure_code(exc)
+        confirmed_children = tuple(
+            number
+            for number in requested_children
+            if number in observed_children
+            and observed_parents.get(number) == snapshot.parent.number
+        )
+        if sub_issue_readback_complete:
+            completed_steps.append("sub_issue_readback")
 
         if not sub_issue_readback_complete or len(confirmed_children) != len(
             requested_children

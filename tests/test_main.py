@@ -147,6 +147,78 @@ def test_project_routes_sync_and_claim_repository_work() -> None:
     assert claim_response.json()["stage"] == "refine"
 
 
+def test_project_api_exposes_dependency_readiness_metadata() -> None:
+    readiness = {
+        "status": "unknown",
+        "counts": {
+            "ready": 0,
+            "incomplete": 0,
+            "blocked": 0,
+            "rejected": 0,
+            "completed": 0,
+            "unknown": 1,
+        },
+        "reasons": ["child_evidence_unknown"],
+        "observed_at": "2026-09-14T08:00:00+00:00",
+    }
+    child = {
+        "id": "#2",
+        "number": 2,
+        "title": "Unknown child",
+        "issue_state": "OPEN",
+        "state_reason": None,
+        "project_status": None,
+        "blocked_by": [],
+        "dependency_read_complete": False,
+        "dependency_read_error": "permission_denied",
+        "readiness": "unknown",
+        "readiness_reasons": ["permission_denied"],
+        "observed_at": readiness["observed_at"],
+    }
+    store = OrchestratorStore()
+    store.sync_project(
+        ProjectSnapshot(
+            "owner:7",
+            "Planning",
+            (
+                RepositorySnapshot(
+                    "owner/api",
+                    (
+                        PbiSnapshot(
+                            "owner/api",
+                            1,
+                            "Parent PBI",
+                            metadata={
+                                "issue_state": "OPEN",
+                                "state_reason": None,
+                                "subtasks": [child],
+                                "dependency_readiness": readiness,
+                            },
+                        ),
+                    ),
+                ),
+            ),
+        )
+    )
+    project_client = TestClient(
+        create_app(
+            orchestrator=Orchestrator(store, ApiProvider()),
+            api_key="test-key",
+            allowed_project_ids={"owner:7"},
+        )
+    )
+
+    response = project_client.get(
+        "/projects/owner:7", headers={"X-API-Key": "test-key"}
+    )
+
+    assert response.status_code == 200
+    pbi = response.json()["repositories"][0]["pbis"][0]
+    assert pbi["metadata"]["subtasks"] == [child]
+    assert pbi["metadata"]["dependency_readiness"] == readiness
+    store.close()
+
+
 def test_create_project_pbi_is_authenticated_scoped_and_idempotent() -> None:
     store = OrchestratorStore()
     provider = ApiProvider()
@@ -207,6 +279,7 @@ def test_pbi_relations_route_is_authenticated_scoped_and_redacted() -> None:
             super().__init__()
             self.relation_prepare_calls = 0
             self.sub_issues: set[int] = set()
+            self.sub_issue_parents: dict[int, int] = {}
             self.sub_issue_writes: list[tuple[int, int]] = []
 
         @staticmethod
@@ -230,7 +303,10 @@ def test_pbi_relations_route_is_authenticated_scoped_and_redacted() -> None:
                     self._issue(child.number, child.url) for child in request.children
                 ),
                 tuple(self._issue(number) for number in sorted(self.sub_issues)),
-                {child.number: None for child in request.children},
+                {
+                    child.number: self.sub_issue_parents.get(child.number)
+                    for child in request.children
+                },
             )
 
         def list_pbi_sub_issues(
@@ -239,6 +315,12 @@ def test_pbi_relations_route_is_authenticated_scoped_and_redacted() -> None:
             assert repository == "owner/api"
             assert parent_issue_number == 1
             return tuple(self._issue(number) for number in sorted(self.sub_issues))
+
+        def get_pbi_parent_issue_number(
+            self, repository: str, child_issue_number: int
+        ) -> int | None:
+            assert repository == "owner/api"
+            return self.sub_issue_parents.get(child_issue_number)
 
         def list_pbi_blocked_by(
             self, repository: str, issue_number: int
@@ -259,7 +341,9 @@ def test_pbi_relations_route_is_authenticated_scoped_and_redacted() -> None:
         ) -> None:
             assert repository == "owner/api"
             self.sub_issue_writes.append((parent_issue_number, child_issue_id))
-            self.sub_issues.add(child_issue_id - 100)
+            child_number = child_issue_id - 100
+            self.sub_issues.add(child_number)
+            self.sub_issue_parents[child_number] = parent_issue_number
 
         def add_pbi_dependency(
             self, repository: str, blocked_issue_number: int, blocker_issue_id: int

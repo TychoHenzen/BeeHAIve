@@ -105,13 +105,20 @@ export function createDashboardView({
       card.append(element("div", "Archived: completion evidence verified", "muted"));
     }
     if (pbi.source_url) card.append(renderEvidenceLink("Source issue", pbi.source_url));
+    if (pbi.issue_state) {
+      const reason = pbi.state_reason ? ` (${pbi.state_reason})` : "";
+      card.append(element("div", `Issue ${pbi.issue_state}${reason}`, "muted"));
+    }
     if (pbi.branch) card.append(element("div", `Branch: ${pbi.branch}`, "muted"));
     if (pbi.pull_request_url) card.append(renderEvidenceLink("Pull request", pbi.pull_request_url));
     card.append(renderProgress(pbi.stage_progress || []));
     const details = element("div", undefined, "details");
     if (pbi.task_contract) details.append(renderTaskContract(pbi.task_contract));
     if (pbi.task_result) details.append(renderTaskResult(pbi.task_result));
-    details.append(renderListSection("Subtasks", pbi.subtasks, (item) => `${item.id || "subtask"}: ${item.title || ""}`));
+    details.append(renderListSection("Subtasks", pbi.subtasks, renderSubtask));
+    if (pbi.dependency_readiness || (pbi.subtasks || []).length > 0) {
+      details.append(renderDependencyReadiness(pbi.dependency_readiness));
+    }
     if (pbi.planning_status) card.append(element("div", `Project status: ${pbi.planning_status}`, "muted"));
     details.append(renderListSection("Pull requests", pbi.pull_requests, (item) => pullRequestLabel(item)));
     if (pbi.checks && typeof pbi.checks === "object") details.append(renderChecks(pbi.checks));
@@ -274,6 +281,46 @@ export function createDashboardView({
       });
       section.append(list);
     });
+    return section;
+  }
+
+  function renderSubtask(item) {
+    const label = `${item.id || "subtask"}: ${item.title || ""}`;
+    const status = item.readiness || "unknown";
+    const issue = item.issue_state
+      ? `Issue ${item.issue_state}${item.state_reason ? ` (${item.state_reason})` : ""}`
+      : "Issue state unavailable";
+    const project = item.project_status
+      ? `Project status ${item.project_status}`
+      : "Project status unavailable";
+    const blockers = item.dependency_read_complete
+      ? `Blocked by ${(item.blocked_by || []).map((blocker) => `#${blocker.number} ${blocker.state}${blocker.state_reason ? ` (${blocker.state_reason})` : ""}`).join(", ") || "none"}`
+      : `Blocked-by facts unavailable (${item.dependency_read_error || "read incomplete"})`;
+    const reasons = (item.readiness_reasons || []).join(", ");
+    const observed = item.observed_at ? ` Observed: ${item.observed_at}.` : "";
+    return `${label}. Readiness: ${status}. ${issue}. ${project}. ${blockers}.${reasons ? ` Reasons: ${reasons}.` : ""}${observed}`;
+  }
+
+  function renderDependencyReadiness(readiness) {
+    const section = element("section");
+    section.append(element("h3", "Dependency readiness"));
+    if (!readiness || typeof readiness !== "object") {
+      section.append(element("p", "Unknown. Readiness evidence is unavailable.", "muted"));
+      return section;
+    }
+    const status = readiness.status || "unknown";
+    const counts = readiness.counts || {};
+    const summary = ["ready", "incomplete", "blocked", "rejected", "completed", "unknown"]
+      .map((outcome) => `${outcome}: ${counts[outcome] || 0}`)
+      .join("; ");
+    section.append(element("p", `Parent readiness: ${status}. ${summary}`));
+    const reasons = Array.isArray(readiness.reasons) ? readiness.reasons : [];
+    if (reasons.length > 0) {
+      section.append(element("p", `Reasons: ${reasons.join(", ")}`, "muted"));
+    }
+    if (readiness.observed_at) {
+      section.append(element("p", `Observed: ${readiness.observed_at}`, "muted"));
+    }
     return section;
   }
 

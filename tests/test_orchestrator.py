@@ -508,15 +508,13 @@ def test_github_provider_maps_live_dashboard_metadata() -> None:
     discovered = provider.discover_project("owner:7")
 
     metadata = discovered.repositories[0].pbis[0].metadata
-    assert metadata["subtasks"] == [
-        {
-            "id": "#2",
-            "number": 2,
-            "title": "API child",
-            "status": "open",
-            "labels": ["stage/implement"],
-        }
-    ]
+    child = metadata["subtasks"][0]  # type: ignore[index]
+    assert child["id"] == "#2"  # type: ignore[index]
+    assert child["title"] == "API child"  # type: ignore[index]
+    assert child["labels"] == ["stage/implement"]  # type: ignore[index]
+    assert child["readiness"] == "unknown"  # type: ignore[index]
+    assert child["readiness_reasons"] == ["child_response_incomplete"]  # type: ignore[index]
+    assert metadata["dependency_readiness"]["status"] == "unknown"  # type: ignore[index]
     assert metadata["readers"] == [
         {"id": "#9:tests", "name": "tests", "pull_request": 9, "status": "fail"},
         {"id": "#9:bot", "name": "bot", "pull_request": 9, "status": "pending"},
@@ -676,6 +674,64 @@ def test_sync_replaces_removed_dashboard_metadata() -> None:
     pbi = store.project_state("project-1")["repositories"][0]["pbis"][0]  # type: ignore[index]
     assert pbi["metadata"] == {}  # type: ignore[index]
     store.close()
+
+
+def test_sync_replays_readiness_metadata_across_store_restart(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "readiness.db"
+    metadata: dict[str, object] = {
+        "subtasks": [
+            {
+                "id": "#2",
+                "number": 2,
+                "readiness": "ready",
+                "readiness_reasons": [],
+                "blocked_by": [],
+            }
+        ],
+        "dependency_readiness": {
+            "status": "ready",
+            "counts": {
+                "ready": 1,
+                "incomplete": 0,
+                "blocked": 0,
+                "rejected": 0,
+                "completed": 0,
+                "unknown": 0,
+            },
+            "reasons": [],
+            "observed_at": "2026-09-14T08:00:00+00:00",
+        },
+    }
+    project = ProjectSnapshot(
+        "project-1",
+        "Planning",
+        (
+            RepositorySnapshot(
+                "owner/api",
+                (PbiSnapshot("owner/api", 1, "Parent PBI", metadata=metadata),),
+            ),
+        ),
+    )
+    store = OrchestratorStore(database)
+
+    store.sync_project(project)
+    first_pbi = store.project_state("project-1")["repositories"][0]["pbis"][0]  # type: ignore[index]
+    first_metadata = deepcopy(first_pbi["metadata"])  # type: ignore[index]
+    first_events = deepcopy(first_pbi["events"])  # type: ignore[index]
+    store.sync_project(project)
+    replayed_pbi = store.project_state("project-1")["repositories"][0]["pbis"][0]  # type: ignore[index]
+
+    assert replayed_pbi["metadata"] == first_metadata  # type: ignore[index]
+    assert replayed_pbi["events"] == first_events  # type: ignore[index]
+    store.close()
+
+    restarted = OrchestratorStore(database)
+    restored_pbi = restarted.project_state("project-1")["repositories"][0]["pbis"][0]  # type: ignore[index]
+    assert restored_pbi["metadata"] == first_metadata  # type: ignore[index]
+    assert restored_pbi["events"] == first_events  # type: ignore[index]
+    restarted.close()
 
 
 def test_sync_keeps_external_done_from_completing_a_local_run() -> None:
@@ -1030,6 +1086,120 @@ class FakeGraphQLClient:
 
     def execute(self, query: str, variables: dict[str, object]) -> dict[str, Any]:
         return self.data
+
+
+def _readiness_connection(nodes: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "nodes": nodes,
+        "pageInfo": {"hasNextPage": False, "endCursor": None},
+    }
+
+
+def _readiness_issue_content(
+    number: int,
+    title: str,
+    state: str,
+    state_reason: str | None,
+    subtasks: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "__typename": "Issue",
+        "number": number,
+        "title": title,
+        "state": state,
+        "stateReason": state_reason,
+        "url": f"https://example.test/owner/api/issues/{number}",
+        "repository": {"nameWithOwner": "owner/api"},
+        "labels": _readiness_connection([]),
+        "subIssues": _readiness_connection(subtasks or []),
+        "comments": _readiness_connection([]),
+        "closedByPullRequestsReferences": _readiness_connection([]),
+    }
+
+
+class ReadinessGraphQLClient(FakeGraphQLClient):
+    def __init__(
+        self,
+        children: list[dict[str, Any]],
+        *,
+        dependency_pages: dict[int, list[list[dict[str, Any]]]] | None = None,
+        rest_statuses: dict[int, int] | None = None,
+        extra_subissues: list[dict[str, Any]] | None = None,
+    ) -> None:
+        child_nodes = [
+            {
+                "number": child["number"],
+                "title": child["title"],
+                "state": child["issue_state"],
+                "stateReason": child["state_reason"],
+                "labels": _readiness_connection([]),
+            }
+            for child in children
+        ]
+        child_nodes.extend(extra_subissues or [])
+        items = [
+            {
+                "content": _readiness_issue_content(
+                    1, "Parent PBI", "OPEN", None, child_nodes
+                ),
+                "fieldValues": {
+                    "nodes": [{"name": "In Progress", "field": {"name": "Status"}}]
+                },
+            }
+        ]
+        for child in children:
+            project_status = child["project_status"]
+            values = (
+                [{"name": project_status, "field": {"name": "Status"}}]
+                if isinstance(project_status, str)
+                else []
+            )
+            items.append(
+                {
+                    "content": _readiness_issue_content(
+                        child["number"],
+                        child["title"],
+                        child["issue_state"],
+                        child["state_reason"],
+                    ),
+                    "fieldValues": {"nodes": values},
+                }
+            )
+        super().__init__(
+            {
+                "user": {
+                    "projectV2": {
+                        "title": "Planning",
+                        "repositories": {
+                            "nodes": [{"nameWithOwner": "owner/api"}],
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        },
+                        "items": {
+                            "nodes": items,
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        },
+                    }
+                }
+            }
+        )
+        self.dependency_pages = dependency_pages or {}
+        self.rest_statuses = rest_statuses or {}
+        self.rest_calls: list[tuple[str, str]] = []
+        self.queries: list[str] = []
+
+    def execute(self, query: str, variables: dict[str, object]) -> dict[str, Any]:
+        self.queries.append(query)
+        return super().execute(query, variables)
+
+    def request_rest(
+        self, method: str, path: str, payload: dict[str, object] | None = None
+    ) -> tuple[int, list[dict[str, Any]]]:
+        self.rest_calls.append((method, path))
+        issue_number = int(path.split("/issues/", 1)[1].split("/", 1)[0])
+        page = int(path.rsplit("page=", 1)[1])
+        pages = self.dependency_pages.get(issue_number, [[]])
+        response = pages[page - 1] if page <= len(pages) else []
+        return self.rest_statuses.get(issue_number, 200), response
 
 
 class PaginatedGraphQLClient:
@@ -1611,6 +1781,176 @@ def test_github_provider_paginates_nested_dashboard_metadata() -> None:
         "consecutive": 2,
         "current_tier": "terra",
     }
+    readiness = metadata["dependency_readiness"]  # type: ignore[index]
+    assert readiness["status"] == "unknown"  # type: ignore[index]
+    assert readiness["counts"]["unknown"] == 101  # type: ignore[index]
+
+
+def test_github_provider_projects_child_facts_and_dependency_pages() -> None:
+    children = [
+        {
+            "number": 2,
+            "title": "Ready",
+            "issue_state": "OPEN",
+            "state_reason": "REOPENED",
+            "project_status": "Todo",
+        },
+        {
+            "number": 3,
+            "title": "Incomplete",
+            "issue_state": "OPEN",
+            "state_reason": None,
+            "project_status": "In Progress",
+        },
+        {
+            "number": 4,
+            "title": "Blocked",
+            "issue_state": "OPEN",
+            "state_reason": None,
+            "project_status": "Todo",
+        },
+        {
+            "number": 5,
+            "title": "Rejected",
+            "issue_state": "CLOSED",
+            "state_reason": "NOT_PLANNED",
+            "project_status": "Done",
+        },
+        {
+            "number": 6,
+            "title": "Completed",
+            "issue_state": "CLOSED",
+            "state_reason": "COMPLETED",
+            "project_status": "Done",
+        },
+        {
+            "number": 7,
+            "title": "Unknown",
+            "issue_state": "OPEN",
+            "state_reason": None,
+            "project_status": "Todo",
+        },
+    ]
+    first_page = [
+        {
+            "id": 1_000 + index,
+            "node_id": f"I_kwDO{index}",
+            "number": 1_000 + index,
+            "html_url": f"https://example.test/issues/{1_000 + index}",
+            "title": f"Completed blocker {index}",
+            "state": "closed",
+            "state_reason": "completed",
+        }
+        for index in range(100)
+    ]
+    final_blocker = {
+        "id": 1_100,
+        "node_id": "I_kwDO1100",
+        "number": 1_100,
+        "html_url": "https://example.test/issues/1100",
+        "title": "Open blocker",
+        "state": "open",
+        "state_reason": None,
+    }
+    client = ReadinessGraphQLClient(
+        children,
+        dependency_pages={4: [first_page, [final_blocker]]},
+        rest_statuses={7: 403},
+    )
+    provider = GitHubProjectProvider("owner", 7, "token", client=client)
+
+    discovered = provider.discover_project("owner:7")
+    parent = discovered.repositories[0].pbis[0]
+    metadata = parent.metadata
+    projected = {child["number"]: child for child in metadata["subtasks"]}  # type: ignore[index]
+    readiness = metadata["dependency_readiness"]  # type: ignore[assignment]
+
+    assert {number: child["readiness"] for number, child in projected.items()} == {
+        2: "ready",
+        3: "incomplete",
+        4: "blocked",
+        5: "rejected",
+        6: "completed",
+        7: "unknown",
+    }
+    assert readiness["status"] == "unknown"  # type: ignore[index]
+    assert readiness["counts"] == {  # type: ignore[index]
+        "ready": 1,
+        "incomplete": 1,
+        "blocked": 1,
+        "rejected": 1,
+        "completed": 1,
+        "unknown": 1,
+    }
+    assert metadata["issue_state"] == "OPEN"
+    assert metadata["project_status"] == "In Progress"
+    assert projected[2]["issue_state"] == "OPEN"
+    assert projected[2]["state_reason"] == "REOPENED"
+    assert projected[2]["project_status"] == "Todo"
+    assert projected[2]["blocked_by"] == []
+    assert projected[2]["dependency_read_complete"] is True
+    assert projected[4]["readiness_reasons"] == ["blocked_by_open:#1100"]
+    assert len(projected[4]["blocked_by"]) == 101
+    assert projected[7]["dependency_read_error"] == "permission_denied"
+    assert [
+        path.rsplit("page=", 1)[1]
+        for method, path in client.rest_calls
+        if method == "GET" and "/issues/4/" in path
+    ] == ["1", "2"]
+    assert all(method == "GET" for method, _ in client.rest_calls)
+    assert not any("mutation" in query.casefold() for query in client.queries)
+
+
+def test_github_provider_keeps_missing_child_project_status_unknown() -> None:
+    client = ReadinessGraphQLClient(
+        [
+            {
+                "number": 2,
+                "title": "Not in a Project status",
+                "issue_state": "OPEN",
+                "state_reason": None,
+                "project_status": None,
+            }
+        ]
+    )
+    provider = GitHubProjectProvider("owner", 7, "token", client=client)
+
+    metadata = provider.discover_project("owner:7").repositories[0].pbis[0].metadata
+    child = metadata["subtasks"][0]  # type: ignore[index]
+
+    assert child["project_status"] is None  # type: ignore[index]
+    assert child["readiness"] == "unknown"  # type: ignore[index]
+    assert child["readiness_reasons"] == ["project_status_unknown"]  # type: ignore[index]
+
+
+def test_github_provider_does_not_drop_a_malformed_child_from_the_aggregate() -> None:
+    client = ReadinessGraphQLClient(
+        [
+            {
+                "number": 2,
+                "title": "Ready-looking child",
+                "issue_state": "OPEN",
+                "state_reason": None,
+                "project_status": "Todo",
+            }
+        ],
+        extra_subissues=[
+            {
+                "number": 8,
+                "title": None,
+                "state": "OPEN",
+                "stateReason": None,
+                "labels": _readiness_connection([]),
+            }
+        ],
+    )
+    provider = GitHubProjectProvider("owner", 7, "token", client=client)
+
+    metadata = provider.discover_project("owner:7").repositories[0].pbis[0].metadata
+
+    assert metadata["subtasks"][0]["readiness"] == "ready"  # type: ignore[index]
+    assert metadata["dependency_readiness"]["status"] == "unknown"  # type: ignore[index]
+    assert "child_response_incomplete" in metadata["dependency_readiness"]["reasons"]  # type: ignore[index]
 
 
 def test_github_provider_paginates_current_pull_request_checks() -> None:

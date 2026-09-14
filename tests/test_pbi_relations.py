@@ -59,6 +59,7 @@ class FakeRelationProvider:
         self.preflight_calls = 0
         self.fail_blocking = False
         self.fail_sub_issue_id: int | None = None
+        self.fail_parent_readback_number: int | None = None
         self.fail_blocked_by_call: tuple[int, int] | None = None
         self.fail_dependency = False
         self.blocked_by_calls: dict[int, int] = {}
@@ -78,6 +79,14 @@ class FakeRelationProvider:
         assert repository == "owner/repo"
         assert parent_issue_number == 1
         return tuple(_fact(number) for number in sorted(self.parent_children))
+
+    def get_pbi_parent_issue_number(
+        self, repository: str, child_issue_number: int
+    ) -> int | None:
+        assert repository == "owner/repo"
+        if child_issue_number == self.fail_parent_readback_number:
+            raise PbiRelationProviderError("permission_denied")
+        return self.parent_by_child[child_issue_number]
 
     def list_pbi_blocked_by(
         self, repository: str, issue_number: int
@@ -170,6 +179,38 @@ def test_partial_sub_issue_failure_reports_confirmed_and_pending_edges() -> None
     assert provider.added_dependencies == []
 
 
+def test_sub_issue_readback_requires_both_parent_and_child_views() -> None:
+    class InconsistentParentProvider(FakeRelationProvider):
+        def get_pbi_parent_issue_number(
+            self, repository: str, child_issue_number: int
+        ) -> int | None:
+            if child_issue_number == 2:
+                return None
+            return super().get_pbi_parent_issue_number(repository, child_issue_number)
+
+    provider = InconsistentParentProvider()
+    result = PbiRelationService(provider).apply(_request())
+
+    assert result.status == "incomplete"
+    assert result.confirmed_children == (3,)
+    assert result.pending_children == (2,)
+    assert result.sub_issue_readback_complete is True
+    assert result.failure_code == "relation_readback_incomplete"
+
+
+def test_parent_endpoint_failure_preserves_other_child_confirmation() -> None:
+    provider = FakeRelationProvider()
+    provider.fail_parent_readback_number = 2
+
+    result = PbiRelationService(provider).apply(_request())
+
+    assert result.status == "incomplete"
+    assert result.confirmed_children == (3,)
+    assert result.pending_children == (2,)
+    assert result.sub_issue_readback_complete is False
+    assert result.failure_code == "permission_denied"
+
+
 def test_dependency_write_denial_reports_confirmed_children_and_pending_edge() -> None:
     provider = FakeRelationProvider()
     provider.fail_dependency = True
@@ -253,8 +294,17 @@ def _rest_issue(number: int, body: str = "") -> dict[str, object]:
 
 
 class FakeRelationGitHubClient:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        include_unrelated_field_value: bool = False,
+        include_status: bool = True,
+        duplicate_status: bool = False,
+    ) -> None:
         self.rest_calls: list[tuple[str, str, object]] = []
+        self.include_unrelated_field_value = include_unrelated_field_value
+        self.include_status = include_status
+        self.duplicate_status = duplicate_status
         self.parent_body = (
             "## Outcome\nOne outcome.\n"
             "## Scope\nOne scope.\n"
@@ -271,6 +321,17 @@ class FakeRelationGitHubClient:
             (2, "item-2", "Backlog"),
             (3, "item-3", "Backlog"),
         ):
+            field_values: list[dict[str, object]] = []
+            if self.include_unrelated_field_value:
+                field_values.append({})
+            status_value: dict[str, object] = {
+                "name": status,
+                "field": {"id": "status-field", "name": "Status"},
+            }
+            if self.include_status:
+                field_values.append(status_value)
+            if self.duplicate_status:
+                field_values.append(status_value)
             items.append(
                 {
                     "id": item_id,
@@ -281,12 +342,7 @@ class FakeRelationGitHubClient:
                         "repository": {"nameWithOwner": "owner/repo"},
                     },
                     "fieldValues": {
-                        "nodes": [
-                            {
-                                "name": status,
-                                "field": {"id": "status-field", "name": "Status"},
-                            }
-                        ],
+                        "nodes": field_values,
                         "pageInfo": {"hasNextPage": False, "endCursor": None},
                     },
                 }
@@ -338,6 +394,54 @@ def test_provider_preflights_project_parent_and_created_children() -> None:
     assert [child.number for child in snapshot.children] == [2, 3]
     assert snapshot.parent_by_child == {2: None, 3: None}
     assert not any(method == "POST" for method, _, _ in client.rest_calls)
+
+
+def test_provider_ignores_unrelated_project_field_values() -> None:
+    client = FakeRelationGitHubClient(include_unrelated_field_value=True)
+    provider = GitHubProjectProvider(
+        owner="owner", project_number=2, token="unused", client=client
+    )
+
+    snapshot = provider.prepare_pbi_relations(_request())
+
+    assert snapshot.parent.number == 1
+    assert [child.number for child in snapshot.children] == [2, 3]
+    assert not any(method == "POST" for method, _, _ in client.rest_calls)
+
+
+def test_provider_fails_closed_when_project_status_is_missing() -> None:
+    client = FakeRelationGitHubClient(include_status=False)
+    provider = GitHubProjectProvider(
+        owner="owner", project_number=2, token="unused", client=client
+    )
+
+    with pytest.raises(PbiRelationValidationError) as error:
+        provider.prepare_pbi_relations(_request())
+
+    assert error.value.code == "parent_not_refined"
+    assert not any(method == "POST" for method, _, _ in client.rest_calls)
+
+
+def test_provider_fails_closed_when_project_status_is_ambiguous() -> None:
+    client = FakeRelationGitHubClient(duplicate_status=True)
+    provider = GitHubProjectProvider(
+        owner="owner", project_number=2, token="unused", client=client
+    )
+
+    with pytest.raises(PbiRelationProviderError, match="project_item_status_ambiguous"):
+        provider.prepare_pbi_relations(_request())
+
+    assert not any(method == "POST" for method, _, _ in client.rest_calls)
+
+
+def test_provider_reads_parent_from_child_endpoint() -> None:
+    client = FakeRelationGitHubClient()
+    provider = GitHubProjectProvider(
+        owner="owner", project_number=2, token="unused", client=client
+    )
+
+    assert provider.get_pbi_parent_issue_number("owner/repo", 2) is None
+    assert client.rest_calls == [("GET", "/repos/owner/repo/issues/2/parent", None)]
 
 
 class FakeRestArrayClient:
