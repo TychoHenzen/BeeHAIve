@@ -209,6 +209,70 @@ def test_urllib_rest_client_marks_http_408_as_unknown(
     assert timeout_error.value.status_code == 408
 
 
+def test_rate_limit_wait_respects_headers_and_secondary_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(provider_module.time, "time", lambda: 1_000)
+
+    assert (
+        provider_module._rate_limit_wait_seconds(
+            GitHubRateLimitError("primary", reset_at=1_040, primary=True),
+            previous_secondary_wait=None,
+        )
+        == 40
+    )
+    assert (
+        provider_module._rate_limit_wait_seconds(
+            GitHubRateLimitError("primary", reset_at=900, retry_after=7, primary=True),
+            previous_secondary_wait=None,
+        )
+        == 7
+    )
+    assert (
+        provider_module._rate_limit_wait_seconds(
+            GitHubRateLimitError(
+                "secondary", reset_at=1_040, retry_after=3, primary=False, remaining=7
+            ),
+            previous_secondary_wait=None,
+        )
+        == 3
+    )
+    assert (
+        provider_module._rate_limit_wait_seconds(
+            GitHubRateLimitError(
+                "secondary", retry_after=3, primary=False, remaining=7
+            ),
+            previous_secondary_wait=3,
+        )
+        == 6
+    )
+    assert (
+        provider_module._rate_limit_wait_seconds(
+            GitHubRateLimitError(
+                "secondary", reset_at=1_040, primary=False, remaining=0
+            ),
+            previous_secondary_wait=None,
+        )
+        == 40
+    )
+    assert (
+        provider_module._rate_limit_wait_seconds(
+            GitHubRateLimitError("secondary", reset_at=900, primary=False, remaining=0),
+            previous_secondary_wait=None,
+        )
+        == 60
+    )
+    assert (
+        provider_module._rate_limit_wait_seconds(
+            GitHubRateLimitError(
+                "secondary", reset_at=1_040, primary=False, remaining=7
+            ),
+            previous_secondary_wait=None,
+        )
+        == 60
+    )
+
+
 def test_urllib_graphql_client_honors_primary_and_secondary_rate_limits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
