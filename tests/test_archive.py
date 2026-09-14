@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from conftest import FakeProvider
 from fastapi.testclient import TestClient
 
 from beehaiive.models import PbiSnapshot, ProjectSnapshot, RepositorySnapshot, Stage
 from beehaiive.orchestrator import Orchestrator
 from beehaiive.storage import OrchestratorStore
 from main import create_app
+from tests.conftest import FakeProvider
 
 
 def _pull_request(

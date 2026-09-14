@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from conftest import FakeProvider
 from fastapi.testclient import TestClient
 
 from beehaiive.models import ProjectSnapshot, RepositorySnapshot
@@ -11,6 +10,7 @@ from beehaiive.pbi_refinement_mutation import (
 )
 from beehaiive.storage import OrchestratorStore
 from main import create_app
+from tests.conftest import FakeProvider
 
 
 def test_apply_refinement_api_requires_operator_and_returns_partial_result() -> None:

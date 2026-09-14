@@ -1,0 +1,288 @@
+{
+  "stagedMap": {
+    "targetScope": [
+      "main.py",
+      "beehaiive",
+      "docs/dashboard-view.mjs",
+      "tests"
+    ],
+    "responsibilities": [
+      {
+        "name": "HTTP composition and request handling",
+        "currentOwners": ["create_app"],
+        "consumers": ["HTTP clients", "dashboard UI"],
+        "dependencies": ["Orchestrator", "WorkflowService", "GitHubProjectProvider"]
+      },
+      {
+        "name": "Dashboard projection and rendering",
+        "currentOwners": ["build_dashboard_state", "renderDashboard"],
+        "consumers": ["dashboard API", "browser"],
+        "dependencies": ["OrchestratorStore", "project API"]
+      },
+      {
+        "name": "GitHub transport and project operations",
+        "currentOwners": [
+          "UrllibGraphQLClient",
+          "GitHubProjectProvider",
+          "PbiCreationService",
+          "PbiRelationService"
+        ],
+        "consumers": ["Orchestrator", "create_app"],
+        "dependencies": ["GitHub GraphQL", "GitHub REST"]
+      },
+      {
+        "name": "PBI and run persistence",
+        "currentOwners": ["OrchestratorStore"],
+        "consumers": ["Orchestrator", "create_app"],
+        "dependencies": ["SQLite"]
+      },
+      {
+        "name": "Agent execution, routing, and worker lifecycle",
+        "currentOwners": [
+          "CodexExecModelExecutor",
+          "AgentWorkerManager",
+          "ModelRouter",
+          "AgentScheduler"
+        ],
+        "consumers": ["create_app", "WorkflowService"],
+        "dependencies": ["subprocess", "SQLite"]
+      },
+      {
+        "name": "Review lifecycle and repair",
+        "currentOwners": [
+          "ReviewService",
+          "ReviewStore",
+          "GitHubReviewProvider",
+          "ReviewRepairService",
+          "ConflictRepairService"
+        ],
+        "consumers": ["create_app", "WorkflowService"],
+        "dependencies": ["GitHubProjectProvider", "SQLite"]
+      },
+      {
+        "name": "Workflow state, worktrees, and quality gates",
+        "currentOwners": [
+          "WorkflowService",
+          "WorkflowStore",
+          "GitWorktreeManager",
+          "RepositoryGateSuite"
+        ],
+        "consumers": ["AgentWorkerManager", "create_app"],
+        "dependencies": ["Git", "SQLite"]
+      },
+      {
+        "name": "Project orchestration coordination",
+        "currentOwners": ["Orchestrator"],
+        "consumers": ["create_app"],
+        "dependencies": ["OrchestratorStore", "ProjectProvider"]
+      }
+    ],
+    "desired": {
+      "ownership": [
+        {
+          "responsibility": "create_handoff",
+          "owner": "GitHubPullRequestHandoffProvider"
+        },
+        {
+          "responsibility": "complete_approved_handoff",
+          "owner": "GitHubPullRequestHandoffProvider"
+        }
+      ],
+      "boundaries": [
+        {
+          "responsibility": "HTTP composition and request handling",
+          "publicBoundary": "main.create_app",
+          "directory": "beehaiive/api"
+        },
+        {
+          "responsibility": "Dashboard projection and rendering",
+          "publicBoundary": "build_dashboard_state and createDashboardView",
+          "directory": "beehaiive/dashboard and docs"
+        },
+        {
+          "responsibility": "GitHub transport and project operations",
+          "publicBoundary": "beehaiive.provider",
+          "directory": "beehaiive/github"
+        },
+        {
+          "responsibility": "PBI and run persistence",
+          "publicBoundary": "OrchestratorStore",
+          "directory": "beehaiive/persistence"
+        },
+        {
+          "responsibility": "Agent execution, routing, and worker lifecycle",
+          "publicBoundary": "existing agent and routing imports",
+          "directory": "beehaiive/agent"
+        },
+        {
+          "responsibility": "Review lifecycle and repair",
+          "publicBoundary": "existing review imports",
+          "directory": "beehaiive/reviews"
+        },
+        {
+          "responsibility": "Workflow state, worktrees, and quality gates",
+          "publicBoundary": "existing workflow imports",
+          "directory": "beehaiive/workflows"
+        },
+        {
+          "responsibility": "Project orchestration coordination",
+          "publicBoundary": "beehaiive.orchestrator.Orchestrator",
+          "directory": "beehaiive/orchestration"
+        }
+      ]
+    }
+  },
+  "structuralOutcomes": [
+    {
+      "responsibility": "HTTP composition and request handling",
+      "desiredOwner": "API responsibility modules",
+      "directory": "beehaiive/api",
+      "publicBoundary": "main.create_app",
+      "dependencyDirection": "Application composition imports route modules; route modules depend on service contracts.",
+      "stableContracts": ["tests/test_main.py", "tests/test_dashboard.py"],
+      "compatibilityRemovals": [],
+      "evidence": {
+        "pbi": "#103",
+        "scannerSymptoms": ["main.py: 2,372 lines", "main.py: 42 top-level types"]
+      }
+    },
+    {
+      "responsibility": "Dashboard projection and rendering",
+      "desiredOwner": "dashboard projection and browser-view modules",
+      "directory": "docs",
+      "publicBoundary": "build_dashboard_state and createDashboardView",
+      "dependencyDirection": "Browser rendering consumes dashboard API data; projection reads storage and project snapshots.",
+      "stableContracts": ["tests/test_dashboard.py", "tests/dashboard-view.test.mjs"],
+      "compatibilityRemovals": [],
+      "evidence": {
+        "pbi": "#114",
+        "scannerSymptoms": [
+          "beehaiive/dashboard.py: 321 lines",
+          "docs/dashboard-view.mjs: 384 lines",
+          "tests/test_dashboard.py: 1,406 lines"
+        ]
+      }
+    },
+    {
+      "responsibility": "GitHub transport and project operations",
+      "desiredOwner": "GitHub transport, project, PBI, and handoff modules",
+      "directory": "beehaiive/github",
+      "publicBoundary": "beehaiive.provider",
+      "dependencyDirection": "Provider services depend on transport; transport does not depend on PBI or handoff services.",
+      "stableContracts": [
+        "tests/test_setup.py",
+        "tests/test_pbi_creation.py",
+        "tests/test_pbi_refinement.py",
+        "tests/test_handoff_completion.py"
+      ],
+      "compatibilityRemovals": [],
+      "evidence": {
+        "pbi": "#104",
+        "scannerSymptoms": ["beehaiive/provider.py: 6,374 lines", "beehaiive/provider.py: 8 top-level types"],
+        "cohesiveExceptions": [
+          {
+            "file": "beehaiive/github/handoff_create.py",
+            "reason": "One idempotent handoff create state machine. Its phase order and replay behavior stay in one operation until tests prove a safe split."
+          },
+          {
+            "file": "beehaiive/github/handoff_merge.py",
+            "reason": "One merge and reconciliation state machine. Splitting phases without replay evidence risks duplicate external mutations."
+          },
+          {
+            "file": "beehaiive/github/pbi_refinement_apply.py",
+            "reason": "One partial-result mutation flow across issue and Project state. Splitting requires per-phase idempotency evidence."
+          }
+        ]
+      }
+    },
+    {
+      "responsibility": "PBI and run persistence",
+      "desiredOwner": "state-lifecycle persistence modules",
+      "directory": "beehaiive/persistence",
+      "publicBoundary": "OrchestratorStore",
+      "dependencyDirection": "Services depend on persistence contracts; persistence does not import orchestration services.",
+      "stableContracts": ["tests/test_orchestrator.py", "tests/test_archive.py", "tests/test_pbi_refinement.py"],
+      "compatibilityRemovals": [],
+      "evidence": {
+        "pbi": "#105",
+        "scannerSymptoms": ["beehaiive/storage.py: 4,118 lines", "beehaiive/storage.py: 2 top-level types"]
+      }
+    },
+    {
+      "responsibility": "Agent execution, routing, and worker lifecycle",
+      "desiredOwner": "executor, router, contract, and worker modules",
+      "directory": "beehaiive/agent",
+      "publicBoundary": "existing agent and routing imports",
+      "dependencyDirection": "Worker coordination depends on executor and contract interfaces; executor does not own worker state.",
+      "stableContracts": ["tests/test_agent.py", "tests/test_routing.py", "tests/test_task_contract_lifecycle.py"],
+      "compatibilityRemovals": [],
+      "evidence": {
+        "pbi": "#106",
+        "scannerSymptoms": [
+          "beehaiive/agent.py: 1,914 lines",
+          "beehaiive/routing.py: 1,287 lines",
+          "beehaiive/contracts.py: 471 lines",
+          "beehaiive/models.py: 335 lines"
+        ]
+      }
+    },
+    {
+      "responsibility": "Review lifecycle and repair",
+      "desiredOwner": "review model, store, provider, service, and repair modules",
+      "directory": "beehaiive/reviews",
+      "publicBoundary": "existing review imports",
+      "dependencyDirection": "Review services depend on stores and providers; repairs depend on review contracts and workflow APIs.",
+      "stableContracts": ["tests/test_review.py", "tests/test_review_provider.py", "tests/test_review_repair.py"],
+      "compatibilityRemovals": [],
+      "evidence": {
+        "pbi": "#107",
+        "scannerSymptoms": [
+          "beehaiive/review.py: 2,483 lines",
+          "beehaiive/review.py: 27 top-level types",
+          "beehaiive/review_repair.py: 726 lines"
+        ]
+      }
+    },
+    {
+      "responsibility": "Workflow state, worktrees, and quality gates",
+      "desiredOwner": "workflow store, worktree, gate, and service modules",
+      "directory": "beehaiive/workflows",
+      "publicBoundary": "existing workflow imports",
+      "dependencyDirection": "Workflow service depends on stores, worktree manager, and gate contracts; those modules do not import the service.",
+      "stableContracts": ["tests/test_workflow.py", "tests/test_quality_gates.py"],
+      "compatibilityRemovals": [],
+      "evidence": {
+        "pbi": "#108",
+        "scannerSymptoms": [
+          "beehaiive/workflow.py: 2,462 lines",
+          "beehaiive/workflow.py: 21 top-level types",
+          "beehaiive/quality_gates.py: 470 lines"
+        ],
+        "cohesiveExceptions": [
+          {
+            "file": "beehaiive/workflows/workflow_service_delivery_mixin.py",
+            "reason": "One guarded commit and push state machine. Keep together until replay tests can verify a safe phase split."
+          }
+        ]
+      }
+    },
+    {
+      "responsibility": "Project orchestration coordination",
+      "desiredOwner": "project sync, claim, handoff, and lock coordinators",
+      "directory": "beehaiive/orchestration",
+      "publicBoundary": "beehaiive.orchestrator.Orchestrator",
+      "dependencyDirection": "Coordination depends on provider and persistence contracts; those owners do not depend on orchestration.",
+      "stableContracts": ["tests/test_orchestrator.py", "tests/test_edges.py"],
+      "compatibilityRemovals": [],
+      "evidence": {
+        "pbi": "#113",
+        "scannerSymptoms": [
+          "beehaiive/orchestrator.py: 528 lines",
+          "beehaiive/orchestrator.py: 3 top-level types",
+          "tests/test_orchestrator.py: 3,101 lines",
+          "tests/test_orchestrator.py: 16 top-level types"
+        ]
+      }
+    }
+  ]
+}

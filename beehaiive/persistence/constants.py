@@ -1,0 +1,119 @@
+from __future__ import annotations
+
+import re
+
+from beehaiive.models import Stage
+
+MAX_AGENT_SESSION_EVENTS = 100
+
+MAX_AGENT_SESSION_EVENT_LENGTH = 4_000
+
+MAX_AGENT_SESSION_TEXT_BYTES = 64_000
+
+PBI_CREATION_LEASE_SECONDS = 300
+
+MAX_PBI_REFINEMENT_QUESTIONS = 25
+
+MAX_PBI_REFINEMENT_TEXT_LENGTH = 1_000
+
+MAX_PBI_REFINEMENT_CORRECTIONS = 3
+
+MAX_PBI_REFINEMENT_EVIDENCE_REFS = 10
+
+MAX_PBI_REFINEMENT_EVIDENCE_LENGTH = 512
+
+MAX_PBI_REFINEMENT_REASON_LENGTH = 500
+
+MAX_PBI_REFINEMENT_GENERATIONS = 3
+
+_REFINEMENT_URL = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+
+_SENSITIVE_URL_PARTS = frozenset(
+    {
+        "apikey",
+        "assertion",
+        "auth",
+        "authorization",
+        "code",
+        "credential",
+        "key",
+        "jwt",
+        "password",
+        "secret",
+        "se",
+        "session",
+        "sig",
+        "signature",
+        "token",
+    }
+)
+
+_REFINEMENT_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b(?P<name>access[_-]?token|refresh[_-]?token|id[_-]?token|token|"
+    r"client[_-]?secret|secret|password|api[_-]?key|private[_-]?key)\b\s*"
+    r"[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s&,;]+)"
+)
+
+_STAGE_ORDER = {
+    Stage.BACKLOG: 0,
+    Stage.REFINE: 1,
+    Stage.IMPLEMENT: 2,
+    Stage.PULL_REQUEST: 3,
+}
+
+DEFAULT_EVENT_LIMIT = 100
+
+MAX_EVENT_LIMIT = 500
+
+DEFAULT_ACTION_LIMIT = 50
+
+MAX_ACTION_LIMIT = 200
+
+MAX_AGENT_RESULT_LENGTH = 4_000
+
+MAX_AGENT_DIAGNOSTIC_LENGTH = 16_000
+
+MAX_META_REVIEW_RECORDS = 25
+
+MAX_META_REVIEW_INPUT_TOKENS = 8_000
+
+MAX_META_REVIEW_SUGGESTIONS = 25
+
+MAX_META_REVIEW_TEXT_LENGTH = 500
+
+MAX_META_REVIEW_ATTEMPTS = 20
+
+MAX_META_REVIEW_EVENT_DETAILS_LENGTH = 8_000
+
+META_REVIEW_LEASE_SECONDS = 900
+
+__all__ = [
+    "DEFAULT_ACTION_LIMIT",
+    "DEFAULT_EVENT_LIMIT",
+    "MAX_ACTION_LIMIT",
+    "MAX_AGENT_DIAGNOSTIC_LENGTH",
+    "MAX_AGENT_RESULT_LENGTH",
+    "MAX_AGENT_SESSION_EVENTS",
+    "MAX_AGENT_SESSION_EVENT_LENGTH",
+    "MAX_AGENT_SESSION_TEXT_BYTES",
+    "MAX_EVENT_LIMIT",
+    "MAX_META_REVIEW_ATTEMPTS",
+    "MAX_META_REVIEW_EVENT_DETAILS_LENGTH",
+    "MAX_META_REVIEW_INPUT_TOKENS",
+    "MAX_META_REVIEW_RECORDS",
+    "MAX_META_REVIEW_SUGGESTIONS",
+    "MAX_META_REVIEW_TEXT_LENGTH",
+    "MAX_PBI_REFINEMENT_CORRECTIONS",
+    "MAX_PBI_REFINEMENT_EVIDENCE_LENGTH",
+    "MAX_PBI_REFINEMENT_EVIDENCE_REFS",
+    "MAX_PBI_REFINEMENT_GENERATIONS",
+    "MAX_PBI_REFINEMENT_QUESTIONS",
+    "MAX_PBI_REFINEMENT_REASON_LENGTH",
+    "MAX_PBI_REFINEMENT_TEXT_LENGTH",
+    "META_REVIEW_LEASE_SECONDS",
+    "PBI_CREATION_LEASE_SECONDS",
+    "_REFINEMENT_SECRET_ASSIGNMENT",
+    "_REFINEMENT_URL",
+    "_SENSITIVE_URL_PARTS",
+    "_STAGE_ORDER",
+]
