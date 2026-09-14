@@ -1,5 +1,9 @@
 # BeeHAIve
 
+<p align="center">
+  <img src="docs/assets/beehaive-logo.png" alt="BeeHAIve logo" width="360">
+</p>
+
 BeeHAIve is a FastAPI control plane for one allowlisted GitHub Project. The
 dashboard reads the live Project state, claims one repository writer run, and
 can execute one bounded local demo task.
