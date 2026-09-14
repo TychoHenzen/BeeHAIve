@@ -44,6 +44,8 @@ from .pbi_creation import (
 PROVIDER_REQUEST_TIMEOUT = 30.0
 DEFAULT_DISCOVERY_CACHE_SECONDS = 600.0
 DISCOVERY_CACHE_SECONDS_ENV = "BEEHAIIVE_GITHUB_DISCOVERY_CACHE_SECONDS"
+SECONDARY_RATE_LIMIT_FALLBACK_SECONDS = 60.0
+HANDOFF_RATE_LIMIT_RETRIES = 2
 
 
 class ProviderError(RuntimeError):
@@ -68,11 +70,13 @@ class GitHubRateLimitError(ProviderError):
         reset_at: float | None = None,
         retry_after: float | None = None,
         primary: bool = False,
+        remaining: float | None = None,
     ) -> None:
         super().__init__(message)
         self.reset_at = reset_at
         self.retry_after = retry_after
         self.primary = primary
+        self.remaining = remaining
 
 
 def _header_value(response: object, name: str) -> str | None:
@@ -100,9 +104,51 @@ def _header_float(response: object, name: str) -> float | None:
     if value is None:
         return None
     try:
-        return float(value)
+        number = float(value)
     except ValueError:
         return None
+    return number if math.isfinite(number) else None
+
+
+def _rate_limit_wait_seconds(
+    error: GitHubRateLimitError,
+    *,
+    previous_secondary_wait: float | None,
+) -> float:
+    now = time.time()
+    reset_at = (
+        error.reset_at
+        if error.reset_at is not None and math.isfinite(error.reset_at)
+        else None
+    )
+    retry_after = (
+        error.retry_after
+        if error.retry_after is not None and math.isfinite(error.retry_after)
+        else None
+    )
+    if error.primary:
+        if reset_at is not None and reset_at > now:
+            return max(0.0, reset_at - now)
+        if retry_after is not None:
+            return max(0.0, retry_after)
+        return SECONDARY_RATE_LIMIT_FALLBACK_SECONDS
+
+    if retry_after is not None:
+        delay = max(0.0, retry_after)
+    elif (
+        error.remaining is not None
+        and error.remaining <= 0
+        and reset_at is not None
+        and reset_at > now
+    ):
+        delay = max(0.0, reset_at - now)
+    else:
+        delay = SECONDARY_RATE_LIMIT_FALLBACK_SECONDS
+    if previous_secondary_wait is not None:
+        delay = max(delay, previous_secondary_wait * 2)
+        if previous_secondary_wait == 0:
+            delay = max(delay, SECONDARY_RATE_LIMIT_FALLBACK_SECONDS)
+    return delay
 
 
 def _rate_error_details(errors: object) -> tuple[str, bool] | None:
@@ -167,6 +213,7 @@ class UrllibGraphQLClient:
         self._cooldown_until = 0.0
         self._cooldown_reset_at: float | None = None
         self._cooldown_retry_after: float | None = None
+        self._cooldown_remaining: float | None = None
         self._cooldown_primary = False
 
     def _raise_if_cooling_down(self) -> None:
@@ -176,12 +223,14 @@ class UrllibGraphQLClient:
                 return
             reset_at = self._cooldown_reset_at or self._cooldown_until
             retry_after = self._cooldown_retry_after
+            remaining = self._cooldown_remaining
             primary = self._cooldown_primary
         raise GitHubRateLimitError(
             "GitHub GraphQL rate limit cooldown is active",
             reset_at=reset_at,
             retry_after=retry_after,
             primary=primary,
+            remaining=remaining,
         )
 
     def _set_cooldown(
@@ -190,22 +239,38 @@ class UrllibGraphQLClient:
         reset_at: float | None,
         retry_after: float | None,
         primary: bool,
+        remaining: float | None,
     ) -> float:
         now = time.time()
-        if primary and reset_at is not None and reset_at > now:
-            cooldown_until = reset_at
-        elif retry_after is not None:
-            cooldown_until = now + max(retry_after, 0.0)
-        elif reset_at is not None and reset_at > now:
-            cooldown_until = reset_at
+        valid_reset_at = (
+            reset_at
+            if reset_at is not None and math.isfinite(reset_at) and reset_at > now
+            else None
+        )
+        valid_retry_after = (
+            retry_after
+            if retry_after is not None and math.isfinite(retry_after)
+            else None
+        )
+        if primary and valid_reset_at is not None:
+            cooldown_until = valid_reset_at
+        elif valid_retry_after is not None:
+            cooldown_until = now + max(valid_retry_after, 0.0)
+        elif remaining is not None and remaining <= 0 and valid_reset_at is not None:
+            cooldown_until = valid_reset_at
         else:
-            cooldown_until = now + 60.0
+            cooldown_until = now + SECONDARY_RATE_LIMIT_FALLBACK_SECONDS
 
         with self._cooldown_lock:
             if cooldown_until > self._cooldown_until:
                 self._cooldown_until = cooldown_until
-                self._cooldown_reset_at = reset_at
-                self._cooldown_retry_after = retry_after
+                self._cooldown_reset_at = valid_reset_at
+                self._cooldown_retry_after = valid_retry_after
+                self._cooldown_remaining = (
+                    remaining
+                    if remaining is not None and math.isfinite(remaining)
+                    else None
+                )
                 self._cooldown_primary = primary
             return self._cooldown_until
 
@@ -239,6 +304,7 @@ class UrllibGraphQLClient:
             reset_at=reset_at,
             retry_after=retry_after,
             primary=primary,
+            remaining=remaining,
         )
         effective_reset_at = reset_at or cooldown_until
         kind = "primary" if primary else "secondary"
@@ -247,6 +313,7 @@ class UrllibGraphQLClient:
             reset_at=effective_reset_at,
             retry_after=retry_after,
             primary=primary,
+            remaining=remaining,
         )
 
     def _record_exhausted_headers(self, response: object) -> None:
@@ -256,6 +323,7 @@ class UrllibGraphQLClient:
                 reset_at=_header_float(response, "x-ratelimit-reset"),
                 retry_after=_header_float(response, "retry-after"),
                 primary=True,
+                remaining=remaining,
             )
 
     def execute(self, query: str, variables: Mapping[str, object]) -> Mapping[str, Any]:
@@ -1506,6 +1574,8 @@ def _mutation_error_result(error: Exception) -> dict[str, object]:
             rate_limit["reset_at"] = error.reset_at
         if error.retry_after is not None and math.isfinite(error.retry_after):
             rate_limit["retry_after"] = error.retry_after
+        if error.remaining is not None and math.isfinite(error.remaining):
+            rate_limit["remaining"] = error.remaining
         result["rate_limit"] = rate_limit
     return result
 
@@ -3953,6 +4023,8 @@ class GitHubProjectProvider:
         pull_request_body = _handoff_body(request.body, identity_marker, request)
         legacy_marker = _legacy_handoff_marker(request)
         legacy_body = _handoff_body(request.body, legacy_marker, request)
+        rate_limit_retries_used = 0
+        previous_secondary_wait: float | None = None
 
         raw_branch_ref = repository.get("ref")
         branch_ref = _mapping(raw_branch_ref) if raw_branch_ref is not None else None
@@ -3998,163 +4070,197 @@ class GitHubProjectProvider:
                     "GitHub branch head does not match the intended base commit"
                 )
         else:
-            action_id = _begin_handoff_mutation(
-                request,
-                "create_ref",
-                identity_marker,
-                {
-                    "branch": request.branch,
-                    "base_branch": base_branch,
-                    "base_sha": base_oid,
-                },
-            )
-            try:
-                create_data = self._client.execute(
-                    CREATE_REF_MUTATION,
+            while True:
+                action_id = _begin_handoff_mutation(
+                    request,
+                    "create_ref",
+                    identity_marker,
                     {
-                        "input": {
-                            "repositoryId": repository_id,
-                            "name": qualified_branch,
-                            "oid": base_oid,
-                        }
+                        "branch": request.branch,
+                        "base_branch": base_branch,
+                        "base_sha": base_oid,
                     },
                 )
-            except ProviderError as create_error:
                 try:
-                    retry_data = self._client.execute(
-                        REPOSITORY_QUERY,
+                    create_data = self._client.execute(
+                        CREATE_REF_MUTATION,
                         {
-                            "owner": owner,
-                            "name": name,
-                            "qualifiedBranch": qualified_branch,
-                            "pullRequestCursor": None,
+                            "input": {
+                                "repositoryId": repository_id,
+                                "name": qualified_branch,
+                                "oid": base_oid,
+                            }
                         },
                     )
-                    retry_repository = _mapping(_mapping(retry_data.get("repository")))
-                except ProviderError:
-                    _finish_handoff_mutation(
-                        request,
-                        action_id,
-                        "uncertain",
-                        {
-                            "reconciliation": "readback_unavailable",
-                            **_mutation_error_result(create_error),
-                        },
+                except ProviderError as create_error:
+                    rate_limit_error = (
+                        create_error
+                        if isinstance(create_error, GitHubRateLimitError)
+                        else None
                     )
-                    raise create_error from None
-                if (
-                    not isinstance(retry_repository.get("id"), str)
-                    or "ref" not in retry_repository
-                ):
-                    _finish_handoff_mutation(
-                        request,
-                        action_id,
-                        "uncertain",
-                        {
-                            "reconciliation": "readback_unavailable",
-                            **_mutation_error_result(create_error),
-                        },
-                    )
-                    raise create_error from None
-                raw_retry_ref = retry_repository.get("ref")
-                if raw_retry_ref is None:
-                    _finish_handoff_mutation(
-                        request,
-                        action_id,
-                        (
-                            "uncertain"
-                            if isinstance(create_error, GitHubOutcomeUnknownError)
-                            else "failed"
-                        ),
-                        {
-                            "reconciliation": "readback_absent",
-                            "branch": request.branch,
-                            **_mutation_error_result(create_error),
-                        },
-                    )
-                    raise create_error from None
-                retry_ref = _mapping(raw_retry_ref)
-                if not _branch_ref_matches(retry_ref, qualified_branch, base_oid):
-                    _finish_handoff_mutation(
-                        request,
-                        action_id,
-                        "failed",
-                        {
-                            "reconciliation": "readback_conflict",
-                            "branch": request.branch,
-                            **_mutation_error_result(create_error),
-                        },
-                    )
-                    raise ProviderError(
-                        "GitHub branch head does not match the intended base commit"
-                    ) from create_error
-                _finish_handoff_mutation(
-                    request,
-                    action_id,
-                    "succeeded",
-                    {
-                        "reconciliation": "readback_present",
-                        "branch": request.branch,
-                        "head_sha": base_oid,
-                        **_mutation_error_result(create_error),
-                    },
-                )
-                repository = retry_repository
-            except Exception as create_error:
-                _finish_handoff_mutation(
-                    request,
-                    action_id,
-                    "uncertain",
-                    {
-                        "reconciliation": "not_checked",
-                        **_mutation_error_result(create_error),
-                    },
-                )
-                raise
-            else:
-                raw_create_ref = create_data.get("createRef")
-                created_ref: Mapping[str, Any] = {}
-                response_invalid = not isinstance(raw_create_ref, Mapping)
-                if isinstance(raw_create_ref, Mapping):
-                    raw_created_ref = cast(Mapping[str, object], raw_create_ref).get(
-                        "ref"
-                    )
-                    if isinstance(raw_created_ref, Mapping):
-                        created_ref = cast(Mapping[str, Any], raw_created_ref)
-                    else:
-                        response_invalid = True
-                if response_invalid or not _branch_ref_matches(
-                    created_ref, qualified_branch, base_oid
-                ):
-                    error = ProviderError(
-                        "GitHub GraphQL returned an invalid object"
-                        if response_invalid
-                        else (
-                            "GitHub did not confirm branch creation: "
-                            f"{qualified_branch}"
+                    if rate_limit_error is not None:
+                        _finish_handoff_mutation(
+                            request,
+                            action_id,
+                            "uncertain",
+                            {
+                                "reconciliation": "awaiting_rate_limit_readback",
+                                **_mutation_error_result(create_error),
+                            },
                         )
+                        delay = _rate_limit_wait_seconds(
+                            rate_limit_error,
+                            previous_secondary_wait=previous_secondary_wait,
+                        )
+                        if not rate_limit_error.primary:
+                            previous_secondary_wait = delay
+                        if delay > 0:
+                            time.sleep(delay)
+                    try:
+                        retry_data = self._client.execute(
+                            REPOSITORY_QUERY,
+                            {
+                                "owner": owner,
+                                "name": name,
+                                "qualifiedBranch": qualified_branch,
+                                "pullRequestCursor": None,
+                            },
+                        )
+                        retry_repository = _mapping(
+                            _mapping(retry_data.get("repository"))
+                        )
+                    except ProviderError:
+                        _finish_handoff_mutation(
+                            request,
+                            action_id,
+                            "uncertain",
+                            {
+                                "reconciliation": "readback_unavailable",
+                                **_mutation_error_result(create_error),
+                            },
+                        )
+                        raise create_error from None
+                    if (
+                        not isinstance(retry_repository.get("id"), str)
+                        or "ref" not in retry_repository
+                    ):
+                        _finish_handoff_mutation(
+                            request,
+                            action_id,
+                            "uncertain",
+                            {
+                                "reconciliation": "readback_unavailable",
+                                **_mutation_error_result(create_error),
+                            },
+                        )
+                        raise create_error from None
+                    raw_retry_ref = retry_repository.get("ref")
+                    if raw_retry_ref is None:
+                        _finish_handoff_mutation(
+                            request,
+                            action_id,
+                            (
+                                "uncertain"
+                                if isinstance(create_error, GitHubOutcomeUnknownError)
+                                else "failed"
+                            ),
+                            {
+                                "reconciliation": "readback_absent",
+                                "branch": request.branch,
+                                **_mutation_error_result(create_error),
+                            },
+                        )
+                        if (
+                            rate_limit_error is not None
+                            and rate_limit_retries_used < HANDOFF_RATE_LIMIT_RETRIES
+                        ):
+                            rate_limit_retries_used += 1
+                            continue
+                        raise create_error from None
+                    retry_ref = _mapping(raw_retry_ref)
+                    if not _branch_ref_matches(retry_ref, qualified_branch, base_oid):
+                        _finish_handoff_mutation(
+                            request,
+                            action_id,
+                            "failed",
+                            {
+                                "reconciliation": "readback_conflict",
+                                "branch": request.branch,
+                                **_mutation_error_result(create_error),
+                            },
+                        )
+                        raise ProviderError(
+                            "GitHub branch head does not match the intended base commit"
+                        ) from create_error
+                    _finish_handoff_mutation(
+                        request,
+                        action_id,
+                        "succeeded",
+                        {
+                            "reconciliation": "readback_present",
+                            "branch": request.branch,
+                            "head_sha": base_oid,
+                            **_mutation_error_result(create_error),
+                        },
                     )
+                    repository = retry_repository
+                    break
+                except Exception as create_error:
                     _finish_handoff_mutation(
                         request,
                         action_id,
                         "uncertain",
                         {
-                            "reconciliation": "response_unverified",
-                            "branch": request.branch,
-                            **_mutation_error_result(error),
+                            "reconciliation": "not_checked",
+                            **_mutation_error_result(create_error),
                         },
                     )
-                    raise error
-                _finish_handoff_mutation(
-                    request,
-                    action_id,
-                    "succeeded",
-                    {
-                        "reconciliation": "mutation_response",
-                        "branch": request.branch,
-                        "head_sha": base_oid,
-                    },
-                )
+                    raise
+                else:
+                    raw_create_ref = create_data.get("createRef")
+                    created_ref: Mapping[str, Any] = {}
+                    response_invalid = not isinstance(raw_create_ref, Mapping)
+                    if isinstance(raw_create_ref, Mapping):
+                        raw_created_ref = cast(
+                            Mapping[str, object], raw_create_ref
+                        ).get("ref")
+                        if isinstance(raw_created_ref, Mapping):
+                            created_ref = cast(Mapping[str, Any], raw_created_ref)
+                        else:
+                            response_invalid = True
+                    if response_invalid or not _branch_ref_matches(
+                        created_ref, qualified_branch, base_oid
+                    ):
+                        error = ProviderError(
+                            "GitHub GraphQL returned an invalid object"
+                            if response_invalid
+                            else (
+                                "GitHub did not confirm branch creation: "
+                                f"{qualified_branch}"
+                            )
+                        )
+                        _finish_handoff_mutation(
+                            request,
+                            action_id,
+                            "uncertain",
+                            {
+                                "reconciliation": "response_unverified",
+                                "branch": request.branch,
+                                **_mutation_error_result(error),
+                            },
+                        )
+                        raise error
+                    _finish_handoff_mutation(
+                        request,
+                        action_id,
+                        "succeeded",
+                        {
+                            "reconciliation": "mutation_response",
+                            "branch": request.branch,
+                            "head_sha": base_oid,
+                        },
+                    )
+                    break
 
         existing = self._find_existing_pull_request(
             owner,
@@ -4197,159 +4303,194 @@ class GitHubProjectProvider:
                 legacy_body,
                 pull_request_body,
             )
-
-        action_id = _begin_handoff_mutation(
-            request,
-            "create_pull_request",
-            identity_marker,
-            {
-                "branch": request.branch,
-                "base_branch": base_branch,
-                **({"head_sha": head_sha} if head_sha is not None else {}),
-            },
-        )
-        try:
-            pull_request_data = self._client.execute(
-                CREATE_PULL_REQUEST_MUTATION,
+        while True:
+            action_id = _begin_handoff_mutation(
+                request,
+                "create_pull_request",
+                identity_marker,
                 {
-                    "input": {
-                        "repositoryId": repository_id,
-                        "baseRefName": base_branch,
-                        "headRefName": request.branch,
-                        "title": request.title,
-                        "body": pull_request_body,
-                        "draft": True,
-                    }
+                    "branch": request.branch,
+                    "base_branch": base_branch,
+                    **({"head_sha": head_sha} if head_sha is not None else {}),
                 },
             )
-        except ProviderError as create_error:
             try:
-                existing = self._find_existing_pull_request(
-                    owner,
-                    name,
-                    qualified_branch,
+                pull_request_data = self._client.execute(
+                    CREATE_PULL_REQUEST_MUTATION,
+                    {
+                        "input": {
+                            "repositoryId": repository_id,
+                            "baseRefName": base_branch,
+                            "headRefName": request.branch,
+                            "title": request.title,
+                            "body": pull_request_body,
+                            "draft": True,
+                        }
+                    },
+                )
+            except ProviderError as create_error:
+                rate_limit_error = (
+                    create_error
+                    if isinstance(create_error, GitHubRateLimitError)
+                    else None
+                )
+                if rate_limit_error is not None:
+                    _finish_handoff_mutation(
+                        request,
+                        action_id,
+                        "uncertain",
+                        {
+                            "reconciliation": "awaiting_rate_limit_readback",
+                            **_mutation_error_result(create_error),
+                        },
+                    )
+                    delay = _rate_limit_wait_seconds(
+                        rate_limit_error,
+                        previous_secondary_wait=previous_secondary_wait,
+                    )
+                    if not rate_limit_error.primary:
+                        previous_secondary_wait = delay
+                    if delay > 0:
+                        time.sleep(delay)
+                try:
+                    existing = self._find_existing_pull_request(
+                        owner,
+                        name,
+                        qualified_branch,
+                        request.branch,
+                        base_branch,
+                        identity_marker,
+                        legacy_marker=legacy_marker,
+                        legacy_body=legacy_body,
+                    )
+                except ProviderError:
+                    _finish_handoff_mutation(
+                        request,
+                        action_id,
+                        "uncertain",
+                        {
+                            "reconciliation": "readback_unavailable",
+                            **_mutation_error_result(create_error),
+                        },
+                    )
+                    raise create_error from None
+                if existing is None:
+                    _finish_handoff_mutation(
+                        request,
+                        action_id,
+                        (
+                            "uncertain"
+                            if isinstance(create_error, GitHubOutcomeUnknownError)
+                            else "failed"
+                        ),
+                        {
+                            "reconciliation": "readback_absent",
+                            **_mutation_error_result(create_error),
+                        },
+                    )
+                    if (
+                        rate_limit_error is not None
+                        and rate_limit_retries_used < HANDOFF_RATE_LIMIT_RETRIES
+                    ):
+                        rate_limit_retries_used += 1
+                        continue
+                    raise create_error from None
+                if not _pull_request_matches(
+                    existing,
                     request.branch,
                     base_branch,
                     identity_marker,
-                    legacy_marker=legacy_marker,
-                    legacy_body=legacy_body,
+                    legacy_marker,
+                    legacy_body,
+                ):
+                    _finish_handoff_mutation(
+                        request,
+                        action_id,
+                        "failed",
+                        {
+                            **_pull_request_audit_result(existing, "readback_conflict"),
+                            **_mutation_error_result(create_error),
+                        },
+                    )
+                    raise ProviderError(
+                        "Pull request branch has a different handoff identity"
+                    ) from create_error
+                _finish_handoff_mutation(
+                    request,
+                    action_id,
+                    "succeeded",
+                    {
+                        **_pull_request_audit_result(existing, "readback_present"),
+                        **_mutation_error_result(create_error),
+                    },
                 )
-            except ProviderError:
+                return self._update_matching_pull_request(
+                    existing,
+                    owner,
+                    name,
+                    qualified_branch,
+                    request,
+                    base_branch,
+                    identity_marker,
+                    legacy_marker,
+                    legacy_body,
+                    pull_request_body,
+                )
+            except Exception as create_error:
                 _finish_handoff_mutation(
                     request,
                     action_id,
                     "uncertain",
                     {
-                        "reconciliation": "readback_unavailable",
+                        "reconciliation": "not_checked",
                         **_mutation_error_result(create_error),
                     },
                 )
-                raise create_error from None
-            if existing is None:
+                raise
+            raw_create_result = pull_request_data.get("createPullRequest")
+            pull_request: Mapping[str, Any] = {}
+            response_invalid = not isinstance(raw_create_result, Mapping)
+            if isinstance(raw_create_result, Mapping):
+                raw_pull_request = cast(Mapping[str, object], raw_create_result).get(
+                    "pullRequest"
+                )
+                if isinstance(raw_pull_request, Mapping):
+                    pull_request = cast(Mapping[str, Any], raw_pull_request)
+                else:
+                    response_invalid = True
+            try:
+                if response_invalid:
+                    raise ProviderError("GitHub GraphQL returned an invalid object")
+                result = self._validated_handoff_result(
+                    pull_request,
+                    request,
+                    base_branch,
+                    identity_marker,
+                    pull_request_body,
+                )
+            except ProviderError as validation_error:
                 _finish_handoff_mutation(
                     request,
                     action_id,
-                    (
-                        "uncertain"
-                        if isinstance(create_error, GitHubOutcomeUnknownError)
-                        else "failed"
-                    ),
+                    "uncertain",
                     {
-                        "reconciliation": "readback_absent",
-                        **_mutation_error_result(create_error),
+                        **_pull_request_audit_result(
+                            pull_request, "response_unverified"
+                        ),
+                        **_mutation_error_result(validation_error),
                     },
                 )
-                raise create_error from None
-            if not _pull_request_matches(
-                existing,
-                request.branch,
-                base_branch,
-                identity_marker,
-                legacy_marker,
-                legacy_body,
-            ):
-                _finish_handoff_mutation(
-                    request,
-                    action_id,
-                    "failed",
-                    {
-                        **_pull_request_audit_result(existing, "readback_conflict"),
-                        **_mutation_error_result(create_error),
-                    },
-                )
-                raise ProviderError(
-                    "Pull request branch has a different handoff identity"
-                ) from create_error
+                raise
             _finish_handoff_mutation(
                 request,
                 action_id,
                 "succeeded",
                 {
-                    **_pull_request_audit_result(existing, "readback_present"),
-                    **_mutation_error_result(create_error),
+                    **_pull_request_audit_result(pull_request, "mutation_response"),
+                    "branch": result.branch,
                 },
             )
-            return self._update_matching_pull_request(
-                existing,
-                owner,
-                name,
-                qualified_branch,
-                request,
-                base_branch,
-                identity_marker,
-                legacy_marker,
-                legacy_body,
-                pull_request_body,
-            )
-        except Exception as create_error:
-            _finish_handoff_mutation(
-                request,
-                action_id,
-                "uncertain",
-                {
-                    "reconciliation": "not_checked",
-                    **_mutation_error_result(create_error),
-                },
-            )
-            raise
-        raw_create_result = pull_request_data.get("createPullRequest")
-        pull_request: Mapping[str, Any] = {}
-        response_invalid = not isinstance(raw_create_result, Mapping)
-        if isinstance(raw_create_result, Mapping):
-            raw_pull_request = cast(Mapping[str, object], raw_create_result).get(
-                "pullRequest"
-            )
-            if isinstance(raw_pull_request, Mapping):
-                pull_request = cast(Mapping[str, Any], raw_pull_request)
-            else:
-                response_invalid = True
-        try:
-            if response_invalid:
-                raise ProviderError("GitHub GraphQL returned an invalid object")
-            result = self._validated_handoff_result(
-                pull_request, request, base_branch, identity_marker, pull_request_body
-            )
-        except ProviderError as validation_error:
-            _finish_handoff_mutation(
-                request,
-                action_id,
-                "uncertain",
-                {
-                    **_pull_request_audit_result(pull_request, "response_unverified"),
-                    **_mutation_error_result(validation_error),
-                },
-            )
-            raise
-        _finish_handoff_mutation(
-            request,
-            action_id,
-            "succeeded",
-            {
-                **_pull_request_audit_result(pull_request, "mutation_response"),
-                "branch": result.branch,
-            },
-        )
-        return result
+            return result
 
     def _validated_handoff_result(
         self,
