@@ -34,6 +34,15 @@ class RunStatus(StrEnum):
     COMPLETED = "completed"
 
 
+class RefinementStatus(StrEnum):
+    """Durable state of one PBI refinement attempt."""
+
+    AWAITING_ANSWERS = "awaiting_answers"
+    EVALUATING = "evaluating"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 PROJECT_TERMINAL_STATUSES = frozenset({"done", "completed", "closed", "merged"})
 ARCHIVE_PROJECT_STATUS = "done"
 
@@ -53,6 +62,74 @@ class PbiSnapshot:
     planning_status: str | None = None
     claimable: bool = True
     metadata: Mapping[str, object] = field(default_factory=_empty_metadata)
+
+
+@dataclass(frozen=True, slots=True)
+class PbiRefinementQuestion:
+    """A bounded question and its answer revisions within one generation."""
+
+    question_id: str
+    text: str
+    answer_history: tuple[Mapping[str, object], ...] = ()
+    evidence_refs: tuple[str, ...] = ()
+
+    @property
+    def revision(self) -> int:
+        return len(self.answer_history)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "question_id": self.question_id,
+            "text": self.text,
+            "revision": self.revision,
+            "answer": (
+                self.answer_history[-1].get("text") if self.answer_history else None
+            ),
+            "answer_history": [dict(answer) for answer in self.answer_history],
+            "evidence_refs": list(self.evidence_refs),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PbiRefinementAttempt:
+    """Restart-safe refinement state for one Project, repository, and PBI."""
+
+    attempt_id: str
+    project_id: str
+    repository: str
+    pbi_number: int
+    generation: int
+    reopen_count: int
+    revision: int
+    status: RefinementStatus
+    questions: tuple[PbiRefinementQuestion, ...]
+    decision: Mapping[str, object] | None
+    failure_reason: str | None
+    retryable_failure: bool
+    history: tuple[Mapping[str, object], ...]
+    authorization: Mapping[str, str]
+    created_at: str
+    updated_at: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "attempt_id": self.attempt_id,
+            "project_id": self.project_id,
+            "repository": self.repository,
+            "pbi_number": self.pbi_number,
+            "generation": self.generation,
+            "reopen_count": self.reopen_count,
+            "revision": self.revision,
+            "status": self.status.value,
+            "questions": [question.as_dict() for question in self.questions],
+            "decision": dict(self.decision) if self.decision is not None else None,
+            "failure_reason": self.failure_reason,
+            "retryable_failure": self.retryable_failure,
+            "history": [dict(item) for item in self.history],
+            "authorization": dict(self.authorization),
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
 
 
 @dataclass(frozen=True, slots=True)
