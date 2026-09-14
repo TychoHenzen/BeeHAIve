@@ -413,6 +413,32 @@ def test_dashboard_projection_separates_project_and_local_statuses(
 
 
 def test_dashboard_api_exposes_terminal_project_and_pull_request_state() -> None:
+    readiness = {
+        "status": "completed",
+        "counts": {
+            "ready": 0,
+            "incomplete": 0,
+            "blocked": 0,
+            "rejected": 0,
+            "completed": 1,
+            "unknown": 0,
+        },
+        "reasons": [],
+        "observed_at": "2026-09-14T08:00:00+00:00",
+    }
+    child = {
+        "id": "#2",
+        "number": 2,
+        "title": "Done child",
+        "issue_state": "CLOSED",
+        "state_reason": "COMPLETED",
+        "project_status": "Done",
+        "blocked_by": [],
+        "dependency_read_complete": True,
+        "readiness": "completed",
+        "readiness_reasons": [],
+        "observed_at": "2026-09-14T08:00:00+00:00",
+    }
     snapshot = ProjectSnapshot(
         "project-1",
         "Planning",
@@ -439,6 +465,10 @@ def test_dashboard_api_exposes_terminal_project_and_pull_request_state() -> None
                                 "verdict": "unproven",
                                 "pull_requests": [],
                             },
+                            "issue_state": "CLOSED",
+                            "state_reason": "COMPLETED",
+                            "subtasks": [child],
+                            "dependency_readiness": readiness,
                         },
                     ),
                 ),
@@ -459,6 +489,10 @@ def test_dashboard_api_exposes_terminal_project_and_pull_request_state() -> None
     assert pbi["stage_label"] == "Merged"
     assert pbi["pull_requests"] == [{"number": 9, "state": "closed", "merged": True}]
     assert pbi["checks"] == {"verdict": "unproven", "pull_requests": []}
+    assert pbi["issue_state"] == "CLOSED"
+    assert pbi["state_reason"] == "COMPLETED"
+    assert pbi["subtasks"] == [child]
+    assert pbi["dependency_readiness"] == readiness
     service.store.close()
 
 

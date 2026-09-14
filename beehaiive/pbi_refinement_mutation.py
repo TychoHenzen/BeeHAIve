@@ -437,3 +437,11 @@ def _contains_managed_heading(value: str) -> bool:
         title in REFINEMENT_SECTION_ORDER
         for _, title in _markdown_headings(value.splitlines(keepends=True))
     )
+
+
+def has_refined_pbi_sections(value: str) -> bool:
+    counts = dict.fromkeys(REFINEMENT_SECTION_ORDER, 0)
+    for _, title in _markdown_headings(value.splitlines(keepends=True)):
+        if title in counts:
+            counts[title] += 1
+    return all(count == 1 for count in counts.values())

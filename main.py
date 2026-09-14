@@ -22,7 +22,7 @@ from fastapi.exception_handlers import (
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from beehaiive import EnvironmentGitHubProvider, Orchestrator, OrchestratorStore, Stage
 from beehaiive.agent import (
@@ -46,6 +46,16 @@ from beehaiive.pbi_refinement_mutation import (
     PbiRefinementMutationError,
     PbiRefinementUpdateRequest,
     PbiRefinementUpdateResult,
+)
+from beehaiive.pbi_relations import (
+    MAX_PBI_RELATION_CHILDREN,
+    MAX_PBI_RELATION_DEPENDENCIES,
+    PbiCreatedIssueReference,
+    PbiRelationDependency,
+    PbiRelationError,
+    PbiRelationProvider,
+    PbiRelationRequest,
+    PbiRelationService,
 )
 from beehaiive.provider import ProviderError
 from beehaiive.quality_gates import RepositoryGateSuite
@@ -104,6 +114,51 @@ class PbiCreationBody(BaseModel):
     title: str = Field(min_length=1, max_length=256)
     body: str = Field(min_length=1, max_length=65_536)
     labels: list[str] = Field(default_factory=list, max_length=20)
+
+
+class PbiCreatedIssueReferenceBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(strict=True, min_length=1, max_length=200)
+    number: int = Field(strict=True, gt=0, le=2_147_483_647)
+    url: str = Field(strict=True, min_length=1, max_length=2_000)
+
+
+class PbiCreatedProjectReferenceBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: str = Field(strict=True, min_length=1, max_length=200)
+    status: str = Field(strict=True, min_length=1, max_length=100)
+
+
+class PbiCreatedIssueResultBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["complete"]
+    repository: str = Field(strict=True, min_length=3, max_length=300)
+    issue: PbiCreatedIssueReferenceBody
+    project: PbiCreatedProjectReferenceBody
+    labels: list[str] | None = Field(default=None, max_length=20)
+    completed_steps: list[str] | None = Field(default=None, max_length=20)
+
+
+class PbiRelationDependencyBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    blocked_issue_number: int = Field(strict=True, gt=0, le=2_147_483_647)
+    blocked_by_issue_number: int = Field(strict=True, gt=0, le=2_147_483_647)
+
+
+class PbiRelationsBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    children: list[PbiCreatedIssueResultBody] = Field(
+        min_length=1, max_length=MAX_PBI_RELATION_CHILDREN
+    )
+    dependencies: list[PbiRelationDependencyBody] = Field(
+        default_factory=lambda: cast(list[PbiRelationDependencyBody], []),
+        max_length=MAX_PBI_RELATION_DEPENDENCIES,
+    )
 
 
 class PbiRefinementQuestionInput(BaseModel):
@@ -398,6 +453,9 @@ def create_app(
     pbi_creation_service = PbiCreationService(
         orchestrator.store,
         cast(PbiCreationProvider, orchestrator.provider),
+    )
+    pbi_relations_service = PbiRelationService(
+        cast(PbiRelationProvider, orchestrator.provider)
     )
     if (
         conflict_repair_service is None
@@ -1468,6 +1526,53 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         status_code = 201 if result.get("status") == "complete" else 202
         return JSONResponse(status_code=status_code, content=result)
+
+    @app.post(
+        "/projects/{project_id}/repositories/{repository:path}/pbis/{pbi_number}/relations"
+    )
+    def apply_project_pbi_relations(  # pyright: ignore[reportUnusedFunction]
+        project_id: str,
+        repository: Annotated[str, FastAPIPath(min_length=3, max_length=300)],
+        pbi_number: Annotated[int, FastAPIPath(gt=0, le=2_147_483_647)],
+        request: PbiRelationsBody,
+        _auth: None = Depends(require_mutation_access),
+    ) -> JSONResponse:
+        relation_request = PbiRelationRequest(
+            project_id=project_id,
+            repository=repository,
+            parent_issue_number=pbi_number,
+            children=tuple(
+                PbiCreatedIssueReference(
+                    repository=child.repository,
+                    node_id=child.issue.id,
+                    number=child.issue.number,
+                    url=child.issue.url,
+                    project_item_id=child.project.item_id,
+                )
+                for child in request.children
+            ),
+            dependencies=tuple(
+                PbiRelationDependency(
+                    edge.blocked_issue_number,
+                    edge.blocked_by_issue_number,
+                )
+                for edge in request.dependencies
+            ),
+        )
+        try:
+            result = pbi_relations_service.apply(relation_request)
+        except PbiRelationError as exc:
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={
+                    "error": {
+                        "code": exc.code,
+                        "detail": "Relation request was rejected",
+                    }
+                },
+            )
+        status_code = 200 if result.status == "complete" else 202
+        return JSONResponse(status_code=status_code, content=result.as_dict())
 
     @app.get("/projects/{project_id}")
     def project_state(  # pyright: ignore[reportUnusedFunction]

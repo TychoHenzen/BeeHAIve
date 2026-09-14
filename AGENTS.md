@@ -8,3 +8,7 @@
 - `/submit-draft-pr` creates or updates the draft pull request.
 - Review is read-only until the user explicitly accepts the findings.
 - `/complete-pr` alone owns making a pull request ready, merging it, confirming the linked issue, and deleting the branch.
+
+## Provider data
+
+- GitHub Project V2 `fieldValues` can contain unrelated union nodes without a `field`; ignore those nodes, but fail closed if Status is missing or ambiguous.

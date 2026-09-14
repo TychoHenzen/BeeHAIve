@@ -12,6 +12,7 @@ import subprocess
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
 from typing import Any, Literal, Protocol, cast
@@ -40,14 +41,27 @@ from .pbi_creation import (
     PbiCreationTarget,
     PbiCreationValidationError,
 )
+from .pbi_readiness import project_pbi_readiness
 from .pbi_refinement_mutation import (
     PbiRefinementMutationError,
     PbiRefinementMutationProvider,
     PbiRefinementTarget,
     PbiRefinementUpdateRequest,
     PbiRefinementUpdateResult,
+    has_refined_pbi_sections,
     is_pbi_refinement_scale_label,
     merge_refinement_sections,
+)
+from .pbi_relations import (
+    MAX_PBI_RELATION_CHILDREN,
+    MAX_PBI_RELATION_GRAPH_ISSUES,
+    PbiRelationIssue,
+    PbiRelationProvider,
+    PbiRelationProviderError,
+    PbiRelationRequest,
+    PbiRelationScopeError,
+    PbiRelationSnapshot,
+    PbiRelationValidationError,
 )
 
 PROVIDER_REQUEST_TIMEOUT = 30.0
@@ -391,7 +405,7 @@ class UrllibGraphQLClient:
         method: str,
         path: str,
         payload: Mapping[str, object] | None = None,
-    ) -> tuple[int, Mapping[str, Any]]:
+    ) -> tuple[int, Mapping[str, Any] | list[Any]]:
         """Call a GitHub REST endpoint without hiding its response status."""
 
         request = Request(
@@ -437,12 +451,12 @@ class UrllibGraphQLClient:
             raise GitHubOutcomeUnknownError(
                 "GitHub REST returned invalid JSON", status_code=status
             ) from exc
-        if not isinstance(decoded, Mapping):
+        if not isinstance(decoded, (Mapping, list)):
             raise GitHubOutcomeUnknownError(
-                "GitHub REST returned a non-object response", status_code=status
+                "GitHub REST returned an invalid response", status_code=status
             )
         self._record_exhausted_headers(response_headers)
-        return status, cast(Mapping[str, Any], decoded)
+        return status, cast(Mapping[str, Any] | list[Any], decoded)
 
 
 class ProjectProvider(Protocol):
@@ -535,6 +549,8 @@ query($owner: String!, $number: Int!, $cursor: String) {
               number
               title
               url
+              state
+              stateReason
               repository { nameWithOwner }
               # Keep the project-wide query below GitHub's node limit. The
               # provider completes these connections with repository queries.
@@ -547,6 +563,7 @@ query($owner: String!, $number: Int!, $cursor: String) {
                   number
                   title
                   state
+                  stateReason
                   labels(first: 20) {
                     nodes { name }
                     pageInfo { hasNextPage endCursor }
@@ -634,6 +651,7 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
           number
           title
           state
+          stateReason
           labels(first: 100) {
             nodes { name }
             pageInfo { hasNextPage endCursor }
@@ -912,6 +930,42 @@ query($owner: String!, $number: Int!, $cursor: String) {
                 field { ... on ProjectV2FieldCommon { id name } }
               }
             }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+
+PBI_RELATION_PROJECT_QUERY = """
+query($owner: String!, $number: Int!, $repositoryCursor: String, $itemCursor: String) {
+  user(login: $owner) {
+    projectV2(number: $number) {
+      id
+      repositories(first: 100, after: $repositoryCursor) {
+        nodes { nameWithOwner }
+        pageInfo { hasNextPage endCursor }
+      }
+      fields(first: 100) {
+        nodes { ... on ProjectV2SingleSelectField { id name } }
+      }
+      items(first: 100, after: $itemCursor) {
+        nodes {
+          id
+          content {
+            __typename
+            ... on Issue { id number repository { nameWithOwner } }
+          }
+          fieldValues(first: 100) {
+            nodes {
+              ... on ProjectV2ItemFieldSingleSelectValue {
+                name
+                field { ... on ProjectV2FieldCommon { id name } }
+              }
+            }
+            pageInfo { hasNextPage endCursor }
           }
         }
         pageInfo { hasNextPage endCursor }
@@ -1295,6 +1349,45 @@ def _stage_from_status(status: str | None) -> Stage | None:
     return project_stage_from_status(status)
 
 
+def _project_item_status_values(item: Mapping[str, Any]) -> list[str]:
+    values: list[str] = []
+    for field_value in _nodes(item.get("fieldValues", {})):
+        raw_field = field_value.get("field")
+        if raw_field is None:
+            continue
+        field = _mapping(raw_field)
+        value = field_value.get("name")
+        if field.get("name") == "Status" and isinstance(value, str):
+            values.append(value)
+    return values
+
+
+def _project_status_index(
+    items: Iterable[Mapping[str, Any]],
+) -> tuple[dict[tuple[str, int], str | None], set[tuple[str, int]]]:
+    statuses: dict[tuple[str, int], str | None] = {}
+    conflicts: set[tuple[str, int]] = set()
+    for item in items:
+        content_value = item.get("content")
+        if content_value is None:
+            continue
+        content = _mapping(content_value)
+        repository_value = content.get("repository")
+        if repository_value is None:
+            continue
+        repository_name = _mapping(repository_value).get("nameWithOwner")
+        number = content.get("number")
+        if not isinstance(repository_name, str) or not isinstance(number, int):
+            continue
+        key = (repository_name.casefold(), number)
+        values = set(_project_item_status_values(item))
+        status = next(iter(values)) if len(values) == 1 else None
+        if len(values) > 1 or (key in statuses and statuses[key] != status):
+            conflicts.add(key)
+        statuses[key] = status
+    return statuses, conflicts
+
+
 def _actor_name(value: object) -> str | None:
     if not isinstance(value, Mapping):
         return None
@@ -1347,6 +1440,15 @@ def _dashboard_metadata(issue: Mapping[str, Any]) -> dict[str, object]:
     source_url = issue.get("url")
     if isinstance(source_url, str):
         metadata["source_url"] = source_url
+    issue_state = issue.get("state")
+    if isinstance(issue_state, str):
+        metadata["issue_state"] = issue_state
+    state_reason = issue.get("stateReason")
+    if isinstance(state_reason, str):
+        metadata["state_reason"] = state_reason
+    project_status = issue.get("projectStatus")
+    if isinstance(project_status, str):
+        metadata["project_status"] = project_status
     labels = _label_names(issue.get("labels", {}))
 
     subtasks: list[dict[str, object]] = []
@@ -1363,12 +1465,48 @@ def _dashboard_metadata(issue: Mapping[str, Any]) -> dict[str, object]:
         state = raw_subtask.get("state")
         if isinstance(state, str):
             subtask["status"] = state.lower()
+            subtask["issue_state"] = state
+        state_reason = raw_subtask.get("stateReason")
+        if isinstance(state_reason, str):
+            subtask["state_reason"] = state_reason
+        child_project_status = raw_subtask.get("projectStatus")
+        if isinstance(child_project_status, str):
+            subtask["project_status"] = child_project_status
+        else:
+            subtask["project_status"] = None
+        subtask["project_status_conflict"] = (
+            raw_subtask.get("projectStatusConflict") is True
+        )
+        subtask["blocked_by"] = raw_subtask.get("blockedBy", [])
+        subtask["dependency_read_complete"] = (
+            raw_subtask.get("dependencyReadComplete") is True
+        )
+        dependency_read_error = raw_subtask.get("dependencyReadError")
+        if isinstance(dependency_read_error, str):
+            subtask["dependency_read_error"] = dependency_read_error
         subtask_labels = _label_names(raw_subtask.get("labels", {}))
         if subtask_labels:
             subtask["labels"] = subtask_labels
         subtasks.append(subtask)
-    if subtasks:
-        metadata["subtasks"] = subtasks
+    readiness_source = _mapping(issue.get("_pbi_readiness_source", {}))
+    is_epic = any(label.casefold() == "effort 13 - epic" for label in labels)
+    if subtasks or is_epic:
+        projected_subtasks, readiness = project_pbi_readiness(
+            subtasks,
+            relation_complete=readiness_source.get("child_relation_complete") is True,
+            relation_error=(
+                readiness_source.get("child_relation_error")
+                if isinstance(readiness_source.get("child_relation_error"), str)
+                else None
+            ),
+            observed_at=(
+                readiness_source.get("observed_at")
+                if isinstance(readiness_source.get("observed_at"), str)
+                else None
+            ),
+        )
+        metadata["subtasks"] = projected_subtasks
+        metadata["dependency_readiness"] = readiness
 
     readers: list[dict[str, object]] = []
     reviewers: dict[str, dict[str, object]] = {}
@@ -1737,7 +1875,12 @@ class GitHubProjectProvider:
         self._discovery_cache: tuple[float, ProjectSnapshot] | None = None
         self._discovery_lock = Lock()
 
-    def _complete_issue_metadata(self, issue: Mapping[str, Any]) -> Mapping[str, Any]:
+    def _complete_issue_metadata(
+        self,
+        issue: Mapping[str, Any],
+        project_statuses: Mapping[tuple[str, int], str | None] | None = None,
+        project_status_conflicts: set[tuple[str, int]] | None = None,
+    ) -> Mapping[str, Any]:
         repository_name = _mapping(issue.get("repository")).get("nameWithOwner")
         issue_number = issue.get("number")
         if not isinstance(repository_name, str) or not isinstance(issue_number, int):
@@ -1756,18 +1899,48 @@ class GitHubProjectProvider:
             variables,
             ("repository", "issue", "labels"),
         )
-        subissues = _complete_connection(
-            self._client,
-            issue.get("subIssues", {}),
-            ISSUE_SUB_ISSUES_QUERY,
-            variables,
-            ("repository", "issue", "subIssues"),
-        )
+        child_relation_complete = True
+        child_relation_error: str | None = None
+        try:
+            subissues = _complete_connection(
+                self._client,
+                issue.get("subIssues", {}),
+                ISSUE_SUB_ISSUES_QUERY,
+                variables,
+                ("repository", "issue", "subIssues"),
+                strict=True,
+            )
+        except (OSError, TypeError, ValueError, ProviderError):
+            subissues = dict(_mapping(issue.get("subIssues", {})))
+            child_relation_complete = False
+            child_relation_error = "child_relation_read_failed"
+        if len(_nodes(subissues)) > MAX_PBI_RELATION_CHILDREN:
+            child_relation_complete = False
+            child_relation_error = "child_limit_exceeded"
         completed_subissues: list[dict[str, Any]] = []
-        for raw_subissue in _nodes(subissues):
+        for index, raw_subissue in enumerate(_nodes(subissues)):
             subissue = dict(raw_subissue)
             subissue_number = subissue.get("number")
-            if isinstance(subissue_number, int):
+            subissue_title = subissue.get("title")
+            if (
+                not isinstance(subissue_number, int)
+                or subissue_number <= 0
+                or not isinstance(subissue_title, str)
+                or not subissue_title.strip()
+            ):
+                child_relation_complete = False
+                child_relation_error = "child_response_incomplete"
+            else:
+                child_key = (repository_name.casefold(), subissue_number)
+                subissue["projectStatus"] = (
+                    project_statuses.get(child_key)
+                    if project_statuses is not None
+                    else None
+                )
+                subissue["projectStatusConflict"] = (
+                    project_status_conflicts is not None
+                    and child_key in project_status_conflicts
+                )
                 subissue["labels"] = _complete_connection(
                     self._client,
                     subissue.get("labels", {}),
@@ -1779,9 +1952,45 @@ class GitHubProjectProvider:
                     },
                     ("repository", "issue", "labels"),
                 )
+                if not child_relation_complete:
+                    subissue["dependencyReadComplete"] = False
+                    subissue["dependencyReadError"] = (
+                        child_relation_error or "child_relation_incomplete"
+                    )
+                elif index >= MAX_PBI_RELATION_CHILDREN:
+                    subissue["dependencyReadComplete"] = False
+                    subissue["dependencyReadError"] = "child_limit_exceeded"
+                else:
+                    try:
+                        blockers = self.list_pbi_blocked_by(
+                            repository_name, subissue_number
+                        )
+                    except PbiRelationProviderError as exc:
+                        subissue["dependencyReadComplete"] = False
+                        subissue["dependencyReadError"] = exc.code
+                    except (OSError, TypeError, ValueError, ProviderError):
+                        subissue["dependencyReadComplete"] = False
+                        subissue["dependencyReadError"] = "dependency_read_failed"
+                    else:
+                        subissue["blockedBy"] = [
+                            {
+                                "number": blocker.number,
+                                "title": blocker.title,
+                                "url": blocker.url,
+                                "state": blocker.state,
+                                "state_reason": blocker.state_reason,
+                            }
+                            for blocker in blockers
+                        ]
+                        subissue["dependencyReadComplete"] = True
             completed_subissues.append(subissue)
         subissues["nodes"] = completed_subissues
         completed_issue["subIssues"] = subissues
+        completed_issue["_pbi_readiness_source"] = {
+            "child_relation_complete": child_relation_complete,
+            "child_relation_error": child_relation_error,
+            "observed_at": datetime.now(UTC).isoformat(),
+        }
         completed_issue["comments"] = _complete_connection(
             self._client,
             issue.get("comments", {}),
@@ -1968,6 +2177,7 @@ class GitHubProjectProvider:
             if not has_next:
                 break
 
+        project_items: list[Mapping[str, Any]] = []
         item_cursor: str | None = None
         while True:
             item_data = self._client.execute(
@@ -1981,50 +2191,56 @@ class GitHubProjectProvider:
             item_connection = _mapping(
                 _project(item_data, self.owner_type).get("items")
             )
-            for item in _nodes(item_connection):
-                content_value = item.get("content")
-                if content_value is None:
-                    continue
-                content = _mapping(content_value)
-                if content.get("__typename") != "Issue":
-                    continue
-                repository = _mapping(content.get("repository"))
-                repository_name = repository.get("nameWithOwner")
-                number = content.get("number")
-                title = content.get("title")
-                if (
-                    not isinstance(repository_name, str)
-                    or not isinstance(number, int)
-                    or not isinstance(title, str)
-                ):
-                    continue
-                content = self._complete_issue_metadata(content)
-                status = None
-                for field_value in _nodes(item.get("fieldValues", {})):
-                    raw_field = field_value.get("field")
-                    if raw_field is None:
-                        continue
-                    field = _mapping(raw_field)
-                    if field.get("name") == "Status" and isinstance(
-                        field_value.get("name"), str
-                    ):
-                        status = field_value["name"]
-                        break
-                stage = _stage_from_status(status)
-                repositories.setdefault(repository_name, []).append(
-                    PbiSnapshot(
-                        repository_name,
-                        number,
-                        title,
-                        stage,
-                        status,
-                        stage is not None,
-                        _dashboard_metadata(content),
-                    )
-                )
+            project_items.extend(_nodes(item_connection))
             has_next, item_cursor = _next_cursor(item_connection)
             if not has_next:
                 break
+
+        project_statuses, project_status_conflicts = _project_status_index(
+            project_items
+        )
+        for item in project_items:
+            content_value = item.get("content")
+            if content_value is None:
+                continue
+            content = _mapping(content_value)
+            if content.get("__typename") != "Issue":
+                continue
+            repository = _mapping(content.get("repository"))
+            repository_name = repository.get("nameWithOwner")
+            number = content.get("number")
+            title = content.get("title")
+            if (
+                not isinstance(repository_name, str)
+                or not isinstance(number, int)
+                or not isinstance(title, str)
+            ):
+                continue
+            key = (repository_name.casefold(), number)
+            status_values = set(_project_item_status_values(item))
+            status = next(iter(status_values)) if len(status_values) == 1 else None
+            content_with_project_status = dict(content)
+            content_with_project_status["projectStatus"] = status
+            content_with_project_status["projectStatusConflict"] = (
+                len(status_values) > 1 or key in project_status_conflicts
+            )
+            completed_content = self._complete_issue_metadata(
+                content_with_project_status,
+                project_statuses,
+                project_status_conflicts,
+            )
+            stage = _stage_from_status(status)
+            repositories.setdefault(repository_name, []).append(
+                PbiSnapshot(
+                    repository_name,
+                    number,
+                    title,
+                    stage,
+                    status,
+                    stage is not None,
+                    _dashboard_metadata(completed_content),
+                )
+            )
 
         repository_snapshots = tuple(
             RepositorySnapshot(
@@ -3368,6 +3584,470 @@ class GitHubProjectProvider:
                 status_code=409,
             )
         return matching_items[0] if matching_items else None
+
+    def prepare_pbi_relations(self, request: PbiRelationRequest) -> PbiRelationSnapshot:
+        request.validate()
+        if request.project_id != self.project_id:
+            raise PbiRelationScopeError()
+        owner, name = self._repository_parts(request.repository)
+        repository = f"{owner}/{name}"
+        if repository.casefold() != request.repository.casefold():
+            raise PbiRelationValidationError(
+                "Repository identity is not canonical", code="invalid_repository"
+            )
+
+        linked_repositories, project_items = self._pbi_relation_project_state()
+        if repository.casefold() not in linked_repositories:
+            raise PbiRelationScopeError(
+                "Repository is not linked to the configured Project"
+            )
+
+        parent, parent_payload = self._pbi_relation_issue_state(
+            repository, request.parent_issue_number
+        )
+        if parent.state != "OPEN":
+            raise PbiRelationValidationError(
+                "Parent PBI must be open", code="parent_not_open", status_code=409
+            )
+        body = parent_payload.get("body")
+        if not isinstance(body, str):
+            raise PbiRelationProviderError("parent_body_unavailable")
+        if not has_refined_pbi_sections(body):
+            raise PbiRelationValidationError(
+                "Parent PBI does not have the required refined sections",
+                code="parent_not_refined",
+                status_code=409,
+            )
+
+        parent_item = self._pbi_relation_project_item(
+            project_items, parent.node_id, repository
+        )
+        if str(parent_item.get("status", "")).casefold() not in {
+            "todo",
+            "in progress",
+        }:
+            raise PbiRelationValidationError(
+                "Parent PBI must be in Todo or In Progress",
+                code="parent_not_refined",
+                status_code=409,
+            )
+
+        children: list[PbiRelationIssue] = []
+        for reference in request.children:
+            issue, _ = self._pbi_relation_issue_state(repository, reference.number)
+            if (
+                issue.node_id != reference.node_id
+                or issue.number != reference.number
+                or issue.url != reference.url
+            ):
+                raise PbiRelationValidationError(
+                    "Created child reference does not match the live issue",
+                    code="child_identity_conflict",
+                    status_code=409,
+                )
+            if issue.state != "OPEN":
+                raise PbiRelationValidationError(
+                    "Created child must remain open",
+                    code="child_not_open",
+                    status_code=409,
+                )
+            self._pbi_relation_project_item(
+                project_items,
+                issue.node_id,
+                repository,
+                expected_item_id=reference.project_item_id,
+            )
+            children.append(issue)
+
+        child_numbers = {issue.number for issue in children}
+        parent_by_child: dict[int, int | None] = {}
+        for child in children:
+            existing_parent = self._pbi_relation_parent_number(repository, child.number)
+            if existing_parent not in (None, parent.number):
+                raise PbiRelationValidationError(
+                    "Child already belongs to another parent",
+                    code="child_has_other_parent",
+                    status_code=409,
+                )
+            parent_by_child[child.number] = existing_parent
+        self._pbi_relation_check_parent_chain(repository, parent.number, child_numbers)
+        parent_sub_issues = self.list_pbi_sub_issues(repository, parent.number)
+        return PbiRelationSnapshot(
+            parent,
+            tuple(children),
+            parent_sub_issues,
+            parent_by_child,
+        )
+
+    def _pbi_relation_project_state(
+        self,
+    ) -> tuple[set[str], dict[str, list[dict[str, object]]]]:
+        repository_cursor: str | None = None
+        item_cursor: str | None = None
+        seen_repository_cursors: set[str] = set()
+        seen_item_cursors: set[str] = set()
+        project_id: str | None = None
+        status_field_id: str | None = None
+        linked_repositories: set[str] = set()
+        project_items: dict[str, list[dict[str, object]]] = {}
+        while True:
+            data = self._client.execute(
+                _owner_query(PBI_RELATION_PROJECT_QUERY, self.owner_type),
+                {
+                    "owner": self.owner,
+                    "number": self.project_number,
+                    "repositoryCursor": repository_cursor,
+                    "itemCursor": item_cursor,
+                },
+            )
+            project = _project(data, self.owner_type)
+            current_project_id = project.get("id")
+            if not isinstance(current_project_id, str) or not current_project_id:
+                raise PbiRelationProviderError("project_unavailable")
+            if project_id is not None and project_id != current_project_id:
+                raise PbiRelationProviderError("project_identity_changed")
+            project_id = current_project_id
+
+            fields_value = project.get("fields")
+            if not isinstance(fields_value, Mapping):
+                raise PbiRelationProviderError("project_fields_incomplete")
+            fields = cast(Mapping[str, Any], fields_value)
+            field_nodes = fields.get("nodes")
+            if not isinstance(field_nodes, list):
+                raise PbiRelationProviderError("project_fields_incomplete")
+            status_fields: list[Mapping[str, Any]] = []
+            for raw_field in cast(list[object], field_nodes):
+                if not isinstance(raw_field, Mapping):
+                    continue
+                field = cast(Mapping[str, Any], raw_field)
+                field_name = field.get("name")
+                if isinstance(field_name, str) and field_name.casefold() == "status":
+                    status_fields.append(field)
+            if len(status_fields) != 1:
+                raise PbiRelationProviderError("project_status_unavailable")
+            raw_status_field_id = status_fields[0].get("id")
+            if not isinstance(raw_status_field_id, str) or not raw_status_field_id:
+                raise PbiRelationProviderError("project_status_unavailable")
+            if status_field_id is not None and status_field_id != raw_status_field_id:
+                raise PbiRelationProviderError("project_status_changed")
+            status_field_id = raw_status_field_id
+
+            repository_nodes, has_repository_page, next_repository_cursor = (
+                self._pbi_relation_connection(project.get("repositories"))
+            )
+            for raw_repository in repository_nodes:
+                repository_name = _mapping(raw_repository).get("nameWithOwner")
+                if not isinstance(repository_name, str) or not repository_name:
+                    raise PbiRelationProviderError("project_repository_incomplete")
+                linked_repositories.add(repository_name.casefold())
+
+            item_nodes, has_item_page, next_item_cursor = self._pbi_relation_connection(
+                project.get("items")
+            )
+            for raw_item in item_nodes:
+                item = _mapping(raw_item)
+                raw_content = item.get("content")
+                if raw_content is None:
+                    continue
+                content = _mapping(raw_content)
+                if content.get("__typename") != "Issue":
+                    continue
+                node_id = content.get("id")
+                number = content.get("number")
+                content_repository = _mapping(content.get("repository")).get(
+                    "nameWithOwner"
+                )
+                item_id = item.get("id")
+                if (
+                    not isinstance(node_id, str)
+                    or type(number) is not int
+                    or not isinstance(content_repository, str)
+                    or not isinstance(item_id, str)
+                ):
+                    raise PbiRelationProviderError("project_item_incomplete")
+                field_values = item.get("fieldValues")
+                values, has_more_values, _ = self._pbi_relation_connection(field_values)
+                if has_more_values:
+                    raise PbiRelationProviderError("project_item_fields_incomplete")
+                statuses: list[str] = []
+                for raw_value in values:
+                    value = _mapping(raw_value)
+                    raw_field = value.get("field")
+                    if raw_field is None:
+                        continue
+                    field = _mapping(raw_field)
+                    if field.get("id") == status_field_id:
+                        name_value = value.get("name")
+                        if not isinstance(name_value, str) or not name_value:
+                            raise PbiRelationProviderError(
+                                "project_item_status_incomplete"
+                            )
+                        statuses.append(name_value)
+                if len(statuses) > 1:
+                    raise PbiRelationProviderError("project_item_status_ambiguous")
+                project_items.setdefault(node_id, []).append(
+                    {
+                        "id": item_id,
+                        "number": number,
+                        "repository": content_repository,
+                        "status": statuses[0] if statuses else None,
+                    }
+                )
+
+            repository_cursor = next_repository_cursor
+            item_cursor = next_item_cursor
+            if has_repository_page and (
+                not repository_cursor or repository_cursor in seen_repository_cursors
+            ):
+                raise PbiRelationProviderError(
+                    "project_repository_pagination_incomplete"
+                )
+            if has_item_page and (not item_cursor or item_cursor in seen_item_cursors):
+                raise PbiRelationProviderError("project_item_pagination_incomplete")
+            if repository_cursor:
+                seen_repository_cursors.add(repository_cursor)
+            if item_cursor:
+                seen_item_cursors.add(item_cursor)
+            if not has_repository_page and not has_item_page:
+                return linked_repositories, project_items
+
+    @staticmethod
+    def _pbi_relation_connection(
+        connection_value: object,
+    ) -> tuple[list[object], bool, str | None]:
+        connection = _mapping(connection_value)
+        nodes = connection.get("nodes")
+        page_info = _mapping(connection.get("pageInfo"))
+        has_next = page_info.get("hasNextPage")
+        cursor = page_info.get("endCursor")
+        if not isinstance(nodes, list) or type(has_next) is not bool:
+            raise PbiRelationProviderError("github_connection_incomplete")
+        if has_next and (not isinstance(cursor, str) or not cursor):
+            raise PbiRelationProviderError("github_cursor_missing")
+        return (
+            cast(list[object], nodes),
+            has_next,
+            cursor if isinstance(cursor, str) else None,
+        )
+
+    @staticmethod
+    def _pbi_relation_project_item(
+        project_items: Mapping[str, list[dict[str, object]]],
+        node_id: str,
+        repository: str,
+        *,
+        expected_item_id: str | None = None,
+    ) -> dict[str, object]:
+        matches = project_items.get(node_id, [])
+        if len(matches) != 1:
+            raise PbiRelationValidationError(
+                "Issue must appear exactly once in the configured Project",
+                code="project_item_unavailable",
+                status_code=409,
+            )
+        item = matches[0]
+        if str(item.get("repository", "")).casefold() != repository.casefold():
+            raise PbiRelationValidationError(
+                "Issue is in another repository", code="cross_repository_issue"
+            )
+        if expected_item_id is not None and item.get("id") != expected_item_id:
+            raise PbiRelationValidationError(
+                "Created child Project item does not match the live item",
+                code="project_item_conflict",
+                status_code=409,
+            )
+        return item
+
+    def _pbi_relation_issue_state(
+        self, repository: str, issue_number: int
+    ) -> tuple[PbiRelationIssue, Mapping[str, Any]]:
+        owner, name = self._repository_parts(repository)
+        path = (
+            f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}"
+            f"/issues/{issue_number}"
+        )
+        status, payload = self._rest_request("GET", path)
+        if status != 200:
+            raise PbiRelationProviderError(self._pbi_relation_status_code(status))
+        issue = self._pbi_relation_issue(payload)
+        if issue.number != issue_number:
+            raise PbiRelationProviderError("issue_identity_conflict")
+        return issue, payload
+
+    @staticmethod
+    def _pbi_relation_issue(payload: Mapping[str, Any]) -> PbiRelationIssue:
+        issue_id = payload.get("id")
+        node_id = payload.get("node_id")
+        number = payload.get("number")
+        url = payload.get("html_url") or payload.get("url")
+        title = payload.get("title")
+        state = payload.get("state")
+        state_reason = payload.get("state_reason")
+        if (
+            type(issue_id) is not int
+            or issue_id <= 0
+            or not isinstance(node_id, str)
+            or not node_id
+            or type(number) is not int
+            or number <= 0
+            or not isinstance(url, str)
+            or not url
+            or not isinstance(title, str)
+            or not isinstance(state, str)
+            or (state_reason is not None and not isinstance(state_reason, str))
+        ):
+            raise PbiRelationProviderError("issue_response_incomplete")
+        return PbiRelationIssue(
+            issue_id,
+            node_id,
+            number,
+            url,
+            title,
+            state.upper(),
+            state_reason,
+        )
+
+    def _pbi_relation_parent_number(
+        self, repository: str, issue_number: int
+    ) -> int | None:
+        owner, name = self._repository_parts(repository)
+        path = (
+            f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}"
+            f"/issues/{issue_number}/parent"
+        )
+        status, payload = self._rest_request("GET", path)
+        if status == 404:
+            return None
+        if status != 200:
+            raise PbiRelationProviderError(self._pbi_relation_status_code(status))
+        return self._pbi_relation_issue(payload).number
+
+    def _pbi_relation_check_parent_chain(
+        self, repository: str, parent_issue_number: int, child_numbers: set[int]
+    ) -> None:
+        current = parent_issue_number
+        visited = {current}
+        for _ in range(100):
+            ancestor = self._pbi_relation_parent_number(repository, current)
+            if ancestor is None:
+                return
+            if ancestor in child_numbers:
+                raise PbiRelationValidationError(
+                    "Parent-child declarations would create a cycle",
+                    code="sub_issue_cycle",
+                    status_code=409,
+                )
+            if ancestor in visited:
+                raise PbiRelationProviderError("sub_issue_graph_inconsistent")
+            visited.add(ancestor)
+            current = ancestor
+        raise PbiRelationProviderError("sub_issue_graph_too_deep")
+
+    @staticmethod
+    def _pbi_relation_status_code(status: int) -> str:
+        if status in {401, 403}:
+            return "permission_denied"
+        if status in {404, 410}:
+            return "issue_unavailable"
+        return "github_request_failed"
+
+    def _pbi_relation_list_issues(
+        self, repository: str, issue_number: int, relation: str
+    ) -> tuple[PbiRelationIssue, ...]:
+        owner, name = self._repository_parts(repository)
+        path = (
+            f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}"
+            f"/issues/{issue_number}/"
+        )
+        path += {
+            "sub_issues": "sub_issues",
+            "blocked_by": "dependencies/blocked_by",
+            "blocking": "dependencies/blocking",
+        }[relation]
+        results: list[PbiRelationIssue] = []
+        page = 1
+        while True:
+            status, payload = self._rest_list_request(
+                "GET", f"{path}?per_page=100&page={page}"
+            )
+            if status != 200:
+                raise PbiRelationProviderError(self._pbi_relation_status_code(status))
+            if (
+                len(payload) > 100
+                or len(results) + len(payload) > MAX_PBI_RELATION_GRAPH_ISSUES
+            ):
+                raise PbiRelationProviderError("relation_set_too_large")
+            for raw_issue in payload:
+                if not isinstance(raw_issue, Mapping):
+                    raise PbiRelationProviderError("relation_response_incomplete")
+                results.append(
+                    self._pbi_relation_issue(cast(Mapping[str, Any], raw_issue))
+                )
+            if len(payload) < 100:
+                return tuple(results)
+            page += 1
+
+    def _rest_list_request(self, method: str, path: str) -> tuple[int, list[object]]:
+        request_rest = getattr(self._client, "request_rest", None)
+        if not callable(request_rest):
+            raise PbiRelationProviderError("rest_api_unavailable")
+        rest_call = cast(
+            Callable[
+                [str, str, Mapping[str, object] | None],
+                tuple[int, Mapping[str, Any] | list[Any]],
+            ],
+            request_rest,
+        )
+        status, payload = rest_call(method, path, None)
+        if not isinstance(payload, list):
+            raise PbiRelationProviderError("github_list_response_invalid")
+        return status, cast(list[object], payload)
+
+    def list_pbi_sub_issues(
+        self, repository: str, parent_issue_number: int
+    ) -> tuple[PbiRelationIssue, ...]:
+        return self._pbi_relation_list_issues(
+            repository, parent_issue_number, "sub_issues"
+        )
+
+    def get_pbi_parent_issue_number(
+        self, repository: str, child_issue_number: int
+    ) -> int | None:
+        return self._pbi_relation_parent_number(repository, child_issue_number)
+
+    def list_pbi_blocked_by(
+        self, repository: str, issue_number: int
+    ) -> tuple[PbiRelationIssue, ...]:
+        return self._pbi_relation_list_issues(repository, issue_number, "blocked_by")
+
+    def list_pbi_blocking(
+        self, repository: str, issue_number: int
+    ) -> tuple[PbiRelationIssue, ...]:
+        return self._pbi_relation_list_issues(repository, issue_number, "blocking")
+
+    def add_pbi_sub_issue(
+        self, repository: str, parent_issue_number: int, child_issue_id: int
+    ) -> None:
+        owner, name = self._repository_parts(repository)
+        path = (
+            f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}"
+            f"/issues/{parent_issue_number}/sub_issues"
+        )
+        status, _ = self._rest_request("POST", path, {"sub_issue_id": child_issue_id})
+        if status != 201:
+            raise PbiRelationProviderError(self._pbi_relation_status_code(status))
+
+    def add_pbi_dependency(
+        self, repository: str, blocked_issue_number: int, blocker_issue_id: int
+    ) -> None:
+        owner, name = self._repository_parts(repository)
+        path = (
+            f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}"
+            f"/issues/{blocked_issue_number}/dependencies/blocked_by"
+        )
+        status, _ = self._rest_request("POST", path, {"issue_id": blocker_issue_id})
+        if status != 201:
+            raise PbiRelationProviderError(self._pbi_relation_status_code(status))
 
     def _resolve_custom_base_branch(
         self, owner: str, name: str, requested: str
@@ -5608,6 +6288,46 @@ class EnvironmentGitHubProvider:
     ) -> PbiRefinementUpdateResult:
         provider = cast(PbiRefinementMutationProvider, self._configured_provider())
         return provider.apply_pbi_refinement(request)
+
+    def prepare_pbi_relations(self, request: PbiRelationRequest) -> PbiRelationSnapshot:
+        provider = cast(PbiRelationProvider, self._configured_provider())
+        return provider.prepare_pbi_relations(request)
+
+    def list_pbi_sub_issues(
+        self, repository: str, parent_issue_number: int
+    ) -> tuple[PbiRelationIssue, ...]:
+        provider = cast(PbiRelationProvider, self._configured_provider())
+        return provider.list_pbi_sub_issues(repository, parent_issue_number)
+
+    def get_pbi_parent_issue_number(
+        self, repository: str, child_issue_number: int
+    ) -> int | None:
+        provider = cast(PbiRelationProvider, self._configured_provider())
+        return provider.get_pbi_parent_issue_number(repository, child_issue_number)
+
+    def list_pbi_blocked_by(
+        self, repository: str, issue_number: int
+    ) -> tuple[PbiRelationIssue, ...]:
+        provider = cast(PbiRelationProvider, self._configured_provider())
+        return provider.list_pbi_blocked_by(repository, issue_number)
+
+    def list_pbi_blocking(
+        self, repository: str, issue_number: int
+    ) -> tuple[PbiRelationIssue, ...]:
+        provider = cast(PbiRelationProvider, self._configured_provider())
+        return provider.list_pbi_blocking(repository, issue_number)
+
+    def add_pbi_sub_issue(
+        self, repository: str, parent_issue_number: int, child_issue_id: int
+    ) -> None:
+        provider = cast(PbiRelationProvider, self._configured_provider())
+        provider.add_pbi_sub_issue(repository, parent_issue_number, child_issue_id)
+
+    def add_pbi_dependency(
+        self, repository: str, blocked_issue_number: int, blocker_issue_id: int
+    ) -> None:
+        provider = cast(PbiRelationProvider, self._configured_provider())
+        provider.add_pbi_dependency(repository, blocked_issue_number, blocker_issue_id)
 
     def create_handoff(self, request: HandoffRequest) -> HandoffResult:
         return self._configured_provider().create_handoff(request)

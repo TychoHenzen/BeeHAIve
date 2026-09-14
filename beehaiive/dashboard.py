@@ -146,6 +146,7 @@ def _pbi_view(
         ]
     escalation = _escalation_view(metadata, events)
     subtasks = _sequence(metadata.get("subtasks"))
+    dependency_readiness = _mapping(metadata.get("dependency_readiness")) or None
     source_url = metadata.get("source_url")
     matching_actions = [
         dict(action)
@@ -173,10 +174,13 @@ def _pbi_view(
         "active": bool(raw_pbi.get("active")),
         "archived": bool(raw_pbi.get("archived")),
         "planning_status": planning_status,
+        "issue_state": metadata.get("issue_state"),
+        "state_reason": metadata.get("state_reason"),
         "source_url": source_url,
         "claimable": bool(raw_pbi.get("claimable")),
         "checks": checks,
         "subtasks": subtasks,
+        "dependency_readiness": dependency_readiness,
         "pull_requests": pull_requests,
         "readers": readers,
         "reviewers": reviewers,
@@ -196,6 +200,7 @@ def _latest_metadata(events: Sequence[Mapping[str, object]]) -> dict[str, object
             "readers",
             "reviewers",
             "subtasks",
+            "dependency_readiness",
             "checks",
             "escalation",
             "escalation_log",
