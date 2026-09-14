@@ -283,4 +283,53 @@ test("rendering a pending operator question exposes its safe state and answer ac
       answer: "main",
     },
   ]);
+
+  view.render({
+    name: "Planning",
+    repositories: [
+      {
+        name: "owner/api",
+        active: true,
+        writer: { status: "idle" },
+        pbis: [
+          {
+            id: "owner/api#1",
+            number: 1,
+            title: "Completed API run",
+            status: "completed",
+            run_id: "run-1",
+            operator_questions: [
+              {
+                question_id: "question-1",
+                revision: 2,
+                kind: "question",
+                status: "answered",
+                question: "Which branch should be used?",
+                answer: "main",
+                notification_status: "cancelled",
+                notification_attempts: 0,
+              },
+            ],
+            task_result: {
+              outcome: "pass",
+              evidence: { summary: "Final implementation verified" },
+              artifact_refs: [],
+            },
+            stage_progress: [],
+            subtasks: [],
+            readers: [],
+            reviewers: {},
+            activity: [],
+          },
+        ],
+      },
+    ],
+  });
+  assert.match(dashboardOutput.textContent, /Task outcome: pass/);
+  const notification = findNode(
+    dashboardOutput,
+    (node) => node.tag === "div" && node._textContent.startsWith("Notification: cancelled"),
+  );
+  assert.ok(notification);
+  assert.equal(notification.className, "muted");
 });

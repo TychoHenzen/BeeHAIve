@@ -36,7 +36,21 @@ export function createDetailRenderers(dom) {
   function renderOperatorQuestion(question) {
     const section = element("section");
     section.append(element("h3", `Operator question: ${question.status || "unknown"}`));
-    section.append(element("div", question.question || "Question text unavailable", "status pending"));
+    section.append(
+      element(
+        "div",
+        question.question || "Question text unavailable",
+        question.status === "pending" ? "status pending" : "muted",
+      ),
+    );
+    const notificationClass =
+      question.notification_status === "delivered"
+        ? "status success"
+        : question.notification_status === "failed"
+          ? "status failure"
+          : ["cancelled", "not_configured"].includes(question.notification_status)
+            ? "muted"
+            : "status pending";
     section.append(
       element(
         "div",
@@ -50,7 +64,7 @@ export function createDetailRenderers(dom) {
       element(
         "div",
         `Notification: ${question.notification_status || "unknown"} · ${question.notification_attempts || 0} attempts`,
-        question.notification_status === "delivered" ? "status success" : "status pending",
+        notificationClass,
       ),
     );
     if (question.notification_last_error) {

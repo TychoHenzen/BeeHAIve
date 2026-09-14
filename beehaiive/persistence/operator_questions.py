@@ -184,7 +184,8 @@ class OperatorQuestionsMixin:
         updated = connection.execute(
             """
             UPDATE runs
-            SET status = 'awaiting_operator', execution_token = NULL,
+            SET status = 'awaiting_operator', task_answer_resumed = 0,
+                execution_token = NULL,
                 owner_id = NULL, lease_token = NULL, lease_expires_at = NULL,
                 last_error = NULL, last_result = NULL, updated_at = ?
             WHERE run_id = ? AND status = ?

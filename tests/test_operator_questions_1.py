@@ -219,3 +219,45 @@ def test_project_sync_preserves_question_block_and_answered_claimability(
     resumed_pbi = store.project_state("project-1")["repositories"][0]["pbis"][0]
     assert resumed_pbi["claimable"] is True
     store.close()
+
+
+def test_new_operator_question_revision_clears_prior_resumed_claimability(
+    tmp_path,
+) -> None:
+    store = OrchestratorStore(tmp_path / "question-revision-sync.sqlite3")
+    orchestrator = Orchestrator(store, FakeProvider(snapshot()))
+    orchestrator.synchronize("project-1")
+    run = orchestrator.claim("project-1", "owner/api", "worker-1")
+    assert run is not None
+    implementation = store.advance(run.run_id, Stage.IMPLEMENT, run.lease_token or "")
+    first_question = store.await_operator(
+        run.run_id,
+        implementation.lease_token or "",
+        kind="question",
+        question="Which branch should be used?",
+        evidence={},
+    )
+    store.answer_operator_question(
+        run.run_id,
+        question_id=str(first_question["question_id"]),
+        revision=int(first_question["revision"]),
+        answer="Use main",
+        authorization_method="X-API-Key",
+    )
+    store.mark_task_question_resumed(run.run_id)
+    resumed = orchestrator.claim("project-1", "owner/api", "worker-2")
+    assert resumed is not None
+    failed = store.fail(resumed.run_id, "Routing exhausted", resumed.lease_token or "")
+    assert failed.status.value == "failed"
+    second_question = store.await_operator_after_failure(
+        resumed.run_id,
+        kind="routing_exhausted",
+        question="Choose a routing target",
+        evidence={},
+    )
+
+    store.sync_project(snapshot())
+    waiting_pbi = store.project_state("project-1")["repositories"][0]["pbis"][0]
+    assert second_question["revision"] == 2
+    assert waiting_pbi["claimable"] is False
+    store.close()

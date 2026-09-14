@@ -10,6 +10,7 @@ import httpx
 WEBHOOK_URL_ENV = "BEEHAIIVE_NOTIFICATION_WEBHOOK_URL"
 WEBHOOK_SECRET_ENV = "BEEHAIIVE_NOTIFICATION_WEBHOOK_SECRET"
 NOTIFICATION_LIMIT = 25
+# ponytail: startup drains 25 questions; add a periodic paged worker if backlogs grow.
 NOTIFICATION_TIMEOUT_SECONDS = 2.0
 
 

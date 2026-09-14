@@ -37,7 +37,9 @@ records its status, and makes at most three attempts for transient failures.
 Without both settings, the question remains available in the dashboard and its
 notification status is `not_configured`. Answering a question cancels its
 undelivered notification. Stopping the run closes its pending question and
-cancels any queued notification.
+cancels any queued notification. Startup drains at most 25 queued notifications
+in one batch; new questions are dispatched when created. SQLite notification
+leases assume one API process per database.
 
 Unknown versions, outcomes, fields, malformed JSON, undeclared artifacts, and
 missing required artifacts fail closed. Evidence and operator text are bounded

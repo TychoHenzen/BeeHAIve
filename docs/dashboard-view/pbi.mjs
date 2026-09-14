@@ -29,6 +29,9 @@ export function createPbiRenderer(dom, details, runAction) {
     const details = element("div", undefined, "details");
     if (pbi.task_contract) details.append(renderTaskContract(pbi.task_contract));
     const operatorQuestions = pbi.operator_questions || [];
+    const hasPendingOperatorQuestion = operatorQuestions.some(
+      (question) => question.status === "pending",
+    );
     if (operatorQuestions.length > 0) {
       operatorQuestions.forEach((question) => {
         const section = renderOperatorQuestion(question);
@@ -53,7 +56,10 @@ export function createPbiRenderer(dom, details, runAction) {
         }
         details.append(section);
       });
-    } else if (pbi.task_result) details.append(renderTaskResult(pbi.task_result));
+    }
+    if (pbi.task_result && !hasPendingOperatorQuestion) {
+      details.append(renderTaskResult(pbi.task_result));
+    }
     details.append(renderListSection("Subtasks", pbi.subtasks, renderSubtask));
     if (pbi.dependency_readiness || (pbi.subtasks || []).length > 0) {
       details.append(renderDependencyReadiness(pbi.dependency_readiness));
