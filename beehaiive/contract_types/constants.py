@@ -9,12 +9,21 @@ MAX_RESULT_KEYS = 40
 MAX_RESULT_DEPTH = 4
 _SECRET_JSON = re.compile(
     r"([\"']?(?:access[_-]?token|refresh[_-]?token|token|api[_-]?key|"
-    r"client[_-]?secret|secret|password)[\"']?\s*:\s*)"
-    r"(?:\"[^\"]*\"|'[^']*'|[^,}\s]+)",
+    r"client[_-]?secret|private[_-]?key|credential|secret|password)"
+    r"[\"']?\s*:\s*)"
+    r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|"
+    r"\[redacted\]|\[[\s\S]*\]|\{[\s\S]*\}|[^,}\s]+)",
     re.IGNORECASE,
 )
 _SECRET_ASSIGNMENT = re.compile(
-    r"\b(token|api[_-]?key|secret|password)\b\s*[:=]\s*\S+", re.IGNORECASE
+    r"\b(access[_-]?token|refresh[_-]?token|client[_-]?secret|"
+    r"private[_-]?key|credential|token|api[_-]?key|secret|password)\b"
+    r"\s*[:=]\s*(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|"
+    r"\[(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\"'\]])*\]|"
+    r"\{[\s\S]*\}|"
+    r"[^\s,;\x7b\x7d\x5b]+(?:\s+(?!(?:[\"']?[A-Za-z_][A-Za-z0-9_-]*"
+    r"[\"']?\s*[:=])|[\x7b\x5b])[^\s,;\x7b\x7d\x5b]+)*)",
+    re.IGNORECASE,
 )
 _BEARER_TOKEN = re.compile(r"\bBearer\s+\S+", re.IGNORECASE)
 _URL_CREDENTIALS = re.compile(r"(https?://)[^/\s:@]+:[^@\s]+@", re.IGNORECASE)

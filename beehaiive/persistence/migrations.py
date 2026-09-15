@@ -154,6 +154,46 @@ class StorageMigrationMixin:
         )
         self._connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS graph_safety_evidence (
+                evidence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workflow_id TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision > 0),
+                definition_hash TEXT NOT NULL,
+                evidence_hash TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE (workflow_id, revision)
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS graph_safety_reviews (
+                review_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workflow_id TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision > 0),
+                definition_hash TEXT NOT NULL,
+                evidence_hash TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                reviewed_at TEXT NOT NULL,
+                UNIQUE (workflow_id, revision)
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS graph_active_versions (
+                workflow_id TEXT PRIMARY KEY,
+                revision INTEGER NOT NULL CHECK (revision > 0),
+                definition_hash TEXT NOT NULL,
+                evidence_hash TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                activated_at TEXT NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS graph_transitions (
                 transition_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 replay_id TEXT NOT NULL UNIQUE,

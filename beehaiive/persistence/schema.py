@@ -220,6 +220,37 @@ class StorageSchemaMixin:
                 CREATE INDEX IF NOT EXISTS graph_transitions_by_execution
                     ON graph_transitions(execution_id, transition_id);
 
+                CREATE TABLE IF NOT EXISTS graph_safety_evidence (
+                    evidence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workflow_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL CHECK (revision > 0),
+                    definition_hash TEXT NOT NULL,
+                    evidence_hash TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (workflow_id, revision)
+                );
+
+                CREATE TABLE IF NOT EXISTS graph_safety_reviews (
+                    review_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workflow_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL CHECK (revision > 0),
+                    definition_hash TEXT NOT NULL,
+                    evidence_hash TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    reviewed_at TEXT NOT NULL,
+                    UNIQUE (workflow_id, revision)
+                );
+
+                CREATE TABLE IF NOT EXISTS graph_active_versions (
+                    workflow_id TEXT PRIMARY KEY,
+                    revision INTEGER NOT NULL CHECK (revision > 0),
+                    definition_hash TEXT NOT NULL,
+                    evidence_hash TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    activated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS graph_transition_claims (
                     replay_id TEXT PRIMARY KEY,
                     owner_id TEXT NOT NULL,

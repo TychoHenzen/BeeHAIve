@@ -20,7 +20,7 @@ class GraphDefinitionMixin:
             definition_data = definition.as_dict()
         except GraphDefinitionError as error:
             raise StoreError(str(error)) from error
-        payload = json.dumps(definition_data, sort_keys=True, separators=(",", ":"))
+        payload = _definition_payload(definition_data)
         with self._transaction() as connection:
             row = connection.execute(
                 """
@@ -31,7 +31,22 @@ class GraphDefinitionMixin:
                 (definition.workflow_id, definition.revision),
             ).fetchone()
             if row is not None:
-                if row["definition_json"] != payload:
+                stored_payload = str(row["definition_json"])
+                if stored_payload != payload:
+                    try:
+                        stored_value = json.loads(stored_payload)
+                        equivalent_payload = (
+                            _definition_payload(
+                                cast(Mapping[str, object], stored_value)
+                            )
+                            if isinstance(stored_value, Mapping)
+                            else ""
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        equivalent_payload = ""
+                else:
+                    equivalent_payload = payload
+                if equivalent_payload != payload:
                     raise StoreError("Graph definition revisions are immutable")
                 return definition
             connection.execute(
@@ -111,3 +126,16 @@ class GraphDefinitionMixin:
 
 
 __all__ = ["GraphDefinitionMixin"]
+
+
+def _definition_payload(value: Mapping[str, object]) -> str:
+    normalized = dict(value)
+    limits = normalized.get("limits")
+    if isinstance(limits, Mapping):
+        normalized_limits = dict(cast(Mapping[str, object], limits))
+        if "timeout_seconds" in normalized_limits:
+            normalized_limits["timeout_seconds"] = float(
+                cast(float, normalized_limits["timeout_seconds"])
+            )
+        normalized["limits"] = normalized_limits
+    return json.dumps(normalized, sort_keys=True, separators=(",", ":"))

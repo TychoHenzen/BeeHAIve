@@ -15,6 +15,7 @@ from beehaiive.api.helpers.configuration import (
     _routing_config_from_environment as _routing_config_from_environment,
 )
 from beehaiive.conflict_repair import ConflictRepairAgent, ConflictRepairService
+from beehaiive.graph_safety import GraphSafetyService
 from beehaiive.meta_review import MetaReviewService
 from beehaiive.pbi_creation import PbiCreationProvider, PbiCreationService
 from beehaiive.pbi_relations import PbiRelationProvider, PbiRelationService
@@ -43,6 +44,7 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
     routing_store = options["routing_store"]
     store = options["store"]
     workflow_service = options["workflow_service"]
+    graph_safety_service = options["graph_safety_service"]
     owns_orchestrator = orchestrator is None
     if orchestrator is not None and orchestrator.model_router is not None:
         if model_router is not None and model_router is not orchestrator.model_router:
@@ -85,6 +87,13 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
         orchestrator.model_router = routing_service
     if orchestrator.model_executor is None:
         orchestrator.model_executor = model_executor
+    if (
+        graph_safety_service is not None
+        and graph_safety_service.store is not orchestrator.store
+    ):
+        raise ValueError("The graph safety service and API must share one state store")
+    if graph_safety_service is None:
+        graph_safety_service = GraphSafetyService(orchestrator.store)
     pbi_creation_service = PbiCreationService(
         orchestrator.store,
         cast(PbiCreationProvider, orchestrator.provider),
@@ -222,5 +231,6 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
         "scheduler_config": scheduler_config,
         "scheduler": scheduler,
         "workflow_service": workflow_service,
+        "graph_safety_service": graph_safety_service,
         "require_review_adapters": require_review_adapters,
     }
