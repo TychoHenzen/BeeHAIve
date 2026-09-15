@@ -1,6 +1,6 @@
 export function createPbiRenderer(dom, details, runAction) {
   const { element, renderEvidenceLink, renderListSection, pullRequestLabel } = dom;
-  const { renderTaskContract, renderTaskResult, renderOperatorQuestion, renderProgress, renderAgentSession, renderSubtask, renderDependencyReadiness, renderChecks, renderReviewers, renderEscalation, renderActivity } = details;
+  const { renderTaskContract, renderTaskResult, renderCanonicalLifecycle, renderOperatorQuestion, renderProgress, renderAgentSession, renderSubtask, renderDependencyReadiness, renderChecks, renderReviewers, renderEscalation, renderActivity } = details;
   function renderPbi(repository, pbi) {
     const card = element("article", undefined, "pbi");
     if (!card.dataset) card.dataset = {};
@@ -27,6 +27,7 @@ export function createPbiRenderer(dom, details, runAction) {
     if (pbi.pull_request_url) card.append(renderEvidenceLink("Pull request", pbi.pull_request_url));
     card.append(renderProgress(pbi.stage_progress || []));
     const details = element("div", undefined, "details");
+    details.append(renderCanonicalLifecycle(pbi.canonical_lifecycle));
     const agentSession = renderAgentSession(pbi.agent_session);
     if (agentSession) details.append(agentSession);
     if (pbi.task_contract) details.append(renderTaskContract(pbi.task_contract));

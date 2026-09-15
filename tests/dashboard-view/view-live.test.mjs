@@ -292,6 +292,64 @@ test("rendering keeps project and pull-request terminal state visible", () => {
   assert.doesNotMatch(dashboardOutput.textContent, /#9: review pending/);
 });
 
+test("rendering exposes the canonical lifecycle state and evidence", () => {
+  const dashboardOutput = new FakeNode("section");
+  const view = createDashboardView({
+    document: new FakeDocument(),
+    summaryOutput: new FakeNode("section"),
+    dashboardOutput,
+    actionLog: new FakeNode("section"),
+    actionsOutput: new FakeNode("div"),
+    runAction: () => {},
+  });
+  view.render({
+    name: "Planning",
+    counts: {},
+    repositories: [
+      {
+        name: "owner/api",
+        active: true,
+        writer: { status: "idle" },
+        pbis: [
+          {
+            number: 1,
+            title: "Blocked API",
+            canonical_lifecycle: {
+              state: "blocked",
+              facts: { project: {}, provider: {}, run: {}, optional_sources: {} },
+              source_version: "v1",
+              reason_code: "conflict",
+              required_action: "Refresh checks",
+              transition_evidence: [
+                {
+                  state_before: "checks",
+                  state_after: "blocked",
+                  reason_code: "conflict",
+                  source_id: "owner/api#1",
+                  observed_at: "2026-09-15T00:00:00+00:00",
+                },
+              ],
+            },
+            stage_progress: [],
+            subtasks: [],
+            readers: [],
+            reviewers: {},
+            activity: [],
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.match(dashboardOutput.textContent, /Canonical lifecycle/);
+  assert.match(dashboardOutput.textContent, /State: blocked/);
+  assert.match(dashboardOutput.textContent, /Reason: conflict/);
+  assert.match(dashboardOutput.textContent, /Required action: Refresh checks/);
+  assert.match(dashboardOutput.textContent, /Facts: project, provider, run, optional_sources/);
+  assert.match(dashboardOutput.textContent, /checks -> blocked/);
+  assert.match(dashboardOutput.textContent, /source owner\/api#1/);
+});
+
 test("rendering a pending operator question exposes its safe state and answer action", () => {
   const summaryOutput = new FakeNode("section");
   const dashboardOutput = new FakeNode("section");
