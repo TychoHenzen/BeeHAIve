@@ -82,6 +82,39 @@ export function createDetailRenderers(dom) {
     return list;
   }
 
+  function renderAgentSession(session) {
+    if (!session || typeof session !== "object") return null;
+    const section = element("section");
+    section.append(element("h3", "Agent session"));
+    const display = (value) => value === undefined || value === null || value === ""
+      ? "Unavailable"
+      : value;
+    [
+      ["Worker", session.worker_id],
+      ["Task", session.task],
+      ["State", session.state],
+    ].forEach(([label, value]) => section.append(element("div", `${label}: ${display(value)}`, "muted")));
+    const events = Array.isArray(session.events) ? session.events.slice(-100) : [];
+    if (events.length === 0) {
+      section.append(element("div", "Events: None", "muted"));
+      return section;
+    }
+    const list = element("ul");
+    events.forEach((event) => {
+      const text = typeof event.text === "string" ? event.text.slice(0, 4_000) : "";
+      const parts = [
+        event.sequence,
+        event.timestamp,
+        event.kind || event.source_type,
+        event.role,
+        text,
+      ].filter((value) => value !== undefined && value !== null && value !== "");
+      list.append(element("li", parts.join(" · "), "muted"));
+    });
+    section.append(element("div", "Events", "muted"), list);
+    return section;
+  }
+
   function renderChecks(checks) {
     const section = element("section");
     const verdict = checks.verdict || "unproven";
@@ -185,5 +218,5 @@ export function createDetailRenderers(dom) {
     }
     return section;
   }
-  return { renderTaskContract, renderTaskResult, renderOperatorQuestion, renderProgress, renderChecks, renderSubtask, renderDependencyReadiness, renderReviewers, renderEscalation, renderActivity };
+  return { renderTaskContract, renderTaskResult, renderOperatorQuestion, renderProgress, renderAgentSession, renderChecks, renderSubtask, renderDependencyReadiness, renderReviewers, renderEscalation, renderActivity };
 }

@@ -1,6 +1,6 @@
 export function createSummaryRenderer(dom, summaryOutput) {
   const { element } = dom;
-  function renderSummary(counts) {
+  function renderSummary(counts, scheduler) {
     summaryOutput.replaceChildren();
     const fields = [
       ["Projects", counts.projects],
@@ -14,6 +14,25 @@ export function createSummaryRenderer(dom, summaryOutput) {
       ["Failed runs", counts.failed_runs],
       ["Completed runs", counts.completed_runs],
     ];
+    if (scheduler && typeof scheduler === "object") {
+      const enabled = scheduler.enabled === true
+        ? "enabled"
+        : scheduler.enabled === false
+          ? "disabled"
+          : "unavailable";
+      const running = scheduler.running === true
+        ? "running"
+        : scheduler.running === false
+          ? "stopped"
+          : "unavailable";
+      const display = (value) => value === undefined || value === null ? "Unavailable" : value;
+      fields.push(
+        ["Scheduler", `${enabled}, ${running}`],
+        ["Worker capacity", `${display(scheduler.active_workers)} / ${display(scheduler.max_concurrency)}`],
+      );
+      if (scheduler.last_poll_at) fields.push(["Last poll", scheduler.last_poll_at]);
+      if (scheduler.last_error) fields.push(["Scheduler error", scheduler.last_error]);
+    }
     fields.forEach(([label, value]) => {
       const card = element("div", undefined, "card");
       card.append(element("div", label, "label"));

@@ -30,7 +30,7 @@ export function createDashboardView({
   }
 
   function render(state) {
-    renderSummary(state.counts || {});
+    renderSummary(state.counts || {}, state.scheduler);
     dashboardOutput.replaceChildren();
     dashboardOutput.append(renderProject(state));
     const repositories = state.repositories || [];

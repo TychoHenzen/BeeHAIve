@@ -35,6 +35,13 @@ test("rendering live state exposes current stages and active actions", () => {
       active_runs: 1,
       failed_runs: 0,
     },
+    scheduler: {
+      enabled: true,
+      running: true,
+      active_workers: 1,
+      max_concurrency: 2,
+      last_poll_at: "2026-09-09T20:00:00Z",
+    },
     repositories: [
       {
         name: "owner/api",
@@ -66,6 +73,29 @@ test("rendering live state exposes current stages and active actions", () => {
               outcome: "pass",
               evidence: { summary: "done" },
               artifact_refs: [{ id: "report", path: "report.txt" }],
+            },
+            agent_session: {
+              session_id: "run-1",
+              worker_id: "worker-1",
+              task: "inspect repository",
+              state: "active",
+              events: [
+                {
+                  sequence: 1,
+                  kind: "progress",
+                  source_type: "turn.started",
+                  timestamp: "2026-09-09T19:59:00Z",
+                  text: "started",
+                },
+                {
+                  sequence: 2,
+                  kind: "message",
+                  source_type: "agent_message",
+                  role: "assistant",
+                  timestamp: "2026-09-09T19:59:30Z",
+                  text: "safe <message>",
+                },
+              ],
             },
             subtasks: [{ id: "#2", title: "Test API" }],
             escalation: { current: 0, current_tier: "terra", consecutive: 0 },
@@ -101,6 +131,9 @@ test("rendering live state exposes current stages and active actions", () => {
   });
 
   assert.match(summaryOutput.textContent, /Projects1/);
+  assert.match(summaryOutput.textContent, /Schedulerenabled, running/);
+  assert.match(summaryOutput.textContent, /Worker capacity1 \/ 2/);
+  assert.match(summaryOutput.textContent, /Last poll2026-09-09T20:00:00Z/);
   assert.match(dashboardOutput.textContent, /Planning/);
   assert.match(dashboardOutput.textContent, /Updated: 2026-09-09T20:00:00Z/);
   assert.match(dashboardOutput.textContent, /Live API/);
@@ -113,6 +146,12 @@ test("rendering live state exposes current stages and active actions", () => {
   assert.match(dashboardOutput.textContent, /Required evidence:.*summary/);
   assert.match(dashboardOutput.textContent, /Inventory report/);
   assert.match(dashboardOutput.textContent, /Artifacts:/);
+  assert.match(dashboardOutput.textContent, /Agent session/);
+  assert.match(dashboardOutput.textContent, /Worker: worker-1/);
+  assert.match(dashboardOutput.textContent, /Task: inspect repository/);
+  assert.match(dashboardOutput.textContent, /State: active/);
+  assert.match(dashboardOutput.textContent, /started/);
+  assert.match(dashboardOutput.textContent, /safe <message>/);
   assert.equal(actionLog.hidden, false);
 
   const startButton = findNode(
@@ -135,6 +174,58 @@ test("rendering live state exposes current stages and active actions", () => {
     repository: "owner/web",
     pbi_number: 3,
   });
+});
+
+test("session and scheduler display stay bounded and fail closed on missing values", () => {
+  const summaryOutput = new FakeNode("section");
+  const dashboardOutput = new FakeNode("section");
+  const actionLog = new FakeNode("section");
+  const actionsOutput = new FakeNode("div");
+  const view = createDashboardView({
+    document: new FakeDocument(),
+    summaryOutput,
+    dashboardOutput,
+    actionLog,
+    actionsOutput,
+    runAction: () => {},
+  });
+  const events = Array.from({ length: 101 }, (_, sequence) => ({
+    sequence,
+    kind: "message",
+    text: sequence === 100 ? "x".repeat(5_000) : `event-${sequence}`,
+  }));
+
+  view.render({
+    name: "Planning",
+    counts: {},
+    scheduler: { enabled: true, running: false, active_workers: 0 },
+    repositories: [
+      {
+        name: "owner/api",
+        active: true,
+        writer: { status: "idle" },
+        pbis: [
+          {
+            number: 1,
+            title: "Bounded API",
+            status: "active",
+            agent_session: { worker_id: "worker-1", task: "inspect", events },
+            stage_progress: [],
+            subtasks: [],
+            readers: [],
+            reviewers: {},
+            activity: [],
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.match(summaryOutput.textContent, /Schedulerenabled, stopped/);
+  assert.match(summaryOutput.textContent, /Worker capacity0 \/ Unavailable/);
+  assert.doesNotMatch(dashboardOutput.textContent, /event-0/);
+  assert.match(dashboardOutput.textContent, /event-99/);
+  assert.equal(dashboardOutput.textContent.includes("x".repeat(4_001)), false);
 });
 
 test("rendering keeps project and pull-request terminal state visible", () => {
