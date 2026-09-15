@@ -178,17 +178,104 @@ def pull_request_line(item: Mapping[str, Any]) -> str:
     return f"#{item.get('number')}: {state}{suffix}"
 
 
+def subtask_line(item: Mapping[str, Any]) -> str:
+    label = f"{item.get('id') or 'subtask'}: {item.get('title') or ''}"
+    readiness = item.get("readiness") or "unknown"
+    issue = (
+        f"Issue {item['issue_state']}"
+        + (f" ({item['state_reason']})" if item.get("state_reason") else "")
+        if item.get("issue_state")
+        else "Issue state unavailable"
+    )
+    project = (
+        f"Project status {item['project_status']}"
+        if item.get("project_status")
+        else "Project status unavailable"
+    )
+    if item.get("dependency_read_complete"):
+        blockers = "Blocked by " + ", ".join(
+            f"#{blocker.get('number')} {blocker.get('state')}"
+            + (f" ({blocker['state_reason']})" if blocker.get("state_reason") else "")
+            for blocker in response_mappings(item.get("blocked_by"))
+        )
+        if blockers == "Blocked by ":
+            blockers = "Blocked by none"
+    else:
+        blockers = (
+            "Blocked-by facts unavailable ("
+            + str(item.get("dependency_read_error") or "read incomplete")
+            + ")"
+        )
+    reasons = item.get("readiness_reasons")
+    reason_text = (
+        ", ".join(str(reason) for reason in reasons)
+        if isinstance(reasons, list)
+        else ""
+    )
+    observed = f" Observed: {item['observed_at']}." if item.get("observed_at") else ""
+    return (
+        f"{label}. Readiness: {readiness}. {issue}. {project}. {blockers}."
+        + (f" Reasons: {reason_text}." if reason_text else "")
+        + observed
+    )
+
+
 def response_metadata_lines(payload: Mapping[str, Any]) -> list[str]:
     lines: list[str] = []
     for repository in response_mappings(payload.get("repositories")):
         for pbi in response_mappings(repository.get("pbis")):
+            canonical = pbi.get("canonical_lifecycle")
+            canonical_values = canonical if isinstance(canonical, Mapping) else {}
+            reason = canonical_values.get("reason_code") or "evidence_missing"
+            action = canonical_values.get("required_action")
+            facts = canonical_values.get("facts")
+            fact_names = (
+                ", ".join(str(name) for name in facts)
+                if isinstance(facts, Mapping) and facts
+                else "Unavailable"
+            )
+            lines.extend(
+                (
+                    f"Canonical lifecycle: Reason: {reason}",
+                    "Canonical lifecycle: Required action: "
+                    + (
+                        str(action)
+                        if isinstance(action, str) and action
+                        else "Unavailable"
+                    ),
+                    f"Canonical lifecycle: Facts: {fact_names}",
+                )
+            )
+            evidence = response_mappings(canonical_values.get("transition_evidence"))
+            if evidence:
+                lines.append("Canonical lifecycle: Transition evidence")
+                for item in evidence[-100:]:
+                    transition = (
+                        f"{item.get('state_before') or 'unknown'} -> "
+                        f"{item.get('state_after') or 'unknown'}"
+                    )
+                    detail = " \u00b7 ".join(
+                        part
+                        for part in (
+                            transition,
+                            str(item.get("reason_code") or "unknown"),
+                            (
+                                f"source {item['source_id']}"
+                                if item.get("source_id")
+                                else ""
+                            ),
+                            str(item.get("observed_at") or "time unavailable"),
+                        )
+                        if part
+                    )
+                    lines.append(f"Canonical lifecycle: {detail}")
+            else:
+                lines.append("Canonical lifecycle: Transition evidence: Unavailable")
             for title, key, formatter in (
                 (
                     "Subtasks",
                     "subtasks",
-                    lambda item: (
-                        f"{item.get('id') or 'subtask'}: {item.get('title') or ''}"
-                    ),
+                    subtask_line,
                 ),
                 (
                     "Readers",
@@ -209,6 +296,29 @@ def response_metadata_lines(payload: Mapping[str, Any]) -> list[str]:
                     lines.extend(f"{title}: {formatter(item)}" for item in values)
                 else:
                     lines.append(f"{title}: None")
+                if key == "subtasks":
+                    readiness = pbi.get("dependency_readiness")
+                    if not values and not (
+                        isinstance(readiness, Mapping) and readiness
+                    ):
+                        continue
+                    if not isinstance(readiness, Mapping):
+                        lines.append(
+                            "Dependency readiness: Unknown. Readiness evidence is "
+                            "unavailable."
+                        )
+                    else:
+                        reasons = response_values(readiness.get("reasons"))
+                        if reasons:
+                            lines.append(
+                                "Dependency readiness: Reasons: "
+                                + ", ".join(str(reason) for reason in reasons)
+                            )
+                        observed_at = readiness.get("observed_at")
+                        if observed_at:
+                            lines.append(
+                                f"Dependency readiness: Observed: {observed_at}"
+                            )
 
             reviewers = pbi.get("reviewers")
             reviewer_values = (

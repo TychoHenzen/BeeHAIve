@@ -31,6 +31,7 @@ class ProjectReadMixin:
             if project is None:
                 raise StoreError(f"Unknown project: {project_id}")
             events_by_pbi = self._events_for_project(project_id, event_limit)
+            evidence_by_pbi = self.lifecycle_evidence_for_project(project_id)
             repositories: list[dict[str, object]] = []
             repository_rows = self._connection.execute(
                 """
@@ -83,7 +84,34 @@ class ProjectReadMixin:
                     (project_id, repository),
                 ).fetchall()
                 for pbi_row in pbi_rows:
-                    events = events_by_pbi.get((repository, int(pbi_row["number"])), [])
+                    pbi_key = (repository, int(pbi_row["number"]))
+                    events = events_by_pbi.get(pbi_key, [])
+                    transition_evidence = evidence_by_pbi.get(pbi_key, [])
+                    task_result = _json_mapping_or_none(pbi_row["task_result_json"])
+                    required_action = (
+                        task_result.get("required_action")
+                        if task_result is not None
+                        else None
+                    )
+                    if (
+                        not isinstance(required_action, str)
+                        or not required_action.strip()
+                    ):
+                        required_action = None
+                    canonical_lifecycle = {
+                        "state": str(pbi_row["canonical_state"] or "unknown"),
+                        "facts": _json_mapping(pbi_row["canonical_facts_json"]),
+                        "source_version": str(
+                            pbi_row["canonical_source_version"] or ""
+                        ),
+                        "reason_code": (
+                            transition_evidence[-1]["reason_code"]
+                            if transition_evidence
+                            else "evidence_missing"
+                        ),
+                        "required_action": required_action,
+                        "transition_evidence": transition_evidence,
+                    }
                     pbi: dict[str, object] = {
                         "id": f"{repository}#{pbi_row['number']}",
                         "number": pbi_row["number"],
@@ -100,10 +128,9 @@ class ProjectReadMixin:
                         "task_contract": _json_mapping_or_none(
                             pbi_row["task_contract_json"]
                         ),
-                        "task_result": _json_mapping_or_none(
-                            pbi_row["task_result_json"]
-                        ),
+                        "task_result": task_result,
                         "task_answer": pbi_row["task_answer"],
+                        "canonical_lifecycle": canonical_lifecycle,
                         "operator_questions": (
                             self.operator_questions_for_run(str(pbi_row["run_id"]))
                             if pbi_row["run_id"]

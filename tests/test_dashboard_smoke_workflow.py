@@ -6,6 +6,7 @@ from scripts.dashboard_smoke_proof import (
     pull_request_line,
     rendered_pull_request_states,
     response_backed_dashboard_fields,
+    response_metadata_lines,
 )
 
 
@@ -86,6 +87,70 @@ def test_response_dashboard_fields_require_the_requested_project() -> None:
     )
 
     assert fields["project_id"] is False
+
+
+def test_response_metadata_lines_include_canonical_and_dependency_sections() -> None:
+    lines = response_metadata_lines(
+        {
+            "repositories": [
+                {
+                    "pbis": [
+                        {
+                            "canonical_lifecycle": {
+                                "reason_code": "advance",
+                                "facts": {"project": {}, "provider": {}},
+                                "transition_evidence": [
+                                    {
+                                        "state_before": "planning",
+                                        "state_after": "refinement",
+                                        "reason_code": "advance",
+                                        "source_id": "owner/api#1",
+                                        "observed_at": "now",
+                                    }
+                                ],
+                            },
+                            "subtasks": [{"id": "child", "title": "Check API"}],
+                        }
+                    ]
+                }
+            ]
+        }
+    )
+    assert "Canonical lifecycle: Reason: advance" in lines
+    assert "Canonical lifecycle: Facts: project, provider" in lines
+    assert (
+        "Subtasks: child: Check API. Readiness: unknown. Issue state unavailable. "
+        "Project status unavailable. Blocked-by facts unavailable (read incomplete)."
+        in lines
+    )
+    assert (
+        "Canonical lifecycle: planning -> refinement · advance · source owner/api#1 · "
+        "now"
+    ) in lines
+    assert "Dependency readiness: Unknown. Readiness evidence is unavailable." in lines
+    multi_reason_lines = response_metadata_lines(
+        {
+            "repositories": [
+                {
+                    "pbis": [
+                        {
+                            "dependency_readiness": {
+                                "status": "unknown",
+                                "reasons": ["first", "second"],
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+    )
+    assert "Dependency readiness: Reasons: first, second" in multi_reason_lines
+    assert not any(
+        line.startswith("Dependency readiness:")
+        for line in response_metadata_lines(
+            {"repositories": [{"pbis": [{"number": 1}]}]}
+        )
+    )
 
 
 @pytest.mark.parametrize(

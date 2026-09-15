@@ -33,6 +33,52 @@ export function createDetailRenderers(dom) {
     return section;
   }
 
+  function renderCanonicalLifecycle(canonical) {
+    const source = canonical && typeof canonical === "object" ? canonical : {};
+    const state = typeof source.state === "string" && source.state.trim()
+      ? source.state
+      : "unknown";
+    const reason = typeof source.reason_code === "string" && source.reason_code.trim()
+      ? source.reason_code
+      : "evidence_missing";
+    const action = typeof source.required_action === "string" && source.required_action.trim()
+      ? source.required_action
+      : "Unavailable";
+    const version = typeof source.source_version === "string" && source.source_version.trim()
+      ? source.source_version
+      : "Unavailable";
+    const facts = source.facts && typeof source.facts === "object"
+      ? Object.keys(source.facts)
+      : [];
+    const evidence = Array.isArray(source.transition_evidence)
+      ? source.transition_evidence.slice(-100)
+      : [];
+    const section = element("section");
+    section.append(element("h3", "Canonical lifecycle"));
+    section.append(element("div", `State: ${state}`, "status"));
+    section.append(element("div", `Reason: ${reason}`, "muted"));
+    section.append(element("div", `Required action: ${action}`, "muted"));
+    section.append(element("div", `Source version: ${version}`, "mono"));
+    section.append(element("div", `Facts: ${facts.length ? facts.join(", ") : "Unavailable"}`, "muted"));
+    if (evidence.length === 0) {
+      section.append(element("div", "Transition evidence: Unavailable", "muted"));
+    } else {
+      const list = element("ul");
+      evidence.forEach((item) => {
+        const transition = `${item.state_before || "unknown"} -> ${item.state_after || "unknown"}`;
+        const detail = [
+          transition,
+          item.reason_code || "unknown",
+          item.source_id ? `source ${item.source_id}` : "",
+          item.observed_at || "time unavailable",
+        ].filter(Boolean).join(" · ");
+        list.append(element("li", detail, "muted"));
+      });
+      section.append(element("div", "Transition evidence", "muted"), list);
+    }
+    return section;
+  }
+
   function renderOperatorQuestion(question) {
     const section = element("section");
     section.append(element("h3", `Operator question: ${question.status || "unknown"}`));
@@ -218,5 +264,5 @@ export function createDetailRenderers(dom) {
     }
     return section;
   }
-  return { renderTaskContract, renderTaskResult, renderOperatorQuestion, renderProgress, renderAgentSession, renderChecks, renderSubtask, renderDependencyReadiness, renderReviewers, renderEscalation, renderActivity };
+  return { renderTaskContract, renderTaskResult, renderCanonicalLifecycle, renderOperatorQuestion, renderProgress, renderAgentSession, renderChecks, renderSubtask, renderDependencyReadiness, renderReviewers, renderEscalation, renderActivity };
 }

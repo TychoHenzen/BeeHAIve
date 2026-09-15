@@ -95,6 +95,14 @@ def test_dashboard_projection_exposes_optional_run_details() -> None:
     assert pbi["task_result"]["artifact_refs"] == [{"id": "report"}]
     assert pbi["agent_session"]["session_id"] == "run-1"
     assert pbi["agent_session"]["events"][0]["sequence"] == 1
+    assert pbi["canonical_lifecycle"] == {
+        "state": "unknown",
+        "facts": {},
+        "source_version": "",
+        "reason_code": "evidence_missing",
+        "required_action": None,
+        "transition_evidence": [],
+    }
 
     completed = build_dashboard_state(
         {
@@ -154,6 +162,44 @@ def test_dashboard_projection_exposes_optional_run_details() -> None:
         {"project_id": "project-1", "name": "Planning", "repositories": None}
     )
     assert empty["repositories"] == []
+
+
+def test_dashboard_projection_preserves_canonical_lifecycle_evidence() -> None:
+    view = build_dashboard_state(
+        {
+            "project_id": "project-1",
+            "name": "Planning",
+            "repositories": [
+                {
+                    "name": "owner/api",
+                    "pbis": [
+                        {
+                            "number": 1,
+                            "canonical_lifecycle": {
+                                "state": "blocked",
+                                "facts": {"provider": {"checks_verdict": "blocking"}},
+                                "source_version": "v1",
+                                "reason_code": "conflict",
+                                "required_action": "Refresh checks",
+                                "transition_evidence": [
+                                    {
+                                        "state_before": "checks",
+                                        "state_after": "blocked",
+                                        "reason_code": "conflict",
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    canonical = view["repositories"][0]["pbis"][0]["canonical_lifecycle"]
+    assert canonical["state"] == "blocked"
+    assert canonical["facts"] == {"provider": {"checks_verdict": "blocking"}}
+    assert canonical["required_action"] == "Refresh checks"
+    assert canonical["transition_evidence"][0]["state_after"] == "blocked"
 
 
 @pytest.mark.parametrize(

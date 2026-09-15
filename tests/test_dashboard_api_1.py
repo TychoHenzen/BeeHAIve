@@ -96,6 +96,17 @@ def test_dashboard_api_exposes_terminal_project_and_pull_request_state() -> None
     assert pbi["state_reason"] == "COMPLETED"
     assert pbi["subtasks"] == [child]
     assert pbi["dependency_readiness"] == readiness
+    canonical = pbi["canonical_lifecycle"]
+    assert canonical["state"] == "completed"
+    assert canonical["reason_code"] == "completion_confirmed"
+    assert canonical["facts"]["project"]["planning_status"] == "Done"
+    assert canonical["transition_evidence"][0]["state_after"] == "completed"
+    api_response = client.get("/projects/project-1")
+    assert api_response.status_code == 200
+    assert (
+        api_response.json()["repositories"][0]["pbis"][0]["canonical_lifecycle"]
+        == canonical
+    )
     service.store.close()
 
 

@@ -254,6 +254,56 @@ class CanonicalLifecycleMixin:
             ).fetchall()
             return tuple(dict(row) for row in rows)
 
+    def lifecycle_evidence_for_project(
+        self: Any, project_id: str
+    ) -> dict[tuple[str, int], list[dict[str, object]]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT repository_name, pbi_number, replay_id, event_type,
+                       source_owner, source_id, source_version, observed_at,
+                       state_before, state_after, reason_code, schema_version,
+                       created_at
+                FROM (
+                    SELECT repository_name, pbi_number, replay_id, event_type,
+                           source_owner, source_id, source_version, observed_at,
+                           state_before, state_after, reason_code, schema_version,
+                           created_at,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY repository_name, pbi_number
+                               ORDER BY evidence_id
+                           ) AS evidence_rank
+                    FROM lifecycle_transition_evidence
+                    WHERE project_id = ?
+                )
+                WHERE evidence_rank <= ?
+                ORDER BY repository_name, pbi_number, evidence_rank
+                """,
+                (project_id, MAX_TRANSITION_EVIDENCE_RECORDS),
+            ).fetchall()
+            evidence_by_pbi: dict[tuple[str, int], list[dict[str, object]]] = {}
+            for row in rows:
+                key = (str(row["repository_name"]), int(row["pbi_number"]))
+                evidence_by_pbi.setdefault(key, []).append(
+                    {
+                        key_name: row[key_name]
+                        for key_name in (
+                            "replay_id",
+                            "event_type",
+                            "source_owner",
+                            "source_id",
+                            "source_version",
+                            "observed_at",
+                            "state_before",
+                            "state_after",
+                            "reason_code",
+                            "schema_version",
+                            "created_at",
+                        )
+                    }
+                )
+            return evidence_by_pbi
+
 
 def _state_or_none(value: object) -> LifecycleState | None:
     if not isinstance(value, str):

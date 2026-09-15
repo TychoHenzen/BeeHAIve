@@ -70,6 +70,29 @@ def pbi_view(
     subtasks = sequence(metadata.get("subtasks"))
     dependency_readiness = mapping(metadata.get("dependency_readiness")) or None
     source_url = metadata.get("source_url")
+    canonical = mapping(raw_pbi.get("canonical_lifecycle"))
+    canonical_state = canonical.get("state")
+    canonical_reason = canonical.get("reason_code")
+    canonical_source_version = canonical.get("source_version")
+    required_action = canonical.get("required_action")
+    canonical_lifecycle = {
+        "state": canonical_state if isinstance(canonical_state, str) else "unknown",
+        "facts": dict(mapping(canonical.get("facts"))),
+        "source_version": (
+            canonical_source_version
+            if isinstance(canonical_source_version, str)
+            else ""
+        ),
+        "reason_code": (
+            canonical_reason
+            if isinstance(canonical_reason, str)
+            else "evidence_missing"
+        ),
+        "required_action": (
+            required_action if isinstance(required_action, str) else None
+        ),
+        "transition_evidence": mappings(canonical.get("transition_evidence")),
+    }
     matching_actions = [
         dict(action)
         for action in actions
@@ -92,6 +115,7 @@ def pbi_view(
         "task_contract": mapping(raw_pbi.get("task_contract")) or None,
         "task_result": mapping(raw_pbi.get("task_result")) or None,
         "task_answer": raw_pbi.get("task_answer"),
+        "canonical_lifecycle": canonical_lifecycle,
         "operator_questions": sequence(raw_pbi.get("operator_questions")),
         "agent_session": mapping(raw_pbi.get("agent_session")) or None,
         "active": bool(raw_pbi.get("active")),
