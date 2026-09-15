@@ -19,6 +19,15 @@ from .graph import (
     GraphNodeKind,
     GraphReference,
 )
+from .graph_execution import (
+    DEFAULT_GRAPH_MAX_STEPS,
+    GraphExecutionError,
+    GraphExecutionPolicy,
+    GraphExecutionService,
+    GraphTransition,
+    GraphTransitionStatus,
+    evaluate_graph_transition,
+)
 from .models import (
     HandoffRequest,
     HandoffResult,
@@ -90,6 +99,7 @@ __all__ = [
     "ArtifactRequirement",
     "ALLOWED_TOOL_CAPABILITIES",
     "ContractError",
+    "DEFAULT_GRAPH_MAX_STEPS",
     "CheckResult",
     "CommandCheck",
     "Constitution",
@@ -98,12 +108,17 @@ __all__ = [
     "FindingStatus",
     "GraphDefinition",
     "GraphDefinitionError",
+    "GraphExecutionError",
+    "GraphExecutionPolicy",
+    "GraphExecutionService",
     "GraphEdge",
     "GraphExecutionLimits",
     "GraphModelPolicy",
     "GraphNode",
     "GraphNodeKind",
     "GraphReference",
+    "GraphTransition",
+    "GraphTransitionStatus",
     "DeterministicCheckRunner",
     "GateResult",
     "GitHubProjectProvider",
@@ -157,4 +172,5 @@ __all__ = [
     "WorkflowRole",
     "WorkflowService",
     "WorkflowStore",
+    "evaluate_graph_transition",
 ]

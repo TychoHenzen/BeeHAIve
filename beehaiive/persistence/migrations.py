@@ -154,6 +154,48 @@ class StorageMigrationMixin:
         )
         self._connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS graph_transitions (
+                transition_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                replay_id TEXT NOT NULL UNIQUE,
+                execution_id TEXT NOT NULL,
+                workflow_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                node_id TEXT NOT NULL,
+                step INTEGER NOT NULL,
+                attempt INTEGER NOT NULL,
+                transition_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS graph_transitions_by_execution
+                ON graph_transitions(execution_id, transition_id)
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS graph_transition_claims (
+                replay_id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                claimed_at TEXT NOT NULL
+            )
+            """
+        )
+        claim_columns = {
+            str(row["name"])
+            for row in self._connection.execute(
+                "PRAGMA table_info(graph_transition_claims)"
+            ).fetchall()
+        }
+        if "owner_id" not in claim_columns:
+            self._connection.execute(
+                "ALTER TABLE graph_transition_claims ADD COLUMN owner_id TEXT "
+                "NOT NULL DEFAULT ''"
+            )
+        self._connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS budget_decision_evidence (
                 evidence_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_id TEXT NOT NULL,
