@@ -186,6 +186,7 @@ def test_storage_migrates_legacy_columns(tmp_path: Path) -> None:
         "agent_sessions",
         "agent_session_events",
         "lifecycle_transition_evidence",
+        "graph_definitions",
         "budget_decision_evidence",
     } <= tables
     assert {

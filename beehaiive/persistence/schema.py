@@ -191,6 +191,19 @@ class StorageSchemaMixin:
                         project_id, repository_name, pbi_number, evidence_id
                     );
 
+                CREATE TABLE IF NOT EXISTS graph_definitions (
+                    definition_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workflow_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL CHECK (revision > 0),
+                    schema_version INTEGER NOT NULL CHECK (schema_version > 0),
+                    definition_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (workflow_id, revision)
+                );
+
+                CREATE INDEX IF NOT EXISTS graph_definitions_by_workflow
+                    ON graph_definitions(workflow_id, revision);
+
                 CREATE TABLE IF NOT EXISTS budget_decision_evidence (
                     evidence_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     project_id TEXT NOT NULL,
