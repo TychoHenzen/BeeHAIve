@@ -8,6 +8,7 @@ from threading import RLock
 
 from .actions import ActionsMixin
 from .agent_sessions import AgentSessionsMixin
+from .budget_evidence import BudgetEvidenceMixin
 from .canonical_lifecycle import CanonicalLifecycleMixin
 from .execution_lease import ExecutionLeaseMixin
 from .handoff_mutation import HandoffMutationMixin
@@ -57,6 +58,7 @@ class OrchestratorStore(
     PbiCreationMixin,
     HandoffMutationMixin,
     AgentSessionsMixin,
+    BudgetEvidenceMixin,
     CanonicalLifecycleMixin,
     MetaReviewMixin,
     ProjectReadMixin,

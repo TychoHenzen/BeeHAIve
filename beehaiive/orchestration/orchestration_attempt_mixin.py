@@ -25,7 +25,7 @@ from ..storage import StoreError
 
 class OrchestrationAttemptMixin:
     def run_implementation_attempt(
-        self: Any, run_id: str, lease_token: str
+        self: Any, run_id: str, lease_token: str, model_override: str | None = None
     ) -> RoutingResult:
         """Execute the model selected for an active implementation run."""
 
@@ -80,6 +80,7 @@ class OrchestrationAttemptMixin:
                 self.model_executor,
                 before_record=validate_execution,
                 persist_task_result=persist_task_result,
+                model_override=model_override,
             )
             if routing.state.status is RoutingStatus.HUMAN_HANDOFF:
                 task_result = routing.task_result

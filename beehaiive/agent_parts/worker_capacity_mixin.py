@@ -145,7 +145,7 @@ class WorkerCapacityMixin:
             recovered.append(run.run_id)
         return tuple(recovered)
 
-    def start(self: Any, run: RunState) -> None:
+    def start(self: Any, run: RunState, *, model_override: str | None = None) -> None:
         if run.status is not RunStatus.ACTIVE or run.lease_token is None:
             raise StoreError("An active leased run is required")
         if self.workflow_service is None:
@@ -160,7 +160,7 @@ class WorkerCapacityMixin:
                 raise WorkerCapacityError("Maximum concurrent agent workers reached")
             thread = Thread(
                 target=self._run,
-                args=(run.run_id, run.lease_token),
+                args=(run.run_id, run.lease_token, model_override),
                 name=f"beehaiive-agent-{run.run_id[:8]}",
                 daemon=True,
             )

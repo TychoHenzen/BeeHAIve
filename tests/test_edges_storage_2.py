@@ -186,10 +186,18 @@ def test_storage_migrates_legacy_columns(tmp_path: Path) -> None:
         "agent_sessions",
         "agent_session_events",
         "lifecycle_transition_evidence",
+        "budget_decision_evidence",
     } <= tables
     assert {
         "canonical_state",
         "canonical_facts_json",
         "canonical_source_version",
     } <= columns
+    budget_columns = {
+        str(row[1])
+        for row in store._connection.execute(
+            "PRAGMA table_info(budget_decision_evidence)"
+        )
+    }
+    assert {"snapshot_json", "fallback_model"} <= budget_columns
     store.close()

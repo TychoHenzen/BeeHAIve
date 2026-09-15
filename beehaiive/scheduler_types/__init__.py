@@ -1,4 +1,13 @@
 from .agent_scheduler import AgentScheduler as AgentScheduler
+from .budget import AccountUsageSnapshot as AccountUsageSnapshot
+from .budget import AllowanceBucket as AllowanceBucket
+from .budget import BudgetAction as BudgetAction
+from .budget import BudgetAdapter as BudgetAdapter
+from .budget import BudgetDecision as BudgetDecision
+from .budget import BudgetEvidence as BudgetEvidence
+from .budget import BudgetPolicy as BudgetPolicy
+from .budget import BudgetReason as BudgetReason
+from .budget import evaluate_budget as evaluate_budget
 from .constants import (
     DEFAULT_SCHEDULER_MAX_CONCURRENCY as DEFAULT_SCHEDULER_MAX_CONCURRENCY,
 )
@@ -22,4 +31,13 @@ __all__ = [
     "SCHEDULER_SHUTDOWN_TIMEOUT_SECONDS",
     "AgentScheduler",
     "SchedulerConfig",
+    "AccountUsageSnapshot",
+    "AllowanceBucket",
+    "BudgetAction",
+    "BudgetAdapter",
+    "BudgetDecision",
+    "BudgetEvidence",
+    "BudgetPolicy",
+    "BudgetReason",
+    "evaluate_budget",
 ]

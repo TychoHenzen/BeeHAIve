@@ -191,6 +191,26 @@ class StorageSchemaMixin:
                         project_id, repository_name, pbi_number, evidence_id
                     );
 
+                CREATE TABLE IF NOT EXISTS budget_decision_evidence (
+                    evidence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id TEXT NOT NULL,
+                    replay_id TEXT NOT NULL UNIQUE,
+                    source_id TEXT NOT NULL,
+                    source_version TEXT NOT NULL,
+                    evidence_status TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    reason_code TEXT NOT NULL,
+                    fallback_model TEXT,
+                    observed_at TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (project_id)
+                        REFERENCES projects(project_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS budget_evidence_by_project
+                    ON budget_decision_evidence(project_id, evidence_id);
+
                 CREATE TABLE IF NOT EXISTS agent_sessions (
                     run_id TEXT PRIMARY KEY,
                     worker_id TEXT NOT NULL,
