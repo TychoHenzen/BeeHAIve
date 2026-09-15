@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import replace
+from datetime import datetime
 from threading import Event, Thread
 from typing import Any, cast
 
@@ -9,6 +11,12 @@ from beehaiive.operator_notifications import (
 )
 
 from ..contracts import TaskContract, TaskResult
+from ..graph import GraphDefinition
+from ..graph_execution import (
+    GraphExecutionPolicy,
+    GraphExecutionService,
+    GraphTransition,
+)
 from ..models import (
     RunState,
     RunStatus,
@@ -24,8 +32,44 @@ from ..storage import StoreError
 
 
 class OrchestrationAttemptMixin:
+    def run_graph_node(
+        self: Any,
+        definition: GraphDefinition,
+        *,
+        run_id: str,
+        lease_token: str,
+        task_id: str,
+        node_id: str,
+        contract: TaskContract,
+        step: int,
+        attempt: int,
+        started_at: datetime | None = None,
+        policy: GraphExecutionPolicy | None = None,
+        guard: Callable[[], None] | None = None,
+    ) -> GraphTransition:
+        return GraphExecutionService(self.store).execute_orchestrated_node(
+            self,
+            definition,
+            run_id=run_id,
+            lease_token=lease_token,
+            task_id=task_id,
+            node_id=node_id,
+            contract=contract,
+            step=step,
+            attempt=attempt,
+            started_at=started_at,
+            policy=policy,
+            guard=guard,
+        )
+
     def run_implementation_attempt(
-        self: Any, run_id: str, lease_token: str, model_override: str | None = None
+        self: Any,
+        run_id: str,
+        lease_token: str,
+        model_override: str | None = None,
+        *,
+        routing_problem_id: str | None = None,
+        task_contract: TaskContract | None = None,
     ) -> RoutingResult:
         """Execute the model selected for an active implementation run."""
 
@@ -34,7 +78,8 @@ class OrchestrationAttemptMixin:
         run = self.store.renew_lease(run_id, lease_token)
         if run.status is not RunStatus.ACTIVE or run.stage is not Stage.IMPLEMENT:
             raise StoreError("Only an active implementation run can execute a model")
-        self._ensure_routing_problem(run_id)
+        problem_id = routing_problem_id or run_id
+        self._ensure_routing_problem(problem_id)
         execution_token = self.store.claim_execution(run_id, lease_token)
         stop_heartbeat = Event()
         heartbeat_errors: list[StoreError] = []
@@ -59,15 +104,19 @@ class OrchestrationAttemptMixin:
                 raise RoutingError(str(exc)) from exc
 
         try:
-            contract = self._task_contract_for_run(run)
+            contract = task_contract or self._task_contract_for_run(run)
             self.store.ensure_task_contract(run_id, contract, lease_token)
             configure_contract = getattr(self.model_executor, "set_task_contract", None)
             if callable(configure_contract):
                 configure_contract(run_id, contract)
 
+            missing_task_result = False
+
             def persist_task_result(execution: ModelExecution) -> TaskResult:
+                nonlocal missing_task_result
                 task_result = execution.task_result
                 if not isinstance(task_result, TaskResult):
+                    missing_task_result = True
                     task_result = TaskResult.invalid(
                         execution.failure_context
                         or "Executor did not return a structured task result"
@@ -76,12 +125,14 @@ class OrchestrationAttemptMixin:
                 return task_result
 
             routing = self.model_router.execute(
-                run_id,
+                problem_id,
                 self.model_executor,
                 before_record=validate_execution,
                 persist_task_result=persist_task_result,
                 model_override=model_override,
             )
+            if routing_problem_id is not None and missing_task_result:
+                routing = replace(routing, task_result=None)
             if routing.state.status is RoutingStatus.HUMAN_HANDOFF:
                 task_result = routing.task_result
                 kind = (
