@@ -32,6 +32,7 @@ class RouterExecutionMixin:
         executor: ModelExecutor,
         before_record: Callable[[], None] | None = None,
         persist_task_result: Callable[[ModelExecution], TaskResult] | None = None,
+        model_override: str | None = None,
     ) -> RoutingResult:
         """Invoke the selected model and persist its measured routing result."""
 
@@ -57,11 +58,13 @@ class RouterExecutionMixin:
                     AttemptOutcome.FAILURE,
                     failure_context=f"Model invocation skipped: {limit_reason}",
                     force_human_reason=limit_reason,
+                    model_override=model_override,
                 )
             try:
-                execution = executor.execute(
-                    self.config.spec_for(current.state.current_tier), current.decision
-                )
+                spec = self.config.spec_for(current.state.current_tier)
+                if model_override is not None:
+                    spec = replace(spec, model=model_override)
+                execution = executor.execute(spec, current.decision)
             except Exception as exc:
                 execution = failed_model_execution(exc)
             if before_record is not None:
@@ -92,6 +95,7 @@ class RouterExecutionMixin:
                             self.config.limits.max_recursive_spawn_depth,
                         ),
                         force_human_reason=usage_violation,
+                        model_override=model_override,
                     ),
                     execution_result=execution.result or None,
                     task_result=execution.task_result,
@@ -106,6 +110,7 @@ class RouterExecutionMixin:
                     failure_context=failure_context,
                     recursive_spawn_depth=execution.recursive_spawn_depth,
                     force_human_reason=task_handoff,
+                    model_override=model_override,
                 ),
                 execution_result=execution.result or None,
                 task_result=execution.task_result,
@@ -123,6 +128,7 @@ class RouterExecutionMixin:
         recursive_spawn_depth: int = 0,
         transition_id: str | None = None,
         force_human_reason: str | None = None,
+        model_override: str | None = None,
     ) -> RoutingResult:
         normalized_id = normalize_problem_id(problem_id)
         try:
@@ -170,6 +176,8 @@ class RouterExecutionMixin:
             raise RoutingError("Only a triage tier can return writer retry context")
 
         spec = self.config.spec_for(state.current_tier)
+        if model_override is not None:
+            spec = replace(spec, model=model_override)
         attempt_round = state.round + 1
         attempt_tokens = input_tokens + output_tokens
         total_tokens = state.total_tokens + attempt_tokens

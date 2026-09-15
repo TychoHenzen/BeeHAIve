@@ -133,6 +133,42 @@ class StorageMigrationMixin:
                 )
             """
         )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS budget_decision_evidence (
+                evidence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id TEXT NOT NULL,
+                replay_id TEXT NOT NULL UNIQUE,
+                source_id TEXT NOT NULL,
+                source_version TEXT NOT NULL,
+                evidence_status TEXT NOT NULL,
+                action TEXT NOT NULL,
+                reason_code TEXT NOT NULL,
+                fallback_model TEXT,
+                observed_at TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (project_id)
+                    REFERENCES projects(project_id) ON DELETE CASCADE
+            )
+            """
+        )
+        budget_columns = {
+            str(row["name"])
+            for row in self._connection.execute(
+                "PRAGMA table_info(budget_decision_evidence)"
+            ).fetchall()
+        }
+        if "fallback_model" not in budget_columns:
+            self._connection.execute(
+                "ALTER TABLE budget_decision_evidence ADD COLUMN fallback_model TEXT"
+            )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS budget_evidence_by_project
+                ON budget_decision_evidence(project_id, evidence_id)
+            """
+        )
 
 
 __all__ = ["StorageMigrationMixin"]

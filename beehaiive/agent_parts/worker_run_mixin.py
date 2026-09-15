@@ -16,7 +16,9 @@ from .worker_text import redact_worker_text as redact_worker_text
 
 
 class WorkerRunMixin:
-    def _run(self: Any, run_id: str, lease_token: str) -> None:
+    def _run(
+        self: Any, run_id: str, lease_token: str, model_override: str | None = None
+    ) -> None:
         workflow_service = self.workflow_service
         with self._lock:
             workspace_lease = self._workspace_leases.get(run_id)
@@ -86,7 +88,14 @@ class WorkerRunMixin:
             self.orchestrator.advance(run_id, Stage.IMPLEMENT, lease_token)
             if validate_workspace_lease is not None:
                 validate_workspace_lease()
-            routing = self.orchestrator.run_implementation_attempt(run_id, lease_token)
+            if model_override is None:
+                routing = self.orchestrator.run_implementation_attempt(
+                    run_id, lease_token
+                )
+            else:
+                routing = self.orchestrator.run_implementation_attempt(
+                    run_id, lease_token, model_override=model_override
+                )
             heartbeat_stop.set()
             if heartbeat_thread is not None and workflow_service is not None:
                 heartbeat_thread.join(

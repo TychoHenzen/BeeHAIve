@@ -65,6 +65,20 @@ def test_success_resets_state_and_a_new_problem_starts_at_first_triage() -> None
     store.close()
 
 
+def test_model_override_is_used_and_recorded() -> None:
+    store = RoutingStore()
+    router = ModelRouter(store, build_routing_config())
+    model = FakeRoutingModel(outcomes=(AttemptOutcome.SUCCESS,))
+    router.begin("override")
+
+    result = router.execute("override", model, model_override="sol")
+
+    assert model.models == ["sol"]
+    assert result.attempt is not None and result.attempt.model == "sol"
+    assert store.get_attempts("override")[0].model == "sol"
+    store.close()
+
+
 def test_triage_exhaustion_requires_human_action() -> None:
     store = RoutingStore()
     router = ModelRouter(store, build_routing_config(max_rounds=10, max_bounces=10))

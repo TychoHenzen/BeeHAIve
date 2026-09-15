@@ -14,8 +14,31 @@ from beehaiive.agent import (
 )
 from beehaiive.orchestrator import Orchestrator
 
+from .budget import (
+    AccountUsageSnapshot,
+    BudgetAction,
+    BudgetAdapter,
+    BudgetDecision,
+    BudgetEvidence,
+    BudgetPolicy,
+    BudgetReason,
+    evaluate_budget,
+)
 from .constants import SCHEDULER_SHUTDOWN_TIMEOUT_SECONDS
 from .scheduler_config import SchedulerConfig
+
+_UNSAFE_BUDGET_REASONS = frozenset(
+    {
+        BudgetReason.EVIDENCE_STALE,
+        BudgetReason.EVIDENCE_UNAVAILABLE,
+        BudgetReason.EVIDENCE_CONTRADICTORY,
+        BudgetReason.BUCKETS_MISSING,
+        BudgetReason.BUCKET_VALUES_INVALID,
+        BudgetReason.BUDGET_EXHAUSTED,
+        BudgetReason.MODEL_UNAVAILABLE,
+        BudgetReason.RESET_UNVERIFIED,
+    }
+)
 
 __all__ = ["AgentScheduler"]
 
@@ -29,6 +52,9 @@ class AgentScheduler:
         worker: AgentWorkerManager,
         project_ids: set[str] | frozenset[str],
         config: SchedulerConfig,
+        *,
+        budget_adapter: BudgetAdapter | None = None,
+        budget_policy: BudgetPolicy | None = None,
     ) -> None:
         self.orchestrator = orchestrator
         self.worker = worker
@@ -41,6 +67,8 @@ class AgentScheduler:
             raise ValueError("A workflow service is required for scheduled workers")
         worker.set_max_concurrent_workers(config.max_concurrency)
         self.config = config
+        self.budget_adapter = budget_adapter
+        self.budget_policy = budget_policy or BudgetPolicy()
         self._owner_id = f"scheduler:{os.getpid()}:{uuid4().hex}"
         self._stop_event = Event()
         self._thread_lock = Lock()
@@ -50,6 +78,7 @@ class AgentScheduler:
         self._last_poll_at: str | None = None
         self._last_error: str | None = None
         self._last_started_run_ids: dict[str, tuple[str, ...]] = {}
+        self._last_budget_decisions: dict[str, dict[str, object]] = {}
         executor_task = getattr(worker.executor, "task", DEFAULT_DEMO_TASK)
         self._task = (
             executor_task
@@ -90,6 +119,7 @@ class AgentScheduler:
     def poll_once(self) -> tuple[str, ...]:
         errors: list[str] = []
         started_by_project: dict[str, list[str]] = {}
+        budget_by_project: dict[str, dict[str, object]] = {}
         try:
             self.worker.recover(self.project_ids)
         except Exception as exc:
@@ -97,6 +127,11 @@ class AgentScheduler:
         project_repositories: list[tuple[str, tuple[str, ...]]] = []
         for project_id in self.project_ids:
             try:
+                budget = self._budget_decision(project_id)
+                if budget is not None:
+                    budget_by_project[project_id] = budget.as_dict()
+                    if budget.action is BudgetAction.PAUSE:
+                        continue
                 self.orchestrator.synchronize(project_id)
                 state = self.orchestrator.store.project_state(project_id)
             except Exception as exc:
@@ -141,7 +176,23 @@ class AgentScheduler:
                     if run is None:
                         continue
                     try:
-                        self.worker.start(run)
+                        if (
+                            budget_by_project.get(project_id, {}).get("action")
+                            == BudgetAction.DOWNGRADE.value
+                        ):
+                            fallback_model = budget_by_project[project_id].get(
+                                "fallback_model"
+                            )
+                            self.worker.start(
+                                run,
+                                model_override=(
+                                    fallback_model
+                                    if isinstance(fallback_model, str)
+                                    else None
+                                ),
+                            )
+                        else:
+                            self.worker.start(run)
                     except WorkerCapacityError as exc:
                         errors.append(self._error_summary(exc))
                         continue
@@ -167,7 +218,7 @@ class AgentScheduler:
                     )
             if not started and attempted:
                 self._candidate_cursor = (start_cursor + 1) % len(candidates)
-        self._record_poll(errors, started_by_project)
+        self._record_poll(errors, started_by_project, budget_by_project)
         return tuple(started)
 
     def status_for(self, project_id: str) -> dict[str, object] | None:
@@ -179,7 +230,8 @@ class AgentScheduler:
             last_poll_at = self._last_poll_at
             last_error = self._last_error
             started = self._last_started_run_ids.get(project_id, ())
-        return {
+            budget = self._last_budget_decisions.get(project_id)
+        status: dict[str, object] = {
             "enabled": True,
             "running": running,
             "poll_interval_seconds": self.config.poll_interval_seconds,
@@ -189,11 +241,15 @@ class AgentScheduler:
             "last_error": last_error,
             "last_started_run_ids": list(started),
         }
+        if self.budget_adapter is not None:
+            status["budget"] = budget
+        return status
 
     def _record_poll(
         self,
         errors: list[str],
         started_by_project: dict[str, list[str]],
+        budget_by_project: dict[str, dict[str, object]] | None = None,
     ) -> None:
         with self._state_lock:
             self._last_poll_at = datetime.now(UTC).isoformat()
@@ -202,6 +258,91 @@ class AgentScheduler:
                 project_id: tuple(run_ids)
                 for project_id, run_ids in started_by_project.items()
             }
+            self._last_budget_decisions = dict(budget_by_project or {})
+
+    def _budget_decision(self, project_id: str) -> BudgetDecision | None:
+        adapter = self.budget_adapter
+        if adapter is None:
+            return None
+        try:
+            snapshot = adapter.snapshot(project_id)
+        except Exception:
+            snapshot = AccountUsageSnapshot(
+                source_id="budget-adapter",
+                source_version="unavailable",
+                observed_at=datetime.now(UTC).isoformat(),
+                evidence=BudgetEvidence.UNAVAILABLE,
+            )
+        previous_loader = getattr(
+            self.orchestrator.store, "budget_snapshot_for_project", None
+        )
+        decision_loader = getattr(
+            self.orchestrator.store, "budget_decision_for_project", None
+        )
+        reset_baseline_loader = getattr(
+            self.orchestrator.store, "budget_reset_baseline_for_project", None
+        )
+        try:
+            previous_value = (
+                previous_loader(project_id) if callable(previous_loader) else None
+            )
+            previous_decision_value = (
+                decision_loader(project_id) if callable(decision_loader) else None
+            )
+            reset_baseline_value = (
+                reset_baseline_loader(project_id)
+                if callable(reset_baseline_loader)
+                else None
+            )
+        except Exception:
+            decision = BudgetDecision(
+                BudgetAction.PAUSE,
+                BudgetReason.EVIDENCE_CONTRADICTORY,
+                snapshot.source_version,
+            )
+            recorder = getattr(self.orchestrator.store, "record_budget_decision", None)
+            if callable(recorder):
+                recorder(project_id, snapshot, decision)
+            return decision
+        previous = (
+            previous_value if isinstance(previous_value, AccountUsageSnapshot) else None
+        )
+        previous_decision = (
+            previous_decision_value
+            if isinstance(previous_decision_value, BudgetDecision)
+            else None
+        )
+        reset_baseline = (
+            reset_baseline_value
+            if isinstance(reset_baseline_value, AccountUsageSnapshot)
+            else None
+        )
+        decision = evaluate_budget(snapshot, self.budget_policy, previous)
+        if (
+            previous_decision is not None
+            and previous_decision.action is BudgetAction.PAUSE
+            and previous_decision.reason in _UNSAFE_BUDGET_REASONS
+        ):
+            verified_decision = (
+                evaluate_budget(snapshot, self.budget_policy, reset_baseline)
+                if reset_baseline is not None
+                else None
+            )
+            if verified_decision is not None and verified_decision.reason in {
+                BudgetReason.RESET_VERIFIED,
+                BudgetReason.BUDGET_LOW,
+            }:
+                decision = verified_decision
+            elif decision.action in {BudgetAction.ALLOW, BudgetAction.DOWNGRADE}:
+                decision = BudgetDecision(
+                    BudgetAction.PAUSE,
+                    BudgetReason.RESET_UNVERIFIED,
+                    snapshot.source_version,
+                )
+        recorder = getattr(self.orchestrator.store, "record_budget_decision", None)
+        if callable(recorder):
+            recorder(project_id, snapshot, decision)
+        return decision
 
     def _error_summary(self, error: Exception) -> str:
         secret_values = tuple(
