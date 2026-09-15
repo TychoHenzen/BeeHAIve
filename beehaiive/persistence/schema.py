@@ -70,6 +70,9 @@ class StorageSchemaMixin:
                     planning_status TEXT,
                     claimable INTEGER NOT NULL DEFAULT 1,
                     metadata_json TEXT NOT NULL DEFAULT '{}',
+                    canonical_state TEXT NOT NULL DEFAULT 'unknown',
+                    canonical_facts_json TEXT NOT NULL DEFAULT '{}',
+                    canonical_source_version TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (project_id, repository_name, number),
                     FOREIGN KEY (project_id, repository_name)
                         REFERENCES repositories(project_id, name) ON DELETE CASCADE
@@ -161,6 +164,32 @@ class StorageSchemaMixin:
                         REFERENCES pbis(project_id, repository_name, number)
                         ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS lifecycle_transition_evidence (
+                    evidence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id TEXT NOT NULL,
+                    repository_name TEXT NOT NULL,
+                    pbi_number INTEGER NOT NULL,
+                    replay_id TEXT NOT NULL UNIQUE,
+                    event_type TEXT NOT NULL,
+                    source_owner TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    source_version TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    state_before TEXT NOT NULL,
+                    state_after TEXT NOT NULL,
+                    reason_code TEXT NOT NULL,
+                    schema_version INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (project_id, repository_name, pbi_number)
+                        REFERENCES pbis(project_id, repository_name, number)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS lifecycle_evidence_by_pbi
+                    ON lifecycle_transition_evidence(
+                        project_id, repository_name, pbi_number, evidence_id
+                    );
 
                 CREATE TABLE IF NOT EXISTS agent_sessions (
                     run_id TEXT PRIMARY KEY,
