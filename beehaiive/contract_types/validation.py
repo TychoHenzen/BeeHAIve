@@ -19,13 +19,34 @@ from .contract_error import ContractError
 
 
 def _redact_text(value: str, limit: int = MAX_RESULT_TEXT) -> str:
+    variants = {value}
+    normalized = value
+    for _ in range(2):
+        normalized = normalized.replace(r"\"", '"').replace(r"\'", "'")
+        variants.add(normalized)
+    candidates: list[str] = []
+    for variant in variants:
+        candidate = variant
+        for _ in range(3):
+            updated = _redact_once(candidate)
+            if updated == candidate:
+                break
+            candidate = updated
+        candidates.append(candidate)
+    redacted = min(
+        candidates,
+        key=lambda candidate: (-candidate.count("[redacted]"), len(candidate)),
+    )
+    return redacted.strip()[:limit]
+
+
+def _redact_once(value: str) -> str:
     redacted = _SECRET_JSON.sub(r"\1[redacted]", value)
     redacted = _BEARER_TOKEN.sub("Bearer [redacted]", redacted)
     redacted = _URL_CREDENTIALS.sub(r"\1[redacted]@", redacted)
-    redacted = _SECRET_ASSIGNMENT.sub(
+    return _SECRET_ASSIGNMENT.sub(
         lambda match: f"{match.group(1)}=[redacted]", redacted
     )
-    return redacted.strip()[:limit]
 
 
 def _bounded_value(value: object, depth: int = 0) -> object:

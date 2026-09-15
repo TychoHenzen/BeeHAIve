@@ -12,6 +12,7 @@ from .budget_evidence import BudgetEvidenceMixin
 from .canonical_lifecycle import CanonicalLifecycleMixin
 from .execution_lease import ExecutionLeaseMixin
 from .graph_definitions import GraphDefinitionMixin
+from .graph_safety import GraphSafetyMixin
 from .graph_transitions import GraphTransitionMixin
 from .handoff_mutation import HandoffMutationMixin
 from .handoff_record import HandoffRecordMixin
@@ -61,6 +62,7 @@ class OrchestratorStore(
     HandoffMutationMixin,
     AgentSessionsMixin,
     GraphDefinitionMixin,
+    GraphSafetyMixin,
     GraphTransitionMixin,
     BudgetEvidenceMixin,
     CanonicalLifecycleMixin,

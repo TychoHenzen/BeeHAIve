@@ -10,6 +10,9 @@ from beehaiive.api.lifecycle import (
     register_background_handlers,
     register_error_handlers,
 )
+from beehaiive.api.routes.graph_safety import (
+    register_routes as register_graph_safety_routes,
+)
 from beehaiive.api.routes.pbi_creation import (
     register_routes as register_pbi_creation_routes,
 )
@@ -25,6 +28,7 @@ from beehaiive.api.routes.system import register_routes as register_system_route
 from beehaiive.api.routes.workflow import register_routes as register_workflow_routes
 from beehaiive.api.runtime import build_api_runtime
 from beehaiive.conflict_repair import ConflictRepairService
+from beehaiive.graph_safety import GraphSafetyService
 from beehaiive.meta_review import MetaReviewService
 from beehaiive.review import (
     PullRequestReviewProvider,
@@ -58,6 +62,7 @@ def create_app(
     meta_review_service: MetaReviewService | None = None,
     workflow_service: WorkflowService | None = None,
     workflow_actor: WorkflowRole | str | None = None,
+    graph_safety_service: GraphSafetyService | None = None,
     conflict_repair_service: ConflictRepairService | None = None,
     review_repair_service: ReviewRepairService | None = None,
 ) -> FastAPI:
@@ -79,6 +84,7 @@ def create_app(
         "routing_store": routing_store,
         "store": store,
         "workflow_service": workflow_service,
+        "graph_safety_service": graph_safety_service,
     }
     runtime = build_api_runtime(runtime_options)
     app = FastAPI(title="BeeHAIve")
@@ -90,6 +96,7 @@ def create_app(
     route_context = runtime | dependencies
     register_reviews_routes(app, route_context)
     register_workflow_routes(app, route_context)
+    register_graph_safety_routes(app, route_context)
     register_system_routes(app, route_context)
     register_pbi_refinement_routes(app, route_context)
     register_pbi_creation_routes(app, route_context)

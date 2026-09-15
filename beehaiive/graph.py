@@ -13,6 +13,7 @@ from .routing import ModelTier
 
 GRAPH_DEFINITION_SCHEMA_VERSION = 1
 MAX_GRAPH_TEXT = 128
+MAX_GRAPH_REVISION = 2_147_483_647
 MAX_GRAPH_NODES = 64
 MAX_GRAPH_EDGES = 128
 MAX_GRAPH_METADATA_KEYS = 40
@@ -276,8 +277,13 @@ class GraphDefinition:
 
     def __post_init__(self) -> None:
         _validate_logical_reference(self.workflow_id, "workflow_id")
-        if type(self.revision) is not int or self.revision <= 0:
-            raise GraphDefinitionError("revision must be a positive integer")
+        if (
+            type(self.revision) is not int
+            or not 1 <= self.revision <= MAX_GRAPH_REVISION
+        ):
+            raise GraphDefinitionError(
+                f"revision must be between 1 and {MAX_GRAPH_REVISION}"
+            )
         if (
             type(self.schema_version) is not int
             or self.schema_version != GRAPH_DEFINITION_SCHEMA_VERSION
@@ -509,6 +515,7 @@ __all__ = [
     "MAX_GRAPH_MAINTENANCE_PASSES",
     "MAX_GRAPH_NODES",
     "MAX_GRAPH_RETRIES",
+    "MAX_GRAPH_REVISION",
     "MAX_GRAPH_TEXT",
     "MAX_GRAPH_TIMEOUT_SECONDS",
 ]

@@ -17,6 +17,8 @@ from .dashboard_commit_push_request import (
 from .dashboard_start_request import DashboardStartRequest as DashboardStartRequest
 from .dashboard_stop_request import DashboardStopRequest as DashboardStopRequest
 from .failure_request import FailureRequest as FailureRequest
+from .graph_safety_request import GraphRollbackRequest as GraphRollbackRequest
+from .graph_safety_request import GraphSafetyRequest as GraphSafetyRequest
 from .handoff_request import HandoffRequest as HandoffRequest
 from .meta_review_decision_request import (
     MetaReviewDecisionRequest as MetaReviewDecisionRequest,
@@ -98,6 +100,8 @@ __all__ = [
     "DashboardStartRequest",
     "DashboardStopRequest",
     "FailureRequest",
+    "GraphRollbackRequest",
+    "GraphSafetyRequest",
     "HandoffRequest",
     "MetaReviewDecisionRequest",
     "MetaReviewRequest",
