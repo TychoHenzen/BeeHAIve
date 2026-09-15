@@ -19,9 +19,13 @@ class OrchestrationSyncMixin:
             if callable(invalidate):
                 invalidate()
         snapshot = self.provider.discover_project(project_id)
+        expected_source_versions = self.store.canonical_source_versions(project_id)
         self._cancel_removed_workers(snapshot)
         self.store.sync_project(snapshot)
         self._route_blocking_check_failures(snapshot)
+        self.store.project_canonical_lifecycle(
+            snapshot, expected_source_versions=expected_source_versions
+        )
         return self.store.project_state(project_id)
 
     def claim(

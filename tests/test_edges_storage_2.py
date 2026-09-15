@@ -182,5 +182,14 @@ def test_storage_migrates_legacy_columns(tmp_path: Path) -> None:
             "SELECT name FROM sqlite_master WHERE type = 'table'"
         )
     }
-    assert {"agent_sessions", "agent_session_events"} <= tables
+    assert {
+        "agent_sessions",
+        "agent_session_events",
+        "lifecycle_transition_evidence",
+    } <= tables
+    assert {
+        "canonical_state",
+        "canonical_facts_json",
+        "canonical_source_version",
+    } <= columns
     store.close()
