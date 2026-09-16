@@ -15,7 +15,7 @@ dev = [
     "pyright==1.1.414",
     "pytest==9.1.1",
     "pytest-cov==7.1.0",
-    "ruff==0.16.6",
+    "ruff==0.16.7",
 ]
 
 [tool.pytest.ini_options]
