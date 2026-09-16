@@ -35,6 +35,8 @@ class WorkerCapacityMixin:
         self._max_concurrent_workers: int | None = None
         self._workspace_leases: dict[str, WorkspaceLease] = {}
         self._workspace_validators: dict[str, Callable[[], None]] = {}
+        self._cancelled_runs: set[str] = set()
+        self._worker_delivery_runs: set[str] = set()
         self._delivery_lock = Lock()
         self._worker_id = f"{os.getpid()}:{uuid4().hex}"
         register = getattr(orchestrator, "register_worker_canceller", None)
@@ -80,6 +82,32 @@ class WorkerCapacityMixin:
             repository,
             owner_id,
             expected_run_id=expected_run_id,
+            agent_session=(
+                self._worker_id,
+                redact_worker_text(task, secret_values, max_length=None),
+            ),
+        )
+
+    def retry(
+        self: Any,
+        project_id: str,
+        repository: str,
+        owner_id: str,
+        task: str,
+        run_id: str,
+    ) -> RunState | None:
+        if not task.strip():
+            raise StoreError("An agent task is required")
+        secret_values = tuple(
+            value
+            for value in getattr(self.executor, "_secret_values", ())
+            if isinstance(value, str)
+        )
+        return self.orchestrator.retry(
+            project_id,
+            repository,
+            owner_id,
+            run_id,
             agent_session=(
                 self._worker_id,
                 redact_worker_text(task, secret_values, max_length=None),
@@ -164,6 +192,7 @@ class WorkerCapacityMixin:
                 name=f"beehaiive-agent-{run.run_id[:8]}",
                 daemon=True,
             )
+            self._cancelled_runs.discard(run.run_id)
             self._threads[run.run_id] = thread
         workspace_lease: WorkspaceLease | None = None
         executor_prepared = False

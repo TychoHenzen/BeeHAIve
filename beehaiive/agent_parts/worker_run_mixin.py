@@ -122,11 +122,37 @@ class WorkerRunMixin:
             ):
                 try:
                     assert workspace_lease is not None and workflow_service is not None
+                    current = self.orchestrator.store.get_run(run_id)
+                    if (
+                        current is None
+                        or current.status is not RunStatus.ACTIVE
+                        or current.lease_token != lease_token
+                        or self.is_cancelled(run_id)
+                    ):
+                        raise WorkflowError(
+                            "Dashboard run was cancelled before Git delivery"
+                        )
                     workflow_service.retain_workspace(
                         workspace_lease.lease_id, workspace_lease.lease_token
                     )
                     preserve_workspace = True
-                    delivery = self.commit_and_push(run_id)
+                    current = self.orchestrator.store.get_run(run_id)
+                    if (
+                        current is None
+                        or current.status is not RunStatus.ACTIVE
+                        or current.lease_token != lease_token
+                        or self.is_cancelled(run_id)
+                    ):
+                        raise WorkflowError(
+                            "Dashboard run was cancelled before Git delivery"
+                        )
+                    with self._lock:
+                        self._worker_delivery_runs.add(run_id)
+                    try:
+                        delivery = self.commit_and_push(run_id)
+                    finally:
+                        with self._lock:
+                            self._worker_delivery_runs.discard(run_id)
                     task_result = getattr(routing, "task_result", None)
                     if delivery.status is not GitDeliveryStatus.PUSHED:
                         result = self._delivery_summary(
@@ -279,6 +305,7 @@ class WorkerRunMixin:
                 current = self._threads.get(run_id)
                 if current is not None and current is current_thread():
                     self._threads.pop(run_id, None)
+                self._cancelled_runs.discard(run_id)
             if (
                 workspace_lease is not None
                 and workflow_service is not None

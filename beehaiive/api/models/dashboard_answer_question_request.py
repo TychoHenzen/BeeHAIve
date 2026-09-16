@@ -9,8 +9,8 @@ __all__ = ["DashboardAnswerQuestionRequest"]
 class DashboardAnswerQuestionRequest(DashboardActionBase):
     action: Literal["answer_question"]
     repository: str
-    pbi_number: int
+    pbi_number: int = Field(strict=True, gt=0, le=2_147_483_647)
     run_id: str
     question_id: str = Field(min_length=1, max_length=64)
-    revision: int = Field(ge=1)
+    revision: int = Field(strict=True, ge=1)
     answer: str = Field(min_length=1, max_length=1_000)

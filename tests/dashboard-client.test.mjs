@@ -150,6 +150,70 @@ test("an action invalidates an older refresh response", async () => {
   assert.equal(statuses.at(-1).kind, "success");
 });
 
+test("changing projects during an action drops the old action response", async () => {
+  let currentProject = "owner:7";
+  let resolveAction;
+  let resolveRefresh;
+  const fetcher = (url) => {
+    if (url.endsWith("/dashboard")) {
+      return new Promise((resolve) => {
+        resolveRefresh = resolve;
+      });
+    }
+    return new Promise((resolve) => {
+      resolveAction = resolve;
+    });
+  };
+  const { client, states } = harness(fetcher, {
+    projectId: () => currentProject,
+  });
+
+  const action = client.runAction({ action: "synchronize" });
+  currentProject = "owner:8";
+  await client.refresh();
+  resolveAction(response({ action: { status: "succeeded" }, state: { project_id: "owner:7" } }));
+  await action;
+  resolveRefresh(response({ project_id: "owner:8" }));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.deepEqual(states.at(-1), { project_id: "owner:8" });
+  assert.equal(states.some((state) => state.project_id === "owner:7"), false);
+});
+
+test("action results remain visible when the final state readback is unavailable", async () => {
+  const { client, states } = harness(async (url) => {
+    if (url.endsWith("/dashboard")) return response({ project_id: "owner:7", actions: [] });
+    return response({
+      action: { kind: "approve", status: "succeeded", result: { approved: true } },
+      result: { approved: true },
+      state: null,
+    });
+  });
+
+  await client.refresh();
+  await client.runAction({ action: "approve" });
+
+  assert.deepEqual(states.at(-1).actions, [
+    { kind: "approve", status: "succeeded", result: { approved: true } },
+  ]);
+});
+
+test("the first action remains visible when no state has loaded", async () => {
+  const { client, states } = harness(async () => response({
+    action: { kind: "synchronize", status: "succeeded" },
+    state: null,
+  }));
+
+  await client.runAction({ action: "synchronize" });
+
+  assert.deepEqual(states, [{
+    project_id: "owner:7",
+    repositories: [],
+    counts: {},
+    actions: [{ kind: "synchronize", status: "succeeded" }],
+  }]);
+});
+
 test("storage errors still clear action busy state", async () => {
   const { client, busy, statuses } = harness(
     async () => response({ action: { status: "succeeded" } }),

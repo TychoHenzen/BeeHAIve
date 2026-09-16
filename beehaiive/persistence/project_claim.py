@@ -20,6 +20,7 @@ class ProjectClaimMixin:
         *,
         expected_run_id: str | None = None,
         agent_session: tuple[str, str] | None = None,
+        allow_failed_expected: bool = False,
     ) -> RunState | None:
         if not owner_id.strip():
             raise StoreError("A worker owner is required")
@@ -51,7 +52,17 @@ class ProjectClaimMixin:
                 """,
                 (project_id, repository, expected_run_id, expected_run_id),
             ).fetchone()
-            if expected_run_id is not None and active is None:
+            if (
+                expected_run_id is not None
+                and active is None
+                and not allow_failed_expected
+            ):
+                return None
+            if (
+                allow_failed_expected
+                and expected_run_id is not None
+                and active is not None
+            ):
                 return None
             if active is not None:
                 active_run = self._run_from_row(active)
@@ -102,8 +113,7 @@ class ProjectClaimMixin:
                     self._upsert_agent_session(connection, run_id, *agent_session)
                 return self._run_for_id(connection, run_id)
 
-            candidate = connection.execute(
-                """
+            candidate_query = """
                 SELECT p.*, r.run_id AS existing_run_id, r.status AS existing_status,
                        r.attempt AS existing_attempt
                 FROM pbis AS p
@@ -126,8 +136,31 @@ class ProjectClaimMixin:
                   )
                 ORDER BY p.number
                 LIMIT 1
-                """,
-                (project_id, repository, Stage.PULL_REQUEST.value),
+                """
+            candidate_parameters: tuple[object, ...] = (
+                project_id,
+                repository,
+                Stage.PULL_REQUEST.value,
+            )
+            if allow_failed_expected and expected_run_id is not None:
+                candidate_query = candidate_query.replace(
+                    "AND p.stage != ?",
+                    "AND p.stage != ?\n                  AND r.run_id = ?",
+                )
+                resumable_statuses = (
+                    "AND (\n"
+                    "                      r.status IS NULL OR r.status = 'failed'\n"
+                    "                      OR (r.status = 'awaiting_operator' "
+                    "AND r.task_answer_resumed = 1)\n"
+                    "                  )"
+                )
+                candidate_query = candidate_query.replace(
+                    resumable_statuses,
+                    "AND r.status = 'failed'",
+                )
+                candidate_parameters += (expected_run_id,)
+            candidate = connection.execute(
+                candidate_query, candidate_parameters
             ).fetchone()
             if candidate is None:
                 return None

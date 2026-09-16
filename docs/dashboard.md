@@ -28,14 +28,18 @@ must be present in `BEEHAIIVE_ALLOWED_PROJECTS`, or in the owner and number
 environment variables used by the service.
 
 Read-only state needs no API key. Operator actions require `BEEHAIIVE_API_KEY`
-and the dashboard API-key field. The dashboard exposes sync, start writer, stop,
-approval, clarification, operator-question answers, and retry commit-and-push
-actions. In documented demo
+and the dashboard API-key field. The dashboard exposes sync, start or claim
+writer, stop, advance, approval, clarification, operator-question answers,
+retry, and commit-and-push delivery actions. The API accepts explicit
+`synchronize`, `claim`, `retry`, and `deliver` action names through the same
+authenticated boundary. In documented demo
 mode, start writer claims one PBI and runs the bounded repository-inventory
 worker. A completed
 result is shown on the PBI card. Every action is recorded as `pending`,
 `succeeded`, or `failed`; a response always includes the latest available run
-state.
+state. The inventory covers the dashboard's current operator controls. Review,
+refinement, graph, and host APIs remain authenticated owning-service boundaries
+until their own dashboard slices add controls.
 
 The dashboard worker runs `codex exec` with a writable sandbox rooted at one
 unique Git worktree. It disables network access and child agents, filters the

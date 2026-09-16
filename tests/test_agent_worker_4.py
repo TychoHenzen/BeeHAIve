@@ -42,7 +42,11 @@ def test_worker_manager_commit_and_push_rejects_invalid_run_context() -> None:
         def commit_and_push(self, *_arguments):
             raise AssertionError("Git delivery must not run for invalid state")
 
-    def run_state(status=RunStatus.ACTIVE, lease_token="run-token"):
+    def run_state(
+        status=RunStatus.ACTIVE,
+        lease_token="run-token",
+        lease_expires_at="2099-01-01T00:00:00+00:00",
+    ):
         return SimpleNamespace(
             run_id="run-40",
             project_id="project-1",
@@ -51,6 +55,7 @@ def test_worker_manager_commit_and_push_rejects_invalid_run_context() -> None:
             title="Commit and push",
             status=status,
             lease_token=lease_token,
+            lease_expires_at=lease_expires_at,
         )
 
     def lease_state(status=LeaseStatus.ACTIVE):
@@ -77,7 +82,21 @@ def test_worker_manager_commit_and_push_rejects_invalid_run_context() -> None:
             repository,
             "active run lease",
         ),
+        (
+            run_state(lease_expires_at="2000-01-01T00:00:00+00:00"),
+            lease_state(),
+            True,
+            repository,
+            "active run lease",
+        ),
         (run_state(), None, True, repository, "leased dashboard worktree"),
+        (
+            run_state(),
+            lease_state(LeaseStatus.STOPPED),
+            True,
+            repository,
+            "active workspace lease",
+        ),
         (
             run_state(RunStatus.FAILED),
             lease_state(),
@@ -115,6 +134,7 @@ def test_worker_manager_revalidates_run_before_git_delivery() -> None:
         title="Commit and push",
         status=RunStatus.ACTIVE,
         lease_token="run-token",
+        lease_expires_at="2099-01-01T00:00:00+00:00",
     )
 
     class FakeStore:

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping, Sequence
 from typing import cast
 
 from .constants import (
     _BEARER_TOKEN,
-    _SECRET_ASSIGNMENT,
-    _SECRET_JSON,
     _URL_CREDENTIALS,
     MAX_CONTRACT_ITEMS,
     MAX_CONTRACT_TEXT,
@@ -41,12 +40,122 @@ def _redact_text(value: str, limit: int = MAX_RESULT_TEXT) -> str:
 
 
 def _redact_once(value: str) -> str:
-    redacted = _SECRET_JSON.sub(r"\1[redacted]", value)
+    redacted = _redact_assignments(value)
     redacted = _BEARER_TOKEN.sub("Bearer [redacted]", redacted)
     redacted = _URL_CREDENTIALS.sub(r"\1[redacted]@", redacted)
-    return _SECRET_ASSIGNMENT.sub(
-        lambda match: f"{match.group(1)}=[redacted]", redacted
-    )
+    return redacted
+
+
+_CREDENTIAL_MARKERS = (
+    "accesstoken",
+    "refreshtoken",
+    "token",
+    "apikey",
+    "clientsecret",
+    "privatekey",
+    "credential",
+    "secret",
+    "password",
+)
+_ASSIGNMENT = re.compile(r"(?<![\w-])(?P<key>[\"']?[A-Za-z][\w-]*[\"']?)\s*[:=]")
+
+
+def is_credential_name(name: str) -> bool:
+    """Return whether a field or environment name can carry a credential."""
+
+    normalized = re.sub(r"[^a-z0-9]", "", name.casefold())
+    return any(marker in normalized for marker in _CREDENTIAL_MARKERS)
+
+
+def _consume_quoted(text: str, start: int) -> int:
+    quote = text[start]
+    index = start + 1
+    while index < len(text):
+        if text[index] == "\\":
+            index += 2
+        elif text[index] == quote:
+            return index + 1
+        else:
+            index += 1
+    return len(text)
+
+
+def _consume_container(text: str, start: int) -> int:
+    pairs = {"[": "]", "{": "}"}
+    stack = [pairs[text[start]]]
+    index = start + 1
+    while index < len(text) and stack:
+        character = text[index]
+        if character in {'"', "'"}:
+            index = _consume_quoted(text, index)
+            continue
+        if character in pairs:
+            stack.append(pairs[character])
+        elif character == stack[-1]:
+            stack.pop()
+        index += 1
+    return index
+
+
+def _consume_bare(text: str, start: int, key: str) -> int:
+    if "privatekey" in re.sub(r"[^a-z0-9]", "", key.casefold()) or text.startswith(
+        "-----BEGIN "
+    ):
+        end_marker = re.search(r"-----END [^-\r\n]+-----", text[start:], re.IGNORECASE)
+        if end_marker is not None:
+            return start + end_marker.end()
+    next_assignment = _ASSIGNMENT.search(text, start)
+    end = len(text)
+    if next_assignment is not None:
+        end = next_assignment.start()
+    for delimiter in ("\r", "\n", ",", ";", "]", "}"):
+        delimiter_index = text.find(delimiter, start, end)
+        if delimiter_index >= 0:
+            end = delimiter_index
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    return end
+
+
+def _consume_value(text: str, start: int, key: str) -> int:
+    if start >= len(text):
+        return start
+    if text[start] in {'"', "'"}:
+        return _consume_quoted(text, start)
+    if text[start] in {"[", "{"}:
+        return _consume_container(text, start)
+    return _consume_bare(text, start, key)
+
+
+def _redact_assignments(text: str) -> str:
+    parts: list[str] = []
+    cursor = 0
+    for match in _ASSIGNMENT.finditer(text):
+        if match.start() < cursor:
+            continue
+        raw_key = match.group("key")
+        key = raw_key.strip("\"'")
+        if not is_credential_name(key):
+            continue
+        value_start = match.end()
+        while value_start < len(text) and text[value_start].isspace():
+            value_start += 1
+        value_end = _consume_value(text, value_start, key)
+        if value_end <= value_start:
+            continue
+        replacement = (
+            '"[redacted]"'
+            if raw_key.startswith('"')
+            else "'[redacted]'"
+            if raw_key.startswith("'")
+            else "[redacted]"
+        )
+        parts.extend((text[cursor:value_start], replacement))
+        cursor = value_end
+    if not parts:
+        return text
+    parts.append(text[cursor:])
+    return "".join(parts)
 
 
 def _bounded_value(value: object, depth: int = 0) -> object:
@@ -108,6 +217,7 @@ def _validate_unique_strings(values: Sequence[str], field_name: str) -> None:
 
 __all__ = [
     "_redact_text",
+    "is_credential_name",
     "_bounded_value",
     "_text",
     "_string_tuple",

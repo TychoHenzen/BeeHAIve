@@ -1,16 +1,14 @@
 from __future__ import annotations
 
 import os
+import re
 
+from beehaiive.contract_types.validation import _redact_text as _redact_text
 from beehaiive.workflow import GateResult
 
 from .constants import (
-    _BEARER_TOKEN,
     _SAFE_ENVIRONMENT_NAMES,
-    _SECRET_ASSIGNMENT,
-    _SECRET_JSON,
     _SECRET_NAME,
-    _URL_CREDENTIALS,
     MAX_AGENT_OUTPUT_LENGTH,
 )
 
@@ -26,12 +24,17 @@ def redact_worker_text(
     for secret in sorted(
         (value for value in secret_values if value), key=len, reverse=True
     ):
-        redacted = redacted.replace(secret, "[redacted]")
-    redacted = _SECRET_JSON.sub(r"\1[redacted]", redacted)
-    redacted = _BEARER_TOKEN.sub("Bearer [redacted]", redacted)
-    redacted = _URL_CREDENTIALS.sub(r"\1[redacted]@", redacted)
-    redacted = _SECRET_ASSIGNMENT.sub(
-        lambda match: f"{match.group(1)}=[redacted]", redacted
+        if len(secret) < 8:
+            redacted = re.sub(
+                rf"(?<![\w]){re.escape(secret)}(?![\w])",
+                "[redacted]",
+                redacted,
+            )
+        else:
+            redacted = redacted.replace(secret, "[redacted]")
+    redacted = _redact_text(
+        redacted,
+        max_length if max_length is not None else max(len(redacted), 4_000),
     )
     return redacted if max_length is None else redacted[:max_length]
 

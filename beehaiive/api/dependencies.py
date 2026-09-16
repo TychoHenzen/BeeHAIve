@@ -4,6 +4,7 @@ from typing import Any
 
 from fastapi import Header, HTTPException, Request
 
+from beehaiive.agent import worker_secret_values
 from beehaiive.api.helpers.http import _required_header as _required_header
 from beehaiive.models import RunStatus
 from beehaiive.review_repair import ReviewRepairService
@@ -27,6 +28,26 @@ def build_route_dependencies(
         api_key if api_key is not None else os.environ.get("BEEHAIIVE_API_KEY")
     )
     refinement_secret_values = (configured_api_key,) if configured_api_key else ()
+    worker_secret_values_from_executor = tuple(
+        value
+        for value in getattr(
+            getattr(runtime["agent_worker"], "executor", None),
+            "_secret_values",
+            (),
+        )
+        if isinstance(value, str) and value
+    )
+    dashboard_secret_values = tuple(
+        dict.fromkeys(
+            value
+            for value in (
+                *refinement_secret_values,
+                *worker_secret_values_from_executor,
+                *worker_secret_values(),
+            )
+            if value
+        )
+    )
     configured_review_actor = (
         review_actor
         if review_actor is not None
@@ -195,6 +216,7 @@ def build_route_dependencies(
     return {
         "refinement_path": refinement_path,
         "refinement_secret_values": refinement_secret_values,
+        "dashboard_secret_values": dashboard_secret_values,
         "routing_snapshot": routing_snapshot,
         "require_api_key": require_api_key,
         "require_handoff_lease_token": require_handoff_lease_token,

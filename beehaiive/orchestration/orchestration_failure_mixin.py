@@ -86,8 +86,9 @@ class OrchestrationFailureMixin:
     def stop(self: Any, run_id: str, reason: str = "Stopped by operator") -> RunState:
         """Apply an authenticated operator stop without a worker lease."""
 
+        stopped = self.store.stop(run_id, reason)
         self._cancel_worker(run_id)
-        return self.store.stop(run_id, reason)
+        return stopped
 
     def recover_routing_problem(self: Any, run_id: str, reason: str) -> None:
         if self.model_router is None:

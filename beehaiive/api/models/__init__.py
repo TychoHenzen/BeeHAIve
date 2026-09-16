@@ -1,7 +1,11 @@
 from .advance_request import AdvanceRequest as AdvanceRequest
 from .conflict_repair_request import ConflictRepairRequest as ConflictRepairRequest
 from .dashboard_action_base import DashboardActionBase as DashboardActionBase
+from .dashboard_action_request import DASHBOARD_ACTIONS as DASHBOARD_ACTIONS
 from .dashboard_action_request import DashboardActionRequest as DashboardActionRequest
+from .dashboard_advance_request import (
+    DashboardAdvanceRequest as DashboardAdvanceRequest,
+)
 from .dashboard_answer_question_request import (
     DashboardAnswerQuestionRequest as DashboardAnswerQuestionRequest,
 )
@@ -14,8 +18,12 @@ from .dashboard_clarify_request import (
 from .dashboard_commit_push_request import (
     DashboardCommitPushRequest as DashboardCommitPushRequest,
 )
+from .dashboard_retry_request import DashboardRetryRequest as DashboardRetryRequest
 from .dashboard_start_request import DashboardStartRequest as DashboardStartRequest
 from .dashboard_stop_request import DashboardStopRequest as DashboardStopRequest
+from .dashboard_synchronize_request import (
+    DashboardSynchronizeRequest as DashboardSynchronizeRequest,
+)
 from .failure_request import FailureRequest as FailureRequest
 from .graph_safety_request import GraphRollbackRequest as GraphRollbackRequest
 from .graph_safety_request import GraphSafetyRequest as GraphSafetyRequest
@@ -93,12 +101,17 @@ __all__ = [
     "AdvanceRequest",
     "ConflictRepairRequest",
     "DashboardActionBase",
+    "DASHBOARD_ACTIONS",
     "DashboardActionRequest",
+    "DashboardAdvanceRequest",
+    "DashboardAnswerQuestionRequest",
     "DashboardApproveRequest",
     "DashboardClarifyRequest",
     "DashboardCommitPushRequest",
+    "DashboardRetryRequest",
     "DashboardStartRequest",
     "DashboardStopRequest",
+    "DashboardSynchronizeRequest",
     "FailureRequest",
     "GraphRollbackRequest",
     "GraphSafetyRequest",
