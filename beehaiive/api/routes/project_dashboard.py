@@ -1,8 +1,10 @@
+import json
 from collections.abc import Callable
 from typing import Any, Literal, cast
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 
+from beehaiive import Orchestrator
 from beehaiive.agent import MAX_AGENT_OUTPUT_LENGTH, redact_worker_text
 from beehaiive.api.helpers.dashboard import (
     DASHBOARD_ACTION_OWNERS as DASHBOARD_ACTION_OWNERS,
@@ -55,10 +57,22 @@ from beehaiive.api.models import DashboardStartRequest as DashboardStartRequest
 from beehaiive.api.models import DashboardStopRequest as DashboardStopRequest
 from beehaiive.api.models import MetaReviewDecisionRequest as MetaReviewDecisionRequest
 from beehaiive.api.models import MetaReviewRequest as MetaReviewRequest
+from beehaiive.api.models import SchedulerConfigRequest as SchedulerConfigRequest
 from beehaiive.dashboard.values import safe_dashboard_value
 from beehaiive.provider import ProviderError
+from beehaiive.scheduler import SchedulerConfig
 from beehaiive.storage import DEFAULT_EVENT_LIMIT, MAX_EVENT_LIMIT, StoreError
 from beehaiive.workflow import WorkflowError
+
+MAX_DASHBOARD_ACTION_BYTES = 64_000
+
+
+async def _require_dashboard_action_size(request: Request) -> None:
+    body = await request.body()
+    if len(body) > MAX_DASHBOARD_ACTION_BYTES:
+        raise HTTPException(
+            status_code=413, detail="Dashboard action request is too large"
+        )
 
 
 def _handle_dashboard_read[T](
@@ -89,6 +103,17 @@ def _handle_dashboard_read[T](
         ) from exc
 
 
+def _project_state_without_graph_trace(
+    orchestrator: Orchestrator, project_id: str, event_limit: int
+) -> dict[str, object]:
+    state = orchestrator.store.project_state(project_id, event_limit)
+    repositories = cast(list[dict[str, object]], state.get("repositories", []))
+    for repository in repositories:
+        for pbi in cast(list[dict[str, object]], repository.get("pbis", [])):
+            pbi.pop("graph_trace", None)
+    return state
+
+
 def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
     agent_worker = context["agent_worker"]
     dashboard_secret_values = context["dashboard_secret_values"]
@@ -100,6 +125,8 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
     scheduler = context["scheduler"]
     scheduler_config = context["scheduler_config"]
     workflow_service = context["workflow_service"]
+    graph_safety_service = context["graph_safety_service"]
+    require_workflow_operator = context["require_workflow_operator"]
 
     @app.get("/projects/{project_id}")
     def project_state(  # pyright: ignore[reportUnusedFunction]
@@ -112,7 +139,9 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
         _access: None = Depends(require_project_access),
     ) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         return _handle_store_error(
-            lambda: orchestrator.store.project_state(project_id, event_limit)
+            lambda: _project_state_without_graph_trace(
+                orchestrator, project_id, event_limit
+            )
         )
 
     @app.get("/projects/{project_id}/dashboard")
@@ -124,6 +153,7 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
             le=MAX_EVENT_LIMIT,
         ),
         archived: bool = Query(default=False),
+        workflow_id: str | None = Query(default=None, max_length=128),
         _access: None = Depends(require_project_access),
     ) -> dict[str, object]:
         return _handle_dashboard_read(
@@ -137,6 +167,8 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
                 scheduler_config,
                 agent_worker,
                 dashboard_secret_values,
+                graph_safety_service,
+                workflow_id,
             ),
             dashboard_secret_values,
         )
@@ -159,6 +191,53 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
             }
 
         return _handle_dashboard_read(read_actions, dashboard_secret_values)
+
+    @app.post("/projects/{project_id}/scheduler")
+    def configure_scheduler(
+        project_id: str,
+        request: SchedulerConfigRequest,
+        _auth: None = Depends(require_mutation_access),
+    ) -> dict[str, object]:
+        if not request.approved:
+            raise HTTPException(
+                status_code=400,
+                detail="Operator approval is required for scheduler configuration",
+            )
+        if scheduler is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Scheduler is unavailable until a workflow-backed agent worker "
+                    "is configured"
+                ),
+            )
+        action = orchestrator.store.begin_action(
+            project_id,
+            "scheduler_configure",
+            request.model_dump(exclude_none=True),
+        )
+        try:
+            scheduler.configure(
+                SchedulerConfig(
+                    enabled=request.enabled,
+                    poll_interval_seconds=request.poll_interval_seconds,
+                    max_concurrency=request.max_concurrency,
+                )
+            )
+            status = cast(dict[str, object], scheduler.status_for(project_id) or {})
+            result: dict[str, object] = {"scheduler": status}
+            completed = orchestrator.store.finish_action(
+                str(action["id"]), "succeeded", result
+            )
+            return {"scheduler": status or {}, "action": completed}
+        except Exception as exc:
+            error = redact_worker_text(
+                str(exc), dashboard_secret_values, max_length=MAX_AGENT_OUTPUT_LENGTH
+            )
+            orchestrator.store.finish_action(str(action["id"]), "failed", error=error)
+            raise HTTPException(
+                status_code=409, detail="Scheduler configuration could not be applied"
+            ) from exc
 
     @app.post("/projects/{project_id}/meta-review")
     def run_meta_review(  # pyright: ignore[reportUnusedFunction]
@@ -205,13 +284,28 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
     def dashboard_action(  # pyright: ignore[reportUnusedFunction]
         project_id: str,
         request: DashboardActionRequest,
+        http_request: Request,
         archived: bool = Query(default=False),
+        workflow_id: str | None = Query(default=None, max_length=128),
         _auth: None = Depends(require_mutation_access),
+        _size: None = Depends(_require_dashboard_action_size),
     ) -> dict[str, object]:
         if not request.approved:
             raise HTTPException(
                 status_code=400,
                 detail="Operator approval is required for dashboard actions",
+            )
+        if request.action in {"graph_review", "graph_activate", "graph_rollback"}:
+            require_workflow_operator(http_request.headers.get("X-API-Key"))
+        body_workflow_id = getattr(request, "workflow_id", None)
+        if (
+            workflow_id is not None
+            and body_workflow_id is not None
+            and workflow_id != body_workflow_id
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Selected workflow ID does not match the action workflow ID",
             )
         if (
             isinstance(request, DashboardStartRequest) and request.worker_id is not None
@@ -352,6 +446,7 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
             if isinstance(
                 request,
                 (
+                    DashboardStartRequest,
                     DashboardAdvanceRequest,
                     DashboardApproveRequest,
                     DashboardAnswerQuestionRequest,
@@ -378,7 +473,33 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
             )
             else None
         )
-        action_request = request.model_dump(exclude_none=True)
+        raw_action_request = request.model_dump(exclude_none=True)
+        if (
+            len(
+                json.dumps(
+                    raw_action_request, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+            )
+            > MAX_DASHBOARD_ACTION_BYTES
+        ):
+            raise HTTPException(
+                status_code=413, detail="Dashboard action request is too large"
+            )
+        action_request = cast(
+            dict[str, object],
+            safe_dashboard_value(raw_action_request, dashboard_secret_values),
+        )
+        if (
+            len(
+                json.dumps(
+                    action_request, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+            )
+            > MAX_DASHBOARD_ACTION_BYTES
+        ):
+            raise HTTPException(
+                status_code=413, detail="Dashboard action request is too large"
+            )
         if isinstance(request, DashboardAnswerQuestionRequest):
             action_request["answer"] = "[redacted]"
         action = orchestrator.store.begin_action(
@@ -389,6 +510,7 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
             pbi_number,
             run_id,
         )
+        workflow_id = workflow_id or getattr(request, "workflow_id", None)
         try:
             result = _execute_dashboard_action(
                 orchestrator,
@@ -396,6 +518,7 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
                 request,
                 agent_worker,
                 dashboard_secret_values,
+                graph_safety_service,
             )
         except (ProviderError, StoreError, WorkflowError) as exc:
             error = redact_worker_text(
@@ -421,6 +544,8 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
                     scheduler_config,
                     agent_worker,
                     dashboard_secret_values,
+                    graph_safety_service,
+                    workflow_id,
                 ),
             }
         except Exception as exc:
@@ -447,6 +572,8 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
                     scheduler_config,
                     agent_worker,
                     dashboard_secret_values,
+                    graph_safety_service,
+                    workflow_id,
                 ),
             }
         safe_result = safe_dashboard_value(result, dashboard_secret_values)
@@ -483,6 +610,8 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
                 scheduler_config,
                 agent_worker,
                 dashboard_secret_values,
+                graph_safety_service,
+                workflow_id,
             ),
         }
 

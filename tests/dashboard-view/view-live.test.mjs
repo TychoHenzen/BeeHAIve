@@ -97,6 +97,30 @@ test("rendering live state exposes current stages and active actions", () => {
                 },
               ],
             },
+            graph_trace: [{
+              execution_id: "run-1",
+              revision: 1,
+              node_id: "start",
+              step: 1,
+              attempt: 1,
+              outcome: "pass",
+              status: "advanced",
+              selected_edge: { target: "done" },
+              reason: "next node",
+              created_at: "2026-09-09T19:59:45Z",
+              evidence: { summary: "safe" },
+            }, {
+              execution_id: "run-1",
+              revision: 1,
+              node_id: "done",
+              step: 2,
+              attempt: 1,
+              outcome: "pass",
+              status: "terminal",
+              reason: "complete",
+              created_at: "2026-09-09T19:59:50Z",
+              evidence: { summary: "finished" },
+            }],
             subtasks: [{ id: "#2", title: "Test API" }],
             escalation: { current: 0, current_tier: "terra", consecutive: 0 },
             escalation_log: [{ tier: "terra", resolved: false }],
@@ -152,6 +176,26 @@ test("rendering live state exposes current stages and active actions", () => {
   assert.match(dashboardOutput.textContent, /State: active/);
   assert.match(dashboardOutput.textContent, /started/);
   assert.match(dashboardOutput.textContent, /safe <message>/);
+  assert.match(dashboardOutput.textContent, /Graph trace/);
+  assert.match(dashboardOutput.textContent, /node start -> done/);
+  assert.match(dashboardOutput.textContent, /run run-1/);
+  const traceFilter = findNode(
+    dashboardOutput,
+    (node) => node.tag === "select",
+  );
+  assert.ok(traceFilter);
+  const traceDetails = findNode(
+    dashboardOutput,
+    (node) => node.tag === "details",
+  );
+  assert.ok(traceDetails);
+  traceFilter.value = "paused";
+  traceFilter.listeners.get("change")();
+  assert.match(dashboardOutput.textContent, /No graph trace events match this filter/);
+  traceFilter.value = "terminal";
+  traceFilter.listeners.get("change")();
+  assert.doesNotMatch(dashboardOutput.textContent, /step 1/);
+  assert.match(dashboardOutput.textContent, /step 2/);
   assert.equal(actionLog.hidden, false);
 
   const startButton = findNode(

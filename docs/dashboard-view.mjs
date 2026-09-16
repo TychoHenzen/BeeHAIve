@@ -1,6 +1,7 @@
 import { createActionRenderer } from "./dashboard-view/actions.mjs";
 import { createDetailRenderers } from "./dashboard-view/details.mjs";
 import { createDom } from "./dashboard-view/dom.mjs";
+import { createGraphRenderer } from "./dashboard-view/graph.mjs";
 import { createPbiRenderer } from "./dashboard-view/pbi.mjs";
 import { createRepositoryRenderer } from "./dashboard-view/repository.mjs";
 import { createSummaryRenderer } from "./dashboard-view/summary.mjs";
@@ -16,6 +17,7 @@ export function createDashboardView({
   const dom = createDom(document);
   const details = createDetailRenderers(dom);
   const renderPbi = createPbiRenderer(dom, details, runAction);
+  const renderGraph = createGraphRenderer(dom, runAction);
   const renderRepository = createRepositoryRenderer(dom, renderPbi, runAction);
   const renderSummary = createSummaryRenderer(dom, summaryOutput);
   const renderActions = createActionRenderer(dom, actionLog, actionsOutput);
@@ -33,6 +35,7 @@ export function createDashboardView({
     renderSummary(state.counts || {}, state.scheduler);
     dashboardOutput.replaceChildren();
     dashboardOutput.append(renderProject(state));
+    dashboardOutput.append(renderGraph(state.graph, state.project_id));
     const repositories = state.repositories || [];
     if (repositories.length === 0) {
       dashboardOutput.append(

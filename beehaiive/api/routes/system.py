@@ -19,6 +19,7 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
         "actions",
         "details",
         "dom",
+        "graph",
         "pbi",
         "repository",
         "summary",
@@ -78,6 +79,20 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
     def dashboard_client_script() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
         return FileResponse(
             docs_directory / "dashboard-client.mjs",
+            media_type="application/javascript",
+        )
+
+    @app.get("/dashboard-ui.mjs", response_class=FileResponse)
+    def dashboard_ui_module() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
+        return FileResponse(
+            docs_directory / "dashboard-ui.mjs",
+            media_type="application/javascript",
+        )
+
+    @app.get("/dashboard-demo.mjs", response_class=FileResponse)
+    def dashboard_demo_module() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
+        return FileResponse(
+            docs_directory / "dashboard-demo.mjs",
             media_type="application/javascript",
         )
 

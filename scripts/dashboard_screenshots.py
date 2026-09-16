@@ -4,17 +4,17 @@ from __future__ import annotations
 
 import base64
 import os
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
 
+from beehaiive.contracts import TaskOutcome, TaskResult
 from beehaiive.models import Stage
 from scripts.dashboard_smoke_browser import (
     DevTools,
     click_button,
     click_repository_button,
-    click_selector,
-    set_input,
     wait_for_action,
     wait_for_action_response,
     wait_for_status,
@@ -67,23 +67,25 @@ def configure_view(devtools: DevTools, *, live: bool = False) -> None:
     node.dataset.runId = "run-redacted";
   }
   if (__LIVE__) {
-    for (const node of document.querySelectorAll(".project-meta h2"))
+    for (const node of document.querySelectorAll("#project-switcher .project-filter"))
       node.textContent = "Configured demo project";
-    for (const [index, node] of [...document.querySelectorAll(".repo h2")].entries())
-      node.textContent = `redacted/repository-${index + 1}`;
-    for (const node of document.querySelectorAll(".pbi-title"))
-      node.textContent = "Bounded demo PBI";
-    for (const node of document.querySelectorAll(".pbi .mono"))
-      node.textContent = "redacted PBI";
-    for (const node of document.querySelectorAll(".pbi .muted"))
-      node.textContent = "redacted metadata";
-    for (const node of document.querySelectorAll(".action-row .muted"))
-      node.textContent = "redacted/repository";
+    const projectNodes = document.querySelectorAll(
+      "[data-testid='work-item'] .row-project"
+    );
+    for (const [index, node] of [...projectNodes].entries())
+      node.textContent = `redacted/project-${index + 1}`;
+    const titleNodes = document.querySelectorAll(
+      "[data-testid='work-item'] .row-title"
+    );
+    for (const node of titleNodes)
+      node.textContent = "Bounded demo work item";
+    for (const node of document.querySelectorAll(
+      "#activity-output .activity-list span"
+    ))
+      node.textContent = "redacted activity";
   }
-  const projectInput = document.querySelector("#project-id");
+  const projectInput = document.querySelector("#settings-project-id");
   if (projectInput) projectInput.value = "redacted:2";
-  const apiInput = document.querySelector("#api-key");
-  if (apiInput) apiInput.value = "";
   return true;
 })()
 """.replace("__LIVE__", "true" if live else "false")
@@ -107,19 +109,15 @@ def capture(devtools: DevTools, filename: str) -> None:
 
 
 def sync_dashboard(devtools: DevTools, api_key: str) -> None:
+    del api_key
     wait_for_status(devtools, "Updated ", "initial screenshot dashboard")
-    set_input(devtools, "#api-key", api_key)
-    if not click_selector(devtools, "#start"):
-        raise SmokeFailure("The screenshot dashboard did not render sync")
-    wait_for_action(devtools, "start")
-    wait_for_action_response(devtools, "start")
 
 
 def reload_dashboard(devtools: DevTools) -> None:
     devtools.command("Page.reload", {"ignoreCache": True})
     wait_until(
         devtools,
-        "Boolean(document.querySelector('.repo'))",
+        "Boolean(document.querySelector('[data-testid=\"work-item\"]'))",
         "dashboard reload",
     )
 
@@ -128,12 +126,12 @@ def start_writer(
     devtools: DevTools, repository_hint: str | None = None
 ) -> tuple[str, int, str]:
     rendered = (
-        click_repository_button(devtools, repository_hint, "Start writer")
+        click_repository_button(devtools, repository_hint, "Start work")
         if repository_hint
-        else click_button(devtools, "Start writer")
+        else click_button(devtools, "Start work")
     )
     if not rendered:
-        raise SmokeFailure("The screenshot dashboard did not render Start writer")
+        raise SmokeFailure("The screenshot dashboard did not render Start work")
     wait_for_action(devtools, "start")
     response = wait_for_action_response(devtools, "start")
     payload = response.get("payload")
@@ -192,7 +190,6 @@ def capture_configured_active_completed() -> None:
         capture(devtools, "dashboard-configured.png")
 
         reload_dashboard(devtools)
-        set_input(devtools, "#api-key", api_key)
         _, _, run_id = start_writer(devtools, repository_hint)
         configure_view(devtools, live=live)
         capture(devtools, "active-demo.png")
@@ -202,8 +199,9 @@ def capture_configured_active_completed() -> None:
             wait_until(
                 devtools,
                 (
-                    "(document.querySelector('.pbi')?.textContent || '')"
-                    ".includes('Result:')"
+                    "(document.querySelector('[data-testid=\"work-item\"]')"
+                    "?.textContent || '')"
+                    ".includes('Delivered')"
                 ),
                 "completed screenshot result",
                 timeout=180.0,
@@ -215,7 +213,39 @@ def capture_configured_active_completed() -> None:
             run = store.get_run(run_id)
             if run is None or run.lease_token is None:
                 raise SmokeFailure("The screenshot run has no active lease")
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                run = store.get_run(run_id)
+                contract = run.task_contract if run is not None else None
+                contract_inputs = (
+                    contract.get("inputs", {}) if isinstance(contract, Mapping) else {}
+                )
+                if (
+                    isinstance(contract_inputs, Mapping)
+                    and isinstance(contract_inputs.get("branch"), str)
+                    and isinstance(contract_inputs.get("tracked_file_count"), int)
+                ):
+                    break
+                time.sleep(0.05)
+            else:
+                raise SmokeFailure(
+                    "The screenshot run did not publish its task contract"
+                )
             run = store.advance(run_id, Stage.IMPLEMENT, run.lease_token)
+            store.record_task_result(
+                run_id,
+                TaskResult(
+                    TaskOutcome.PASS,
+                    {
+                        "repository": contract_inputs.get("repository", "owner/api"),
+                        "branch": contract_inputs.get("branch", ""),
+                        "tracked_file_count": contract_inputs.get(
+                            "tracked_file_count", 0
+                        ),
+                    },
+                ),
+                run.lease_token or "",
+            )
             store.complete_agent_run(
                 run_id,
                 (
@@ -227,7 +257,8 @@ def capture_configured_active_completed() -> None:
             )
         wait_until(
             devtools,
-            "(document.querySelector('.pbi')?.textContent || '').includes('Result:')",
+            "(document.querySelector('[data-testid=\"work-item\"]')"
+            "?.textContent || '').includes('Delivered')",
             "completed screenshot result",
         )
         configure_view(devtools, live=live)
@@ -248,8 +279,10 @@ def capture_stopped() -> None:
         devtools = environment.devtools
         sync_dashboard(devtools, api_key)
         start_writer(devtools, repository_hint)
-        if not click_button(devtools, "Stop"):
-            raise SmokeFailure("The screenshot dashboard did not render Stop")
+        if not click_button(devtools, "Inspect run"):
+            raise SmokeFailure("The screenshot dashboard did not render Inspect run")
+        if not click_button(devtools, "Stop run"):
+            raise SmokeFailure("The screenshot dashboard did not render Stop run")
         wait_for_action(devtools, "stop")
         wait_for_action_response(devtools, "stop")
         configure_view(devtools, live=mode == "live")

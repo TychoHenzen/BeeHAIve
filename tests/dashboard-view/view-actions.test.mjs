@@ -302,3 +302,155 @@ test("inactive PBIs expose evidence without mutation controls", () => {
     false,
   );
 });
+
+test("graph state exposes draft controls and version readback", () => {
+  const dashboardOutput = new FakeNode("section");
+  const actionPayloads = [];
+  const view = createDashboardView({
+    document: new FakeDocument(),
+    summaryOutput: new FakeNode("section"),
+    dashboardOutput,
+    actionLog: new FakeNode("section"),
+    actionsOutput: new FakeNode("div"),
+    runAction: (payload) => actionPayloads.push(payload),
+  });
+
+  view.render({
+    counts: {},
+    graph: {
+      workflow_id: "dashboard-flow",
+      active: { revision: 1 },
+      definitions: [{
+        workflow_id: "dashboard-flow",
+        revision: 1,
+        nodes: [{ node_id: "start", kind: "prompt" }],
+        edges: Array.from({ length: 128 }, (_, index) => ({
+          source: "start",
+          target: "done",
+          condition: `condition-${index}`,
+        })),
+        definition_hash: "abc",
+        safety_evidence: {
+          evidence_hash: "def",
+          evidence: {
+            safety: {
+              passed: false,
+              checks: [{ name: "reachability", status: "fail", reason: "unused node" }],
+            },
+          },
+        },
+        review: { actor: "operator" },
+        active: true,
+      }],
+    },
+    repositories: [],
+  });
+
+  assert.match(dashboardOutput.textContent, /Workflow graph/);
+  assert.match(dashboardOutput.textContent, /Nodes: start \(prompt\)/);
+  assert.match(dashboardOutput.textContent, /condition-127/);
+  assert.match(dashboardOutput.textContent, /reachability: fail/);
+  const evaluate = findNode(
+    dashboardOutput,
+    (node) => node.tag === "button" && node.textContent === "Evaluate draft",
+  );
+  assert.ok(evaluate);
+  evaluate.click();
+  assert.equal(actionPayloads[0].action, "graph_evaluate");
+  assert.equal(actionPayloads[0].workflow_id, "dashboard-flow");
+  assert.equal(actionPayloads[0].candidate.workflow_id, "dashboard-flow");
+});
+
+test("graph revision controls include baseline data for activation", () => {
+  const dashboardOutput = new FakeNode("section");
+  const actionPayloads = [];
+  const view = createDashboardView({
+    document: new FakeDocument(),
+    summaryOutput: new FakeNode("section"),
+    dashboardOutput,
+    actionLog: new FakeNode("section"),
+    actionsOutput: new FakeNode("div"),
+    runAction: (payload) => actionPayloads.push(payload),
+  });
+
+  view.render({
+    counts: {},
+    graph: {
+      workflow_id: "dashboard-flow",
+      active: { revision: 1 },
+      definitions: [
+        { workflow_id: "dashboard-flow", revision: 1, nodes: [], edges: [] },
+        { workflow_id: "dashboard-flow", revision: 2, nodes: [], edges: [] },
+      ],
+    },
+    repositories: [],
+  });
+
+  const activate = findNode(
+    dashboardOutput,
+    (node) => node.tag === "button" && node.textContent === "Activate reviewed draft",
+  );
+  assert.ok(activate);
+  activate.click();
+  assert.equal(actionPayloads[0].action, "graph_activate");
+  assert.equal(actionPayloads[0].baseline.revision, 1);
+  assert.deepEqual(actionPayloads[0].baseline_fixtures, {});
+});
+
+test("graph drafts survive a polling rerender", () => {
+  const dashboardOutput = new FakeNode("section");
+  const view = createDashboardView({
+    document: new FakeDocument(),
+    summaryOutput: new FakeNode("section"),
+    dashboardOutput,
+    actionLog: new FakeNode("section"),
+    actionsOutput: new FakeNode("div"),
+    runAction: () => {},
+  });
+  const state = {
+    counts: {},
+    graph: {
+      workflow_id: "dashboard-flow",
+      active: null,
+      definitions: [],
+    },
+    repositories: [],
+  };
+
+  view.render(state);
+  const draft = findNode(dashboardOutput, (node) => node.tag === "textarea");
+  assert.ok(draft);
+  draft.value = '{"workflow_id":"dashboard-flow","revision":1}';
+  draft.listeners.get("input")();
+  view.render(state);
+  const rerendered = findNode(dashboardOutput, (node) => node.tag === "textarea");
+  assert.ok(rerendered);
+  assert.equal(rerendered.value, draft.value);
+});
+
+test("graph drafts do not cross project boundaries", () => {
+  const dashboardOutput = new FakeNode("section");
+  const view = createDashboardView({
+    document: new FakeDocument(),
+    summaryOutput: new FakeNode("section"),
+    dashboardOutput,
+    actionLog: new FakeNode("section"),
+    actionsOutput: new FakeNode("div"),
+    runAction: () => {},
+  });
+  const base = {
+    counts: {},
+    graph: { workflow_id: "dashboard-flow", active: null, definitions: [] },
+    repositories: [],
+  };
+
+  view.render({ ...base, project_id: "project-a" });
+  const firstDraft = findNode(dashboardOutput, (node) => node.tag === "textarea");
+  assert.ok(firstDraft);
+  firstDraft.value = '{"workflow_id":"dashboard-flow","revision":99}';
+  firstDraft.listeners.get("input")();
+  view.render({ ...base, project_id: "project-b" });
+  const secondDraft = findNode(dashboardOutput, (node) => node.tag === "textarea");
+  assert.ok(secondDraft);
+  assert.notEqual(secondDraft.value, firstDraft.value);
+});

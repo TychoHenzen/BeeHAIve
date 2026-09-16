@@ -76,3 +76,36 @@ def test_dashboard_start_cleanup_failure_is_reported() -> None:
     finally:
         service.stop = original_stop  # type: ignore[method-assign]
         service.store.close()
+
+
+def test_dashboard_start_passes_the_selected_pbi_to_the_worker() -> None:
+    service = Orchestrator(OrchestratorStore(), FakeProvider(dashboard_snapshot()))
+    service.synchronize("project-1")
+    selected: list[int | None] = []
+
+    class TargetingWorker:
+        def claim(self, project_id, repository, owner_id, task, **options):
+            selected.append(options.get("expected_pbi_number"))
+            return service.claim(
+                project_id,
+                repository,
+                owner_id,
+                expected_pbi_number=options.get("expected_pbi_number"),
+            )
+
+        def start(self, run) -> None:
+            del run
+
+    try:
+        result = main_module._execute_dashboard_action(
+            service,
+            "project-1",
+            main_module.DashboardStartRequest(
+                action="start", approved=True, repository="owner/api", pbi_number=1
+            ),
+            TargetingWorker(),
+        )
+        assert result["run"]["pbi_number"] == 1
+        assert selected == [1]
+    finally:
+        service.store.close()

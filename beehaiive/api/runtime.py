@@ -14,6 +14,7 @@ from beehaiive.api.helpers.configuration import (
 from beehaiive.api.helpers.configuration import (
     _routing_config_from_environment as _routing_config_from_environment,
 )
+from beehaiive.autonomous import AutonomousLifecycleService
 from beehaiive.conflict_repair import ConflictRepairAgent, ConflictRepairService
 from beehaiive.graph_safety import GraphSafetyService
 from beehaiive.meta_review import MetaReviewService
@@ -45,6 +46,7 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
     store = options["store"]
     workflow_service = options["workflow_service"]
     graph_safety_service = options["graph_safety_service"]
+    autonomous_service = options.get("autonomous_service")
     owns_orchestrator = orchestrator is None
     if orchestrator is not None and orchestrator.model_router is not None:
         if model_router is not None and model_router is not orchestrator.model_router:
@@ -94,6 +96,15 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("The graph safety service and API must share one state store")
     if graph_safety_service is None:
         graph_safety_service = GraphSafetyService(orchestrator.store)
+    scheduler_config = SchedulerConfig.from_environment()
+    if autonomous_service is None:
+        autonomous_service = AutonomousLifecycleService(
+            orchestrator, max_concurrency=scheduler_config.max_concurrency
+        )
+    else:
+        set_capacity = getattr(autonomous_service, "set_max_concurrency", None)
+        if callable(set_capacity):
+            set_capacity(scheduler_config.max_concurrency)
     pbi_creation_service = PbiCreationService(
         orchestrator.store,
         cast(PbiCreationProvider, orchestrator.provider),
@@ -205,15 +216,34 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
         )
 
     configured_projects = _configured_project_ids(allowed_project_ids)
-    scheduler_config = SchedulerConfig.from_environment()
     scheduler = None
-    if scheduler_config.enabled:
-        if agent_worker is None:
-            raise ValueError(
-                "The scheduler requires a configured dashboard agent worker"
-            )
+    if scheduler_config.enabled and agent_worker is None:
+        raise ValueError("The scheduler requires a configured dashboard agent worker")
+    if scheduler_config.enabled and not configured_projects:
+        raise ValueError("The scheduler requires at least one allowlisted project")
+    if agent_worker is not None and configured_projects:
         scheduler = AgentScheduler(
-            orchestrator, agent_worker, configured_projects, scheduler_config
+            orchestrator,
+            agent_worker,
+            configured_projects,
+            scheduler_config,
+            autonomous_start=autonomous_service.start,
+            autonomous_has_capacity=(
+                autonomous_service.has_capacity
+                if callable(getattr(autonomous_service, "has_capacity", None))
+                else None
+            ),
+            autonomous_set_capacity=(
+                autonomous_service.set_max_concurrency
+                if callable(getattr(autonomous_service, "set_max_concurrency", None))
+                else None
+            ),
+            autonomous_active_count=(
+                autonomous_service.active_count
+                if callable(getattr(autonomous_service, "active_count", None))
+                else None
+            ),
+            allow_disabled=not scheduler_config.enabled,
         )
     return {
         "orchestrator": orchestrator,
@@ -232,5 +262,6 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
         "scheduler": scheduler,
         "workflow_service": workflow_service,
         "graph_safety_service": graph_safety_service,
+        "autonomous_service": autonomous_service,
         "require_review_adapters": require_review_adapters,
     }

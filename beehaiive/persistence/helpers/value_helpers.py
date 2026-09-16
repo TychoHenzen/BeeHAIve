@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping, Sequence
 from typing import cast
 from urllib.parse import parse_qsl, urlsplit
 
 from beehaiive.models import (
-    ARCHIVE_PROJECT_STATUS,
     PROJECT_TERMINAL_STATUSES,
     PbiSnapshot,
     RunStatus,
@@ -47,22 +45,7 @@ def _archive_eligible(pbi: PbiSnapshot, run_status: str | None = None) -> bool:
         RunStatus.FAILED.value,
     }:
         return False
-    if (pbi.planning_status or "").strip().lower() not in PROJECT_TERMINAL_STATUSES:
-        return False
-    if (pbi.planning_status or "").strip().lower() != ARCHIVE_PROJECT_STATUS:
-        return False
-    pull_requests = pbi.metadata.get("pull_requests")
-    if not isinstance(pull_requests, Sequence) or isinstance(
-        pull_requests, (str, bytes, bytearray)
-    ):
-        return False
-    return any(
-        isinstance(raw_pull_request, Mapping)
-        and (pull_request := cast(Mapping[str, object], raw_pull_request)).get("merged")
-        is True
-        and pull_request.get("source_branch_state") == "deleted"
-        for raw_pull_request in cast(Sequence[object], pull_requests)
-    )
+    return (pbi.planning_status or "").strip().lower() in PROJECT_TERMINAL_STATUSES
 
 
 def _bounded_event_details(value: object) -> dict[str, object]:

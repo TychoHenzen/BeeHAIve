@@ -69,6 +69,7 @@ class WorkerCapacityMixin:
         task: str,
         *,
         expected_run_id: str | None = None,
+        expected_pbi_number: int | None = None,
     ) -> RunState | None:
         if not task.strip():
             raise StoreError("An agent task is required")
@@ -82,6 +83,7 @@ class WorkerCapacityMixin:
             repository,
             owner_id,
             expected_run_id=expected_run_id,
+            expected_pbi_number=expected_pbi_number,
             agent_session=(
                 self._worker_id,
                 redact_worker_text(task, secret_values, max_length=None),

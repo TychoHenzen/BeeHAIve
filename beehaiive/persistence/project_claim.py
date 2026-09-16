@@ -19,11 +19,16 @@ class ProjectClaimMixin:
         lease_token: str | None = None,
         *,
         expected_run_id: str | None = None,
+        expected_pbi_number: int | None = None,
         agent_session: tuple[str, str] | None = None,
         allow_failed_expected: bool = False,
     ) -> RunState | None:
         if not owner_id.strip():
             raise StoreError("A worker owner is required")
+        if expected_pbi_number is not None and (
+            type(expected_pbi_number) is not int or expected_pbi_number <= 0
+        ):
+            raise StoreError("A PBI number must be a positive integer")
         if agent_session is not None and (
             not agent_session[0].strip() or not agent_session[1].strip()
         ):
@@ -48,9 +53,17 @@ class ProjectClaimMixin:
                 WHERE p.project_id = ? AND p.repository_name = ?
                   AND r.status = 'active'
                   AND (? IS NULL OR r.run_id = ?)
+                  AND (? IS NULL OR p.number = ?)
                 LIMIT 1
                 """,
-                (project_id, repository, expected_run_id, expected_run_id),
+                (
+                    project_id,
+                    repository,
+                    expected_run_id,
+                    expected_run_id,
+                    expected_pbi_number,
+                    expected_pbi_number,
+                ),
             ).fetchone()
             if (
                 expected_run_id is not None
@@ -130,6 +143,7 @@ class ProjectClaimMixin:
                   AND p.repository_name = ?
                   AND p.claimable = 1
                   AND p.stage != ?
+                  AND (? IS NULL OR p.number = ?)
                   AND (
                       r.status IS NULL OR r.status = 'failed'
                       OR (r.status = 'awaiting_operator' AND r.task_answer_resumed = 1)
@@ -141,6 +155,8 @@ class ProjectClaimMixin:
                 project_id,
                 repository,
                 Stage.PULL_REQUEST.value,
+                expected_pbi_number,
+                expected_pbi_number,
             )
             if allow_failed_expected and expected_run_id is not None:
                 candidate_query = candidate_query.replace(

@@ -37,6 +37,7 @@ class OrchestrationSyncMixin:
         lease_token: str | None = None,
         *,
         expected_run_id: str | None = None,
+        expected_pbi_number: int | None = None,
         agent_session: tuple[str, str] | None = None,
     ) -> RunState | None:
         return self.store.claim_next(
@@ -45,6 +46,7 @@ class OrchestrationSyncMixin:
             owner_id,
             lease_token,
             expected_run_id=expected_run_id,
+            expected_pbi_number=expected_pbi_number,
             agent_session=agent_session,
         )
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any
+import json
+from typing import Any, cast
 
 from beehaiive.models import RunState
 
@@ -9,6 +10,9 @@ from .constants import MAX_EVENT_LIMIT as MAX_EVENT_LIMIT
 from .errors import StoreError
 from .helpers.value_helpers import _json_mapping as _json_mapping
 from .helpers.value_helpers import _json_mapping_or_none as _json_mapping_or_none
+
+MAX_GRAPH_TRACE_BYTES = 64_000
+MAX_GRAPH_TRACE_EVENT_CHARS = 4_000
 
 
 class ProjectReadMixin:
@@ -141,6 +145,13 @@ class ProjectReadMixin:
                         "planning_status": pbi_row["planning_status"],
                         "claimable": bool(pbi_row["claimable"]),
                         "events": events,
+                        "graph_trace": (
+                            _bounded_graph_trace(
+                                self.graph_transitions_for(str(pbi_row["run_id"]))
+                            )
+                            if pbi_row["run_id"]
+                            else []
+                        ),
                     }
                     agent_session = (
                         self._agent_session_for_run(
@@ -186,3 +197,53 @@ class ProjectReadMixin:
 
 
 __all__ = ["ProjectReadMixin"]
+
+
+def _bounded_graph_trace(transitions: tuple[object, ...]) -> list[dict[str, object]]:
+    selected: list[dict[str, object]] = []
+    total_bytes = 2
+    for transition in reversed(transitions[-100:]):
+        as_dict = getattr(transition, "as_dict", None)
+        item = cast(dict[str, object], as_dict()) if callable(as_dict) else None
+        if not isinstance(item, dict):
+            continue
+        item = _bounded_graph_trace_event(item)
+        item_bytes = len(
+            json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        )
+        separator_bytes = 1 if selected else 0
+        if (
+            item_bytes > MAX_GRAPH_TRACE_BYTES
+            or total_bytes + separator_bytes + item_bytes > MAX_GRAPH_TRACE_BYTES
+        ):
+            if selected:
+                break
+            continue
+        selected.append(item)
+        total_bytes += separator_bytes + item_bytes
+    selected.reverse()
+    return selected
+
+
+def _bounded_graph_trace_event(item: dict[str, object]) -> dict[str, object]:
+    payload = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+    if len(payload) <= MAX_GRAPH_TRACE_EVENT_CHARS:
+        return item
+    return {
+        "execution_id": str(item.get("execution_id", ""))[:256],
+        "task_id": str(item.get("task_id", ""))[:256],
+        "workflow_id": str(item.get("workflow_id", ""))[:256],
+        "revision": item.get("revision", 0),
+        "node_id": str(item.get("node_id", ""))[:256],
+        "step": item.get("step", 0),
+        "attempt": item.get("attempt", 0),
+        "outcome": str(item.get("outcome", ""))[:64],
+        "status": str(item.get("status", ""))[:64],
+        "selected_edge": None,
+        "reason": str(item.get("reason", ""))[:512],
+        "evidence": {"truncated": True},
+        "created_at": str(item.get("created_at", ""))[:128],
+        "question": None,
+        "required_action": None,
+        "replay_id": str(item.get("replay_id", ""))[:256],
+    }

@@ -11,6 +11,7 @@ __all__ = ["DashboardStartRequest"]
 class DashboardStartRequest(DashboardActionBase):
     action: Literal["start", "claim"]
     repository: str | None = None
+    pbi_number: int | None = Field(default=None, strict=True, gt=0)
     worker_id: str | None = Field(default=None, max_length=200)
 
     @field_validator("worker_id")

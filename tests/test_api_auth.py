@@ -57,3 +57,37 @@ def test_mutating_routes_require_authentication_and_project_scope(
     assert missing_worker.status_code == 401
     assert unknown_run.status_code == 403
     assert unconfigured.status_code == 503
+
+
+def test_dashboard_actions_use_server_owned_key_for_same_origin_browser_requests() -> (
+    None
+):
+    service = Orchestrator(OrchestratorStore(), ApiProvider())
+    client = TestClient(
+        create_app(
+            orchestrator=service,
+            api_key="server-key",
+            allowed_project_ids={"owner:7"},
+        )
+    )
+
+    browser_request = client.post(
+        "/projects/owner:7/sync",
+        headers={
+            "X-BeeHAIve-Dashboard": "1",
+            "Origin": "http://testserver",
+            "Sec-Fetch-Site": "same-origin",
+        },
+    )
+    cross_origin_request = client.post(
+        "/projects/owner:7/sync",
+        headers={
+            "X-BeeHAIve-Dashboard": "1",
+            "Origin": "https://attacker.example",
+            "Sec-Fetch-Site": "cross-site",
+        },
+    )
+
+    assert browser_request.status_code == 200
+    assert cross_origin_request.status_code == 401
+    service.store.close()

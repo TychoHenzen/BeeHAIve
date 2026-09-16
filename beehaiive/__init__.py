@@ -1,5 +1,17 @@
 """Durable orchestration primitives for BeeHAIve."""
 
+from .autonomous import (
+    ADVISOR_STEP,
+    AUTONOMOUS_STEPS,
+    AutonomousLifecycleRunner,
+    AutonomousLifecycleService,
+    AutonomousRunResult,
+    CodexSkillExecutor,
+    PlaceholderSkillExecutor,
+    SkillHandoff,
+    SkillStep,
+    select_work_item,
+)
 from .conflict_repair import ConflictRepairAgent, ConflictRepairService
 from .contracts import (
     ArtifactRequirement,
@@ -114,9 +126,15 @@ from .workflow import (
 )
 
 __all__ = [
+    "ADVISOR_STEP",
+    "AUTONOMOUS_STEPS",
     "AllowListReviewAuthorizer",
+    "AutonomousLifecycleRunner",
+    "AutonomousLifecycleService",
+    "AutonomousRunResult",
     "ConflictRepairAgent",
     "ConflictRepairService",
+    "CodexSkillExecutor",
     "ArtifactRequirement",
     "ALLOWED_TOOL_CAPABILITIES",
     "ContractError",
@@ -177,6 +195,7 @@ __all__ = [
     "ProjectProvider",
     "ProjectSnapshot",
     "PullRequestSnapshot",
+    "PlaceholderSkillExecutor",
     "RepairRecord",
     "RepairStatus",
     "ReaderResult",
@@ -199,6 +218,8 @@ __all__ = [
     "RoutingLimits",
     "RoutingStore",
     "Stage",
+    "SkillHandoff",
+    "SkillStep",
     "TaskContract",
     "TaskOutcome",
     "TaskResult",
@@ -207,6 +228,7 @@ __all__ = [
     "WorkflowRole",
     "WorkflowService",
     "WorkflowStore",
+    "select_work_item",
     "evaluate_graph_transition",
     "compare_graphs",
     "graph_definition_hash",

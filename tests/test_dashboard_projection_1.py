@@ -3,6 +3,79 @@ import pytest
 from beehaiive.dashboard import build_dashboard_state
 
 
+def test_dashboard_projection_exposes_autonomous_handoffs_from_actions() -> None:
+    view = build_dashboard_state(
+        {
+            "project_id": "project-1",
+            "name": "Planning",
+            "repositories": [
+                {
+                    "name": "owner/api",
+                    "pbis": [{"number": 1, "title": "API one", "stage": "backlog"}],
+                }
+            ],
+        },
+        [
+            {
+                "kind": "skill:next-ticket",
+                "repository": "owner/api",
+                "pbi_number": 1,
+                "result": {
+                    "step": "next-ticket",
+                    "status": "succeeded",
+                    "summary": "Implemented the PBI.",
+                    "handover": {"single_branch": True},
+                },
+            }
+        ],
+    )
+
+    assert view["repositories"][0]["pbis"][0]["autonomous_handoffs"] == [
+        {
+            "step": "next-ticket",
+            "status": "succeeded",
+            "summary": "Implemented the PBI.",
+            "handover": {"single_branch": True},
+        }
+    ]
+
+
+def test_dashboard_projection_overlays_autonomous_run_state_until_sync() -> None:
+    state = {
+        "project_id": "project-1",
+        "name": "Planning",
+        "repositories": [
+            {
+                "name": "owner/api",
+                "pbis": [{"number": 1, "title": "API one", "stage": "backlog"}],
+            }
+        ],
+    }
+    pending = {
+        "kind": "autonomous_start",
+        "status": "pending",
+        "repository": "owner/api",
+        "pbi_number": 1,
+        "run_id": "auto-1",
+    }
+    running = build_dashboard_state(state, [pending])
+    assert running["repositories"][0]["pbis"][0]["status"] == "active"
+    assert running["repositories"][0]["pbis"][0]["run_id"] == "auto-1"
+
+    completed = build_dashboard_state(
+        state,
+        [
+            {
+                **pending,
+                "status": "succeeded",
+                "result": {"status": "completed", "summary": "Delivered."},
+            }
+        ],
+    )
+    assert completed["repositories"][0]["pbis"] == []
+    assert completed["recent_deliveries"][0]["pbi"]["status"] == "completed"
+
+
 def test_dashboard_projection_exposes_optional_run_details() -> None:
     view = build_dashboard_state(
         {
@@ -162,6 +235,35 @@ def test_dashboard_projection_exposes_optional_run_details() -> None:
         {"project_id": "project-1", "name": "Planning", "repositories": None}
     )
     assert empty["repositories"] == []
+
+
+def test_dashboard_projection_keeps_recent_deliveries_outside_the_active_queue() -> (
+    None
+):
+    view = build_dashboard_state(
+        {
+            "project_id": "project-1",
+            "name": "Planning",
+            "repositories": [
+                {
+                    "name": "owner/api",
+                    "pbis": [
+                        {
+                            "number": 1,
+                            "title": "Delivered work",
+                            "stage": "merge",
+                            "status": "idle",
+                            "archived": True,
+                            "result": "Merged",
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert view["repositories"][0]["pbis"] == []
+    assert view["recent_deliveries"][0]["pbi"]["title"] == "Delivered work"
 
 
 def test_dashboard_projection_preserves_canonical_lifecycle_evidence() -> None:

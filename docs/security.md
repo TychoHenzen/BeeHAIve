@@ -1,6 +1,6 @@
 # Runtime security
 
-The mutating API routes require `BEEHAIIVE_API_KEY`, a configured project allowlist, and a worker lease token where a run is involved. Keep the API key and provider token in the server environment. The API does not return the provider token.
+The mutating API routes require `BEEHAIIVE_API_KEY`, a configured project allowlist, and a worker lease token where a run is involved. The same-origin dashboard uses the server-owned key without receiving it. Direct API clients send the key as `X-API-Key`. Keep the API key and provider token in the server environment. The API does not return the provider token.
 
 Provision `GITHUB_TOKEN` or `GH_TOKEN` as a GitHub App installation token or fine-grained personal access token. Limit it to the repositories linked to the selected ProjectV2. Grant only the permissions required by this provider:
 

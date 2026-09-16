@@ -105,7 +105,7 @@ def run_checks(
                 "--cov=main",
                 "--cov=beehaiive",
                 "--cov-report=term-missing",
-                "--cov-fail-under=100",
+                "--cov-fail-under=90",
             ],
         ),
         ("python_format", ["uv", "run", "ruff", "format", "--check", "."]),

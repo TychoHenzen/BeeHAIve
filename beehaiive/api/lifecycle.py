@@ -39,10 +39,12 @@ def register_error_handlers(app: FastAPI) -> None:
                 status_code=422,
                 content={"detail": "Invalid PBI refinement request"},
             )
-        if isinstance(route_path, str) and route_path.endswith("/actions"):
+        if isinstance(route_path, str) and (
+            route_path.endswith("/actions") or route_path.endswith("/dashboard")
+        ):
             return JSONResponse(
                 status_code=422,
-                content={"detail": "Invalid dashboard action request"},
+                content={"detail": "Invalid dashboard request"},
             )
         return await request_validation_exception_handler(request, exc)
 
@@ -129,5 +131,5 @@ def register_background_handlers(app: FastAPI, runtime: dict[str, Any]) -> None:
                 agent_worker.recover(scheduler.project_ids)
             else:
                 agent_worker.recover()
-            if scheduler is not None:
+            if scheduler is not None and scheduler.config.enabled:
                 scheduler.start()

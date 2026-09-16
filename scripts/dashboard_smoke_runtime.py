@@ -321,6 +321,57 @@ def build_app(mode: str, project_id: str, directory: Path) -> ApplicationResourc
                 Constitution.load(Path(__file__).parents[1] / "constitution.json"),
                 [CommandCheck("fixture", ("git", "status", "--short"))],
             )
+            from beehaiive import (
+                GraphDefinition,
+                GraphEdge,
+                GraphNode,
+                GraphNodeKind,
+                GraphReference,
+                GraphSafetyService,
+            )
+
+            GraphSafetyService(state_store).evaluate(
+                GraphDefinition(
+                    "fixture-flow",
+                    1,
+                    (
+                        GraphNode(
+                            "start",
+                            GraphNodeKind.PROMPT,
+                            GraphReference("prompt/start"),
+                        ),
+                        GraphNode(
+                            "done",
+                            GraphNodeKind.SKILL,
+                            GraphReference("skill/done"),
+                        ),
+                    ),
+                    (GraphEdge("start", "done", "pass"),),
+                    metadata={"revision": 1},
+                ),
+                {
+                    "happy": {
+                        "start": {
+                            "outcome": "pass",
+                            "evidence": {},
+                            "artifact_refs": [],
+                            "question": None,
+                            "required_action": None,
+                            "validation_reason": None,
+                            "answer": None,
+                        },
+                        "done": {
+                            "outcome": "pass",
+                            "evidence": {},
+                            "artifact_refs": [],
+                            "question": None,
+                            "required_action": None,
+                            "validation_reason": None,
+                            "answer": None,
+                        },
+                    }
+                },
+            )
         runtime_stores.append(workflow_service.store)
         agent_worker = AgentWorkerManager(orchestrator, executor, workflow_service)
         with isolated_module_environment(directory):
@@ -335,6 +386,7 @@ def build_app(mode: str, project_id: str, directory: Path) -> ApplicationResourc
                 model_router=model_router,
                 agent_worker=agent_worker,
                 workflow_service=workflow_service,
+                workflow_actor="operator" if mode == "fixture" else None,
             )
     except Exception as error:
         cleanup_errors = close_stores(runtime_stores)
