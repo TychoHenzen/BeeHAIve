@@ -155,8 +155,6 @@ class ProjectClaimMixin:
                 project_id,
                 repository,
                 Stage.PULL_REQUEST.value,
-                expected_pbi_number,
-                expected_pbi_number,
             )
             if allow_failed_expected and expected_run_id is not None:
                 candidate_query = candidate_query.replace(
@@ -175,6 +173,7 @@ class ProjectClaimMixin:
                     "AND r.status = 'failed'",
                 )
                 candidate_parameters += (expected_run_id,)
+            candidate_parameters += (expected_pbi_number, expected_pbi_number)
             candidate = connection.execute(
                 candidate_query, candidate_parameters
             ).fetchone()

@@ -221,7 +221,11 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("The scheduler requires a configured dashboard agent worker")
     if scheduler_config.enabled and not configured_projects:
         raise ValueError("The scheduler requires at least one allowlisted project")
-    if agent_worker is not None and configured_projects:
+    if (
+        agent_worker is not None
+        and getattr(agent_worker, "workflow_service", None) is not None
+        and configured_projects
+    ):
         scheduler = AgentScheduler(
             orchestrator,
             agent_worker,

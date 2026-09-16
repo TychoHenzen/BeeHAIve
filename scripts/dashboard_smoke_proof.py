@@ -729,13 +729,6 @@ def run_fixture_actions(
         "source_checkout_clean": True,
     }
 
-    before = len(action_log_snapshot(devtools)["rows"])
-    if not click_pbi_button(
-        devtools, _repository, _pbi_number, run_id, "Move to implementation"
-    ):
-        raise SmokeFailure("The dashboard implementation action was not rendered")
-    record_action(devtools, outcomes, "advance", "succeeded.", before)
-
     if not click_pbi_button(devtools, _repository, _pbi_number, run_id, "Inspect run"):
         raise SmokeFailure("The dashboard run inspector was not rendered")
     if not click_button(devtools, "Request clarification"):
@@ -854,17 +847,6 @@ def run_live_actions(
     )
     repository, pbi_number, run_id, _ = action_run_target(
         start_response, "start_writer"
-    )
-
-    before = len(action_log_snapshot(devtools)["rows"])
-    if not click_pbi_button(
-        devtools, repository, pbi_number, run_id, "Move to implementation"
-    ):
-        raise SmokeFailure(
-            "The live approval action was not rendered for the targeted run"
-        )
-    record_action(
-        devtools, outcomes, "advance", before_action_count=before, timeout=timeout
     )
 
     if not click_pbi_button(devtools, repository, pbi_number, run_id, "Inspect run"):

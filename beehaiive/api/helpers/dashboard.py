@@ -564,13 +564,21 @@ def _execute_start(
     task = getattr(getattr(agent_worker, "executor", None), "task", None)
     if not isinstance(task, str) or not task.strip():
         task = DEFAULT_DEMO_TASK
-    run = agent_worker.claim(
-        project_id,
-        request.repository,
-        request.worker_id or "dashboard-operator",
-        task=task,
-        expected_pbi_number=request.pbi_number,
-    )
+    if request.pbi_number is None:
+        run = agent_worker.claim(
+            project_id,
+            request.repository,
+            request.worker_id or "dashboard-operator",
+            task=task,
+        )
+    else:
+        run = agent_worker.claim(
+            project_id,
+            request.repository,
+            request.worker_id or "dashboard-operator",
+            task=task,
+            expected_pbi_number=request.pbi_number,
+        )
     if run is None:
         raise StoreError("No claimable PBI is available for this repository")
     try:

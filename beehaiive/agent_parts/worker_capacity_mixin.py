@@ -78,17 +78,16 @@ class WorkerCapacityMixin:
             for value in getattr(self.executor, "_secret_values", ())
             if isinstance(value, str)
         )
-        return self.orchestrator.claim(
-            project_id,
-            repository,
-            owner_id,
-            expected_run_id=expected_run_id,
-            expected_pbi_number=expected_pbi_number,
-            agent_session=(
+        options: dict[str, object] = {
+            "expected_run_id": expected_run_id,
+            "agent_session": (
                 self._worker_id,
                 redact_worker_text(task, secret_values, max_length=None),
             ),
-        )
+        }
+        if expected_pbi_number is not None:
+            options["expected_pbi_number"] = expected_pbi_number
+        return self.orchestrator.claim(project_id, repository, owner_id, **options)
 
     def retry(
         self: Any,

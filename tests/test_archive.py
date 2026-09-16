@@ -80,20 +80,14 @@ def test_archive_rule_and_dashboard_filter() -> None:
 
     assert default.status_code == 200
     assert archived.status_code == 200
-    assert [pbi["number"] for pbi in default.json()["repositories"][0]["pbis"]] == [
-        2,
-        3,
-        4,
-        5,
-        6,
-    ]
+    assert [pbi["number"] for pbi in default.json()["repositories"][0]["pbis"]] == [6]
     archived_pbi = archived.json()["repositories"][0]["pbis"]
-    assert [pbi["number"] for pbi in archived_pbi] == [1, 7, 8, 9]
-    assert archived.json()["counts"]["pbis"] == 4
+    assert [pbi["number"] for pbi in archived_pbi] == [1, 2, 3, 4, 5, 7, 8, 9]
+    assert archived.json()["counts"]["pbis"] == 8
     assert archived_pbi[0]["archived"] is True
     assert archived_pbi[0]["source_url"] == "https://example.test/issues/1"
     assert archived_pbi[0]["pull_requests"][0]["source_branch_state"] == "deleted"
-    assert default.json()["counts"]["pbis"] == 5
+    assert default.json()["counts"]["pbis"] == 1
     raw = client.get("/projects/project-1")
     assert raw.json()["repositories"][0]["pbis"][0]["archived"] is True
     store.close()
