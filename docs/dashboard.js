@@ -30,6 +30,8 @@ function toggleControls(disabled) {
   refreshButton.disabled = disabled;
   startButton.disabled = disabled;
   archivedInput.disabled = disabled;
+  projectInput.disabled = disabled;
+  apiKeyInput.disabled = disabled;
 }
 
 let client;

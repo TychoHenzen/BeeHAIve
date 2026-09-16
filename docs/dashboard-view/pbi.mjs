@@ -38,7 +38,7 @@ export function createPbiRenderer(dom, details, runAction) {
     if (operatorQuestions.length > 0) {
       operatorQuestions.forEach((question) => {
         const section = renderOperatorQuestion(question);
-        if (question.status === "pending" && pbi.run_id) {
+        if (question.status === "pending" && pbi.run_id && pbi.active !== false) {
           const answer = element("button", "Answer operator question", "secondary");
           answer.type = "button";
           answer.addEventListener("click", () => {
@@ -85,7 +85,7 @@ export function createPbiRenderer(dom, details, runAction) {
         delivery.append(element("div", pbi.delivery.evidence, "muted"));
       }
       card.append(delivery);
-      if (pbi.delivery.retry_available && pbi.run_id) {
+      if (pbi.delivery.retry_available && pbi.run_id && pbi.active !== false) {
         const retry = element("button", "Retry commit and push", "secondary");
         retry.type = "button";
         retry.addEventListener("click", () => runAction({
@@ -101,23 +101,52 @@ export function createPbiRenderer(dom, details, runAction) {
     }
     if (pbi.last_error) card.append(element("p", `Failure: ${pbi.last_error}`, "status failure"));
     if (pbi.result) card.append(element("p", `Result: ${pbi.result}`, "status success"));
-    if (pbi.status !== "active" || !pbi.run_id) return card;
+    if (pbi.active === false) return card;
+    if (pbi.status === "failed" && pbi.claimable && pbi.run_id
+      && !(pbi.delivery && pbi.delivery.retry_available)) {
+      const retry = element("button", "Retry writer", "secondary");
+      retry.type = "button";
+      retry.addEventListener("click", () => runAction({
+        action: "retry",
+        repository,
+        pbi_number: pbi.number,
+        run_id: pbi.run_id,
+      }));
+      const controls = element("div", undefined, "actions");
+      controls.append(retry);
+      card.append(controls);
+    }
+    if (!["active", "awaiting_operator"].includes(pbi.status) || !pbi.run_id) return card;
     const controls = element("div", undefined, "actions");
+    if (pbi.status === "active" && pbi.stage === "refine") {
+      const advance = element("button", "Advance to implementation", "secondary");
+      advance.type = "button";
+      advance.addEventListener("click", () => runAction({
+        action: "advance",
+        repository,
+        pbi_number: pbi.number,
+        run_id: pbi.run_id,
+        target: "implement",
+      }));
+      controls.append(advance);
+    }
     const stop = element("button", "Stop", "danger");
     stop.type = "button";
-    stop.addEventListener("click", () => runAction({ action: "stop", run_id: pbi.run_id, repository, pbi_number: pbi.number }));
+    stop.addEventListener("click", () => runAction({ action: "stop", run_id: pbi.run_id, repository }));
     controls.append(stop);
-    const approve = element("button", "Record approval", "secondary");
-    approve.type = "button";
-    approve.addEventListener("click", () => runAction({ action: "approve", repository, pbi_number: pbi.number, run_id: pbi.run_id }));
-    controls.append(approve);
-    const clarify = element("button", "Request clarification", "secondary");
-    clarify.type = "button";
-    clarify.addEventListener("click", () => {
-      const message = window.prompt("Clarification for the active run:");
-      if (message && message.trim()) runAction({ action: "clarify", repository, pbi_number: pbi.number, run_id: pbi.run_id, clarification: message.trim() });
-    });
-    controls.append(clarify);
+    if (pbi.status === "active") {
+      const approve = element("button", "Record approval", "secondary");
+      approve.type = "button";
+      approve.addEventListener("click", () => runAction({ action: "approve", repository, pbi_number: pbi.number, run_id: pbi.run_id }));
+      controls.append(approve);
+      const clarify = element("button", "Request clarification", "secondary");
+      clarify.type = "button";
+      clarify.addEventListener("click", () => {
+        const message = window.prompt("Clarification for the active run:");
+        if (message && message.trim()) runAction({ action: "clarify", repository, pbi_number: pbi.number, run_id: pbi.run_id, clarification: message.trim() });
+      });
+      controls.append(clarify);
+    }
     card.append(controls);
     return card;
   }

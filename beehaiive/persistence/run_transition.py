@@ -8,6 +8,31 @@ from .errors import StoreError
 
 
 class RunTransitionMixin:
+    def record_operator_action(
+        self: Any, run_id: str, action: str, details: dict[str, object]
+    ) -> RunState:
+        if action not in {"approve", "clarify"}:
+            raise StoreError(f"Unsupported operator action: {action}")
+        with self._transaction() as connection:
+            row = self._run_for_id(connection, run_id)
+            if row is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            if row.status is not RunStatus.ACTIVE:
+                raise StoreError("Only an active run can accept operator actions")
+            self._require_lease(row, row.lease_token or "")
+            self._record_event(
+                connection,
+                row.project_id,
+                row.repository,
+                row.pbi_number,
+                run_id,
+                f"operator_{action}",
+                row.stage,
+                row.stage,
+                details,
+            )
+            return self._run_for_id(connection, run_id) or row
+
     def advance(self: Any, run_id: str, target: Stage, lease_token: str) -> RunState:
         with self._transaction() as connection:
             row = self._run_for_id(connection, run_id)

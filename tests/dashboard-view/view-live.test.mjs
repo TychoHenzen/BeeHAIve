@@ -172,7 +172,6 @@ test("rendering live state exposes current stages and active actions", () => {
     action: "stop",
     run_id: "run-3",
     repository: "owner/web",
-    pbi_number: 3,
   });
 });
 

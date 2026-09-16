@@ -6,6 +6,7 @@ from ..checks import blocking_check_failure
 from ..models import (
     ProjectSnapshot,
     RunState,
+    RunStatus,
     Stage,
 )
 
@@ -52,6 +53,31 @@ class OrchestrationSyncMixin:
         if target is Stage.IMPLEMENT:
             self._ensure_routing_problem(run.run_id)
         return run
+
+    def retry(
+        self: Any,
+        project_id: str,
+        repository: str,
+        owner_id: str,
+        run_id: str,
+        agent_session: tuple[str, str] | None = None,
+    ) -> RunState | None:
+        current = self.store.get_run(run_id)
+        if current is None or current.status is not RunStatus.FAILED:
+            return None
+        return self.store.claim_next(
+            project_id,
+            repository,
+            owner_id,
+            expected_run_id=run_id,
+            agent_session=agent_session,
+            allow_failed_expected=True,
+        )
+
+    def record_operator_action(
+        self: Any, run_id: str, action: str, details: dict[str, object]
+    ) -> RunState:
+        return self.store.record_operator_action(run_id, action, details)
 
     def renew_lease(self: Any, run_id: str, lease_token: str) -> RunState:
         return self.store.renew_lease(run_id, lease_token)

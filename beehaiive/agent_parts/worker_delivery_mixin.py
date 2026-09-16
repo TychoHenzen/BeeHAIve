@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from beehaiive.models import RunStatus
+from beehaiive.persistence.helpers.lease_helpers import _lease_is_active
 from beehaiive.storage import StoreError
 from beehaiive.workflow import (
     GitDeliveryResult,
@@ -39,7 +40,17 @@ class WorkerDeliveryMixin:
         return validate
 
     def cancel(self: Any, run_id: str) -> None:
+        with self._lock:
+            self._cancelled_runs.add(run_id)
         self.executor.cancel(run_id)
+
+    def is_cancelled(self: Any, run_id: str) -> bool:
+        with self._lock:
+            return run_id in self._cancelled_runs
+
+    def _is_worker_delivery(self: Any, run_id: str) -> bool:
+        with self._lock:
+            return run_id in self._worker_delivery_runs
 
     def commit_and_push(self: Any, run_id: str) -> GitDeliveryResult:
         service = self.workflow_service
@@ -55,12 +66,29 @@ class WorkerDeliveryMixin:
                 RunStatus.FAILED,
             }:
                 raise StoreError("Run is not eligible for Git delivery")
-            if run.status is RunStatus.ACTIVE and not run.lease_token:
+            if run.status is RunStatus.ACTIVE and (
+                not run.lease_token
+                or not _lease_is_active(getattr(run, "lease_expires_at", None))
+            ):
                 raise StoreError("An active run lease is required for Git delivery")
+            if self._is_worker_delivery(run_id) and (
+                run.status is not RunStatus.ACTIVE or not run.lease_token
+            ):
+                raise StoreError("Dashboard run was cancelled before Git delivery")
+            if run.status is RunStatus.ACTIVE and self.is_cancelled(run_id):
+                raise StoreError("Dashboard run was cancelled before Git delivery")
             lease = service.workspace_for_run(run_id)
             if lease is None:
                 raise StoreError(
                     "A leased dashboard worktree is required for Git delivery"
+                )
+            if (
+                run.status is RunStatus.ACTIVE
+                and lease.status is not LeaseStatus.ACTIVE
+                and not self._is_worker_delivery(run_id)
+            ):
+                raise StoreError(
+                    "An active workspace lease is required for Git delivery"
                 )
             if (
                 run.status is not RunStatus.ACTIVE
@@ -92,6 +120,20 @@ class WorkerDeliveryMixin:
                     or current.pbi_number != run.pbi_number
                     or current.status is not expected_status
                     or current.lease_token != expected_token
+                    or (
+                        expected_status is RunStatus.ACTIVE
+                        and not _lease_is_active(
+                            getattr(current, "lease_expires_at", None)
+                        )
+                    )
+                    or (
+                        self._is_worker_delivery(run_id)
+                        and current.status is not RunStatus.ACTIVE
+                    )
+                    or (
+                        expected_status is RunStatus.ACTIVE
+                        and self.is_cancelled(run_id)
+                    )
                 ):
                     raise WorkflowError("Dashboard run lease changed")
 

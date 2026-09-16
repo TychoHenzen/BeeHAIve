@@ -11,13 +11,26 @@ export function createDashboardClient({
   let stateRevision = 0;
   let refreshController = null;
   let actionPending = false;
+  let actionProject = "";
+  let currentState = null;
+  let stateProject = "";
 
   async function refresh() {
-    if (actionPending) return null;
+    const currentProject = projectId().trim();
+    if (actionPending) {
+      if (currentProject !== actionProject) {
+        stateRevision += 1;
+      }
+      return null;
+    }
     const revision = ++stateRevision;
     refreshController?.abort();
     refreshController = null;
-    const currentProject = projectId().trim();
+    if (stateProject && stateProject !== currentProject) {
+      currentState = null;
+      stateProject = currentProject;
+      onState({ project_id: currentProject, repositories: [], actions: [], counts: {} });
+    }
     if (!currentProject) {
       onStatus("Enter a project ID to load live state.");
       return null;
@@ -33,6 +46,8 @@ export function createDashboardClient({
       );
       const payload = await readJson(response);
       if (revision !== stateRevision) return null;
+      currentState = payload;
+      stateProject = currentProject;
       onState(payload);
       onStatus(`Updated ${payload.updated_at || "now"}.`, "success");
       return payload;
@@ -48,6 +63,7 @@ export function createDashboardClient({
   async function runAction(payload) {
     if (actionPending) return null;
     actionPending = true;
+    actionProject = projectId().trim();
     const revision = ++stateRevision;
     refreshController?.abort();
     refreshController = null;
@@ -71,7 +87,26 @@ export function createDashboardClient({
       );
       const result = await readJson(response);
       if (revision !== stateRevision) return null;
-      if (result.state) onState(result.state);
+      if (result.state) {
+        currentState = result.state;
+        stateProject = actionProject;
+        onState(result.state);
+      } else if (currentState) {
+        currentState = {
+          ...currentState,
+          actions: [...(currentState.actions || []), result.action].slice(-50),
+        };
+        onState(currentState);
+      } else {
+        currentState = {
+          project_id: actionProject,
+          repositories: [],
+          counts: {},
+          actions: [result.action],
+        };
+        stateProject = actionProject;
+        onState(currentState);
+      }
       if (result.action.status === "failed") {
         onStatus(`${payload.action} failed: ${result.action.error}`, "failure");
       } else {
@@ -83,7 +118,10 @@ export function createDashboardClient({
       return null;
     } finally {
       actionPending = false;
+      const changedProject = projectId().trim() !== actionProject;
+      actionProject = "";
       onBusy(false);
+      if (changedProject) void refresh();
     }
   }
 

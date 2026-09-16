@@ -22,7 +22,8 @@ MAX_AGENT_TIMEOUT_SECONDS = 900.0
 POST_TERMINATION_GRACE_SECONDS = 1.0
 
 _SECRET_NAME = re.compile(
-    r"(?:TOKEN|SECRET|PASSWORD|API[_-]?KEY|PRIVATE[_-]?KEY)", re.IGNORECASE
+    r"(?:TOKEN|SECRET|PASSWORD|API[_-]?KEY|PRIVATE[_-]?KEY|CREDENTIAL)",
+    re.IGNORECASE,
 )
 
 _SAFE_ENVIRONMENT_NAMES = frozenset(
@@ -69,14 +70,18 @@ _SESSION_PROGRESS_EVENTS = frozenset(
 )
 
 _SECRET_ASSIGNMENT = re.compile(
-    r"\b(token|api[_-]?key|secret|password)\b\s*[:=]\s*\S+",
+    r"\b((?:[\w-]+[_-])?(?:access[_-]?token|refresh[_-]?token|token|"
+    r"api[_-]?key|secret|password|client[_-]?secret|private[_-]?key|"
+    r"credential))\b\s*[:=]\s*\S+",
     re.IGNORECASE,
 )
 
 _SECRET_JSON = re.compile(
-    r"([\"']?(?:access[_-]?token|refresh[_-]?token|token|api[_-]?key|"
-    r"client[_-]?secret|secret|password)[\"']?\s*:\s*)"
-    r"(?:\"[^\"]*\"|'[^']*'|[^,}\s]+)",
+    r"([\"']?(?:(?:[\w-]+[_-])?(?:access[_-]?token|refresh[_-]?token|"
+    r"token|api[_-]?key|client[_-]?secret|private[_-]?key|credential|"
+    r"secret|password))[\"']?\s*:\s*)"
+    r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|\[[^\]]*\]|"
+    r"\{[^}]*\}|[^,}\s]+)",
     re.IGNORECASE,
 )
 

@@ -19,7 +19,13 @@ def test_dashboard_delivery_projection_handles_missing_lease_and_gate() -> None:
     )
     workflow_service.workspace_for_run = lambda _run_id: lease
     workflow_service.store = SimpleNamespace(latest_gate=lambda _lease_id, _gate: None)
-    assert main_module._dashboard_delivery(workflow_service, "run-40") is None
+    assert main_module._dashboard_delivery(workflow_service, "run-40") == {
+        "status": "retained",
+        "commit_sha": None,
+        "branch": "codex/40",
+        "evidence": "A retained worktree is available for delivery retry.",
+        "retry_available": True,
+    }
 
     workflow_service.store.latest_gate = lambda _lease_id, _gate: SimpleNamespace(
         checks=(SimpleNamespace(name="other", evidence="value"),)

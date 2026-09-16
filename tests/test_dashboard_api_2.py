@@ -101,6 +101,21 @@ def test_dashboard_retries_a_blocked_push_without_recommitting(tmp_path: Path) -
         assert delivery["commit_sha"] == saved_sha
         assert delivery["retry_available"] is True
 
+        blocked_action = client.post(
+            "/projects/project-1/actions",
+            headers={"X-API-Key": "test-key"},
+            json={
+                "action": "commit_push",
+                "approved": True,
+                "repository": "owner/api",
+                "pbi_number": 1,
+                "run_id": run_id,
+            },
+        )
+        assert blocked_action.status_code == 200
+        assert blocked_action.json()["action"]["status"] == "failed"
+        assert blocked_action.json()["result"]["delivery"]["status"] == "blocked"
+
         offline.rename(remote)
         retried = client.post(
             "/projects/project-1/actions",

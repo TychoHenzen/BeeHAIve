@@ -39,6 +39,11 @@ def register_error_handlers(app: FastAPI) -> None:
                 status_code=422,
                 content={"detail": "Invalid PBI refinement request"},
             )
+        if isinstance(route_path, str) and route_path.endswith("/actions"):
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "Invalid dashboard action request"},
+            )
         return await request_validation_exception_handler(request, exc)
 
     @app.exception_handler(HTTPException)
