@@ -829,10 +829,19 @@ class AutonomousLifecycleService:
         workspace_root.mkdir(parents=True, exist_ok=True)
         workspace_id = uuid4().hex
         branch = f"codex/beehaiive-autonomous-{run_id[:12]}"
+        base_ref = os.environ.get("BEEHAIIVE_AUTONOMOUS_BASE_REF", "origin/master")
+        run_git = getattr(worktrees, "run_git", None)
+        if callable(run_git):
+            try:
+                if run_git("rev-parse", "--verify", base_ref).returncode != 0:
+                    base_ref = "HEAD"
+            except Exception:
+                base_ref = "HEAD"
         lease = acquire(
             f"dashboard-run:{run_id}",
             branch,
             workspace_root / workspace_id,
+            base_ref,
         )
         with self._lock:
             self._workspaces[run_id] = lease
