@@ -75,6 +75,8 @@ def test_autonomous_runtime_resolves_bare_codex_before_windows_launch(
             "launched_executable": launches[0][0] if launches else None,
         }
         assert launches[0][0] == str(resolved_executable)
+        assert "scheduler already assigned PBI #1" in launches[0][-1]
+        assert "internal handover after doing the stage work" in launches[0][-1]
     finally:
         store.close()
 

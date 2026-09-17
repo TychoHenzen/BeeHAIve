@@ -264,6 +264,23 @@ def _handover(value: object) -> dict[str, object]:
     return source
 
 
+def _skill_status(value: object) -> str:
+    status = _text(value, "succeeded").casefold()
+    return (
+        "succeeded"
+        if status
+        in {
+            "complete",
+            "completed",
+            "done",
+            "passed",
+            "success",
+            "succeeded",
+        }
+        else status
+    )
+
+
 class AutonomousLifecycleRunner:
     def __init__(
         self,
@@ -297,7 +314,7 @@ class AutonomousLifecycleRunner:
             except Exception as error:
                 raw_result = {"status": "blocked", "summary": str(error)}
             result = _mapping(raw_result)
-            status = _text(result.get("status"), "succeeded")
+            status = _skill_status(result.get("status"))
             summary = _text(result.get("summary"), f"{step.name} completed")
             handover = {**handover, **_handover(result.get("handover"))}
             handoff = SkillHandoff(step.name, status, summary[:4_000], handover)
@@ -319,7 +336,7 @@ class AutonomousLifecycleRunner:
                         advisor_mapping = _mapping(advisor_result)
                         advisor_handoff = SkillHandoff(
                             ADVISOR_STEP.name,
-                            _text(advisor_mapping.get("status"), "succeeded"),
+                            _skill_status(advisor_mapping.get("status")),
                             _text(
                                 advisor_mapping.get("summary"),
                                 "Advisor handoff recorded",
@@ -402,7 +419,14 @@ class CodexSkillExecutor:
             "on the same branch. Submit the pull request published, not draft. "
             "Do not re-run review after applying selected fixes. Return one JSON "
             "object with status, summary, and handover. Do not include secrets. "
-            "This context is unattended. Never ask for input or wait for approval. "
+            f"The scheduler already assigned PBI #{context.get('pbi_number')}. "
+            "Do not ask the operator to choose another PBI. This context is "
+            "unattended. Never ask for input or wait for approval. The JSON is "
+            "an internal handover after doing the stage work, not a substitute "
+            "for doing it. For non-destructive unresolved choices, choose the "
+            "smallest conservative reversible default, record that decision in "
+            "the issue or evidence, and continue. Stop only for missing authority, "
+            "credentials, or a destructive policy choice that cannot be made safely. "
             "If a material blocker remains, return blocked JSON with its exact "
             "reason.\n"
             f"PBI context: {json.dumps(dict(context), sort_keys=True)}\n"

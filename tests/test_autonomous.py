@@ -65,6 +65,31 @@ def test_placeholder_runner_passes_one_branch_handover_through_all_skills() -> N
     assert all(handoff.handover["single_branch"] for handoff in result.handoffs)
 
 
+def test_runner_normalizes_completed_skill_status() -> None:
+    class CompletedExecutor:
+        def execute(self, step, context, handover):
+            del step, context
+            return {
+                "status": "completed",
+                "summary": "stage completed",
+                "handover": handover,
+            }
+
+    result = AutonomousLifecycleRunner(CompletedExecutor()).run(
+        {
+            "project_id": "project-1",
+            "repository": "owner/api",
+            "pbi_number": 1,
+            "planning_status": "Todo",
+            "stage": "implement",
+        }
+    )
+
+    assert result.status == "completed"
+    assert len(result.handoffs) == len(AUTONOMOUS_STEPS) - 1
+    assert all(handoff.status == "succeeded" for handoff in result.handoffs)
+
+
 def test_blocker_calls_the_advisor_once() -> None:
     class Blocker:
         def __init__(self) -> None:
