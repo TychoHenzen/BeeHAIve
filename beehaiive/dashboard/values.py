@@ -40,6 +40,7 @@ _STRUCTURAL_DASHBOARD_KEYS = frozenset(
         "artifact_refs",
         "attempt",
         "autonomous_handoffs",
+        "autonomous_current_step",
         "autonomous_status",
         "baseline",
         "baseline_fixtures",

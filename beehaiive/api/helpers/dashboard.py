@@ -104,6 +104,7 @@ def _dashboard_state(
     secret_values: tuple[str, ...] = (),
     graph_safety_service: GraphSafetyService | None = None,
     workflow_id: str | None = None,
+    autonomous_service: object | None = None,
 ) -> dict[str, object]:
     orchestrator.synchronize(project_id)
     state = orchestrator.store.project_state(project_id, event_limit)
@@ -133,6 +134,23 @@ def _dashboard_state(
     )
     dashboard["workflow_ids"] = list(orchestrator.store.graph_workflow_ids())
     dashboard["workflow_skill_ids"] = _workflow_skill_ids()
+    status_for_work_item = getattr(autonomous_service, "status_for_work_item", None)
+    if callable(status_for_work_item):
+        repositories = cast(list[dict[str, object]], dashboard["repositories"])
+        for repository in repositories:
+            repository_name = repository.get("name")
+            if not isinstance(repository_name, str):
+                continue
+            for pbi in cast(list[dict[str, object]], repository["pbis"]):
+                number = pbi.get("number")
+                if type(number) is not int:
+                    continue
+                live = status_for_work_item(project_id, repository_name, number)
+                if not isinstance(live, Mapping):
+                    continue
+                pbi["autonomous_status"] = live.get("status")
+                pbi["autonomous_current_step"] = live.get("current_step")
+                pbi["autonomous_handoffs"] = live.get("handoffs", [])
     if workflow_service is not None:
         repositories = cast(list[dict[str, object]], dashboard["repositories"])
         for repository in repositories:

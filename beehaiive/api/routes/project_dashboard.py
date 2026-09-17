@@ -116,6 +116,7 @@ def _project_state_without_graph_trace(
 
 def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
     agent_worker = context["agent_worker"]
+    autonomous_service = context["autonomous_service"]
     dashboard_secret_values = context["dashboard_secret_values"]
     meta_review_service = context["meta_review_service"]
     orchestrator = context["orchestrator"]
@@ -169,6 +170,7 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
                 dashboard_secret_values,
                 graph_safety_service,
                 workflow_id,
+                autonomous_service,
             ),
             dashboard_secret_values,
         )

@@ -233,7 +233,9 @@ def test_session_tab_and_transcript_survive_refresh(dashboard_page) -> None:
                 "title": "Session-backed work",
                 "stage": "implement",
                 "status": "active",
-                "run_id": "run-1",
+                    "run_id": "run-1",
+                    "autonomous_status": "running",
+                    "autonomous_current_step": "next-ticket",
                     "agent_session": {
                     "worker_id": "worker-1",
                     "task": "Implement the selected PBI",
@@ -263,6 +265,7 @@ def test_session_tab_and_transcript_survive_refresh(dashboard_page) -> None:
     item.get_by_test_id("inspect-work").click()
     inspector = page.locator("#details-pane")
     inspector.get_by_test_id("detail-tab-session").click()
+    expect(inspector).to_contain_text("Current skill: next-ticket")
     expect(inspector.locator(".session-transcript")).to_contain_text("event-0")
     expect(inspector.locator(".session-transcript")).to_contain_text("event-9")
     expect(inspector.locator(".session-transcript")).to_contain_text(

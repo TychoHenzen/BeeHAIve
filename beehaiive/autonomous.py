@@ -661,6 +661,19 @@ class AutonomousLifecycleService:
                 raise ValueError("Unknown autonomous run")
             return dict(run)
 
+    def status_for_work_item(
+        self, project_id: str, repository: str, pbi_number: int
+    ) -> dict[str, object] | None:
+        with self._lock:
+            for run in self._runs.values():
+                if (
+                    run.get("project_id") == project_id
+                    and run.get("repository") == repository
+                    and run.get("pbi_number") == pbi_number
+                ):
+                    return dict(run)
+        return None
+
     def has_capacity(self) -> bool:
         with self._lock:
             return len(self._active_projects) < self._max_concurrency

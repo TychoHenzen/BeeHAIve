@@ -563,20 +563,22 @@ export function createDashboardUi({
     }
     renderEvidence(checksPanel, item);
     const session = map(pbi.agent_session);
+    const autonomousStep = text(pbi.autonomous_current_step, "");
     const autonomousSessions = list(pbi.autonomous_handoffs)
       .map(map)
       .filter((handoff) => text(handoff.session_output, "").trim());
-    if (Object.keys(session).length || autonomousSessions.length) {
+    if (Object.keys(session).length || autonomousSessions.length || autonomousStep) {
       const sessionCard = element("section", undefined, "detail-card");
       sessionCard.append(element("h3", "Session"));
       const sessionGrid = element("div", undefined, "detail-grid");
-      [["Worker", session.worker_id], ["Task", session.task], ["State", session.state]].forEach(([label, value]) => {
+      [["Worker", session.worker_id || (autonomousStep || autonomousSessions.length ? "autonomous" : undefined)], ["Task", session.task || (autonomousStep ? `Running skill: ${autonomousStep}` : undefined)], ["State", session.state || pbi.autonomous_status]].forEach(([label, value]) => {
         if (value === undefined || value === null || value === "") return;
         const cell = element("p");
         cell.append(element("strong", label), element("span", value));
         sessionGrid.append(cell);
       });
       sessionCard.append(sessionGrid);
+      if (autonomousStep) sessionCard.append(element("p", `Current skill: ${autonomousStep}`, "activity-detail"));
       const events = list(session.events);
       if (events.length) {
         const eventList = element("div", undefined, "agent-events");
@@ -729,6 +731,7 @@ export function createDashboardUi({
       const heading = element("div", undefined, "agent-heading");
       heading.append(element("span", "", "status-dot"), element("strong", agentLabel(item)), element("span", stateLabel, `tag ${pbi.autonomous_status === "blocked" || pbi.status === "failed" ? "warn" : "accent"}`));
       card.append(heading, element("p", `${item.repository}#${text(pbi.number, "?")} · ${text(pbi.title, "Untitled work item")}`));
+      if (pbi.autonomous_current_step) card.append(element("p", `Current skill: ${pbi.autonomous_current_step}`, "activity-detail"));
       if (pbi.last_error) card.append(element("p", `Failure: ${pbi.last_error}`, "activity-detail"));
       const events = list(map(pbi.agent_session).events).slice(-3);
       if (events.length) {
