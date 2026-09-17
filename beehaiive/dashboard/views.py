@@ -6,6 +6,29 @@ from typing import cast
 from .stages import display_stage, display_stage_label, stage_progress
 from .values import integer, mapping, mappings, sequence
 
+_TERMINAL_PLANNING_STATUSES = frozenset({"closed", "completed", "done", "merged"})
+
+
+def _provider_completion_confirmed(
+    planning_status: object,
+    issue_state: object,
+    pull_requests: Sequence[object],
+) -> bool:
+    normalized_planning_status = (
+        planning_status.strip().casefold() if isinstance(planning_status, str) else ""
+    )
+    normalized_issue_state = (
+        issue_state.strip().casefold() if isinstance(issue_state, str) else ""
+    )
+    return (
+        normalized_planning_status in _TERMINAL_PLANNING_STATUSES
+        or normalized_issue_state == "closed"
+        or any(
+            mapping(pull_request).get("merged") is True
+            for pull_request in pull_requests
+        )
+    )
+
 
 def repository_view(
     raw_repository: Mapping[str, object],
@@ -112,7 +135,19 @@ def pbi_view(
         ),
         None,
     )
-    if autonomous_action is not None:
+    provider_completed = _provider_completion_confirmed(
+        planning_status, metadata.get("issue_state"), pull_requests
+    )
+    if autonomous_action is not None and provider_completed:
+        status = "completed"
+        run_id = None
+        raw_stage = "merge"
+        active = False
+        archived = True
+        claimable = False
+        autonomous_status = "completed"
+        last_error = None
+    elif autonomous_action is not None:
         autonomous_result = mapping(autonomous_action.get("result"))
         if autonomous_action.get("status") == "pending":
             status = "active"

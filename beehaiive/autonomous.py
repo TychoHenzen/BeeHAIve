@@ -19,6 +19,7 @@ __all__ = [
     "AutonomousLifecycleService",
     "AutonomousRunResult",
     "CodexSkillExecutor",
+    "DEFAULT_AUTONOMOUS_TIMEOUT_SECONDS",
     "PlaceholderSkillExecutor",
     "SkillHandoff",
     "SkillStep",
@@ -116,6 +117,8 @@ ADVISOR_STEP = SkillStep(
     "Give one bounded second opinion for a blocker without mutating the repository.",
     model="gpt-5.6-luna",
 )
+
+DEFAULT_AUTONOMOUS_TIMEOUT_SECONDS = 1_800.0
 
 
 class SkillExecutor(Protocol):
@@ -287,10 +290,12 @@ class AutonomousLifecycleRunner:
         executor: SkillExecutor,
         advisor: SkillExecutor | None = None,
         on_handoff: Callable[[SkillHandoff], None] | None = None,
+        on_step: Callable[[str], None] | None = None,
     ) -> None:
         self.executor = executor
         self.advisor = advisor
         self.on_handoff = on_handoff
+        self.on_step = on_step
 
     def run(self, context: Mapping[str, object]) -> AutonomousRunResult:
         repository = _text(context.get("repository"), "unknown repository")
@@ -309,6 +314,8 @@ class AutonomousLifecycleRunner:
         advisor_handoff: SkillHandoff | None = None
         steps = AUTONOMOUS_STEPS[_start_index(context) :]
         for step in steps:
+            if self.on_step is not None:
+                self.on_step(step.name)
             try:
                 raw_result = self.executor.execute(step, context, handover)
             except Exception as error:
@@ -665,6 +672,12 @@ class AutonomousLifecycleService:
         context: Mapping[str, object],
         action_id: str,
     ) -> None:
+        def record_step(step: str) -> None:
+            with self._lock:
+                current = self._runs.get(run_id)
+                if current is not None:
+                    current["current_step"] = step
+
         def record(handoff: SkillHandoff) -> None:
             pbi_number = context.get("pbi_number")
             if type(pbi_number) is not int or pbi_number <= 0:
@@ -694,7 +707,9 @@ class AutonomousLifecycleService:
 
         executor = self._executor_for(context)
         advisor = self._advisor_for(context)
-        runner = AutonomousLifecycleRunner(executor, advisor, record)
+        runner = AutonomousLifecycleRunner(
+            executor, advisor, record, on_step=record_step
+        )
         try:
             result = runner.run(context)
             self.orchestrator.store.finish_action(
@@ -735,7 +750,12 @@ class AutonomousLifecycleService:
             return CodexSkillExecutor(
                 os.environ.get("BEEHAIIVE_AGENT_REPOSITORY", str(Path.cwd())),
                 os.environ.get("BEEHAIIVE_CODEX_EXECUTABLE", "codex"),
-                float(os.environ.get("BEEHAIIVE_AUTONOMOUS_TIMEOUT_SECONDS", "900")),
+                float(
+                    os.environ.get(
+                        "BEEHAIIVE_AUTONOMOUS_TIMEOUT_SECONDS",
+                        str(DEFAULT_AUTONOMOUS_TIMEOUT_SECONDS),
+                    )
+                ),
             )
         del context
         return PlaceholderSkillExecutor()

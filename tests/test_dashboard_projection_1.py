@@ -76,6 +76,50 @@ def test_dashboard_projection_overlays_autonomous_run_state_until_sync() -> None
     assert completed["recent_deliveries"][0]["pbi"]["status"] == "completed"
 
 
+def test_provider_completion_clears_old_autonomous_failure() -> None:
+    view = build_dashboard_state(
+        {
+            "project_id": "project-1",
+            "name": "Planning",
+            "repositories": [
+                {
+                    "name": "owner/api",
+                    "pbis": [
+                        {
+                            "number": 1,
+                            "title": "Delivered work",
+                            "stage": "implement",
+                            "planning_status": "Done",
+                            "archived": True,
+                            "metadata": {
+                                "issue_state": "CLOSED",
+                                "pull_requests": [{"number": 9, "merged": True}],
+                            },
+                        }
+                    ],
+                }
+            ],
+        },
+        [
+            {
+                "kind": "autonomous_start",
+                "status": "failed",
+                "repository": "owner/api",
+                "pbi_number": 1,
+                "run_id": "auto-1",
+                "error": "old timeout",
+            }
+        ],
+        include_archived=True,
+    )
+
+    pbi = view["repositories"][0]["pbis"][0]
+    assert pbi["status"] == "completed"
+    assert pbi["stage_label"] == "Merged"
+    assert pbi["autonomous_status"] == "completed"
+    assert pbi["last_error"] is None
+
+
 def test_dashboard_projection_exposes_optional_run_details() -> None:
     view = build_dashboard_state(
         {

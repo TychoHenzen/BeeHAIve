@@ -53,7 +53,7 @@ BEEHAIIVE_AGENT_REPOSITORY_NAME=<owner>/<repository>
 # BEEHAIIVE_CODEX_EXECUTABLE=codex
 # BEEHAIIVE_CODEX_MODEL=<model>
 # BEEHAIIVE_AUTONOMOUS_MODE=codex
-# BEEHAIIVE_AUTONOMOUS_TIMEOUT_SECONDS=900
+# BEEHAIIVE_AUTONOMOUS_TIMEOUT_SECONDS=1800
 # BEEHAIIVE_WORKFLOW_REPOSITORY=<path-to-BeeHAIve>
 # BEEHAIIVE_STATE_DB=.beehaiive/state.db
 # BEEHAIIVE_ROUTING_DB=.beehaiive/routing.db
@@ -68,7 +68,9 @@ The project ID is exactly `<owner>:<number>`. The tracked launcher reads the
 gitignored `.env` file before checking these values. Existing process variables
 take precedence. `BEEHAIIVE_AGENT_REPOSITORY_NAME` must match the repository
 selected in the Project. The timeout must be finite and no greater than 900
-seconds. Project discovery is cached for 10 minutes by default, so the
+seconds for regular worker runs. Autonomous skill contexts default to 1800
+seconds because an implementation handoff can run repository checks before
+returning its handover. Project discovery is cached for 10 minutes by default, so the
 dashboard's five-second polling does not repeat the full GraphQL discovery.
 When `BEEHAIIVE_CODEX_EXECUTABLE` is a bare command such as `codex`, the
 autonomous runner resolves the native Windows executable before launching it.

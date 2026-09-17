@@ -75,7 +75,8 @@ def test_runner_normalizes_completed_skill_status() -> None:
                 "handover": handover,
             }
 
-    result = AutonomousLifecycleRunner(CompletedExecutor()).run(
+    steps: list[str] = []
+    result = AutonomousLifecycleRunner(CompletedExecutor(), on_step=steps.append).run(
         {
             "project_id": "project-1",
             "repository": "owner/api",
@@ -88,6 +89,7 @@ def test_runner_normalizes_completed_skill_status() -> None:
     assert result.status == "completed"
     assert len(result.handoffs) == len(AUTONOMOUS_STEPS) - 1
     assert all(handoff.status == "succeeded" for handoff in result.handoffs)
+    assert steps == [step.name for step in AUTONOMOUS_STEPS[1:]]
 
 
 def test_blocker_calls_the_advisor_once() -> None:
