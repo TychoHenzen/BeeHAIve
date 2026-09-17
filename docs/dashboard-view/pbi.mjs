@@ -1,6 +1,6 @@
 export function createPbiRenderer(dom, details, runAction) {
   const { element, renderEvidenceLink, renderListSection, pullRequestLabel } = dom;
-  const { renderTaskContract, renderTaskResult, renderCanonicalLifecycle, renderOperatorQuestion, renderProgress, renderAgentSession, renderSubtask, renderDependencyReadiness, renderChecks, renderReviewers, renderEscalation, renderActivity } = details;
+  const { renderTaskContract, renderTaskResult, renderCanonicalLifecycle, renderOperatorQuestion, renderProgress, renderAgentSession, renderGraphTrace, renderSubtask, renderDependencyReadiness, renderChecks, renderReviewers, renderEscalation, renderActivity } = details;
   function renderPbi(repository, pbi) {
     const card = element("article", undefined, "pbi");
     if (!card.dataset) card.dataset = {};
@@ -30,6 +30,7 @@ export function createPbiRenderer(dom, details, runAction) {
     details.append(renderCanonicalLifecycle(pbi.canonical_lifecycle));
     const agentSession = renderAgentSession(pbi.agent_session);
     if (agentSession) details.append(agentSession);
+    if (pbi.graph_trace) details.append(renderGraphTrace(pbi.graph_trace));
     if (pbi.task_contract) details.append(renderTaskContract(pbi.task_contract));
     const operatorQuestions = pbi.operator_questions || [];
     const hasPendingOperatorQuestion = operatorQuestions.some(

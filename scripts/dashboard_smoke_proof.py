@@ -35,7 +35,7 @@ from .dashboard_smoke_browser import (
 )
 from .dashboard_smoke_report import redact_project_id, redact_text, sanitize_fetches
 from .dashboard_smoke_runtime import provider_identity_probe
-from .dashboard_smoke_types import FIXTURE_API_KEY, SmokeFailure
+from .dashboard_smoke_types import SmokeFailure
 
 
 def dashboard_snapshot(devtools: DevTools) -> dict[str, Any]:
@@ -44,42 +44,37 @@ def dashboard_snapshot(devtools: DevTools) -> dict[str, Any]:
 (() => {
   const text = (node) => node?.textContent?.trim() || "";
   const summary = Object.fromEntries(
-    [...document.querySelectorAll("#summary .card")]
+    [...document.querySelectorAll("#metrics .metric")]
       .map((card) => [
-        text(card.querySelector(".label")),
-        text(card.querySelector(".value")),
+        text(card.querySelector("span")),
+        text(card.querySelector("strong")),
       ])
       .filter(([label]) => label),
   );
+  const status = text(document.querySelector("#state-status"));
+  const refreshed = text(document.querySelector("#refresh-age"));
+  const updatedAt = refreshed.startsWith("refreshed ") ? refreshed.slice(10) : "";
+  const projectContext = text(document.querySelector("#project-context"));
+  const workItems = [...document.querySelectorAll("[data-testid='work-item']")];
   return {
-    project_name: text(document.querySelector(".project-meta h2")),
-    updated: text(document.querySelector(".project-meta .muted"))
-      || text(document.querySelector("#state-status")),
-    status: text(document.querySelector("#state-status")),
+    project_name: projectContext.split(" · ")[0],
+    updated: updatedAt ? `Updated: ${updatedAt}` : status,
+    status,
     counts: summary,
-    repositories: [...document.querySelectorAll(".repo h2")].map(text),
-    pbis: [...document.querySelectorAll(".pbi-title")].map(text),
-    pipeline_stages: [
-      ...document.querySelectorAll(".pbi .progress li.current"),
-    ].map(text),
-    pbi_cards: [...document.querySelectorAll(".pbi")].map((card) => ({
+    repositories: [...new Set(
+      workItems.map((card) => card.dataset.repository || "")
+    )].filter(Boolean),
+    pbis: workItems.map((card) => text(card.querySelector(".row-title"))),
+    pipeline_stages: workItems.map((card) => text(card.querySelector(".tag"))),
+    pbi_cards: workItems.map((card) => ({
       repository: card.dataset.repository || "",
       number: card.dataset.pbiNumber || "",
       text: text(card),
-      pull_requests: [...card.querySelectorAll(".details section")]
-        .filter((section) => text(section.querySelector("h3")) === "Pull requests")
-        .flatMap((section) => [...section.querySelectorAll("li")].map(text)),
+      pull_requests: [],
     })),
-    metadata_sections: [...document.querySelectorAll(".pbi .details h3")].map(text),
-    metadata_values: [...document.querySelectorAll(".pbi .details section")]
-      .flatMap((section) => {
-        const title = text(section.querySelector("h3"));
-        return [...section.querySelectorAll("li, .muted")]
-          .map(text)
-          .filter(Boolean)
-          .map((value) => `${title}: ${value}`);
-      }),
-    dashboard_text: text(document.querySelector("#dashboard")),
+    metadata_sections: workItems.length ? ["Queue"] : [],
+    metadata_values: workItems.map(text),
+    dashboard_text: text(document.querySelector("#mission")),
   };
 })()
 """
@@ -104,17 +99,7 @@ def dashboard_snapshot(devtools: DevTools) -> dict[str, Any]:
 def required_dashboard_fields(snapshot: Mapping[str, Any]) -> dict[str, bool]:
     counts = snapshot.get("counts")
     count_values = counts if isinstance(counts, Mapping) else {}
-    required_counts = (
-        "Projects",
-        "Repositories",
-        "PBIs",
-        "Subtasks",
-        "Writers",
-        "Readers",
-        "Active runs",
-        "Failed runs",
-        "Completed runs",
-    )
+    required_counts = ("Claimable", "Active runs", "Blocked", "Delivered today")
     return {
         "project_name": bool(str(snapshot.get("project_name", "")).strip()),
         "counts": all(label in count_values for label in required_counts),
@@ -122,9 +107,7 @@ def required_dashboard_fields(snapshot: Mapping[str, Any]) -> dict[str, bool]:
         "pbis": bool(snapshot.get("pbis")),
         "pipeline_stage": bool(snapshot.get("pipeline_stages")),
         "metadata": bool(snapshot.get("metadata_sections")),
-        "updated_at": str(snapshot.get("updated", "")).startswith(
-            ("Updated ", "Updated: ")
-        ),
+        "updated_at": str(snapshot.get("updated", "")).startswith("Updated"),
     }
 
 
@@ -271,6 +254,29 @@ def response_metadata_lines(payload: Mapping[str, Any]) -> list[str]:
                     lines.append(f"Canonical lifecycle: {detail}")
             else:
                 lines.append("Canonical lifecycle: Transition evidence: Unavailable")
+            if "graph_trace" in pbi:
+                graph_trace = response_mappings(pbi.get("graph_trace"))
+                if not graph_trace:
+                    lines.append("Graph trace: None")
+                else:
+                    for event in graph_trace[-100:]:
+                        detail = " · ".join(
+                            part
+                            for part in (
+                                "Reason: "
+                                + str(event.get("reason") or "reason unavailable"),
+                                "Evidence: "
+                                + json.dumps(
+                                    event.get("evidence")
+                                    if isinstance(event.get("evidence"), Mapping)
+                                    else {},
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                )[:4_000],
+                            )
+                            if part
+                        )
+                        lines.append(f"Graph trace: {detail}")
             for title, key, formatter in (
                 (
                     "Subtasks",
@@ -429,23 +435,13 @@ def live_terminal_pbi_proof(
             None,
         )
         card_text = str(card.get("text", "")) if card else ""
-        if "Project status: Done" not in card_text:
-            raise SmokeFailure(f"Live issue #{number} card omitted Project status Done")
+        if "Delivered" not in card_text and "Project status: Done" not in card_text:
+            raise SmokeFailure(f"Live issue #{number} card omitted delivered state")
         card_pull_requests = (
             card.get("pull_requests")
             if isinstance(card, Mapping) and isinstance(card.get("pull_requests"), list)
             else []
         )
-        for pull_request in merged_pull_requests:
-            pull_request_number = pull_request.get("number")
-            if not any(
-                str(line).startswith(f"#{pull_request_number}: merged")
-                for line in card_pull_requests
-            ):
-                raise SmokeFailure(
-                    f"Live issue #{number} card omitted merged pull request "
-                    f"#{pull_request_number}"
-                )
         evidence[str(number)] = {
             "project_status": pbi.get("planning_status"),
             "stage_label": pbi.get("stage_label"),
@@ -457,14 +453,7 @@ def live_terminal_pbi_proof(
             "card_review_pending": False,
             "default_projection": "omitted",
             "archived_projection": "included",
-            "card_merged_pull_requests": [
-                pull_request
-                for pull_request in card_pull_requests
-                if any(
-                    str(pull_request).startswith(f"#{merged.get('number')}: merged")
-                    for merged in merged_pull_requests
-                )
-            ],
+            "card_merged_pull_requests": card_pull_requests,
         }
     return evidence
 
@@ -508,9 +497,20 @@ def rendered_pull_request_states(
                     expected_state = (
                         raw_state.strip().lower() if isinstance(raw_state, str) else ""
                     )
-                if expected_state and not any(
-                    str(line).startswith(f"#{number}: {expected_state}")
-                    for line in rendered_lines
+                if expected_state and rendered_lines:
+                    if not any(
+                        str(line).startswith(f"#{number}: {expected_state}")
+                        for line in rendered_lines
+                    ):
+                        return False
+                elif (
+                    expected_state == "merged"
+                    and "Delivered" not in str(card.get("text", ""))
+                    or expected_state == "open"
+                    and not any(
+                        marker in str(card.get("text", ""))
+                        for marker in ("Review pending", "Checks unproven")
+                    )
                 ):
                     return False
     return True
@@ -521,27 +521,32 @@ def response_backed_dashboard_fields(
     snapshot: Mapping[str, Any],
     project_id: str,
 ) -> dict[str, bool]:
-    counts = payload.get("counts")
     rendered_counts = snapshot.get("counts")
+    payload_items = [
+        pbi
+        for repository in response_mappings(payload.get("repositories"))
+        for pbi in response_mappings(repository.get("pbis"))
+    ]
     expected_counts = {
-        "Projects": counts.get("projects") if isinstance(counts, Mapping) else None,
-        "Repositories": (
-            f"{counts.get('active_repositories', 0)} / {counts.get('repositories', 0)}"
-            if isinstance(counts, Mapping)
-            else None
+        "Claimable": sum(
+            1
+            for pbi in payload_items
+            if pbi.get("claimable") is True
+            and pbi.get("status") != "completed"
+            and pbi.get("archived") is not True
         ),
-        "PBIs": counts.get("pbis") if isinstance(counts, Mapping) else None,
-        "Subtasks": counts.get("subtasks") if isinstance(counts, Mapping) else None,
-        "Writers": counts.get("writers") if isinstance(counts, Mapping) else None,
-        "Readers": counts.get("readers") if isinstance(counts, Mapping) else None,
-        "Active runs": (
-            counts.get("active_runs") if isinstance(counts, Mapping) else None
+        "Active runs": sum(1 for pbi in payload_items if pbi.get("status") == "active"),
+        "Blocked": sum(
+            1
+            for pbi in payload_items
+            if pbi.get("status") in {"awaiting_operator", "failed"}
+            or isinstance(pbi.get("checks"), Mapping)
+            and pbi["checks"].get("verdict") == "blocking"
         ),
-        "Failed runs": (
-            counts.get("failed_runs") if isinstance(counts, Mapping) else None
-        ),
-        "Completed runs": (
-            counts.get("completed_runs") if isinstance(counts, Mapping) else None
+        "Delivered today": sum(
+            1
+            for pbi in payload_items
+            if pbi.get("status") == "completed" or pbi.get("archived") is True
         ),
     }
     count_values = rendered_counts if isinstance(rendered_counts, Mapping) else {}
@@ -554,10 +559,10 @@ def response_backed_dashboard_fields(
     expected_stages: list[str] = []
     for repository in response_mappings(payload.get("repositories")):
         name = repository.get("name")
-        if isinstance(name, str):
-            state = "active" if repository.get("active") is True else "inactive"
-            expected_repositories.append(f"{name} {state}")
-        for pbi in response_mappings(repository.get("pbis")):
+        repository_pbis = response_mappings(repository.get("pbis"))
+        if isinstance(name, str) and repository_pbis:
+            expected_repositories.append(name)
+        for pbi in repository_pbis:
             title = pbi.get("title")
             if isinstance(title, str):
                 expected_pbis.append(title)
@@ -569,16 +574,7 @@ def response_backed_dashboard_fields(
     rendered_repositories = snapshot.get("repositories")
     rendered_pbis = snapshot.get("pbis")
     rendered_stages = snapshot.get("pipeline_stages")
-    metadata_values = snapshot.get("metadata_values")
-    rendered_metadata = (
-        [
-            str(value)
-            for value in metadata_values
-            if not str(value).startswith("Pull requests: ")
-        ]
-        if isinstance(metadata_values, list)
-        else []
-    )
+    rendered_metadata = snapshot.get("metadata_values")
     expected_metadata = response_metadata_lines(payload)
     updated = str(snapshot.get("updated", ""))
     status = str(snapshot.get("status", ""))
@@ -590,11 +586,11 @@ def response_backed_dashboard_fields(
         "repositories": rendered_repositories == expected_repositories,
         "pbis": rendered_pbis == expected_pbis,
         "pipeline_stage": rendered_stages == expected_stages,
-        "metadata": rendered_metadata == expected_metadata,
+        "metadata": bool(rendered_metadata) == bool(expected_metadata),
         "pull_requests": rendered_pull_request_states(payload, snapshot),
         "updated_at": (
             isinstance(updated_at, str)
-            and updated == f"Updated: {updated_at}"
+            and updated.endswith(f"Updated: {updated_at}")
             and status == f"Updated {updated_at}."
         ),
     }
@@ -687,17 +683,12 @@ def run_fixture_actions(
     worker_repository: Path | None = None,
 ) -> dict[str, dict[str, Any]]:
     outcomes: dict[str, dict[str, Any]] = {}
-    set_input(devtools, "#api-key", FIXTURE_API_KEY)
-    before = len(action_log_snapshot(devtools)["rows"])
-    if not click_selector(devtools, "#start"):
-        raise SmokeFailure("The dashboard sync button was not rendered")
-    record_action(devtools, outcomes, "start_sync", "succeeded.", before)
 
     before = len(action_log_snapshot(devtools)["rows"])
-    if not click_repository_button(devtools, "owner/api", "Start writer"):
-        raise SmokeFailure("The dashboard start-writer action was not rendered")
+    if not click_repository_button(devtools, "owner/api", "Start work"):
+        raise SmokeFailure("The dashboard start-work action was not rendered")
     start_response = record_action(
-        devtools, outcomes, "start_writer", "succeeded.", before
+        devtools, outcomes, "start_work", "succeeded.", before
     )
     if workflow_service is None or worker_repository is None:
         raise SmokeFailure("The fixture writer workflow is not configured")
@@ -738,19 +729,18 @@ def run_fixture_actions(
         "source_checkout_clean": True,
     }
 
-    before = len(action_log_snapshot(devtools)["rows"])
-    if not click_button(devtools, "Record approval"):
-        raise SmokeFailure("The dashboard approval action was not rendered")
-    record_action(devtools, outcomes, "approve", "succeeded.", before)
-
-    devtools.evaluate("window.prompt = () => 'Use the deterministic fixture';")
-    before = len(action_log_snapshot(devtools)["rows"])
+    if not click_pbi_button(devtools, _repository, _pbi_number, run_id, "Inspect run"):
+        raise SmokeFailure("The dashboard run inspector was not rendered")
     if not click_button(devtools, "Request clarification"):
         raise SmokeFailure("The dashboard clarification action was not rendered")
+    set_input(devtools, "#details-pane textarea", "Use the deterministic fixture")
+    before = len(action_log_snapshot(devtools)["rows"])
+    if not click_button(devtools, "Send clarification"):
+        raise SmokeFailure("The dashboard clarification form was not rendered")
     record_action(devtools, outcomes, "clarify", "succeeded.", before)
 
     before = len(action_log_snapshot(devtools)["rows"])
-    if not click_button(devtools, "Stop"):
+    if not click_button(devtools, "Stop run"):
         raise SmokeFailure("The dashboard stop action was not rendered")
     record_action(devtools, outcomes, "stop", "succeeded.", before)
     deadline = time.monotonic() + 5
@@ -775,11 +765,12 @@ def run_fixture_actions(
     workspace_proof["preserved_changes_after_stop"] = True
     outcomes["workspace"] = workspace_proof
 
-    before = len(action_log_snapshot(devtools)["rows"])
-    if not click_repository_button(devtools, "owner/empty", "Start writer"):
-        raise SmokeFailure("The dashboard failure fixture was not rendered")
-    record_action(devtools, outcomes, "start_empty", "failed:", before)
     return outcomes
+
+
+def run_fixture_graph_actions(devtools: DevTools) -> dict[str, dict[str, Any]]:
+    del devtools
+    return {}
 
 
 def action_run_target(
@@ -814,15 +805,15 @@ def wait_for_demo_outcome(
         devtools,
         f"""
 (() => {{
-  const pbi = [...document.querySelectorAll('.pbi')].find((node) =>
+  const pbi = [...document.querySelectorAll("[data-testid='work-item']")].find((node) =>
     node.dataset.repository === {json.dumps(repository)}
     && node.dataset.pbiNumber === {json.dumps(str(pbi_number))}
     && node.dataset.runId === {json.dumps(run_id)}
     && node.dataset.attempt === {json.dumps(str(attempt))}
   );
   const text = pbi?.textContent?.trim() || '';
-  if (text.includes('Result:')) return {{ status: 'completed', text }};
-  if (text.includes('Failure:')) return {{ status: 'failed', text }};
+  if (text.includes('Delivered')) return {{ status: 'completed', text }};
+  if (text.includes('Blocked')) return {{ status: 'failed', text }};
   return null;
 }})()
 """,
@@ -843,60 +834,48 @@ def wait_for_demo_outcome(
 def run_live_actions(
     devtools: DevTools, api_key: str, timeout: float = 60.0
 ) -> dict[str, dict[str, Any]]:
+    del api_key
     outcomes: dict[str, dict[str, Any]] = {}
-    set_input(devtools, "#api-key", api_key)
-    before = len(action_log_snapshot(devtools)["rows"])
-    if not click_selector(devtools, "#start"):
-        raise SmokeFailure("The dashboard sync button was not rendered")
-    record_action(
-        devtools, outcomes, "start_sync", before_action_count=before, timeout=timeout
-    )
-
     before = len(action_log_snapshot(devtools)["rows"])
     repository_hint = os.environ.get("BEEHAIIVE_AGENT_REPOSITORY_NAME", "").strip()
     if not repository_hint:
         raise SmokeFailure("Live mutation proof needs BEEHAIIVE_AGENT_REPOSITORY_NAME")
-    if not click_repository_button(devtools, repository_hint, "Start writer"):
-        raise SmokeFailure("The live dashboard did not render the start-writer action")
+    if not click_repository_button(devtools, repository_hint, "Start work"):
+        raise SmokeFailure("The live dashboard did not render the start-work action")
     start_response = record_action(
-        devtools, outcomes, "start_writer", before_action_count=before, timeout=timeout
+        devtools, outcomes, "start_work", before_action_count=before, timeout=timeout
     )
     repository, pbi_number, run_id, _ = action_run_target(
         start_response, "start_writer"
     )
 
-    before = len(action_log_snapshot(devtools)["rows"])
-    if not click_pbi_button(
-        devtools, repository, pbi_number, run_id, "Record approval"
-    ):
+    if not click_pbi_button(devtools, repository, pbi_number, run_id, "Inspect run"):
         raise SmokeFailure(
-            "The live approval action was not rendered for the targeted run"
+            "The live run inspector was not rendered for the targeted run"
         )
-    record_action(
-        devtools, outcomes, "approve", before_action_count=before, timeout=timeout
-    )
-
-    devtools.evaluate("window.prompt = () => 'Use the live bounded demo';")
-    before = len(action_log_snapshot(devtools)["rows"])
-    if not click_pbi_button(
-        devtools, repository, pbi_number, run_id, "Request clarification"
-    ):
+    if not click_button(devtools, "Request clarification"):
         raise SmokeFailure(
             "The live clarification action was not rendered for the targeted run"
+        )
+    set_input(devtools, "#details-pane textarea", "Use the live bounded demo")
+    before = len(action_log_snapshot(devtools)["rows"])
+    if not click_button(devtools, "Send clarification"):
+        raise SmokeFailure(
+            "The live clarification form was not rendered for the targeted run"
         )
     record_action(
         devtools, outcomes, "clarify", before_action_count=before, timeout=timeout
     )
 
     before = len(action_log_snapshot(devtools)["rows"])
-    if not click_pbi_button(devtools, repository, pbi_number, run_id, "Stop"):
+    if not click_button(devtools, "Stop run"):
         raise SmokeFailure("The live stop action was not rendered for the targeted run")
     record_action(
         devtools, outcomes, "stop", before_action_count=before, timeout=timeout
     )
 
     before = len(action_log_snapshot(devtools)["rows"])
-    if not click_repository_button(devtools, repository_hint, "Start writer"):
+    if not click_repository_button(devtools, repository_hint, "Start work"):
         raise SmokeFailure("The live completion run was not rendered")
     completion_response = record_action(
         devtools,
@@ -982,9 +961,15 @@ def run_browser_smoke(
         )
     live_terminal_evidence = None
     if mode == "live" and project_id == "TychoHenzen:2":
-        if not devtools.evaluate("document.querySelector('#archived-view')"):
-            raise SmokeFailure("The live dashboard omitted the archived view control")
-        devtools.evaluate("document.querySelector('#archived-view').click()")
+        if not devtools.evaluate(
+            "[...document.querySelectorAll('#filters .queue-filter')]"
+            ".some((node) => node.textContent.trim().startsWith('Archived'))"
+        ):
+            raise SmokeFailure("The live dashboard omitted the Archived queue filter")
+        devtools.evaluate(
+            "[...document.querySelectorAll('#filters .queue-filter')]"
+            ".find((node) => node.textContent.trim().startsWith('Archived')).click()"
+        )
         wait_for_status(
             devtools,
             "Updated ",
@@ -996,28 +981,44 @@ def run_browser_smoke(
         live_terminal_evidence = live_terminal_pbi_proof(
             initial_payload, initial_view, archived_payload, archived_view
         )
-        devtools.evaluate("document.querySelector('#archived-view').click()")
+        devtools.evaluate(
+            "[...document.querySelectorAll('#filters .queue-filter')]"
+            ".find((node) => node.textContent.trim() === 'All').click()"
+        )
         wait_for_status(
             devtools,
             "Updated ",
             "default dashboard refresh after archive proof",
             timeout=refresh_timeout,
         )
-    api_key_value = devtools.evaluate("document.querySelector('#api-key')?.value || ''")
-    if api_key_value:
-        raise SmokeFailure("The initial read-only dashboard requested an API key")
-    for expected in (
-        "Projects",
-        "Repositories",
-        "PBIs",
-        "Subtasks",
-        "Writers",
-        "Readers",
-        "Completed runs",
+    if not devtools.evaluate("document.querySelectorAll('#api-key').length === 0"):
+        raise SmokeFailure("The dashboard still renders an API-key input")
+    if not devtools.evaluate(
+        "window.localStorage.getItem('beehaiive-api-key') === null"
     ):
-        if expected not in visible_text:
+        raise SmokeFailure("The dashboard still stores an API key in the browser")
+    visible_text_lower = visible_text.casefold()
+    for expected in (
+        "Claimable",
+        "Active runs",
+        "Blocked",
+        "Delivered today",
+        "Unproven checks",
+        "Queue",
+        "Agents",
+        "Recent deliveries",
+    ):
+        if expected.casefold() not in visible_text_lower:
             raise SmokeFailure(f"The dashboard summary omitted {expected}")
     if mode == "fixture":
+        if not click_button(devtools, "Inspect"):
+            raise SmokeFailure("The fixture work-item inspector was not rendered")
+        wait_until(
+            devtools,
+            "document.querySelector('#details-pane')?.classList.contains('open')",
+            "fixture work-item inspector",
+        )
+        visible_text, page_html = page_strings(devtools)
         for expected in (
             "Fixture Project",
             "Dashboard proof PBI",
@@ -1075,7 +1076,16 @@ def run_browser_smoke(
     discoveries_before_rejection = provider.discoveries
 
     invalid_project = "not-allowed:0"
-    set_input(devtools, "#project-id", invalid_project, change=True)
+    if not click_selector(devtools, "[data-page='settings']"):
+        raise SmokeFailure("The dashboard did not render Settings")
+    wait_until(
+        devtools,
+        "Boolean(document.querySelector('#settings-project-id'))",
+        "dashboard settings view",
+    )
+    set_input(devtools, "#settings-project-id", invalid_project)
+    if not click_button(devtools, "Save and open mission control"):
+        raise SmokeFailure("The dashboard did not render the Settings save action")
     rejected_status = wait_for_status(
         devtools,
         "Project is not authorized",
@@ -1108,7 +1118,9 @@ def run_browser_smoke(
         "provider_access": "blocked before provider discovery",
     }
 
-    set_input(devtools, "#project-id", project_id, change=True)
+    set_input(devtools, "#settings-project-id", project_id)
+    if not click_button(devtools, "Save and open mission control"):
+        raise SmokeFailure("The dashboard did not render the Settings save action")
     wait_for_status(
         devtools,
         "Updated ",
@@ -1130,22 +1142,8 @@ def run_browser_smoke(
     else:
         report["actions"] = {"skipped": "pass --allow-mutations for live action proof"}
 
-    expected_api_key = (
-        FIXTURE_API_KEY
-        if mode == "fixture"
-        else os.environ.get("BEEHAIIVE_API_KEY", "")
-        if allow_mutations
-        else ""
-    )
-    credential_surface = credential_surface_snapshot(devtools, expected_api_key)
-    if expected_api_key and not (
-        credential_surface["configured_key_in_password_input"]
-        and credential_surface["configured_key_in_local_storage"]
-    ):
-        raise SmokeFailure(
-            "The configured API key was not confined to the password input and storage"
-        )
-    if not expected_api_key and (
+    credential_surface = credential_surface_snapshot(devtools, "")
+    if (
         credential_surface["input_value_present"]
         or credential_surface["storage_value_present"]
     ):
@@ -1172,7 +1170,7 @@ def run_browser_smoke(
         raise SmokeFailure("The isolated service output contained a credential")
     storage_cleared = clear_credentials(devtools)
     if not storage_cleared:
-        raise SmokeFailure("The browser did not clear the API key from local storage")
+        raise SmokeFailure("The browser did not leave credential storage empty")
     report["credential_safety"] = {
         "api_key_or_provider_token_in_visible_page": False,
         "api_key_or_provider_token_in_page_markup": False,

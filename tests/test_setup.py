@@ -25,7 +25,7 @@ def test_readme_documents_the_clean_device_demo_path() -> None:
         "GitHub CLI",
         "Node.js",
         "Chromium",
-        "Start writer",
+        "Start work",
         "Result",
         "Failure",
         "Stop the run before removing local `.beehaiive` state.",

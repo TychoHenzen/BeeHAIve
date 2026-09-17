@@ -11,6 +11,36 @@ from .helpers.lease_helpers import _now as _now
 
 
 class ProjectClaimMixin:
+    def set_pbi_claimable(
+        self: Any, project_id: str, repository: str, pbi_number: int
+    ) -> dict[str, object]:
+        with self._transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT stage, active, archived
+                FROM pbis
+                WHERE project_id = ? AND repository_name = ? AND number = ?
+                """,
+                (project_id, repository, pbi_number),
+            ).fetchone()
+            if row is None or not bool(row["active"]):
+                raise StoreError("PBI is not available for requeue")
+            if row["stage"] == Stage.PULL_REQUEST.value:
+                raise StoreError("A pull-request PBI cannot be requeued")
+            connection.execute(
+                """
+                UPDATE pbis
+                SET claimable = 1, last_error = NULL, archived = 0
+                WHERE project_id = ? AND repository_name = ? AND number = ?
+                """,
+                (project_id, repository, pbi_number),
+            )
+        return {
+            "repository": repository,
+            "pbi_number": pbi_number,
+            "claimable": True,
+        }
+
     def claim_next(
         self: Any,
         project_id: str,
@@ -19,11 +49,16 @@ class ProjectClaimMixin:
         lease_token: str | None = None,
         *,
         expected_run_id: str | None = None,
+        expected_pbi_number: int | None = None,
         agent_session: tuple[str, str] | None = None,
         allow_failed_expected: bool = False,
     ) -> RunState | None:
         if not owner_id.strip():
             raise StoreError("A worker owner is required")
+        if expected_pbi_number is not None and (
+            type(expected_pbi_number) is not int or expected_pbi_number <= 0
+        ):
+            raise StoreError("A PBI number must be a positive integer")
         if agent_session is not None and (
             not agent_session[0].strip() or not agent_session[1].strip()
         ):
@@ -48,9 +83,17 @@ class ProjectClaimMixin:
                 WHERE p.project_id = ? AND p.repository_name = ?
                   AND r.status = 'active'
                   AND (? IS NULL OR r.run_id = ?)
+                  AND (? IS NULL OR p.number = ?)
                 LIMIT 1
                 """,
-                (project_id, repository, expected_run_id, expected_run_id),
+                (
+                    project_id,
+                    repository,
+                    expected_run_id,
+                    expected_run_id,
+                    expected_pbi_number,
+                    expected_pbi_number,
+                ),
             ).fetchone()
             if (
                 expected_run_id is not None
@@ -130,6 +173,7 @@ class ProjectClaimMixin:
                   AND p.repository_name = ?
                   AND p.claimable = 1
                   AND p.stage != ?
+                  AND (? IS NULL OR p.number = ?)
                   AND (
                       r.status IS NULL OR r.status = 'failed'
                       OR (r.status = 'awaiting_operator' AND r.task_answer_resumed = 1)
@@ -159,6 +203,7 @@ class ProjectClaimMixin:
                     "AND r.status = 'failed'",
                 )
                 candidate_parameters += (expected_run_id,)
+            candidate_parameters += (expected_pbi_number, expected_pbi_number)
             candidate = connection.execute(
                 candidate_query, candidate_parameters
             ).fetchone()

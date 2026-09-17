@@ -12,6 +12,7 @@ from beehaiive.storage import MAX_AGENT_DIAGNOSTIC_LENGTH, StoreError
 from beehaiive.workflow import GateResult, GitDeliveryStatus, LeaseStatus, WorkflowError
 
 from .worker_text import _gate_summary as _gate_summary
+from .worker_text import format_worker_exception as format_worker_exception
 from .worker_text import redact_worker_text as redact_worker_text
 
 
@@ -245,7 +246,9 @@ class WorkerRunMixin:
                 and run.status is RunStatus.ACTIVE
                 and run.lease_token == lease_token
             ):
-                failure = redact_worker_text(f"Agent worker failed: {exc}")
+                failure = redact_worker_text(
+                    f"Agent worker failed: {format_worker_exception(exc)}"
+                )
                 try:
                     self.orchestrator.store.fail_agent_run(run_id, failure, lease_token)
                 except StoreError:

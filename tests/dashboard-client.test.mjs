@@ -18,6 +18,7 @@ function harness(fetcher, options = {}) {
   const client = createDashboardClient({
     fetcher,
     projectId: options.projectId || (() => "owner:7"),
+    workflowId: options.workflowId,
     archived: options.archived,
     apiKey: () => "test-key",
     saveApiKey: options.saveApiKey,
@@ -88,6 +89,52 @@ test("actions preserve the archived dashboard view when enabled", async () => {
   assert.equal(requestedUrl, "/projects/owner%3A7/actions?archived=true");
 });
 
+test("actions preserve the selected workflow graph", async () => {
+  let requestedUrl;
+  const { client } = harness(async (url) => {
+    requestedUrl = url;
+    return response({ action: { status: "succeeded" }, state: { graph: {} } });
+  }, { workflowId: () => "owner/flow" });
+
+  await client.runAction({ action: "synchronize" });
+
+  assert.equal(
+    requestedUrl,
+    "/projects/owner%3A7/actions?workflow_id=owner%2Fflow",
+  );
+});
+
+test("changing workflows during an action drops stale state", async () => {
+  let selectedWorkflow = "old-flow";
+  let actionResolve;
+  let refreshCalls = 0;
+  const fetcher = (url) => {
+    if (url.includes("/actions")) {
+      return new Promise((resolve) => { actionResolve = resolve; });
+    }
+    refreshCalls += 1;
+    const workflow = url.includes("new-flow") ? "new-flow" : "old-flow";
+    return Promise.resolve(response({ workflow_id: workflow }));
+  };
+  const { client, states } = harness(fetcher, {
+    workflowId: () => selectedWorkflow,
+  });
+
+  await client.refresh();
+  const action = client.runAction({ action: "synchronize" });
+  selectedWorkflow = "new-flow";
+  await client.refresh();
+  actionResolve(response({
+    action: { status: "succeeded" },
+    state: { workflow_id: "old-flow" },
+  }));
+  await action;
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(states.at(-1).workflow_id, "new-flow");
+  assert.equal(refreshCalls, 2);
+});
+
 test("actions expose pending, success, and failure states", async () => {
   let resolveAction;
   const fetcher = () => new Promise((resolve) => {
@@ -148,6 +195,21 @@ test("an action invalidates an older refresh response", async () => {
 
   assert.deepEqual(states, [{ version: 2 }]);
   assert.equal(statuses.at(-1).kind, "success");
+});
+
+test("refresh requests the selected workflow graph", async () => {
+  let requestedUrl;
+  const { client } = harness(async (url) => {
+    requestedUrl = url;
+    return response({ updated_at: "graph" });
+  }, { workflowId: () => "owner/flow" });
+
+  await client.refresh();
+
+  assert.equal(
+    requestedUrl,
+    "/projects/owner%3A7/dashboard?workflow_id=owner%2Fflow",
+  );
 });
 
 test("changing projects during an action drops the old action response", async () => {

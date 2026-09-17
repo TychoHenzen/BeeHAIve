@@ -385,7 +385,7 @@ def click_pbi_button(
         devtools.evaluate(
             f"""
 (() => {{
-  const pbi = [...document.querySelectorAll(".pbi")].find((node) =>
+  const pbi = [...document.querySelectorAll("[data-testid='work-item']")].find((node) =>
     node.dataset.repository === {json.dumps(repository)}
     && node.dataset.pbiNumber === {json.dumps(str(pbi_number))}
     && node.dataset.runId === {json.dumps(run_id)}
@@ -421,10 +421,8 @@ def click_repository_button(devtools: DevTools, repository: str, label: str) -> 
         devtools.evaluate(
             f"""
 (() => {{
-  const repo = [...document.querySelectorAll(".repo")]
-    .find((node) => node.querySelector("h2")?.textContent.includes(
-      {json.dumps(repository)}
-    ));
+  const repo = [...document.querySelectorAll("[data-testid='work-item']")]
+    .find((node) => node.dataset.repository === {json.dumps(repository)});
   const button = [...(repo?.querySelectorAll("button") || [])]
     .find((node) => node.textContent.trim() === {json.dumps(label)});
   if (!button) return false;
@@ -506,10 +504,13 @@ def action_log_snapshot(devtools: DevTools) -> dict[str, Any]:
     value = devtools.evaluate(
         """
 (() => {
-  const log = document.querySelector("#action-log");
+  const log = document.querySelector("#action-log")
+    || document.querySelector(".activity-panel");
   return {
     visible: Boolean(log && !log.hidden),
-    rows: [...document.querySelectorAll("#actions .action-row")]
+    rows: [...document.querySelectorAll(
+      "#actions .action-row, #activity .activity-list li"
+    )]
       .map((row) => row.textContent?.trim() || "")
   };
 })()

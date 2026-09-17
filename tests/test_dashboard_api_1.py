@@ -83,7 +83,7 @@ def test_dashboard_api_exposes_terminal_project_and_pull_request_state() -> None
         main_module.create_app(orchestrator=service, allowed_project_ids={"project-1"})
     )
 
-    response = client.get("/projects/project-1/dashboard")
+    response = client.get("/projects/project-1/dashboard?archived=true")
 
     assert response.status_code == 200
     pbi = response.json()["repositories"][0]["pbis"][0]

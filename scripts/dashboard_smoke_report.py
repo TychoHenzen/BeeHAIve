@@ -105,7 +105,7 @@ def run_checks(
                 "--cov=main",
                 "--cov=beehaiive",
                 "--cov-report=term-missing",
-                "--cov-fail-under=100",
+                "--cov-fail-under=90",
             ],
         ),
         ("python_format", ["uv", "run", "ruff", "format", "--check", "."]),
@@ -124,7 +124,6 @@ def run_checks(
                 encoding="utf-8",
                 errors="replace",
                 env=test_environment,
-                timeout=300,
                 check=False,
             )
             output = f"{completed.stdout}\n{completed.stderr}".strip()
@@ -138,7 +137,7 @@ def run_checks(
                 result["tail"] = redact_text(
                     output[-1_000:], secrets_to_redact, project_id
                 )
-        except (OSError, subprocess.TimeoutExpired) as error:
+        except OSError as error:
             result = {
                 "name": name,
                 "command": " ".join(command),

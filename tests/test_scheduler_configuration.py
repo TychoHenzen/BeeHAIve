@@ -90,3 +90,21 @@ def test_scheduler_status_reports_a_running_background_thread() -> None:
     assert scheduler.status_for("project")["running"] is True
     release.set()
     scheduler.shutdown()
+
+
+def test_scheduler_can_be_enabled_and_reconfigured_at_runtime() -> None:
+    scheduler, _orchestrator, worker = _scheduler({"project": {"repositories": []}})
+    scheduler.configure(
+        SchedulerConfig(enabled=False, poll_interval_seconds=30, max_concurrency=3)
+    )
+    assert scheduler.status_for("project")["enabled"] is False
+    assert scheduler.status_for("project")["max_concurrency"] == 3
+    assert worker.maximum == 3
+
+    scheduler.configure(
+        SchedulerConfig(enabled=True, poll_interval_seconds=3600, max_concurrency=2)
+    )
+    assert scheduler.status_for("project")["enabled"] is True
+    assert scheduler.status_for("project")["running"] is True
+    assert worker.maximum == 2
+    scheduler.shutdown()

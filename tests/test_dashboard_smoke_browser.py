@@ -87,7 +87,7 @@ def test_set_input_fails_at_a_missing_control() -> None:
             return False
 
     with pytest.raises(SmokeFailure, match="was not rendered"):
-        set_input(MissingInputDevTools(), "#project-id", "owner:7")
+        set_input(MissingInputDevTools(), "#settings-project-id", "owner:7")
 
 
 def test_live_timeout_uses_provider_deadline_or_explicit_value() -> None:

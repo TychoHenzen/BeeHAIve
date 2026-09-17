@@ -124,6 +124,14 @@ class GraphDefinitionMixin:
                 raise StoreError("Stored graph definition is invalid") from error
         return tuple(definitions)
 
+    def graph_workflow_ids(self: Any) -> tuple[str, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT DISTINCT workflow_id FROM graph_definitions "
+                "ORDER BY workflow_id"
+            ).fetchall()
+        return tuple(str(row["workflow_id"]) for row in rows if row["workflow_id"])
+
 
 __all__ = ["GraphDefinitionMixin"]
 

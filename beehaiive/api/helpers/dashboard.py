@@ -1,4 +1,6 @@
-from collections.abc import Callable
+import os
+from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import cast
 
 from fastapi import HTTPException
@@ -9,6 +11,7 @@ from beehaiive.agent import (
     DEMO_TASK_NAME,
     MAX_AGENT_OUTPUT_LENGTH,
     AgentWorkerManager,
+    format_worker_exception,
     redact_worker_text,
 )
 from beehaiive.api.models import DASHBOARD_ACTIONS as DASHBOARD_ACTIONS
@@ -22,14 +25,24 @@ from beehaiive.api.models import DashboardClarifyRequest as DashboardClarifyRequ
 from beehaiive.api.models import (
     DashboardCommitPushRequest as DashboardCommitPushRequest,
 )
+from beehaiive.api.models import (
+    DashboardGraphRollbackRequest as DashboardGraphRollbackRequest,
+)
+from beehaiive.api.models import (
+    DashboardGraphSafetyRequest as DashboardGraphSafetyRequest,
+)
+from beehaiive.api.models import DashboardRequeueRequest as DashboardRequeueRequest
 from beehaiive.api.models import DashboardRetryRequest as DashboardRetryRequest
 from beehaiive.api.models import DashboardStartRequest as DashboardStartRequest
 from beehaiive.api.models import DashboardStopRequest as DashboardStopRequest
 from beehaiive.api.models import (
     DashboardSynchronizeRequest as DashboardSynchronizeRequest,
 )
+from beehaiive.autonomous import ADVISOR_STEP, AUTONOMOUS_STEPS
 from beehaiive.dashboard import build_dashboard_state
 from beehaiive.dashboard.values import safe_dashboard_value
+from beehaiive.graph import GraphDefinition
+from beehaiive.graph_safety import GraphSafetyService, graph_definition_hash
 from beehaiive.models import RunState, RunStatus
 from beehaiive.scheduler import AgentScheduler, SchedulerConfig
 from beehaiive.storage import StoreError
@@ -48,12 +61,37 @@ DASHBOARD_ACTION_OWNERS = {
     "clarify": "action_log",
     "answer_question": "orchestrator",
     "retry": "agent_worker",
+    "requeue": "orchestrator",
     "commit_push": "agent_worker",
     "deliver": "agent_worker",
+    "graph_evaluate": "graph_safety",
+    "graph_review": "graph_safety",
+    "graph_activate": "graph_safety",
+    "graph_rollback": "graph_safety",
 }
 DASHBOARD_ACTION_READBACK = {
     action: "action,state" for action in DASHBOARD_ACTION_OWNERS
 }
+
+
+def _workflow_skill_ids() -> list[str]:
+    roots = [Path.home() / ".codex" / "skills", Path.home() / ".agents" / "skills"]
+    configured = os.environ.get("BEEHAIIVE_DOD_GUARD_SKILLS", "").strip()
+    if configured:
+        roots.append(Path(configured))
+    known = {
+        f"skill/{Path(step.skill_path).parent.name}"
+        for step in (*AUTONOMOUS_STEPS, ADVISOR_STEP)
+        if Path(step.skill_path).is_file()
+    }
+    known.update(
+        f"skill/{skill_file.parent.name}"
+        for root in roots
+        if root.is_dir()
+        for skill_file in root.glob("*/SKILL.md")
+        if skill_file.is_file()
+    )
+    return sorted(known)
 
 
 def _dashboard_state(
@@ -66,11 +104,15 @@ def _dashboard_state(
     scheduler_config: SchedulerConfig | None = None,
     agent_worker: AgentWorkerManager | None = None,
     secret_values: tuple[str, ...] = (),
+    graph_safety_service: GraphSafetyService | None = None,
+    workflow_id: str | None = None,
+    autonomous_service: object | None = None,
 ) -> dict[str, object]:
     orchestrator.synchronize(project_id)
     state = orchestrator.store.project_state(project_id, event_limit)
     actions = orchestrator.store.actions_for_project(project_id)
     dashboard = build_dashboard_state(state, actions, archived)
+    dashboard["archived"] = archived
     dashboard["supported_actions"] = sorted(DASHBOARD_ACTIONS)
     dashboard["supported_action_owners"] = dict(DASHBOARD_ACTION_OWNERS)
     dashboard["supported_action_readback"] = dict(DASHBOARD_ACTION_READBACK)
@@ -89,21 +131,65 @@ def _dashboard_state(
             "last_error": None,
             "last_started_run_ids": [],
         }
-    if workflow_service is None:
-        return cast(dict[str, object], safe_dashboard_value(dashboard, secret_values))
-    repositories = cast(list[dict[str, object]], dashboard["repositories"])
-    for repository in repositories:
-        for pbi in cast(list[dict[str, object]], repository["pbis"]):
-            run_id = pbi.get("run_id")
-            if isinstance(run_id, str):
-                quality_gates = _dashboard_quality_gate_summary(
-                    workflow_service, run_id
-                )
-                if quality_gates is not None:
-                    pbi["quality_gates"] = quality_gates
-                delivery = _dashboard_delivery(workflow_service, run_id)
-                if delivery is not None:
-                    pbi["delivery"] = delivery
+    dashboard["graph"] = _dashboard_graph_state(
+        orchestrator, workflow_id, graph_safety_service
+    )
+    dashboard["workflow_ids"] = list(orchestrator.store.graph_workflow_ids())
+    dashboard["workflow_skill_ids"] = _workflow_skill_ids()
+    status_for_work_item = getattr(autonomous_service, "status_for_work_item", None)
+    if callable(status_for_work_item):
+        repositories = cast(list[dict[str, object]], dashboard["repositories"])
+        for repository in repositories:
+            repository_name = repository.get("name")
+            if not isinstance(repository_name, str):
+                continue
+            for pbi in cast(list[dict[str, object]], repository["pbis"]):
+                number = pbi.get("number")
+                if type(number) is not int:
+                    continue
+                live = status_for_work_item(project_id, repository_name, number)
+                if not isinstance(live, Mapping):
+                    continue
+                live_values = cast(Mapping[str, object], live)
+                pbi["autonomous_status"] = live_values.get("status")
+                pbi["autonomous_current_step"] = live_values.get("current_step")
+                pbi["autonomous_handoffs"] = live_values.get("handoffs", [])
+                pbi["autonomous_process"] = live_values.get("process")
+                live_events = live_values.get("session_events", [])
+                if (
+                    (isinstance(live_events, list) and live_events)
+                    or live_values.get("current_step")
+                    or live_values.get("process")
+                ):
+                    pbi["agent_session"] = {
+                        "worker_id": "autonomous",
+                        "task": (
+                            "Running skill: "
+                            f"{live_values.get('current_step', 'unknown')}"
+                        ),
+                        "state": "active",
+                        "events": live_events,
+                        "activity_state": live_values.get("status"),
+                        "started_at": live_values.get("started_at"),
+                        "step_started_at": live_values.get("step_started_at"),
+                        "last_output_at": live_values.get("last_output_at"),
+                        "last_output": live_values.get("last_output"),
+                        "process": live_values.get("process"),
+                    }
+    if workflow_service is not None:
+        repositories = cast(list[dict[str, object]], dashboard["repositories"])
+        for repository in repositories:
+            for pbi in cast(list[dict[str, object]], repository["pbis"]):
+                run_id = pbi.get("run_id")
+                if isinstance(run_id, str):
+                    quality_gates = _dashboard_quality_gate_summary(
+                        workflow_service, run_id
+                    )
+                    if quality_gates is not None:
+                        pbi["quality_gates"] = quality_gates
+                    delivery = _dashboard_delivery(workflow_service, run_id)
+                    if delivery is not None:
+                        pbi["delivery"] = delivery
     return cast(dict[str, object], safe_dashboard_value(dashboard, secret_values))
 
 
@@ -117,6 +203,8 @@ def _dashboard_state_or_none(
     scheduler_config: SchedulerConfig | None = None,
     agent_worker: AgentWorkerManager | None = None,
     secret_values: tuple[str, ...] = (),
+    graph_safety_service: GraphSafetyService | None = None,
+    workflow_id: str | None = None,
 ) -> dict[str, object] | None:
     try:
         return _dashboard_state(
@@ -129,6 +217,8 @@ def _dashboard_state_or_none(
             scheduler_config,
             agent_worker,
             secret_values,
+            graph_safety_service,
+            workflow_id,
         )
     except Exception:
         return None
@@ -227,6 +317,102 @@ def _dashboard_pbi(
             if raw_pbi.get("number") == pbi_number:
                 return raw_pbi
     return None
+
+
+def _dashboard_graph_state(
+    orchestrator: Orchestrator,
+    workflow_id: str | None,
+    graph_safety_service: GraphSafetyService | None,
+) -> dict[str, object]:
+    if not workflow_id:
+        return {
+            "workflow_id": None,
+            "definitions": [],
+            "active": None,
+            "empty": True,
+            "message": "Enter a workflow ID to view graph state.",
+        }
+    service = graph_safety_service or GraphSafetyService(orchestrator.store)
+    store = service.store
+    if store is None:
+        return {
+            "workflow_id": workflow_id,
+            "definitions": [],
+            "active": None,
+            "empty": True,
+            "message": "Graph state is unavailable.",
+        }
+    definitions = store.graph_definitions_for(workflow_id)
+    active = store.active_graph_version(workflow_id)
+    selected_definitions = list(definitions[-100:])
+    active_revision = active.get("revision") if active is not None else None
+    if active_revision is not None and not any(
+        definition.revision == active_revision for definition in selected_definitions
+    ):
+        active_definition = next(
+            (
+                definition
+                for definition in definitions
+                if definition.revision == active_revision
+            ),
+            None,
+        )
+        if active_definition is not None:
+            selected_definitions = [active_definition, *list(definitions[-99:])]
+            selected_definitions.sort(key=lambda definition: definition.revision)
+    entries: list[dict[str, object]] = []
+    for definition in selected_definitions:
+        definition_hash = graph_definition_hash(definition)
+        evidence = store.graph_safety_evidence_for(
+            definition.workflow_id, definition.revision
+        )
+        review = store.graph_safety_review_for(
+            definition.workflow_id, definition.revision
+        )
+        entry = definition.as_dict()
+        entry.update(
+            {
+                "definition_hash": definition_hash,
+                "safety_evidence": evidence,
+                "review": review,
+                "active": bool(
+                    active is not None and active.get("revision") == definition.revision
+                ),
+            }
+        )
+        entries.append(entry)
+    return {
+        "workflow_id": workflow_id,
+        "definitions": entries,
+        "active": dict(active) if active is not None else None,
+        "empty": not entries,
+        "message": "No graph definitions available." if not entries else "",
+    }
+
+
+def _redact_graph_value(
+    value: object, secret_values: tuple[str, ...], depth: int = 0
+) -> object:
+    if depth > 12:
+        raise StoreError("Graph input is nested too deeply")
+    if isinstance(value, str):
+        return redact_worker_text(
+            value, secret_values, max_length=MAX_AGENT_OUTPUT_LENGTH
+        )
+    if isinstance(value, Mapping):
+        mapping = cast(Mapping[object, object], value)
+        return {
+            redact_worker_text(
+                str(key), secret_values, max_length=MAX_AGENT_OUTPUT_LENGTH
+            ): _redact_graph_value(item, secret_values, depth + 1)
+            for key, item in mapping.items()
+        }
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray, str)):
+        sequence = cast(Sequence[object], value)
+        return [
+            _redact_graph_value(item, secret_values, depth + 1) for item in sequence
+        ]
+    return value
 
 
 def _require_active_dashboard_run(
@@ -388,7 +574,7 @@ def _start_dashboard_worker(
         agent_worker.start(run)
     except Exception as exc:
         failure = redact_worker_text(
-            f"Agent worker failed to start: {exc}",
+            f"Agent worker failed to start: {format_worker_exception(exc)}",
             secret_values,
             max_length=MAX_AGENT_OUTPUT_LENGTH,
         )
@@ -446,19 +632,28 @@ def _execute_start(
     task = getattr(getattr(agent_worker, "executor", None), "task", None)
     if not isinstance(task, str) or not task.strip():
         task = DEFAULT_DEMO_TASK
-    run = agent_worker.claim(
-        project_id,
-        request.repository,
-        request.worker_id or "dashboard-operator",
-        task=task,
-    )
+    if request.pbi_number is None:
+        run = agent_worker.claim(
+            project_id,
+            request.repository,
+            request.worker_id or "dashboard-operator",
+            task=task,
+        )
+    else:
+        run = agent_worker.claim(
+            project_id,
+            request.repository,
+            request.worker_id or "dashboard-operator",
+            task=task,
+            expected_pbi_number=request.pbi_number,
+        )
     if run is None:
         raise StoreError("No claimable PBI is available for this repository")
     try:
         agent_worker.start(run)
     except Exception as exc:
         failure = redact_worker_text(
-            f"Agent worker failed to start: {exc}",
+            f"Agent worker failed to start: {format_worker_exception(exc)}",
             secret_values,
             max_length=MAX_AGENT_OUTPUT_LENGTH,
         )
@@ -493,6 +688,34 @@ def _execute_retry(
         expected_run_id=request.run_id,
         secret_values=secret_values,
     )
+
+
+def _execute_requeue(
+    orchestrator: Orchestrator,
+    project_id: str,
+    request: DashboardActionRequest,
+    agent_worker: AgentWorkerManager | None,
+    secret_values: tuple[str, ...],
+) -> dict[str, object]:
+    del agent_worker, secret_values
+    if not isinstance(request, DashboardRequeueRequest):
+        raise StoreError(f"No dashboard handler for action: {request.action}")
+    actions = orchestrator.store.actions_for_project(project_id)
+    blocked = any(
+        action.get("kind") == "autonomous_start"
+        and action.get("repository") == request.repository
+        and action.get("pbi_number") == request.pbi_number
+        and action.get("run_id") == request.run_id
+        and action.get("status") == "failed"
+        for action in actions
+    )
+    if not blocked:
+        raise StoreError("Only a blocked autonomous run can be made claimable")
+    return {
+        "pbi": orchestrator.store.set_pbi_claimable(
+            project_id, request.repository, request.pbi_number
+        )
+    }
 
 
 def _execute_advance(
@@ -616,6 +839,72 @@ def _execute_approve(
     return {"approved": True, "run_id": run.run_id, "run_status": run.status.value}
 
 
+def _execute_graph_safety(
+    orchestrator: Orchestrator,
+    project_id: str,
+    request: DashboardActionRequest,
+    agent_worker: AgentWorkerManager | None,
+    secret_values: tuple[str, ...],
+    graph_safety_service: GraphSafetyService | None = None,
+) -> dict[str, object]:
+    del project_id, agent_worker
+    if not isinstance(request, DashboardGraphSafetyRequest):
+        raise StoreError(f"No dashboard handler for action: {request.action}")
+    service = graph_safety_service or GraphSafetyService(orchestrator.store)
+    candidate_payload = _redact_graph_value(request.candidate, secret_values)
+    if not isinstance(candidate_payload, Mapping):
+        raise StoreError("Graph candidate must be an object")
+    candidate = GraphDefinition.from_dict(cast(Mapping[str, object], candidate_payload))
+    if candidate.workflow_id != request.workflow_id:
+        raise StoreError("Graph workflow ID does not match the selected workflow")
+    baseline = (
+        GraphDefinition.from_dict(
+            cast(
+                Mapping[str, object],
+                _redact_graph_value(request.baseline, secret_values),
+            )
+        )
+        if request.baseline is not None
+        else None
+    )
+    fixtures = cast(
+        Mapping[str, object], _redact_graph_value(request.fixtures, secret_values)
+    )
+    baseline_fixtures = cast(
+        Mapping[str, object],
+        _redact_graph_value(request.baseline_fixtures, secret_values),
+    )
+    evaluation = service.evaluate(
+        candidate,
+        fixtures,
+        baseline=baseline,
+        baseline_fixtures=baseline_fixtures,
+    )
+    result: dict[str, object] = {"graph": evaluation.as_dict()}
+    if request.action == "graph_review":
+        result["review"] = service.review(evaluation, "operator").as_dict()
+    elif request.action == "graph_activate":
+        result["activation"] = service.activate(evaluation, "operator").as_dict()
+    return result
+
+
+def _execute_graph_rollback(
+    orchestrator: Orchestrator,
+    project_id: str,
+    request: DashboardActionRequest,
+    agent_worker: AgentWorkerManager | None,
+    secret_values: tuple[str, ...],
+    graph_safety_service: GraphSafetyService | None = None,
+) -> dict[str, object]:
+    del project_id, agent_worker, secret_values
+    if not isinstance(request, DashboardGraphRollbackRequest):
+        raise StoreError(f"No dashboard handler for action: {request.action}")
+    activation = (
+        graph_safety_service or GraphSafetyService(orchestrator.store)
+    ).rollback(request.workflow_id, request.revision, "operator")
+    return {"graph": {"activation": activation.as_dict()}}
+
+
 DASHBOARD_ACTION_DISPATCH: dict[str, DashboardActionHandler] = {
     "start": _execute_start,
     "claim": _execute_start,
@@ -627,8 +916,13 @@ DASHBOARD_ACTION_DISPATCH: dict[str, DashboardActionHandler] = {
     "clarify": _execute_clarify,
     "answer_question": _execute_answer_question,
     "retry": _execute_retry,
+    "requeue": _execute_requeue,
     "commit_push": _execute_delivery,
     "deliver": _execute_delivery,
+    "graph_evaluate": _execute_graph_safety,
+    "graph_review": _execute_graph_safety,
+    "graph_activate": _execute_graph_safety,
+    "graph_rollback": _execute_graph_rollback,
 }
 if (
     frozenset(DASHBOARD_ACTION_DISPATCH) != frozenset(DASHBOARD_ACTION_OWNERS)
@@ -644,7 +938,26 @@ def _execute_dashboard_action(
     request: DashboardActionRequest,
     agent_worker: AgentWorkerManager | None = None,
     secret_values: tuple[str, ...] = (),
+    graph_safety_service: GraphSafetyService | None = None,
 ) -> dict[str, object]:
+    if isinstance(request, DashboardGraphSafetyRequest):
+        return _execute_graph_safety(
+            orchestrator,
+            project_id,
+            request,
+            agent_worker,
+            secret_values,
+            graph_safety_service,
+        )
+    if isinstance(request, DashboardGraphRollbackRequest):
+        return _execute_graph_rollback(
+            orchestrator,
+            project_id,
+            request,
+            agent_worker,
+            secret_values,
+            graph_safety_service,
+        )
     handler = DASHBOARD_ACTION_DISPATCH.get(request.action)
     if handler is None:
         raise StoreError(f"Unsupported dashboard action: {request.action}")

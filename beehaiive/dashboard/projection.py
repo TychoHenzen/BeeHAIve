@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 
 from .values import mapping, mappings, sequence
-from .views import repository_view
+from .views import pbi_view, repository_view
 
 
 def build_dashboard_state(
@@ -15,10 +15,25 @@ def build_dashboard_state(
 
     repositories: list[dict[str, object]] = []
     all_pbis: list[dict[str, object]] = []
+    recent_deliveries: list[dict[str, object]] = []
     for raw_repository in mappings(state.get("repositories")):
         repository = repository_view(raw_repository, actions, include_archived)
         repositories.append(repository)
         all_pbis.extend(mappings(repository.get("pbis")))
+        for raw_pbi in mappings(raw_repository.get("pbis")):
+            pbi = pbi_view(raw_pbi, raw_repository.get("name"), actions)
+            if (
+                pbi.get("archived")
+                or pbi.get("result")
+                or sequence(pbi.get("pull_requests"))
+            ):
+                recent_deliveries.append(
+                    {
+                        "repository": raw_repository.get("name"),
+                        "project": state.get("name"),
+                        "pbi": pbi,
+                    }
+                )
 
     readers = sum(len(sequence(pbi.get("readers"))) for pbi in all_pbis)
     readers += sum(
@@ -66,5 +81,6 @@ def build_dashboard_state(
             "completed_runs": completed_runs,
         },
         "repositories": repositories,
+        "recent_deliveries": recent_deliveries[-100:],
         "actions": [dict(action) for action in actions],
     }

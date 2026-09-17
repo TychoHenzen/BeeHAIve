@@ -1,5 +1,6 @@
 from beehaiive.agent import (
     AgentWorkerManager,
+    format_worker_exception,
 )
 from beehaiive.models import (
     RunState,
@@ -14,6 +15,19 @@ from beehaiive.storage import StoreError
 from tests.support.agent.immediate_executor import (
     ImmediateExecutor as ImmediateExecutor,
 )
+
+
+def test_worker_exception_detail_includes_missing_path() -> None:
+    try:
+        raise FileNotFoundError(
+            2, "The system cannot find the file specified", "missing.exe"
+        )
+    except FileNotFoundError as error:
+        detail = format_worker_exception(error)
+
+    assert "FileNotFoundError" in detail
+    assert "filename='missing.exe'" in detail
+    assert "Missing path details" in detail
 
 
 def test_worker_manager_recovers_when_failure_lease_is_lost() -> None:
@@ -62,8 +76,9 @@ def test_worker_manager_recovers_when_failure_lease_is_lost() -> None:
     manager = AgentWorkerManager(orchestrator, executor)
     manager._run(run.run_id, run.lease_token or "")
 
-    assert orchestrator.store.recovery == (
-        run.run_id,
-        "Agent worker failed: worker exploded",
-        "lease-1",
-    )
+    assert orchestrator.store.recovery is not None
+    assert orchestrator.store.recovery[0] == run.run_id
+    assert "Agent worker failed:" in orchestrator.store.recovery[1]
+    assert "worker exploded" in orchestrator.store.recovery[1]
+    assert "Traceback" not in orchestrator.store.recovery[1]
+    assert orchestrator.store.recovery[2] == "lease-1"

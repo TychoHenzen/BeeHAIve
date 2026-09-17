@@ -10,6 +10,9 @@ from beehaiive.api.lifecycle import (
     register_background_handlers,
     register_error_handlers,
 )
+from beehaiive.api.routes.autonomous import (
+    register_routes as register_autonomous_routes,
+)
 from beehaiive.api.routes.graph_safety import (
     register_routes as register_graph_safety_routes,
 )
@@ -27,6 +30,7 @@ from beehaiive.api.routes.runs import register_routes as register_runs_routes
 from beehaiive.api.routes.system import register_routes as register_system_routes
 from beehaiive.api.routes.workflow import register_routes as register_workflow_routes
 from beehaiive.api.runtime import build_api_runtime
+from beehaiive.autonomous import AutonomousLifecycleService
 from beehaiive.conflict_repair import ConflictRepairService
 from beehaiive.graph_safety import GraphSafetyService
 from beehaiive.meta_review import MetaReviewService
@@ -65,6 +69,7 @@ def create_app(
     graph_safety_service: GraphSafetyService | None = None,
     conflict_repair_service: ConflictRepairService | None = None,
     review_repair_service: ReviewRepairService | None = None,
+    autonomous_service: AutonomousLifecycleService | None = None,
 ) -> FastAPI:
     runtime_options: dict[str, Any] = {
         "agent_worker": agent_worker,
@@ -85,6 +90,7 @@ def create_app(
         "store": store,
         "workflow_service": workflow_service,
         "graph_safety_service": graph_safety_service,
+        "autonomous_service": autonomous_service,
     }
     runtime = build_api_runtime(runtime_options)
     app = FastAPI(title="BeeHAIve")
@@ -94,6 +100,7 @@ def create_app(
         runtime, api_key, review_actor, workflow_actor
     )
     route_context = runtime | dependencies
+    register_autonomous_routes(app, route_context)
     register_reviews_routes(app, route_context)
     register_workflow_routes(app, route_context)
     register_graph_safety_routes(app, route_context)

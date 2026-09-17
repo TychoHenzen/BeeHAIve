@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from threading import Event, Lock, Thread
 from typing import cast
@@ -10,6 +11,7 @@ from beehaiive.agent import (
     DEFAULT_DEMO_TASK,
     AgentWorkerManager,
     WorkerCapacityError,
+    format_worker_exception,
     redact_worker_text,
 )
 from beehaiive.orchestrator import Orchestrator
@@ -53,6 +55,11 @@ class AgentScheduler:
         project_ids: set[str] | frozenset[str],
         config: SchedulerConfig,
         *,
+        autonomous_start: Callable[[str], Mapping[str, object]] | None = None,
+        autonomous_has_capacity: Callable[[], bool] | None = None,
+        autonomous_set_capacity: Callable[[int], None] | None = None,
+        autonomous_active_count: Callable[[], int] | None = None,
+        allow_disabled: bool = False,
         budget_adapter: BudgetAdapter | None = None,
         budget_policy: BudgetPolicy | None = None,
     ) -> None:
@@ -61,12 +68,16 @@ class AgentScheduler:
         self.project_ids = tuple(sorted(project_ids))
         if not self.project_ids:
             raise ValueError("The scheduler requires at least one allowlisted project")
-        if not config.enabled:
+        if not config.enabled and not allow_disabled:
             raise ValueError("The scheduler must be enabled before it can be created")
         if worker.workflow_service is None:
             raise ValueError("A workflow service is required for scheduled workers")
         worker.set_max_concurrent_workers(config.max_concurrency)
         self.config = config
+        self.autonomous_start = autonomous_start
+        self.autonomous_has_capacity = autonomous_has_capacity
+        self.autonomous_set_capacity = autonomous_set_capacity
+        self.autonomous_active_count = autonomous_active_count
         self.budget_adapter = budget_adapter
         self.budget_policy = budget_policy or BudgetPolicy()
         self._owner_id = f"scheduler:{os.getpid()}:{uuid4().hex}"
@@ -74,7 +85,7 @@ class AgentScheduler:
         self._thread_lock = Lock()
         self._state_lock = Lock()
         self._thread: Thread | None = None
-        self._candidate_cursor = 0
+        self._candidate_cursor: int = 0
         self._last_poll_at: str | None = None
         self._last_error: str | None = None
         self._last_started_run_ids: dict[str, tuple[str, ...]] = {}
@@ -87,6 +98,8 @@ class AgentScheduler:
         )
 
     def start(self) -> None:
+        if not self.config.enabled:
+            return
         with self._thread_lock:
             if self._thread is not None and self._thread.is_alive():
                 return
@@ -115,6 +128,21 @@ class AgentScheduler:
                 "Agent scheduler did not stop within "
                 f"{SCHEDULER_SHUTDOWN_TIMEOUT_SECONDS:g} seconds"
             )
+
+    def configure(self, config: SchedulerConfig) -> None:
+        was_running = False
+        with self._thread_lock:
+            if self._thread is not None:
+                was_running = self._thread.is_alive()
+        self.worker.set_max_concurrent_workers(config.max_concurrency)
+        if self.autonomous_set_capacity is not None:
+            self.autonomous_set_capacity(config.max_concurrency)
+        with self._state_lock:
+            self.config = config
+        if config.enabled and not was_running:
+            self.start()
+        elif not config.enabled and was_running:
+            self.shutdown()
 
     def poll_once(self) -> tuple[str, ...]:
         errors: list[str] = []
@@ -167,6 +195,24 @@ class AgentScheduler:
                 ]
                 attempted = True
                 try:
+                    if self.autonomous_start is not None:
+                        if started:
+                            break
+                        if (
+                            self.autonomous_has_capacity is not None
+                            and not self.autonomous_has_capacity()
+                        ):
+                            break
+                        autonomous = self.autonomous_start(project_id)
+                        run_id = autonomous.get("run_id")
+                        if not isinstance(run_id, str) or not run_id:
+                            raise RuntimeError("Autonomous run did not return an id")
+                        started.append(run_id)
+                        started_by_project.setdefault(project_id, []).append(run_id)
+                        self._candidate_cursor = (start_cursor + offset + 1) % len(
+                            candidates
+                        )
+                        continue
                     run = self.worker.claim(
                         project_id,
                         repository,
@@ -227,16 +273,20 @@ class AgentScheduler:
         with self._thread_lock:
             running = self._thread is not None and self._thread.is_alive()
         with self._state_lock:
+            config = self.config
             last_poll_at = self._last_poll_at
             last_error = self._last_error
             started = self._last_started_run_ids.get(project_id, ())
             budget = self._last_budget_decisions.get(project_id)
+        active_workers = self.worker.active_worker_count
+        if self.autonomous_active_count is not None:
+            active_workers += self.autonomous_active_count()
         status: dict[str, object] = {
-            "enabled": True,
+            "enabled": config.enabled,
             "running": running,
-            "poll_interval_seconds": self.config.poll_interval_seconds,
-            "max_concurrency": self.config.max_concurrency,
-            "active_workers": self.worker.active_worker_count,
+            "poll_interval_seconds": config.poll_interval_seconds,
+            "max_concurrency": config.max_concurrency,
+            "active_workers": active_workers,
             "last_poll_at": last_poll_at,
             "last_error": last_error,
             "last_started_run_ids": list(started),
@@ -350,7 +400,11 @@ class AgentScheduler:
             for value in getattr(self.worker.executor, "_secret_values", ())
             if isinstance(value, str)
         )
-        return redact_worker_text(f"{type(error).__name__}: {error}", secret_values)
+        return redact_worker_text(
+            f"{type(error).__name__}: {format_worker_exception(error)}",
+            secret_values,
+            max_length=16_000,
+        )
 
     def _run(self) -> None:
         while not self._stop_event.is_set():

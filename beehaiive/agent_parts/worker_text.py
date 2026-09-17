@@ -39,6 +39,20 @@ def redact_worker_text(
     return redacted if max_length is None else redacted[:max_length]
 
 
+def format_worker_exception(error: Exception) -> str:
+    details = str(error)
+    if isinstance(error, FileNotFoundError):
+        details = f"{type(error).__name__}: {details}"
+        details += (
+            "\nMissing path details: "
+            f"filename={error.filename!r}; "
+            f"filename2={getattr(error, 'filename2', None)!r}; "
+            f"errno={error.errno}; "
+            f"winerror={getattr(error, 'winerror', None)!r}"
+        )
+    return details.strip()
+
+
 def safe_worker_environment() -> dict[str, str]:
     """Keep only the environment variables allowed in bounded worker processes."""
 
@@ -85,6 +99,7 @@ def _gate_summary(result: GateResult) -> dict[str, object]:
 
 __all__ = [
     "redact_worker_text",
+    "format_worker_exception",
     "safe_worker_environment",
     "worker_secret_values",
     "_gate_summary",

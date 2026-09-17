@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shutil
+from pathlib import Path
 from typing import cast
 
 
@@ -24,4 +26,11 @@ def _text_value(value: object) -> str:
     return ""
 
 
-__all__ = ["_nonnegative_int", "_text_value"]
+def resolve_executable(executable: str) -> str:
+    configured = executable.strip()
+    if Path(configured).suffix.lower() in {".bat", ".cmd", ".exe"}:
+        return shutil.which(configured) or configured
+    return shutil.which(f"{configured}.exe") or shutil.which(configured) or configured
+
+
+__all__ = ["_nonnegative_int", "_text_value", "resolve_executable"]

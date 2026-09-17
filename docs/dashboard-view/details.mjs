@@ -161,6 +161,71 @@ export function createDetailRenderers(dom) {
     return section;
   }
 
+  function renderGraphTrace(trace) {
+    const section = element("section");
+    section.append(element("h3", "Graph trace"));
+    const events = Array.isArray(trace) ? trace.slice(-100) : [];
+    if (events.length === 0) {
+      section.append(element("div", "None", "muted"));
+      return section;
+    }
+    const filterLabel = element("label");
+    filterLabel.append(element("span", "Filter graph trace"));
+    const filter = element("select");
+    filter.value = "all";
+    [
+      ["All", "all"],
+      ["Advanced", "advanced"],
+      ["Terminal", "terminal"],
+      ["Paused", "paused"],
+    ].forEach(([label, value]) => {
+      const option = element("option", label);
+      option.value = value;
+      filter.append(option);
+    });
+    filterLabel.append(filter);
+    const list = element("ul");
+    const renderEvents = () => {
+      list.replaceChildren();
+      const matching = events.filter(
+        (event) => filter.value === "all" || event.status === filter.value,
+      );
+      if (matching.length === 0) {
+        list.append(
+          element("li", "No graph trace events match this filter.", "muted"),
+        );
+        return;
+      }
+      matching.forEach((event) => {
+          const edge = event.selected_edge && event.selected_edge.target
+            ? ` -> ${event.selected_edge.target}`
+            : "";
+          const summary = [
+            `run ${event.execution_id || "unknown"}`,
+            `step ${event.step ?? "?"}`,
+            `node ${event.node_id || "unknown"}${edge}`,
+            event.outcome || "outcome unknown",
+            event.status || "state unknown",
+            event.created_at || "time unavailable",
+          ].join(" · ");
+          const evidence = event.evidence && typeof event.evidence === "object"
+            ? JSON.stringify(event.evidence).slice(0, 4_000)
+            : "Evidence unavailable";
+          const disclosure = element("details");
+          disclosure.append(
+            element("summary", summary),
+            element("div", `Reason: ${event.reason || "reason unavailable"} · Evidence: ${evidence}`, "muted"),
+          );
+          list.append(disclosure);
+      });
+    };
+    filter.addEventListener("change", renderEvents);
+    renderEvents();
+    section.append(filterLabel);
+    section.append(list);
+    return section;
+  }
+
   function renderChecks(checks) {
     const section = element("section");
     const verdict = checks.verdict || "unproven";
@@ -264,5 +329,5 @@ export function createDetailRenderers(dom) {
     }
     return section;
   }
-  return { renderTaskContract, renderTaskResult, renderCanonicalLifecycle, renderOperatorQuestion, renderProgress, renderAgentSession, renderChecks, renderSubtask, renderDependencyReadiness, renderReviewers, renderEscalation, renderActivity };
+  return { renderTaskContract, renderTaskResult, renderCanonicalLifecycle, renderOperatorQuestion, renderProgress, renderAgentSession, renderGraphTrace, renderChecks, renderSubtask, renderDependencyReadiness, renderReviewers, renderEscalation, renderActivity };
 }

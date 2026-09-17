@@ -128,7 +128,20 @@ def build_route_dependencies(
         request: Request,
         supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
     ) -> None:
-        require_api_key(supplied_api_key)
+        if supplied_api_key is None:
+            dashboard_marker = request.headers.get("X-BeeHAIve-Dashboard")
+            origin = request.headers.get("Origin")
+            expected_origin = str(request.base_url).rstrip("/")
+            fetch_site = request.headers.get("Sec-Fetch-Site")
+            if (
+                dashboard_marker != "1"
+                or (origin is None or origin.rstrip("/") != expected_origin)
+                or fetch_site not in {None, "same-origin", "same-site", "none"}
+            ):
+                require_api_key(None)
+            require_api_key(configured_api_key)
+        else:
+            require_api_key(supplied_api_key)
 
         path_params = request.path_params
         project_id = path_params.get("project_id")

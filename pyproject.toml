@@ -12,6 +12,7 @@ dependencies = [
 dev = [
     "httpx==0.28.1",
     "pip-audit==2.10.1",
+    "playwright==1.55.0",
     "pyright==1.1.414",
     "pytest==9.1.1",
     "pytest-cov==7.1.0",
@@ -21,6 +22,7 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = ["e2e: browser-level dashboard use-case tests"]
 
 [tool.ruff]
 target-version = "py313"

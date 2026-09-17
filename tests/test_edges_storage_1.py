@@ -58,6 +58,31 @@ def test_claim_recovery_cannot_claim_a_different_run() -> None:
     store.close()
 
 
+def test_claim_can_target_the_selected_pbi() -> None:
+    snapshot = ProjectSnapshot(
+        "project-1",
+        "Planning",
+        (
+            RepositorySnapshot(
+                "owner/api",
+                (
+                    PbiSnapshot("owner/api", 1, "first"),
+                    PbiSnapshot("owner/api", 2, "second"),
+                ),
+            ),
+        ),
+    )
+    store = OrchestratorStore()
+    store.sync_project(snapshot)
+
+    selected = store.claim_next(
+        "project-1", "owner/api", "worker-2", expected_pbi_number=2
+    )
+
+    assert selected is not None and selected.pbi_number == 2
+    store.close()
+
+
 def test_claim_renews_same_lease_and_registers_agent_session() -> None:
     store = OrchestratorStore()
     store.sync_project(_storage_snapshot())

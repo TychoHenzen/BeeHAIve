@@ -6,6 +6,11 @@ from .dashboard_answer_question_request import DashboardAnswerQuestionRequest
 from .dashboard_approve_request import DashboardApproveRequest
 from .dashboard_clarify_request import DashboardClarifyRequest
 from .dashboard_commit_push_request import DashboardCommitPushRequest
+from .dashboard_graph_request import (
+    DashboardGraphRollbackRequest,
+    DashboardGraphSafetyRequest,
+)
+from .dashboard_requeue_request import DashboardRequeueRequest
 from .dashboard_retry_request import DashboardRetryRequest
 from .dashboard_start_request import DashboardStartRequest
 from .dashboard_stop_request import DashboardStopRequest
@@ -18,11 +23,14 @@ DashboardActionRequest = Annotated[
     | DashboardSynchronizeRequest
     | DashboardAdvanceRequest
     | DashboardRetryRequest
+    | DashboardRequeueRequest
     | DashboardAnswerQuestionRequest
     | DashboardStopRequest
     | DashboardApproveRequest
     | DashboardClarifyRequest
-    | DashboardCommitPushRequest,
+    | DashboardCommitPushRequest
+    | DashboardGraphSafetyRequest
+    | DashboardGraphRollbackRequest,
     Field(discriminator="action"),
 ]
 

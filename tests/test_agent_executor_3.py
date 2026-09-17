@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import beehaiive.agent_parts.values as agent_values
 from beehaiive.agent import (
     CodexExecModelExecutor,
 )
@@ -115,6 +116,31 @@ def test_executor_validates_configuration_and_reads_environment(
     monkeypatch.setenv("BEEHAIIVE_AGENT_TIMEOUT_SECONDS", "inf")
     with pytest.raises(ValueError, match="finite"):
         CodexExecModelExecutor.from_environment()
+
+
+def test_executor_resolves_native_codex_and_reports_launch_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    native = tmp_path / "codex.exe"
+    monkeypatch.setattr(
+        agent_values.shutil,
+        "which",
+        lambda command: str(native) if command == "codex.exe" else None,
+    )
+    executor = CodexExecModelExecutor(
+        tmp_path, executable="codex", repository_name="owner/api"
+    )
+    assert executor.executable == str(native)
+
+    missing = tmp_path / "missing-codex.exe"
+    with pytest.raises(RuntimeError) as error:
+        executor._start_process([str(missing), "--cd", str(tmp_path)], {})
+    message = str(error.value)
+    assert "Codex launch failed" in message
+    assert "missing-codex.exe" in message
+    assert "filename=" in message
+    assert "errno=2" in message
+    assert "cwd=" in message
 
 
 def test_executor_binds_repository_and_uses_selected_model(tmp_path: Path) -> None:
