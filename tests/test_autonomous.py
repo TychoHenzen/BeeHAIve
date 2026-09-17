@@ -93,6 +93,13 @@ def test_autonomous_backlog_always_starts_with_refinement() -> None:
 def test_autonomous_resume_starts_after_a_published_pull_request() -> None:
     actions = [
         {
+            "kind": "skill:next-ticket",
+            "status": "failed",
+            "repository": "owner/api",
+            "pbi_number": 1,
+            "result": {"status": "blocked", "handover": {"pbi_number": 1}},
+        },
+        {
             "kind": "skill:submit-draft-pr",
             "status": "failed",
             "repository": "owner/api",

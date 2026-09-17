@@ -884,6 +884,10 @@ class AutonomousLifecycleService:
             if action.get("status") != "succeeded" and not (
                 _skill_status(result.get("status")) == "succeeded" or published
             ):
+                if not handover.get("branch") and not handover.get(
+                    "workspace_branch"
+                ):
+                    continue
                 return {}
             next_index = step_names.index(step) + 1
             if next_index >= len(step_names):
