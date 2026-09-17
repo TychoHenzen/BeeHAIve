@@ -1,6 +1,6 @@
-import { createDashboardClient } from "/dashboard-client.mjs?v=7";
-import { createDemoClient } from "/dashboard-demo.mjs?v=7";
-import { createDashboardUi } from "/dashboard-ui.mjs?v=7";
+import { createDashboardClient } from "/dashboard-client.mjs?v=8";
+import { createDemoClient } from "/dashboard-demo.mjs?v=8";
+import { createDashboardUi } from "/dashboard-ui.mjs?v=8";
 
 const settingsProjectInput = document.querySelector("#settings-project-id");
 const settingsWorkflowInput = document.querySelector("#settings-workflow-id");
@@ -16,6 +16,7 @@ const workflowCreateForm = document.querySelector("#workflow-create-form");
 const workflowCreateId = document.querySelector("#workflow-create-id");
 const workflowCreateFeedback = document.querySelector("#workflow-create-feedback");
 const statusOutput = document.querySelector("#state-status");
+const connectionState = document.querySelector("#connection-state");
 const projectContext = document.querySelector("#project-context");
 const pageTitle = document.querySelector("#page-title");
 const welcome = document.querySelector("#welcome");
@@ -48,9 +49,31 @@ settingsWorkflowInput.value = initialWorkflow;
 let archivedMode = params.get("archived") === "true";
 let schedulerSettingsDirty = false;
 
+function setConnectionState(state, label) {
+  if (!connectionState) return;
+  connectionState.dataset.state = state;
+  connectionState.title = label;
+  connectionState.setAttribute("aria-label", label);
+}
+
 function setStatus(message, kind = "") {
+  if (message === "Loading live state...") {
+    setConnectionState("checking", "Checking connection");
+    statusOutput.className = "status";
+    statusOutput.textContent = "";
+    return;
+  }
+  if (message.startsWith("Updated ")) {
+    setConnectionState("connected", "Connected");
+    statusOutput.className = "status";
+    statusOutput.textContent = "";
+    return;
+  }
   statusOutput.textContent = message;
   statusOutput.className = `status ${kind}`;
+  if (message.startsWith("Live state failed")) {
+    setConnectionState("error", "Connection failed");
+  }
 }
 
 function setSettingsFeedback(message, kind = "") {
@@ -260,11 +283,13 @@ schedulerSave.addEventListener("click", () => {
     max_concurrency: maxConcurrency,
     poll_interval_seconds: pollInterval,
   }).then((result) => {
-    if (result) {
+    if (result && !result.error) {
       schedulerSettingsDirty = false;
       setSchedulerFeedback("Scheduler settings applied.", "success");
+    } else if (result?.error) {
+      setSchedulerFeedback(`Scheduler settings failed: ${result.error}`, "failure");
     } else {
-      setSchedulerFeedback("Scheduler settings failed. See the status above.", "failure");
+      setSchedulerFeedback("Scheduler settings failed.", "failure");
     }
   });
 });
@@ -291,8 +316,8 @@ workflowCreateForm.addEventListener("submit", (event) => {
     candidate: draft,
     fixtures: draft.fixtures,
   }).then((result) => {
-    if (!result) {
-      setWorkflowCreateFeedback("The workflow draft could not be created. See the status above.", "failure");
+    if (!result || result.error) {
+      setWorkflowCreateFeedback(`The workflow draft could not be created${result?.error ? `: ${result.error}` : "."}`, "failure");
       return;
     }
     setWorkflowCreateFeedback("Workflow draft created and evaluated.", "success");
@@ -324,4 +349,4 @@ document.addEventListener("keydown", (event) => {
 setPage(window.location.hash || "mission", false);
 if (demo || settingsProjectInput.value.trim()) openProject(false);
 else showWelcome();
-if (!demo) window.setInterval(() => void client.refresh(), 5000);
+if (!demo) window.setInterval(() => void client.refresh(), 15000);

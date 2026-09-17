@@ -11,6 +11,11 @@ from typing import Protocol, cast
 from uuid import uuid4
 
 from beehaiive.agent_parts.values import resolve_executable
+from beehaiive.agent_parts.worker_text import (
+    format_worker_exception,
+    redact_worker_text,
+    worker_secret_values,
+)
 
 __all__ = [
     "ADVISOR_STEP",
@@ -167,6 +172,7 @@ class SkillHandoff:
     status: str
     summary: str
     handover: Mapping[str, object]
+    session_output: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -174,6 +180,7 @@ class SkillHandoff:
             "status": self.status,
             "summary": self.summary,
             "handover": dict(self.handover),
+            "session_output": self.session_output,
         }
 
 
@@ -284,6 +291,17 @@ def _skill_status(value: object) -> str:
     )
 
 
+def _session_output(stdout: str, stderr: str) -> str:
+    sections = []
+    if stdout.strip():
+        sections.append(f"[stdout]\n{stdout.strip()}")
+    if stderr.strip():
+        sections.append(f"[stderr]\n{stderr.strip()}")
+    return redact_worker_text(
+        "\n\n".join(sections), worker_secret_values(), max_length=16_000
+    )
+
+
 class AutonomousLifecycleRunner:
     def __init__(
         self,
@@ -319,12 +337,21 @@ class AutonomousLifecycleRunner:
             try:
                 raw_result = self.executor.execute(step, context, handover)
             except Exception as error:
-                raw_result = {"status": "blocked", "summary": str(error)}
+                raw_result = {
+                    "status": "blocked",
+                    "summary": format_worker_exception(error),
+                }
             result = _mapping(raw_result)
             status = _skill_status(result.get("status"))
             summary = _text(result.get("summary"), f"{step.name} completed")
             handover = {**handover, **_handover(result.get("handover"))}
-            handoff = SkillHandoff(step.name, status, summary[:4_000], handover)
+            handoff = SkillHandoff(
+                step.name,
+                status,
+                summary[:4_000],
+                handover,
+                _text(result.get("session_output")) or None,
+            )
             handoffs.append(handoff)
             if self.on_handoff is not None:
                 self.on_handoff(handoff)
@@ -349,6 +376,7 @@ class AutonomousLifecycleRunner:
                                 "Advisor handoff recorded",
                             )[:4_000],
                             _handover(advisor_mapping.get("handover")),
+                            _text(advisor_mapping.get("session_output")) or None,
                         )
                         if self.on_handoff is not None:
                             self.on_handoff(advisor_handoff)
@@ -356,7 +384,7 @@ class AutonomousLifecycleRunner:
                         advisor_handoff = SkillHandoff(
                             ADVISOR_STEP.name,
                             "failed",
-                            str(advisor_error)[:4_000],
+                            format_worker_exception(advisor_error)[:4_000],
                             handover,
                         )
                         if self.on_handoff is not None:
@@ -418,6 +446,14 @@ class CodexSkillExecutor:
     ) -> Mapping[str, object]:
         if not Path(step.skill_path).is_file():
             raise FileNotFoundError(f"Skill file not found: {step.skill_path}")
+        workspace_instruction = ""
+        if context.get("workspace_path") and context.get("workspace_branch"):
+            workspace_instruction = (
+                f"The server assigned checkout {context['workspace_path']!r} "
+                f"on branch {context['workspace_branch']!r}. Use that checkout "
+                "and branch for every lifecycle step. Do not create another "
+                "checkout or branch, and do not modify the server checkout.\n"
+            )
         prompt = (
             "You are one autonomous BeeHAIve lifecycle context. Read and follow "
             f"this skill file exactly: {step.skill_path}\n"
@@ -436,6 +472,7 @@ class CodexSkillExecutor:
             "credentials, or a destructive policy choice that cannot be made safely. "
             "If a material blocker remains, return blocked JSON with its exact "
             "reason.\n"
+            f"{workspace_instruction}"
             f"PBI context: {json.dumps(dict(context), sort_keys=True)}\n"
             f"Handover: {json.dumps(dict(handover), sort_keys=True)}"
         )
@@ -470,21 +507,22 @@ class CodexSkillExecutor:
         except FileNotFoundError as error:
             raise RuntimeError(
                 f"Codex launch failed: executable={self.executable!r}; "
-                f"cwd={str(self.repository)!r}; filename={error.filename!r}; "
-                f"errno={error.errno}; message={error.strerror or str(error)}"
+                f"cwd={str(self.repository)!r}; details:\n"
+                f"{format_worker_exception(error)}"
             ) from error
         except subprocess.TimeoutExpired as error:
             raise RuntimeError(
                 f"Codex timed out after {self.timeout_seconds:g}s: "
                 f"executable={self.executable!r}; cwd={str(self.repository)!r}; "
                 f"stdout_tail={_output_tail(error.stdout).strip() or '<none>'!r}; "
-                f"stderr_tail={_output_tail(error.stderr).strip() or '<none>'!r}"
+                f"stderr_tail={_output_tail(error.stderr).strip() or '<none>'!r}; "
+                f"details:\n{format_worker_exception(error)}"
             ) from error
         except OSError as error:
             raise RuntimeError(
                 f"Codex launch failed: executable={self.executable!r}; "
-                f"cwd={str(self.repository)!r}; errno={error.errno}; "
-                f"message={error.strerror or str(error)}"
+                f"cwd={str(self.repository)!r}; details:\n"
+                f"{format_worker_exception(error)}"
             ) from error
         if result.returncode != 0:
             detail = _output_tail(result.stderr or result.stdout).strip()
@@ -495,7 +533,10 @@ class CodexSkillExecutor:
             )
         value = _last_json_mapping(result.stdout)
         if value is not None:
-            return value
+            return {
+                **value,
+                "session_output": _session_output(result.stdout, result.stderr),
+            }
         raise RuntimeError(
             f"Codex skill context returned no JSON handover: "
             f"executable={self.executable!r}; cwd={str(self.repository)!r}; "
@@ -512,6 +553,7 @@ class AutonomousLifecycleService:
         executor: SkillExecutor | None = None,
         advisor: SkillExecutor | None = None,
         max_concurrency: int = 1,
+        workflow_service: object | None = None,
     ) -> None:
         if type(max_concurrency) is not int or max_concurrency <= 0:
             raise ValueError("Autonomous worker capacity must be a positive integer")
@@ -526,6 +568,8 @@ class AutonomousLifecycleService:
         self._lock = RLock()
         self._executor = executor
         self._advisor = advisor
+        self._workflow_service = workflow_service
+        self._workspaces: dict[str, object] = {}
 
     def start(
         self,
@@ -705,13 +749,20 @@ class AutonomousLifecycleService:
                         handoff.as_dict(),
                     ]
 
-        executor = self._executor_for(context)
-        advisor = self._advisor_for(context)
-        runner = AutonomousLifecycleRunner(
-            executor, advisor, record, on_step=record_step
-        )
+        workspace_context = dict(context)
+        workspace_created = False
         try:
-            result = runner.run(context)
+            workspace_context = self._prepare_workspace(run_id, workspace_context)
+            workspace_created = "workspace_path" in workspace_context
+            executor = self._executor_for(workspace_context)
+            advisor = self._advisor_for(workspace_context)
+            runner = AutonomousLifecycleRunner(
+                executor, advisor, record, on_step=record_step
+            )
+            result = runner.run(workspace_context)
+            if workspace_created:
+                self._release_workspace(run_id)
+                workspace_created = False
             self.orchestrator.store.finish_action(
                 action_id,
                 "succeeded" if result.status == "completed" else "failed",
@@ -728,27 +779,112 @@ class AutonomousLifecycleService:
                     current["handoffs"] = recorded_handoffs
                     current["current_step"] = None
         except Exception as error:
+            detail = format_worker_exception(error)
             self.orchestrator.store.finish_action(
                 action_id,
                 "failed",
                 None,
-                str(error)[:4_000],
+                redact_worker_text(detail)[:4_000],
             )
             with self._lock:
                 current = self._runs.get(run_id)
                 if current is not None:
-                    current.update({"status": "failed", "error": str(error)[:4_000]})
+                    current.update(
+                        {
+                            "status": "failed",
+                            "error": redact_worker_text(detail)[:4_000],
+                        }
+                    )
         finally:
+            if workspace_created:
+                self._release_workspace(run_id)
             with self._lock:
                 self._active_projects.discard(str(context["project_id"]))
+
+    def _prepare_workspace(
+        self, run_id: str, context: dict[str, object]
+    ) -> dict[str, object]:
+        mode = os.environ.get("BEEHAIIVE_AUTONOMOUS_MODE", "codex").strip().lower()
+        if self._executor is not None or mode != "codex":
+            return context
+        service = self._workflow_service
+        if service is None:
+            raise RuntimeError(
+                "Autonomous Codex execution requires the server workflow service; "
+                "no checkout was touched"
+            )
+        worktrees = getattr(service, "worktrees", None)
+        repository = getattr(worktrees, "repository", None)
+        acquire = getattr(service, "acquire_workspace", None)
+        if not isinstance(repository, Path) or not callable(acquire):
+            raise RuntimeError(
+                "Autonomous Codex execution requires a server-managed repository "
+                "worktree service; no checkout was touched"
+            )
+        workspace_root = (
+            repository.parent
+            / f".{repository.name}.beehaiive"
+            / "autonomous-worktrees"
+        )
+        workspace_root.mkdir(parents=True, exist_ok=True)
+        workspace_id = uuid4().hex
+        branch = f"codex/beehaiive-autonomous-{run_id[:12]}"
+        lease = acquire(
+            f"dashboard-run:{run_id}",
+            branch,
+            workspace_root / workspace_id,
+        )
+        with self._lock:
+            self._workspaces[run_id] = lease
+        return {
+            **context,
+            "workspace_path": lease.worktree_path,
+            "workspace_branch": lease.branch,
+        }
+
+    def _release_workspace(self, run_id: str) -> None:
+        with self._lock:
+            lease = self._workspaces.pop(run_id, None)
+        service = self._workflow_service
+        if lease is None or service is None:
+            return
+        lease_id = getattr(lease, "lease_id", None)
+        lease_token = getattr(lease, "lease_token", None)
+        worktrees = getattr(service, "worktrees", None)
+        if not isinstance(lease_id, str) or not callable(
+            getattr(service, "release_workspace", None)
+        ):
+            return
+        try:
+            clean = bool(worktrees.clean(lease.worktree_path))
+        except Exception:
+            clean = False
+        try:
+            if clean:
+                service.release_workspace(lease_id)
+            elif callable(getattr(service, "retain_workspace", None)):
+                service.retain_workspace(lease_id, lease_token)
+        except Exception as error:
+            with self._lock:
+                current = self._runs.get(run_id)
+                if current is not None:
+                    current["workspace_cleanup_error"] = redact_worker_text(
+                        format_worker_exception(error)
+                    )[:4_000]
 
     def _executor_for(self, context: Mapping[str, object]) -> SkillExecutor:
         if self._executor is not None:
             return self._executor
         mode = os.environ.get("BEEHAIIVE_AUTONOMOUS_MODE", "codex").strip().lower()
         if mode == "codex":
+            repository = context.get("workspace_path")
+            if not isinstance(repository, str) or not repository.strip():
+                raise RuntimeError(
+                    "Autonomous Codex execution has no leased worktree; "
+                    "no checkout was touched"
+                )
             return CodexSkillExecutor(
-                os.environ.get("BEEHAIIVE_AGENT_REPOSITORY", str(Path.cwd())),
+                repository,
                 os.environ.get("BEEHAIIVE_CODEX_EXECUTABLE", "codex"),
                 float(
                     os.environ.get(

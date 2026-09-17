@@ -11,6 +11,7 @@ from beehaiive.agent import (
     DEFAULT_DEMO_TASK,
     AgentWorkerManager,
     WorkerCapacityError,
+    format_worker_exception,
     redact_worker_text,
 )
 from beehaiive.orchestrator import Orchestrator
@@ -399,7 +400,9 @@ class AgentScheduler:
             for value in getattr(self.worker.executor, "_secret_values", ())
             if isinstance(value, str)
         )
-        return redact_worker_text(f"{type(error).__name__}: {error}", secret_values)
+        return redact_worker_text(
+            format_worker_exception(error), secret_values, max_length=16_000
+        )
 
     def _run(self) -> None:
         while not self._stop_event.is_set():

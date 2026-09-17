@@ -249,8 +249,9 @@ export function createDashboardClient({
       onStatus("scheduler settings applied.", "success");
       return result;
     } catch (error) {
-      onStatus(`scheduler configuration failed: ${error.message}`, "failure");
-      return null;
+      const message = `scheduler configuration failed: ${error.message}`;
+      onStatus(message, "failure");
+      return { error: message };
     } finally {
       actionPending = false;
       actionProject = "";

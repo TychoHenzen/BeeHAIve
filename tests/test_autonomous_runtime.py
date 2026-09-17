@@ -60,7 +60,9 @@ def test_autonomous_runtime_resolves_bare_codex_before_windows_launch(
     store = OrchestratorStore()
     service = Orchestrator(store, FakeProvider(dashboard_snapshot()))
     service.synchronize("project-1")
-    automation = AutonomousLifecycleService(service)
+    automation = AutonomousLifecycleService(
+        service, CodexSkillExecutor(tmp_path, "codex")
+    )
     try:
         started = automation.start("project-1", "owner/api", 1)
         deadline = time.monotonic() + 3
@@ -136,3 +138,5 @@ def test_autonomous_runtime_accepts_pretty_printed_json_handover(
 
     assert result["status"] == "succeeded"
     assert result["handover"] == {"step": "next"}
+    assert "log" in result["session_output"]
+    assert '"status":"succeeded"' in result["session_output"]

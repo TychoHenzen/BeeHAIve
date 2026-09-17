@@ -14,6 +14,7 @@ from beehaiive.workflow import WorkflowError, WorkflowService, WorkspaceLease
 
 from .errors import WorkerCapacityError as WorkerCapacityError
 from .interfaces import CancellableModelExecutor as CancellableModelExecutor
+from .worker_text import format_worker_exception as format_worker_exception
 from .worker_text import redact_worker_text as redact_worker_text
 
 if TYPE_CHECKING:
@@ -161,7 +162,9 @@ class WorkerCapacityMixin:
                     and current.status is RunStatus.ACTIVE
                     and current.lease_token == lease_token
                 ):
-                    failure = redact_worker_text(f"Agent recovery failed: {exc}")
+                    failure = redact_worker_text(
+                        f"Agent recovery failed:\n{format_worker_exception(exc)}"
+                    )
                     try:
                         store.fail_agent_run(run.run_id, failure, lease_token)
                     except StoreError:

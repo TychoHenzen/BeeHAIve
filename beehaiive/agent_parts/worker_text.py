@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import traceback
 
 from beehaiive.contract_types.validation import _redact_text as _redact_text
 from beehaiive.workflow import GateResult
@@ -37,6 +38,21 @@ def redact_worker_text(
         max_length if max_length is not None else max(len(redacted), 4_000),
     )
     return redacted if max_length is None else redacted[:max_length]
+
+
+def format_worker_exception(error: Exception) -> str:
+    details = "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+    if isinstance(error, FileNotFoundError):
+        details += (
+            "\nMissing path details: "
+            f"filename={error.filename!r}; "
+            f"filename2={getattr(error, 'filename2', None)!r}; "
+            f"errno={error.errno}; "
+            f"winerror={getattr(error, 'winerror', None)!r}"
+        )
+    return details.strip()
 
 
 def safe_worker_environment() -> dict[str, str]:
@@ -85,6 +101,7 @@ def _gate_summary(result: GateResult) -> dict[str, object]:
 
 __all__ = [
     "redact_worker_text",
+    "format_worker_exception",
     "safe_worker_environment",
     "worker_secret_values",
     "_gate_summary",

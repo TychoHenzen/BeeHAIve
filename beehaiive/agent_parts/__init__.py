@@ -19,6 +19,7 @@ from .values import _nonnegative_int as _nonnegative_int
 from .values import _text_value as _text_value
 from .worker_manager import AgentWorkerManager as AgentWorkerManager
 from .worker_text import _gate_summary as _gate_summary
+from .worker_text import format_worker_exception as format_worker_exception
 from .worker_text import redact_worker_text as redact_worker_text
 from .worker_text import safe_worker_environment as safe_worker_environment
 from .worker_text import worker_secret_values as worker_secret_values
@@ -43,6 +44,7 @@ __all__ = [
     "_SESSION_PROGRESS_EVENTS",
     "_URL_CREDENTIALS",
     "_gate_summary",
+    "format_worker_exception",
     "_nonnegative_int",
     "_text_value",
     "redact_worker_text",

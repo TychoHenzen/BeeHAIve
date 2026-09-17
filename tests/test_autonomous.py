@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from threading import Event
 
 import pytest
 
+import beehaiive.autonomous as autonomous
 from beehaiive.autonomous import (
     ADVISOR_STEP,
     AUTONOMOUS_STEPS,
@@ -16,6 +18,7 @@ from beehaiive.autonomous import (
 from beehaiive.orchestrator import Orchestrator
 from beehaiive.storage import OrchestratorStore
 from tests.conftest import FakeProvider
+from tests.support.agent.helpers import make_git_repository, workflow_service_for
 from tests.support.dashboard.helpers import dashboard_snapshot
 
 
@@ -92,6 +95,31 @@ def test_runner_normalizes_completed_skill_status() -> None:
     assert steps == [step.name for step in AUTONOMOUS_STEPS[1:]]
 
 
+def test_runner_keeps_bounded_skill_session_output() -> None:
+    class SessionExecutor:
+        def execute(self, step, _context, handover):
+            return {
+                "status": "succeeded",
+                "summary": "stage completed",
+                "session_output": f"session output for {step.name}",
+                "handover": handover,
+            }
+
+    result = AutonomousLifecycleRunner(SessionExecutor()).run(
+        {
+            "project_id": "project-1",
+            "repository": "owner/api",
+            "pbi_number": 1,
+            "planning_status": "Todo",
+            "stage": "implement",
+        }
+    )
+
+    assert result.handoffs[0].session_output == (
+        "session output for next-ticket"
+    )
+
+
 def test_blocker_calls_the_advisor_once() -> None:
     class Blocker:
         def __init__(self) -> None:
@@ -155,6 +183,61 @@ def test_autonomous_service_persists_skill_handoffs() -> None:
             if str(action["kind"]).startswith("skill:")
         } == {f"skill:{step.name}" for step in AUTONOMOUS_STEPS}
     finally:
+        store.close()
+
+
+def test_codex_autonomous_run_uses_a_server_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = make_git_repository(tmp_path / "repository")
+    workflow_service, workflow_store = workflow_service_for(tmp_path, repository)
+    store = OrchestratorStore()
+    orchestrator = Orchestrator(store, FakeProvider(dashboard_snapshot()))
+    orchestrator.synchronize("project-1")
+    workspaces: list[Path] = []
+
+    class RecordingExecutor:
+        def __init__(self, path, *_args) -> None:
+            self.repository = Path(path)
+
+        def execute(self, _step, context, handover):
+            workspaces.append(self.repository)
+            assert context["workspace_path"] == str(self.repository)
+            assert context["workspace_branch"].startswith(
+                "codex/beehaiive-autonomous-"
+            )
+            return {
+                "status": "succeeded",
+                "summary": "stage completed",
+                "handover": handover,
+            }
+
+    monkeypatch.setenv("BEEHAIIVE_AUTONOMOUS_MODE", "codex")
+    monkeypatch.setattr(autonomous, "CodexSkillExecutor", RecordingExecutor)
+    service = AutonomousLifecycleService(
+        orchestrator,
+        workflow_service=workflow_service,
+    )
+
+    try:
+        started = service.start("project-1", "owner/api", 1)
+        deadline = time.monotonic() + 3
+        current = service.status(str(started["run_id"]))
+        while current["status"] == "running" and time.monotonic() < deadline:
+            time.sleep(0.01)
+            current = service.status(str(started["run_id"]))
+        assert current["status"] == "completed"
+        assert workspaces
+        assert all(path != repository for path in workspaces)
+        assert len({str(path) for path in workspaces}) == 1
+        workspace_root = (
+            repository.parent / ".repository.beehaiive" / "autonomous-worktrees"
+        )
+        assert not any(workspace_root.glob("*")), current.get(
+            "workspace_cleanup_error"
+        )
+    finally:
+        workflow_store.close()
         store.close()
 
 

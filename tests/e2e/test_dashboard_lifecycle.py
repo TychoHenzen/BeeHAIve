@@ -218,6 +218,127 @@ def test_real_mode_uses_server_owned_auth_for_actions(dashboard_page) -> None:
 
 
 @pytest.mark.e2e
+def test_session_tab_and_transcript_survive_refresh(dashboard_page) -> None:
+    page, base_url = dashboard_page
+    state = {
+        "project_id": "owner:1",
+        "name": "Server project",
+        "updated_at": "now",
+        "repositories": [{
+            "name": "owner/app",
+            "active": True,
+            "writer": {"status": "active", "current_pbi": 1},
+            "pbis": [{
+                "number": 1,
+                "title": "Session-backed work",
+                "stage": "implement",
+                "status": "active",
+                "run_id": "run-1",
+                    "agent_session": {
+                    "worker_id": "worker-1",
+                    "task": "Implement the selected PBI",
+                    "state": "running",
+                    "events": [
+                        {"kind": "message", "text": f"event-{index}"}
+                        for index in range(10)
+                        ],
+                    },
+                    "autonomous_handoffs": [{
+                        "step": "next-ticket",
+                        "status": "succeeded",
+                        "session_output": "codex emitted the stage transcript",
+                    }],
+                }],
+        }],
+        "actions": [],
+    }
+
+    page.route("**/projects/**", lambda route: route.fulfill(
+        status=200,
+        content_type="application/json",
+        body=json.dumps(state),
+    ))
+    page.goto(f"{base_url}/dashboard?project=owner:1")
+    item = work_item(page, "Session-backed work")
+    item.get_by_test_id("inspect-work").click()
+    inspector = page.locator("#details-pane")
+    inspector.get_by_test_id("detail-tab-session").click()
+    expect(inspector.locator(".session-transcript")).to_contain_text("event-0")
+    expect(inspector.locator(".session-transcript")).to_contain_text("event-9")
+    expect(inspector.locator(".session-transcript")).to_contain_text(
+        "codex emitted the stage transcript"
+    )
+    page.get_by_role("button", name="Refresh", exact=True).click(force=True)
+    expect(inspector.get_by_test_id("detail-tab-session")).to_have_attribute(
+        "aria-selected", "true"
+    )
+    expect(inspector.locator(".session-transcript")).to_contain_text("event-0")
+    expect(inspector.locator(".session-transcript")).to_contain_text("event-9")
+
+
+@pytest.mark.e2e
+def test_connection_indicator_and_scheduler_error_are_actionable(
+    dashboard_page,
+) -> None:
+    page, base_url = dashboard_page
+    state = {
+        "project_id": "owner:1",
+        "name": "Server project",
+        "updated_at": "now",
+        "repositories": [],
+        "actions": [],
+        "scheduler": {
+            "enabled": False,
+            "running": False,
+            "max_concurrency": 1,
+            "poll_interval_seconds": 600,
+            "active_workers": 0,
+        },
+    }
+    requests = 0
+
+    def api(route) -> None:
+        nonlocal requests
+        if route.request.method == "POST":
+            route.fulfill(
+                status=503,
+                content_type="application/json",
+                body=json.dumps({"detail": "scheduler process is unavailable"}),
+            )
+            return
+        requests += 1
+        if requests > 1:
+            route.fulfill(
+                status=503,
+                content_type="application/json",
+                body=json.dumps({"detail": "read model is unavailable"}),
+            )
+            return
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(state),
+        )
+
+    page.route("**/projects/**", api)
+    page.goto(f"{base_url}/dashboard?project=owner:1#settings")
+    expect(page.locator("#connection-state")).to_have_attribute(
+        "data-state", "connected"
+    )
+    expect(page.locator("#state-status")).to_have_text("")
+    page.get_by_role("button", name="Refresh", exact=True).click()
+    expect(page.locator("#connection-state")).to_have_attribute("data-state", "error")
+    expect(page.locator("#state-status")).to_contain_text("read model is unavailable")
+
+    page.locator("#settings-max-workers").fill("1")
+    page.locator("#settings-poll-interval").fill("30")
+    page.get_by_test_id("scheduler-configure").click()
+    expect(page.locator("#scheduler-feedback")).to_contain_text(
+        "scheduler process is unavailable"
+    )
+
+
+@pytest.mark.e2e
 def test_evidence_log_shows_latest_server_actions(dashboard_page) -> None:
     page, base_url = dashboard_page
     actions = [

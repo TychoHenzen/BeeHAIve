@@ -11,6 +11,7 @@ from beehaiive.agent import (
     DEMO_TASK_NAME,
     MAX_AGENT_OUTPUT_LENGTH,
     AgentWorkerManager,
+    format_worker_exception,
     redact_worker_text,
 )
 from beehaiive.api.models import DASHBOARD_ACTIONS as DASHBOARD_ACTIONS
@@ -530,7 +531,7 @@ def _start_dashboard_worker(
         agent_worker.start(run)
     except Exception as exc:
         failure = redact_worker_text(
-            f"Agent worker failed to start: {exc}",
+            f"Agent worker failed to start:\n{format_worker_exception(exc)}",
             secret_values,
             max_length=MAX_AGENT_OUTPUT_LENGTH,
         )
@@ -609,7 +610,7 @@ def _execute_start(
         agent_worker.start(run)
     except Exception as exc:
         failure = redact_worker_text(
-            f"Agent worker failed to start: {exc}",
+            f"Agent worker failed to start:\n{format_worker_exception(exc)}",
             secret_values,
             max_length=MAX_AGENT_OUTPUT_LENGTH,
         )

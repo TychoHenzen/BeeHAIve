@@ -99,7 +99,9 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
     scheduler_config = SchedulerConfig.from_environment()
     if autonomous_service is None:
         autonomous_service = AutonomousLifecycleService(
-            orchestrator, max_concurrency=scheduler_config.max_concurrency
+            orchestrator,
+            max_concurrency=scheduler_config.max_concurrency,
+            workflow_service=workflow_service,
         )
     else:
         set_capacity = getattr(autonomous_service, "set_max_concurrency", None)

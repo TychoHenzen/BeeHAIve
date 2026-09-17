@@ -65,7 +65,12 @@
       .content { min-width: 0; }
       .topbar { display: flex; align-items: center; gap: 16px; min-height: 76px; padding: 16px 26px; border-bottom: 1px solid var(--divider); }
       .topbar-copy { min-width: 150px; }
+      .page-title-row { display: flex; align-items: center; gap: 8px; }
       .topbar-copy p { margin: 0; color: #7e8294; font-size: .7rem; }
+      .connection-state { display: inline-block; width: 10px; height: 10px; border: 1px solid #777b8d; border-radius: 50%; background: #777b8d; vertical-align: middle; }
+      .connection-state[data-state="checking"] { border-color: var(--yellow); background: var(--yellow); }
+      .connection-state[data-state="connected"] { border-color: var(--green); background: var(--green); }
+      .connection-state[data-state="error"] { border-color: var(--red); background: var(--red); }
       .project-context { max-width: 190px; overflow: hidden; color: #a9abba; text-overflow: ellipsis; white-space: nowrap; font: .72rem ui-monospace, SFMono-Regular, Consolas, monospace; }
       .project-switcher { display: flex; gap: 2px; overflow-x: auto; }
       .project-filter { min-height: 32px; padding: 0 10px; border-color: transparent; background: transparent; color: #a9abba; font-size: .76rem; white-space: nowrap; }
@@ -145,6 +150,7 @@
       .failure-summary { border: 1px solid #8d3f4c; background: #2b1821; }
       .failure-summary h3 { color: #ffaaa9; }
       .failure-summary p { color: #ffd1d1; }
+      .error-details { margin: 0; color: #ffd1d1; font: .72rem/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
       .detail-card h3 { color: #d6d7df; }
       .detail-card p { margin: 0; color: #a7aaba; font-size: .76rem; }
       .detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 14px; }
@@ -159,6 +165,7 @@
       .detail-progress-step.current span { color: #d8d0ff; }
       .detail-actions { display: flex; flex-wrap: wrap; gap: 6px; }
       .detail-actions button { font-size: .72rem; }
+      .session-transcript { max-height: 420px; overflow: auto; margin: 0; padding: 11px; border: 1px solid var(--divider); border-radius: 8px; background: #0c0d18; color: #d2d4df; font: .68rem/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
       .inline-form { display: grid; gap: 7px; padding: 11px; border: 1px solid var(--divider); border-radius: 8px; background: var(--surface-raised); }
       .inline-form label { color: #9b9fae; font-size: .74rem; }
       .inline-form textarea { width: 100%; min-height: 84px; resize: vertical; }
@@ -298,7 +305,7 @@
       <div class="content">
         <header class="topbar">
           <div class="topbar-copy">
-            <h1 id="page-title">Mission control</h1>
+            <div class="page-title-row"><h1 id="page-title">Mission control</h1><span id="connection-state" class="connection-state" data-state="unknown" role="status" aria-label="Connection not checked" title="Connection not checked"></span></div>
             <p>Read from the service · <span id="project-context">No project selected</span> · <span id="refresh-age">waiting for refresh</span></p>
           </div>
           <div id="project-switcher" class="project-switcher" role="group" aria-label="Project filter"></div>
@@ -405,6 +412,6 @@
     <aside id="details-pane" class="details-pane" aria-label="Run inspector" aria-hidden="true">
       <div id="details-output"></div>
     </aside>
-    <script type="module" src="/dashboard.js?v=7"></script>
+    <script type="module" src="/dashboard.js?v=8"></script>
   </body>
 </html>

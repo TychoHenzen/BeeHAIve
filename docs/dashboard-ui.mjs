@@ -221,6 +221,7 @@ export function createDashboardUi({
   let currentFilter = initialFilter;
   let currentProjectFilter = "all";
   let selectedKey = "";
+  let selectedDetailTab = "lifecycle";
   let currentPage = "mission";
   const graphDrafts = new Map();
 
@@ -490,7 +491,7 @@ export function createDashboardUi({
     if (pbi.last_error || pbi.status === "failed") {
       const failure = element("section", undefined, "detail-card failure-summary");
       failure.append(element("h3", "Why it stopped"));
-      failure.append(element("p", pbi.last_error || "No failure detail was recorded."));
+      failure.append(element("pre", pbi.last_error || "No failure detail was recorded.", "error-details"));
       body.append(failure);
     }
     const tabs = element("div", undefined, "detail-tabs");
@@ -512,7 +513,10 @@ export function createDashboardUi({
       tab.dataset.testid = `detail-tab-${tabId}`;
       tab.setAttribute("role", "tab");
       tab.setAttribute("aria-selected", String(index === 0));
-      tab.addEventListener("click", () => selectTab(tabId));
+      tab.addEventListener("click", () => {
+        selectedDetailTab = tabId;
+        selectTab(tabId);
+      });
       tabs.append(tab);
     });
     body.append(tabs);
@@ -559,7 +563,10 @@ export function createDashboardUi({
     }
     renderEvidence(checksPanel, item);
     const session = map(pbi.agent_session);
-    if (Object.keys(session).length) {
+    const autonomousSessions = list(pbi.autonomous_handoffs)
+      .map(map)
+      .filter((handoff) => text(handoff.session_output, "").trim());
+    if (Object.keys(session).length || autonomousSessions.length) {
       const sessionCard = element("section", undefined, "detail-card");
       sessionCard.append(element("h3", "Session"));
       const sessionGrid = element("div", undefined, "detail-grid");
@@ -570,12 +577,19 @@ export function createDashboardUi({
         sessionGrid.append(cell);
       });
       sessionCard.append(sessionGrid);
-      const events = list(session.events).slice(-8);
+      const events = list(session.events);
       if (events.length) {
         const eventList = element("div", undefined, "agent-events");
         events.forEach((event) => eventList.append(element("div", `${text(event.kind || event.source_type, "event")} · ${text(event.text, "")}`)));
         sessionCard.append(eventList);
       }
+      const transcriptSections = [];
+      const eventTranscript = events.map((event) => text(event.text, "")).join("\n");
+      if (eventTranscript.trim()) transcriptSections.push(eventTranscript);
+      if (text(session.session_output, "").trim()) transcriptSections.push(text(session.session_output, ""));
+      autonomousSessions.forEach((handoff) => transcriptSections.push(`[${text(handoff.step, "skill")}]\n${text(handoff.session_output, "")}`));
+      const transcript = transcriptSections.join("\n\n");
+      if (transcript.trim()) sessionCard.append(element("pre", transcript, "session-transcript"));
       sessionPanel.append(sessionCard);
     } else {
       sessionPanel.append(element("div", "No worker session has been recorded.", "empty"));
@@ -591,7 +605,7 @@ export function createDashboardUi({
     }
     body.append(lifecyclePanel, sessionPanel, contractPanel, checksPanel, deliveryPanel);
     renderDelivery(deliveryPanel, item);
-    selectTab("lifecycle");
+    selectTab(selectedDetailTab);
     const controls = element("div", undefined, "detail-actions");
     if (runAutonomous && pbi.claimable && !pbi.run_id && !isCompleted(pbi)) {
       controls.append(actionButton(autonomousLabel, {
@@ -619,6 +633,7 @@ export function createDashboardUi({
 
   function openInspector(item) {
     selectedKey = `${item.repository}:${item.pbi.number}`;
+    selectedDetailTab = "lifecycle";
     renderInspector(item);
   }
 

@@ -28,6 +28,7 @@ from .agent_parts import WorkerCapacityError as WorkerCapacityError
 from .agent_parts import _gate_summary as _gate_summary
 from .agent_parts import _nonnegative_int as _nonnegative_int
 from .agent_parts import _text_value as _text_value
+from .agent_parts import format_worker_exception as format_worker_exception
 from .agent_parts import redact_worker_text as redact_worker_text
 from .agent_parts import safe_worker_environment as safe_worker_environment
 from .agent_parts import worker_secret_values as worker_secret_values
@@ -58,6 +59,7 @@ __all__ = [
     "_SESSION_PROGRESS_EVENTS",
     "_URL_CREDENTIALS",
     "_gate_summary",
+    "format_worker_exception",
     "_nonnegative_int",
     "_text_value",
     "redact_worker_text",
