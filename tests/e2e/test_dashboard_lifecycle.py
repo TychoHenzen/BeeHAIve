@@ -298,6 +298,57 @@ def test_agents_exposes_retry_for_blocked_autonomous_work(dashboard_page) -> Non
 
 
 @pytest.mark.e2e
+def test_workflow_query_selects_live_graph(dashboard_page) -> None:
+    page, base_url = dashboard_page
+    state = {
+        "project_id": "owner:1",
+        "name": "Server project",
+        "updated_at": "now",
+        "counts": {},
+        "repositories": [],
+        "actions": [],
+        "workflow_ids": ["flow"],
+        "graph": {
+            "workflow_id": "flow",
+            "active": None,
+            "empty": False,
+            "definitions": [
+                {
+                    "workflow_id": "flow",
+                    "revision": 1,
+                    "schema_version": 1,
+                    "nodes": [
+                        {
+                            "node_id": "start",
+                            "kind": "prompt",
+                            "reference": {"reference_id": "prompt/start"},
+                        }
+                    ],
+                    "edges": [],
+                }
+            ],
+        },
+    }
+
+    def api(route) -> None:
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(state),
+        )
+
+    page.route("**/projects/**", api)
+    page.goto(
+        f"{base_url}/dashboard?project=owner:1&workflow_id=flow#workflow-graphs"
+    )
+    expect(page.locator("#workflow-select")).to_have_value("flow")
+    expect(page.locator("#graph-output")).to_contain_text("Revision 1")
+    expect(page.locator("#graph-output")).not_to_contain_text(
+        "Choose a workflow ID in Settings"
+    )
+
+
+@pytest.mark.e2e
 def test_real_mode_wires_autonomous_lifecycle_endpoint(dashboard_page) -> None:
     page, base_url = dashboard_page
     state = {
@@ -467,6 +518,19 @@ def test_sidebar_pages_and_settings_are_real_views(dashboard_page) -> None:
     )
     assert page.locator("#workflow-select option").count() == 3
     expect(page.locator("#graph-output")).to_contain_text("new-flow")
+    editor = page.locator(".workflow-editor")
+    expect(editor).to_be_visible()
+    editor.get_by_label("Node ID").first.fill("begin")
+    editor.get_by_test_id("graph-add-node").click()
+    expect(editor.get_by_label("Node ID")).to_have_count(3)
+    editor.get_by_test_id("graph-add-edge").click()
+    expect(editor.get_by_label("Condition")).to_have_count(2)
+    editor.get_by_test_id("graph-save-draft").click()
+    expect(page.locator("#state-status")).to_contain_text(
+        "graph_evaluate succeeded."
+    )
+    expect(page.locator("#graph-output")).to_contain_text("Revision 2")
+    expect(page.locator("#graph-output")).to_contain_text("begin")
     page.locator("#workflow-select").select_option("demo-flow")
     assert page.locator("#graph-output textarea").count() == 0
     for testid in ("graph-evaluate", "graph-review", "graph-activate"):

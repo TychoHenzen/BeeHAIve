@@ -195,6 +195,7 @@ export function createDashboardUi({
   let currentProjectFilter = "all";
   let selectedKey = "";
   let currentPage = "mission";
+  const graphDrafts = new Map();
 
   function element(tag, value, className) {
     const node = document.createElement(tag);
@@ -753,6 +754,217 @@ export function createDashboardUi({
     );
   }
 
+  function clone(value) {
+    return JSON.parse(JSON.stringify(value));
+  }
+
+  function graphDraft(workflowId, latest) {
+    const key = `${text(currentState?.project_id, "")}:${workflowId}`;
+    const latestRevision = Number(map(latest).revision) || 0;
+    const cached = graphDrafts.get(key);
+    if (cached && cached.dirty && Number(cached.revision) > latestRevision) return cached;
+    const draft = latest
+      ? clone(definitionDocument(latest))
+      : {
+        workflow_id: workflowId,
+        schema_version: 1,
+        nodes: [
+          { node_id: "start", kind: "prompt", reference: { reference_id: "prompt/start" } },
+          { node_id: "work", kind: "skill", reference: { reference_id: "skill/work" } },
+        ],
+        edges: [{ source: "start", target: "work", condition: "pass" }],
+      };
+    draft.workflow_id = workflowId;
+    draft.revision = latestRevision + 1;
+    draft.schema_version = 1;
+    draft.nodes = list(draft.nodes);
+    draft.edges = list(draft.edges);
+    draft.dirty = false;
+    graphDrafts.set(key, draft);
+    return draft;
+  }
+
+  function editorField(labelText, value, id, onInput) {
+    const field = element("div", undefined, "field");
+    const label = element("label", labelText);
+    label.htmlFor = id;
+    const input = element("input");
+    input.id = id;
+    input.value = text(value, "");
+    input.required = true;
+    input.addEventListener("input", () => onInput(input.value));
+    field.append(label, input);
+    return { field, input };
+  }
+
+  function editorSelect(labelText, value, id, options, onChange) {
+    const field = element("div", undefined, "field");
+    const label = element("label", labelText);
+    label.htmlFor = id;
+    const select = element("select");
+    select.id = id;
+    options.forEach(([optionValue, optionLabel]) => {
+      const option = element("option", optionLabel);
+      option.value = optionValue;
+      option.selected = optionValue === value;
+      select.append(option);
+    });
+    select.addEventListener("change", () => onChange(select.value));
+    field.append(label, select);
+    return { field, select };
+  }
+
+  function renderGraphEditor(workflowId, latest) {
+    const draft = graphDraft(workflowId, latest);
+    const editor = element("section", undefined, "workflow-editor");
+    editor.dataset.testid = "graph-editor";
+    const heading = element("div", undefined, "panel-heading");
+    heading.append(element("h3", `Edit next revision ${draft.revision}`));
+    heading.append(element("p", "Change nodes and transitions here. The service evaluates the draft before review or activation."));
+    editor.append(heading);
+
+    const nodeHeading = element("div", undefined, "editor-heading");
+    nodeHeading.append(element("h4", "Nodes"));
+    const addNode = element("button", "Add node", "secondary");
+    addNode.type = "button";
+    addNode.dataset.testid = "graph-add-node";
+    addNode.addEventListener("click", () => {
+      let index = draft.nodes.length + 1;
+      while (draft.nodes.some((node) => map(node).node_id === `node-${index}`)) index += 1;
+      draft.nodes.push({
+        node_id: `node-${index}`,
+        kind: "skill",
+        reference: { reference_id: `skill/node-${index}` },
+      });
+      draft.dirty = true;
+      renderGraphPage(currentState);
+    });
+    nodeHeading.append(addNode);
+    editor.append(nodeHeading);
+    const nodeList = element("div", undefined, "workflow-editor-list");
+    draft.nodes.forEach((rawNode, index) => {
+      const node = map(rawNode);
+      const reference = map(node.reference);
+      const row = element("div", undefined, "workflow-editor-row");
+      const oldId = text(node.node_id, "");
+      let previousId = oldId;
+      const nodeId = editorField("Node ID", oldId, `graph-node-id-${index}`, (value) => {
+        const nextId = value.trim();
+        node.node_id = nextId;
+        draft.edges.forEach((edge) => {
+          if (edge.source === previousId) edge.source = nextId;
+          if (edge.target === previousId) edge.target = nextId;
+        });
+        previousId = nextId;
+        draft.dirty = true;
+      });
+      const kind = editorSelect(
+        "Kind",
+        text(node.kind, "skill"),
+        `graph-node-kind-${index}`,
+        [["prompt", "Prompt"], ["skill", "Skill"], ["tool", "Tool"]],
+        (value) => {
+          node.kind = value;
+          if (value === "tool" && !["read_project", "read_repository", "read_pull_request", "run_checks", "request_operator"].includes(reference.reference_id)) {
+            reference.reference_id = "read_repository";
+            referenceInput.input.value = "read_repository";
+          }
+          draft.dirty = true;
+        },
+      );
+      const referenceInput = editorField("Reference", reference.reference_id, `graph-node-reference-${index}`, (value) => {
+        reference.reference_id = value.trim();
+        draft.dirty = true;
+      });
+      const remove = element("button", "Remove", "danger");
+      remove.type = "button";
+      remove.dataset.testid = "graph-remove-node";
+      remove.disabled = draft.nodes.length <= 1;
+      remove.addEventListener("click", () => {
+        draft.nodes.splice(index, 1);
+        draft.edges = draft.edges.filter((edge) => edge.source !== oldId && edge.target !== oldId);
+        draft.dirty = true;
+        renderGraphPage(currentState);
+      });
+      row.append(nodeId.field, kind.field, referenceInput.field, remove);
+      nodeList.append(row);
+    });
+    editor.append(nodeList);
+
+    const edgeHeading = element("div", undefined, "editor-heading");
+    edgeHeading.append(element("h4", "Transitions"));
+    const addEdge = element("button", "Add transition", "secondary");
+    addEdge.type = "button";
+    addEdge.dataset.testid = "graph-add-edge";
+    addEdge.addEventListener("click", () => {
+      const ids = draft.nodes.map((node) => text(map(node).node_id, "")).filter(Boolean);
+      if (!ids.length) return;
+      draft.edges.push({ source: ids[0], target: ids[1] || ids[0], condition: "always" });
+      draft.dirty = true;
+      renderGraphPage(currentState);
+    });
+    edgeHeading.append(addEdge);
+    editor.append(edgeHeading);
+    const edgeList = element("div", undefined, "workflow-editor-list");
+    const nodeOptions = draft.nodes.map((node) => {
+      const id = text(map(node).node_id, "");
+      return [id, id];
+    }).filter(([id]) => id);
+    draft.edges.forEach((rawEdge, index) => {
+      const edge = map(rawEdge);
+      const row = element("div", undefined, "workflow-editor-row edge");
+      const source = editorSelect("From", text(edge.source, ""), `graph-edge-source-${index}`, nodeOptions, (value) => {
+        edge.source = value;
+        draft.dirty = true;
+      });
+      const target = editorSelect("To", text(edge.target, ""), `graph-edge-target-${index}`, nodeOptions, (value) => {
+        edge.target = value;
+        draft.dirty = true;
+      });
+      const condition = editorField("Condition", edge.condition, `graph-edge-condition-${index}`, (value) => {
+        edge.condition = value.trim();
+        draft.dirty = true;
+      });
+      const remove = element("button", "Remove", "danger");
+      remove.type = "button";
+      remove.dataset.testid = "graph-remove-edge";
+      remove.addEventListener("click", () => {
+        draft.edges.splice(index, 1);
+        draft.dirty = true;
+        renderGraphPage(currentState);
+      });
+      row.append(source.field, target.field, condition.field, remove);
+      edgeList.append(row);
+    });
+    editor.append(edgeList);
+
+    const actions = element("div", undefined, "settings-actions");
+    const save = element("button", "Save and evaluate draft", "primary");
+    save.type = "button";
+    save.dataset.testid = "graph-save-draft";
+    save.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const candidate = definitionDocument(draft);
+      candidate.workflow_id = workflowId;
+      candidate.revision = Number(draft.revision);
+      const payload = {
+        action: "graph_evaluate",
+        workflow_id: workflowId,
+        candidate,
+        fixtures: definitionFixtures(candidate),
+      };
+      if (latest) {
+        const baseline = definitionDocument(latest);
+        payload.baseline = baseline;
+        payload.baseline_fixtures = definitionFixtures(baseline);
+      }
+      void runAction(payload);
+    });
+    actions.append(save);
+    editor.append(actions);
+    return editor;
+  }
+
   function definitionFixtures(definition) {
     const result = {
       outcome: "pass",
@@ -792,6 +1004,7 @@ export function createDashboardUi({
     }
     const latest = map(definitions[0]);
     const actionDefinition = definitionDocument(latest);
+    graphOutput.append(renderGraphEditor(workflowId, latest));
     definitions.forEach((definition) => {
       const current = map(definition);
       const revision = current.revision ?? "?";

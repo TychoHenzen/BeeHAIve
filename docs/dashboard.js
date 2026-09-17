@@ -1,6 +1,6 @@
-import { createDashboardClient } from "/dashboard-client.mjs?v=5";
-import { createDemoClient } from "/dashboard-demo.mjs?v=5";
-import { createDashboardUi } from "/dashboard-ui.mjs?v=5";
+import { createDashboardClient } from "/dashboard-client.mjs?v=6";
+import { createDemoClient } from "/dashboard-demo.mjs?v=6";
+import { createDashboardUi } from "/dashboard-ui.mjs?v=6";
 
 const settingsProjectInput = document.querySelector("#settings-project-id");
 const settingsWorkflowInput = document.querySelector("#settings-workflow-id");
@@ -43,7 +43,8 @@ function normalizePage(value) {
 }
 
 settingsProjectInput.value = demo ? "demo:1" : params.get("project") || "";
-settingsWorkflowInput.value = params.get("workflow_id") || (demo ? "demo-flow" : "");
+let initialWorkflow = params.get("workflow_id") || (demo ? "demo-flow" : "");
+settingsWorkflowInput.value = initialWorkflow;
 let archivedMode = params.get("archived") === "true";
 let schedulerSettingsDirty = false;
 
@@ -171,6 +172,7 @@ function handleState(state) {
     settingsPollInterval.value = String(scheduler.poll_interval_seconds || 600);
   }
   ui.render(state);
+  if (initialWorkflow && settingsWorkflowInput.value === initialWorkflow) initialWorkflow = "";
 }
 
 function toggleBusy(disabled) {
@@ -187,7 +189,7 @@ function toggleBusy(disabled) {
 if (demo) {
   client = createDemoClient({
     archived: () => archivedMode,
-    workflowId: () => settingsWorkflowInput.value.trim(),
+    workflowId: () => settingsWorkflowInput.value.trim() || initialWorkflow,
     onState: handleState,
     onStatus: setStatus,
       onBusy: toggleBusy,
@@ -199,7 +201,7 @@ if (demo) {
   client = createDashboardClient({
     fetcher: window.fetch.bind(window),
     projectId: () => settingsProjectInput.value,
-    workflowId: () => settingsWorkflowInput.value,
+    workflowId: () => settingsWorkflowInput.value || initialWorkflow,
     archived: () => archivedMode,
     onState: handleState,
     onStatus: setStatus,
@@ -209,7 +211,7 @@ if (demo) {
 
 function openProject(navigateToMission = true) {
   const project = settingsProjectInput.value.trim();
-  const workflow = settingsWorkflowInput.value.trim();
+  const workflow = settingsWorkflowInput.value.trim() || initialWorkflow;
   if (!project) {
     setSettingsFeedback("Enter a project ID such as owner:123.", "failure");
     setStatus("Choose a project in Settings before opening mission control.", "failure");

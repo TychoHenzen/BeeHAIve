@@ -188,6 +188,16 @@
       .workflow-create { display: grid; gap: 10px; padding: 14px; border: 1px solid var(--divider); border-radius: 10px; background: var(--surface-raised); }
       .workflow-create form { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; }
       .workflow-create .field { flex: 1 1 260px; }
+      .workflow-editor { display: grid; gap: 12px; padding: 16px; border: 1px solid var(--divider); border-radius: 10px; background: var(--surface); }
+      .workflow-editor .panel-heading { align-items: start; }
+      .workflow-editor .panel-heading p { max-width: 700px; }
+      .editor-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+      .editor-heading h4 { margin: 0; color: #dedfe6; }
+      .workflow-editor-list { display: grid; gap: 8px; }
+      .workflow-editor-row { display: grid; grid-template-columns: minmax(130px, 1fr) 150px minmax(160px, 1.4fr) auto; gap: 8px; align-items: end; padding: 10px; border: 1px solid var(--divider); border-radius: 8px; background: var(--surface-raised); }
+      .workflow-editor-row.edge { grid-template-columns: minmax(130px, 1fr) minmax(130px, 1fr) minmax(150px, 1fr) auto; }
+      .workflow-editor-row button { min-height: 36px; }
+      @media (max-width: 760px) { .workflow-editor-row, .workflow-editor-row.edge { grid-template-columns: 1fr 1fr; } .workflow-editor-row button { grid-column: 2; } }
       .graph-definition h3, .settings-card h3, .project-card h3 { margin: 0; }
       .graph-meta { display: flex; flex-wrap: wrap; gap: 7px; color: #9b9fae; font-size: .72rem; }
       .graph-nodes { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
@@ -382,6 +392,6 @@
     <aside id="details-pane" class="details-pane" aria-label="Run inspector" aria-hidden="true">
       <div id="details-output"></div>
     </aside>
-    <script type="module" src="/dashboard.js?v=5"></script>
+    <script type="module" src="/dashboard.js?v=6"></script>
   </body>
 </html>

@@ -255,7 +255,16 @@ export function createDemoClient({ onState, onStatus, onBusy, archived = () => f
         state.graphs[payload.workflow_id] = graph;
         if (!state.workflow_ids.includes(payload.workflow_id)) state.workflow_ids.push(payload.workflow_id);
       }
-      const latest = graph.definitions[graph.definitions.length - 1];
+      let latest = graph.definitions[graph.definitions.length - 1];
+      if (payload.action === "graph_evaluate" && payload.candidate && Number(payload.candidate.revision) > Number(latest?.revision || 0)) {
+        graph.definitions.push({
+          ...clone(payload.candidate),
+          active: false,
+          review: false,
+          definition_hash: `demo-${graph.workflow_id}-${payload.candidate.revision}`,
+        });
+        latest = graph.definitions[graph.definitions.length - 1];
+      }
       if (payload.action === "graph_evaluate" && latest) {
         latest.safety_evidence = {
           evidence: {
