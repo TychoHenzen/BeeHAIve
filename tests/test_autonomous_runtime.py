@@ -46,7 +46,7 @@ def test_autonomous_runtime_resolves_bare_codex_before_windows_launch(
             [
                 sys.executable,
                 "-c",
-                "print('{\"status\":\"succeeded\",\"summary\":\"launched\"}')",
+                'print(\'{"status":"succeeded","summary":"launched"}\')',
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -130,8 +130,8 @@ def test_autonomous_runtime_accepts_pretty_printed_json_handover(
         "import sys\n"
         "print('progress', file=sys.stderr)\n"
         "print('log')\n"
-        "print('{\"status\":\"succeeded\",\"summary\":\"pretty\", "
-        "\"handover\":{\"step\":\"next\"}}')\n"
+        'print(\'{"status":"succeeded","summary":"pretty", '
+        '"handover":{"step":"next"}}\')\n'
     )
 
     def launch(_command, _environment):
@@ -174,7 +174,7 @@ def test_autonomous_runtime_reports_process_activity(
             [
                 sys.executable,
                 "-c",
-                "print('{\"status\":\"succeeded\",\"summary\":\"done\"}', flush=True)",
+                'print(\'{"status":"succeeded","summary":"done"}\', flush=True)',
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

@@ -79,15 +79,14 @@ def test_autonomous_explicit_resume_accepts_an_in_progress_pbi() -> None:
 
 
 def test_autonomous_backlog_always_starts_with_refinement() -> None:
-    assert autonomous._start_index(
-        {"planning_status": "Backlog", "stage": "refine"}
-    ) == 0
-    assert autonomous._start_index(
-        {"planning_status": "Backlog", "stage": "implement"}
-    ) == 0
-    assert autonomous._start_index(
-        {"planning_status": "Todo", "stage": "backlog"}
-    ) == 1
+    assert (
+        autonomous._start_index({"planning_status": "Backlog", "stage": "refine"}) == 0
+    )
+    assert (
+        autonomous._start_index({"planning_status": "Backlog", "stage": "implement"})
+        == 0
+    )
+    assert autonomous._start_index({"planning_status": "Todo", "stage": "backlog"}) == 1
 
 
 def test_placeholder_runner_passes_one_branch_handover_through_all_skills() -> None:
@@ -162,9 +161,7 @@ def test_runner_keeps_bounded_skill_session_output() -> None:
         }
     )
 
-    assert result.handoffs[0].session_output == (
-        "session output for next-ticket"
-    )
+    assert result.handoffs[0].session_output == ("session output for next-ticket")
 
 
 def test_runner_passes_the_previous_handover_into_the_next_context() -> None:
@@ -308,9 +305,7 @@ def test_codex_autonomous_run_uses_a_server_worktree(
         def execute(self, _step, context, handover):
             workspaces.append(self.repository)
             assert context["workspace_path"] == str(self.repository)
-            assert context["workspace_branch"].startswith(
-                "codex/beehaiive-autonomous-"
-            )
+            assert context["workspace_branch"].startswith("codex/beehaiive-autonomous-")
             return {
                 "status": "succeeded",
                 "summary": "stage completed",
@@ -338,9 +333,7 @@ def test_codex_autonomous_run_uses_a_server_worktree(
         workspace_root = (
             repository.parent / ".repository.beehaiive" / "autonomous-worktrees"
         )
-        assert not any(workspace_root.glob("*")), current.get(
-            "workspace_cleanup_error"
-        )
+        assert not any(workspace_root.glob("*")), current.get("workspace_cleanup_error")
     finally:
         workflow_store.close()
         store.close()

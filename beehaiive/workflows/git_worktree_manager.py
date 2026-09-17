@@ -254,9 +254,7 @@ class GitWorktreeManager:
                 if self.git_timeout_seconds is None
                 else f"{self.git_timeout_seconds:g} seconds"
             )
-            raise WorkflowError(
-                f"git command timed out after {timeout}"
-            ) from exc
+            raise WorkflowError(f"git command timed out after {timeout}") from exc
         return result
 
     def _commit_exists(self, commit: str) -> bool:

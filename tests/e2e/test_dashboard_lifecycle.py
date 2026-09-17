@@ -224,48 +224,57 @@ def test_session_tab_and_transcript_survive_refresh(dashboard_page) -> None:
         "project_id": "owner:1",
         "name": "Server project",
         "updated_at": "now",
-        "repositories": [{
-            "name": "owner/app",
-            "active": True,
-            "writer": {"status": "active", "current_pbi": 1},
-            "pbis": [{
-                "number": 1,
-                "title": "Session-backed work",
-                "stage": "implement",
-                "status": "active",
-                    "run_id": "run-1",
-                    "autonomous_status": "running",
-                    "autonomous_current_step": "next-ticket",
-                    "agent_session": {
-                    "worker_id": "worker-1",
-                    "task": "Implement the selected PBI",
-                        "state": "running",
-                        "process": {
+        "repositories": [
+            {
+                "name": "owner/app",
+                "active": True,
+                "writer": {"status": "active", "current_pbi": 1},
+                "pbis": [
+                    {
+                        "number": 1,
+                        "title": "Session-backed work",
+                        "stage": "implement",
+                        "status": "active",
+                        "run_id": "run-1",
+                        "autonomous_status": "running",
+                        "autonomous_current_step": "next-ticket",
+                        "agent_session": {
+                            "worker_id": "worker-1",
+                            "task": "Implement the selected PBI",
                             "state": "running",
-                            "pid": 1234,
-                            "model": "gpt-5.6-luna",
-                            "timeout_seconds": None,
-                    },
-                    "events": [
-                        {"kind": "message", "text": f"event-{index}"}
-                        for index in range(10)
+                            "process": {
+                                "state": "running",
+                                "pid": 1234,
+                                "model": "gpt-5.6-luna",
+                                "timeout_seconds": None,
+                            },
+                            "events": [
+                                {"kind": "message", "text": f"event-{index}"}
+                                for index in range(10)
+                            ],
+                        },
+                        "autonomous_handoffs": [
+                            {
+                                "step": "next-ticket",
+                                "status": "succeeded",
+                                "session_output": "codex emitted the stage transcript",
+                            }
                         ],
-                    },
-                    "autonomous_handoffs": [{
-                        "step": "next-ticket",
-                        "status": "succeeded",
-                        "session_output": "codex emitted the stage transcript",
-                    }],
-                }],
-        }],
+                    }
+                ],
+            }
+        ],
         "actions": [],
     }
 
-    page.route("**/projects/**", lambda route: route.fulfill(
-        status=200,
-        content_type="application/json",
-        body=json.dumps(state),
-    ))
+    page.route(
+        "**/projects/**",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(state),
+        ),
+    )
     page.goto(f"{base_url}/dashboard?project=owner:1")
     item = work_item(page, "Session-backed work")
     item.get_by_test_id("inspect-work").click()
@@ -296,37 +305,44 @@ def test_dashboard_distinguishes_a_timed_out_process(dashboard_page) -> None:
         "project_id": "owner:1",
         "name": "Server project",
         "updated_at": "now",
-        "repositories": [{
-            "name": "owner/app",
-            "active": True,
-            "pbis": [{
-                "number": 1,
-                "title": "Timed out work",
-                "stage": "implement",
-                "status": "failed",
-                "run_id": "run-1",
-                "autonomous_status": "blocked",
-                "agent_session": {
-                    "worker_id": "autonomous",
-                    "state": "failed",
-                    "process": {
-                        "state": "timed_out",
-                        "pid": 1234,
-                        "model": "gpt-5.6-luna",
-                        "timeout_seconds": 1800,
-                        "returncode": -9,
-                    },
-                    "events": [],
-                },
-            }],
-        }],
+        "repositories": [
+            {
+                "name": "owner/app",
+                "active": True,
+                "pbis": [
+                    {
+                        "number": 1,
+                        "title": "Timed out work",
+                        "stage": "implement",
+                        "status": "failed",
+                        "run_id": "run-1",
+                        "autonomous_status": "blocked",
+                        "agent_session": {
+                            "worker_id": "autonomous",
+                            "state": "failed",
+                            "process": {
+                                "state": "timed_out",
+                                "pid": 1234,
+                                "model": "gpt-5.6-luna",
+                                "timeout_seconds": 1800,
+                                "returncode": -9,
+                            },
+                            "events": [],
+                        },
+                    }
+                ],
+            }
+        ],
         "actions": [],
     }
-    page.route("**/projects/**", lambda route: route.fulfill(
-        status=200,
-        content_type="application/json",
-        body=json.dumps(state),
-    ))
+    page.route(
+        "**/projects/**",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(state),
+        ),
+    )
     page.goto(f"{base_url}/dashboard?project=owner:1")
     item = work_item(page, "Timed out work")
     item.get_by_test_id("inspect-work").click()
@@ -477,11 +493,13 @@ def test_agents_exposes_retry_for_blocked_autonomous_work(dashboard_page) -> Non
             route.fulfill(
                 status=200,
                 content_type="application/json",
-                body=json.dumps({
-                    "action": {"kind": "requeue", "status": "succeeded"},
-                    "result": {"pbi": {"claimable": True}},
-                    "state": state,
-                }),
+                body=json.dumps(
+                    {
+                        "action": {"kind": "requeue", "status": "succeeded"},
+                        "result": {"pbi": {"claimable": True}},
+                        "state": state,
+                    }
+                ),
             )
             return
         route.fulfill(
@@ -511,35 +529,40 @@ def test_queue_orders_running_work_before_claimable_work(dashboard_page) -> None
         "project_id": "owner:1",
         "name": "Server project",
         "updated_at": "now",
-        "repositories": [{
-            "name": "owner/app",
-            "active": True,
-            "writer": {"status": "active", "current_pbi": 1},
-            "pbis": [
-                {
-                    "number": 2,
-                    "title": "Claimable work",
-                    "status": "idle",
-                    "claimable": True,
-                    "active": True,
-                },
-                {
-                    "number": 1,
-                    "title": "Running work",
-                    "status": "active",
-                    "run_id": "run-1",
-                    "active": True,
-                },
-            ],
-        }],
+        "repositories": [
+            {
+                "name": "owner/app",
+                "active": True,
+                "writer": {"status": "active", "current_pbi": 1},
+                "pbis": [
+                    {
+                        "number": 2,
+                        "title": "Claimable work",
+                        "status": "idle",
+                        "claimable": True,
+                        "active": True,
+                    },
+                    {
+                        "number": 1,
+                        "title": "Running work",
+                        "status": "active",
+                        "run_id": "run-1",
+                        "active": True,
+                    },
+                ],
+            }
+        ],
         "actions": [],
     }
 
-    page.route("**/projects/**", lambda route: route.fulfill(
-        status=200,
-        content_type="application/json",
-        body=json.dumps(state),
-    ))
+    page.route(
+        "**/projects/**",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(state),
+        ),
+    )
     page.goto(f"{base_url}/dashboard?project=owner:1#queue")
     expect(page.locator('[data-testid="work-item"]').first).to_contain_text(
         "Running work"
@@ -587,9 +610,7 @@ def test_workflow_query_selects_live_graph(dashboard_page) -> None:
         )
 
     page.route("**/projects/**", api)
-    page.goto(
-        f"{base_url}/dashboard?project=owner:1&workflow_id=flow#workflow-graphs"
-    )
+    page.goto(f"{base_url}/dashboard?project=owner:1&workflow_id=flow#workflow-graphs")
     expect(page.locator("#workflow-select")).to_have_value("flow")
     expect(page.locator("#graph-output")).to_contain_text("Revision 1")
     expect(page.locator("#graph-output")).not_to_contain_text(
@@ -784,12 +805,12 @@ def test_sidebar_pages_and_settings_are_real_views(dashboard_page) -> None:
     editor.get_by_test_id("graph-add-edge").click()
     expect(editor.get_by_label("Outcome")).to_have_count(2)
     expect(editor.locator("#graph-node-reference-0")).to_have_attribute("rows", "4")
-    expect(editor.locator("#graph-node-reference-1")).to_have_value(re.compile(r"^skill/"))
+    expect(editor.locator("#graph-node-reference-1")).to_have_value(
+        re.compile(r"^skill/")
+    )
     expect(editor.locator("svg.workflow-graph-visual")).to_be_visible()
     editor.get_by_test_id("graph-save-draft").click()
-    expect(page.locator("#state-status")).to_contain_text(
-        "graph_evaluate succeeded."
-    )
+    expect(page.locator("#state-status")).to_contain_text("graph_evaluate succeeded.")
     expect(page.locator("#graph-output")).to_contain_text("Revision 2")
     expect(page.locator("#graph-output")).to_contain_text("begin")
     page.locator("#workflow-select").select_option("demo-flow")

@@ -80,8 +80,14 @@ class WorkflowServiceDeliveryMixin:
                                 root_common_path = (
                                     self.worktrees.repository / root_common_path
                                 )
-                            if root_common_path.resolve() not in worktree_git_path.resolve().parents:
-                                return "The leased worktree belongs to a different repository."
+                            if (
+                                root_common_path.resolve()
+                                not in worktree_git_path.resolve().parents
+                            ):
+                                return (
+                                    "The leased worktree belongs to a different "
+                                    "repository."
+                                )
                 return "The leased worktree could not be opened as a Git worktree."
             if prefix:
                 return "The exact leased worktree could not be verified."

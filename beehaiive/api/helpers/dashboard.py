@@ -163,7 +163,10 @@ def _dashboard_state(
                 ):
                     pbi["agent_session"] = {
                         "worker_id": "autonomous",
-                        "task": f"Running skill: {live_values.get('current_step', 'unknown')}",
+                        "task": (
+                            "Running skill: "
+                            f"{live_values.get('current_step', 'unknown')}"
+                        ),
                         "state": "active",
                         "events": live_events,
                         "activity_state": live_values.get("status"),

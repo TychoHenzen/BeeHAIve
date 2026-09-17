@@ -45,6 +45,7 @@ class _WorkflowWorkspaceService(Protocol):
 
     def retain_workspace(self, lease_id: str, lease_token: str | None) -> object: ...
 
+
 __all__ = [
     "ADVISOR_STEP",
     "AUTONOMOUS_STEPS",
@@ -1048,9 +1049,7 @@ class AutonomousLifecycleService:
                 "worktree service; no checkout was touched"
             )
         workspace_root = (
-            repository.parent
-            / f".{repository.name}.beehaiive"
-            / "autonomous-worktrees"
+            repository.parent / f".{repository.name}.beehaiive" / "autonomous-worktrees"
         )
         workspace_root.mkdir(parents=True, exist_ok=True)
         workspace_id = uuid4().hex
@@ -1058,9 +1057,10 @@ class AutonomousLifecycleService:
         base_ref = os.environ.get("BEEHAIIVE_AUTONOMOUS_BASE_REF", "origin/master")
         typed_worktrees = cast(_WorktreeService, worktrees)
         try:
-            if typed_worktrees.run_git(
-                "rev-parse", "--verify", base_ref
-            ).returncode != 0:
+            if (
+                typed_worktrees.run_git("rev-parse", "--verify", base_ref).returncode
+                != 0
+            ):
                 base_ref = "HEAD"
         except Exception:
             base_ref = "HEAD"

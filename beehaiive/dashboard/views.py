@@ -139,8 +139,7 @@ def pbi_view(
         (
             action
             for action in matching_actions
-            if action.get("kind") == "requeue"
-            and action.get("status") == "succeeded"
+            if action.get("kind") == "requeue" and action.get("status") == "succeeded"
         ),
         None,
     )
