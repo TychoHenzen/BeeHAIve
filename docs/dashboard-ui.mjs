@@ -75,6 +75,55 @@ function map(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
 
+function timestampAgeSeconds(value) {
+  const timestamp = Date.parse(String(value || ""));
+  return Number.isFinite(timestamp)
+    ? Math.max(0, (Date.now() - timestamp) / 1000)
+    : null;
+}
+
+function durationLabel(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds)) return "unknown duration";
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.floor(seconds % 60)}s`;
+  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+}
+
+function runActivity(pbi) {
+  const session = map(pbi.agent_session);
+  const process = map(session.process || pbi.autonomous_process);
+  const processState = String(process.state || "");
+  const startedAt = process.started_at || session.started_at;
+  const elapsed = timestampAgeSeconds(startedAt);
+  const elapsedText = elapsed === null ? "elapsed unknown" : `elapsed ${durationLabel(elapsed)}`;
+  const pid = process.pid ? ` · PID ${process.pid}` : "";
+  const latest = String(session.last_output || "").replace(/\s+/g, " ").trim().slice(-240);
+  if (processState === "running") {
+    const lastOutputAt = session.last_output_at;
+    const silence = timestampAgeSeconds(lastOutputAt);
+    const outputText = silence === null
+      ? "no output yet"
+      : silence >= 60
+        ? `silent for ${durationLabel(silence)}`
+        : `last output ${durationLabel(silence)} ago`;
+    const timeout = process.timeout_seconds === null || process.timeout_seconds === undefined
+      ? "no timeout configured"
+      : `timeout ${durationLabel(process.timeout_seconds)}`;
+    return `Process alive${pid} · ${outputText} · ${timeout} · ${elapsedText}${latest ? ` · latest: ${latest}` : ""}`;
+  }
+  if (processState === "starting") return `Starting Codex process · ${elapsedText}`;
+  if (processState === "launch_failed") return `Codex process failed to start${process.error ? `: ${process.error}` : ""}`;
+  if (processState === "timed_out") {
+    return `Timed out after ${durationLabel(process.timeout_seconds)} · process terminated${pid}`;
+  }
+  if (processState === "error") return `Process ended with an error${pid}`;
+  if (processState === "exited") {
+    return `Process exited${process.returncode !== undefined ? ` with code ${process.returncode}` : ""}${pid}`;
+  }
+  return session.state ? `Session ${session.state}` : "";
+}
+
 function stageId(pbi) {
   const raw = String(pbi.stage || "backlog");
   return STAGES.some(([id]) => id === raw) ? raw : "backlog";
@@ -581,6 +630,8 @@ export function createDashboardUi({
       });
       sessionCard.append(sessionGrid);
       if (autonomousStep) sessionCard.append(element("p", `Current skill: ${autonomousStep}`, "activity-detail"));
+      const activity = runActivity(pbi);
+      if (activity) sessionCard.append(element("p", activity, "run-activity"));
       const events = list(session.events);
       if (events.length) {
         const eventList = element("div", undefined, "agent-events");
@@ -736,6 +787,8 @@ export function createDashboardUi({
       heading.append(element("span", "", "status-dot"), element("strong", agentLabel(item)), element("span", stateLabel, `tag ${pbi.autonomous_status === "blocked" || pbi.status === "failed" ? "warn" : "accent"}`));
       card.append(heading, element("p", `${item.repository}#${text(pbi.number, "?")} · ${text(pbi.title, "Untitled work item")}`));
       if (pbi.autonomous_current_step) card.append(element("p", `Current skill: ${pbi.autonomous_current_step}`, "activity-detail"));
+      const activity = runActivity(pbi);
+      if (activity) card.append(element("p", activity, "run-activity"));
       if (pbi.last_error) card.append(element("p", `Failure: ${pbi.last_error}`, "activity-detail"));
       const events = list(map(pbi.agent_session).events).slice(-3);
       if (events.length) {

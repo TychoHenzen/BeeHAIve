@@ -176,6 +176,7 @@
       .activity-list li { display: grid; grid-template-columns: 118px minmax(0, 1fr); gap: 10px; color: #9b9fae; font-size: .72rem; }
       .activity-list time { min-width: 118px; color: #777b8d; }
       .activity-detail { display: block; margin-top: 2px; color: #777b8d; font-size: .68rem; }
+      .run-activity { display: block; margin-top: 2px; color: var(--text); font: .72rem/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; }
       .agent-card, .delivery-card { display: grid; gap: 6px; padding: 12px; border-radius: 10px; background: var(--surface); box-shadow: 0 4px 18px #0002; }
       .agent-card.blocked { border: 1px solid #8d3f4c; background: #2b1821; }
       .agent-heading, .delivery-heading { display: flex; align-items: center; gap: 8px; }
@@ -412,6 +413,6 @@
     <aside id="details-pane" class="details-pane" aria-label="Run inspector" aria-hidden="true">
       <div id="details-output"></div>
     </aside>
-    <script type="module" src="/dashboard.js?v=10"></script>
+    <script type="module" src="/dashboard.js?v=11"></script>
   </body>
 </html>

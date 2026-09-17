@@ -61,6 +61,10 @@ def _output_tail(value: object) -> str:
     return str(value or "")[-2_000:]
 
 
+def _now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
 def _last_json_mapping(output: str) -> Mapping[str, object] | None:
     decoder = json.JSONDecoder()
     best: Mapping[str, object] | None = None
@@ -476,6 +480,7 @@ class CodexSkillExecutor:
         executable: str = "codex",
         timeout_seconds: float | None = None,
         on_output: Callable[[str], None] | None = None,
+        on_process: Callable[[Mapping[str, object]], None] | None = None,
     ) -> None:
         self.repository = Path(repository).resolve()
         self.executable = resolve_executable(executable)
@@ -483,6 +488,7 @@ class CodexSkillExecutor:
             timeout_seconds if timeout_seconds and timeout_seconds > 0 else None
         )
         self.on_output = on_output
+        self.on_process = on_process
 
     def execute(
         self,
@@ -539,20 +545,66 @@ class CodexSkillExecutor:
         if step.model:
             command.extend(("--model", step.model))
         command.append(prompt)
-        started_at = datetime.now(UTC).isoformat()
+        started_at = _now_iso()
         process = None
         try:
-            process = CodexProcessMixin._start_process(
-                command,
-                safe_worker_environment(),
-            )
-            stdout, stderr, timed_out = CodexProcessMixin._communicate_bounded(
-                process,
-                self.timeout_seconds,
-                self.on_output,
-                stderr_line_handler=self.on_output,
-                terminate_descendants=True,
-            )
+            try:
+                process = CodexProcessMixin._start_process(
+                    command,
+                    safe_worker_environment(),
+                )
+            except Exception as error:
+                if self.on_process is not None:
+                    self.on_process(
+                        {
+                            "state": "launch_failed",
+                            "finished_at": _now_iso(),
+                            "executable": self.executable,
+                            "cwd": str(self.repository),
+                            "error": format_worker_exception(error),
+                        }
+                    )
+                raise
+            if self.on_process is not None:
+                self.on_process(
+                    {
+                        "state": "running",
+                        "pid": process.pid,
+                        "started_at": started_at,
+                        "executable": self.executable,
+                        "cwd": str(self.repository),
+                        "timeout_seconds": self.timeout_seconds,
+                    }
+                )
+            timed_out = False
+            process_state = "running"
+            try:
+                stdout, stderr, timed_out = CodexProcessMixin._communicate_bounded(
+                    process,
+                    self.timeout_seconds,
+                    self.on_output,
+                    stderr_line_handler=self.on_output,
+                    terminate_descendants=True,
+                )
+                process_state = "timed_out" if timed_out else "exited"
+            except subprocess.TimeoutExpired:
+                CodexProcessMixin._terminate_process(process)
+                stdout, stderr = "", ""
+                timed_out = True
+                process_state = "timed_out"
+            except Exception:
+                process_state = "error"
+                raise
+            finally:
+                if self.on_process is not None:
+                    self.on_process(
+                        {
+                            "state": process_state,
+                            "pid": process.pid,
+                            "finished_at": _now_iso(),
+                            "returncode": process.returncode,
+                        }
+                    )
         except FileNotFoundError as error:
             raise RuntimeError(
                 f"Codex launch failed: executable={self.executable!r}; "
@@ -675,6 +727,11 @@ class AutonomousLifecycleService:
                 "pbi_number": selected_number,
                 "status": "running",
                 "current_step": None,
+                "started_at": _now_iso(),
+                "step_started_at": None,
+                "last_output_at": None,
+                "last_output": None,
+                "process": {"state": "starting"},
                 "handoffs": [],
                 "session_events": [],
                 "action_id": action["id"],
@@ -815,6 +872,19 @@ class AutonomousLifecycleService:
                 current = self._runs.get(run_id)
                 if current is not None:
                     current["current_step"] = step
+                    current["step_started_at"] = _now_iso()
+                    current["last_output_at"] = None
+                    current["last_output"] = None
+                    current["process"] = {"state": "starting"}
+
+        def record_process(process: Mapping[str, object]) -> None:
+            with self._lock:
+                current = self._runs.get(run_id)
+                if current is not None:
+                    current["process"] = {
+                        **_mapping(current.get("process")),
+                        **dict(process),
+                    }
 
         def record_output(line: str) -> None:
             if not line.strip():
@@ -828,6 +898,8 @@ class AutonomousLifecycleService:
             with self._lock:
                 current = self._runs.get(run_id)
                 if current is not None:
+                    current["last_output_at"] = event["created_at"]
+                    current["last_output"] = event["text"]
                     current["session_events"] = [
                         *cast(list[dict[str, object]], current["session_events"]),
                         event,
@@ -865,8 +937,12 @@ class AutonomousLifecycleService:
         try:
             workspace_context = self._prepare_workspace(run_id, workspace_context)
             workspace_created = "workspace_path" in workspace_context
-            executor = self._executor_for(workspace_context, record_output)
-            advisor = self._advisor_for(workspace_context, record_output)
+            executor = self._executor_for(
+                workspace_context, record_output, record_process
+            )
+            advisor = self._advisor_for(
+                workspace_context, record_output, record_process
+            )
             runner = AutonomousLifecycleRunner(
                 executor, advisor, record, on_step=record_step
             )
@@ -889,6 +965,7 @@ class AutonomousLifecycleService:
                     current.update(result.as_dict())
                     current["handoffs"] = recorded_handoffs
                     current["current_step"] = None
+                    current["finished_at"] = _now_iso()
         except Exception as error:
             detail = format_worker_exception(error)
             self.orchestrator.store.finish_action(
@@ -904,6 +981,7 @@ class AutonomousLifecycleService:
                         {
                             "status": "failed",
                             "error": redact_worker_text(detail)[:4_000],
+                            "finished_at": _now_iso(),
                         }
                     )
         finally:
@@ -996,6 +1074,7 @@ class AutonomousLifecycleService:
         self,
         context: Mapping[str, object],
         on_output: Callable[[str], None] | None = None,
+        on_process: Callable[[Mapping[str, object]], None] | None = None,
     ) -> SkillExecutor:
         if self._executor is not None:
             return self._executor
@@ -1012,6 +1091,7 @@ class AutonomousLifecycleService:
                 os.environ.get("BEEHAIIVE_CODEX_EXECUTABLE", "codex"),
                 _autonomous_timeout(),
                 on_output=on_output,
+                on_process=on_process,
             )
         del context
         return PlaceholderSkillExecutor()
@@ -1020,6 +1100,7 @@ class AutonomousLifecycleService:
         self,
         context: Mapping[str, object],
         on_output: Callable[[str], None] | None = None,
+        on_process: Callable[[Mapping[str, object]], None] | None = None,
     ) -> SkillExecutor | None:
         if self._advisor is not None:
             return self._advisor
@@ -1027,5 +1108,5 @@ class AutonomousLifecycleService:
             os.environ.get("BEEHAIIVE_AUTONOMOUS_MODE", "codex").strip().lower()
             == "codex"
         ):
-            return self._executor_for(context, on_output)
+            return self._executor_for(context, on_output, on_process)
         return PlaceholderSkillExecutor()

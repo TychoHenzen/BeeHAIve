@@ -61,6 +61,9 @@ Production lifecycle buttons call the server autonomous-run endpoint. The
 guided demo is the only browser-local placeholder and is labeled in its
 buttons and status message. Recent activity includes the action reason,
 selected PBI, run stage, scheduler settings, and bounded failure details.
+The active run inspector also shows whether the Codex process is starting,
+alive, exited, or timed out, with its PID, elapsed time, last-output age, and
+configured timeout.
 In documented demo mode, start work claims one PBI and runs the bounded
 repository-inventory worker. A completed result is shown in the work-item row
 and run inspector. Every action is recorded as `pending`, `succeeded`, or `failed`; a

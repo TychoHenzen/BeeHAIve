@@ -68,11 +68,9 @@ The project ID is exactly `<owner>:<number>`. The tracked launcher reads the
 gitignored `.env` file before checking these values. Existing process variables
 take precedence. `BEEHAIIVE_AGENT_REPOSITORY_NAME` must match the repository
 selected in the Project. The timeout must be finite and no greater than 900
-seconds for regular worker runs. Autonomous skill contexts default to 1800
-seconds because an implementation handoff can run repository checks before
-returning its handover. Autonomous contexts have no hard wall-clock timeout by
-default. Set `BEEHAIIVE_AUTONOMOUS_TIMEOUT_SECONDS` to a positive value only when
-you explicitly want a limit. Project discovery is cached for 10 minutes by default,
+seconds for regular worker runs. Autonomous skill contexts have no hard
+wall-clock timeout by default. Set `BEEHAIIVE_AUTONOMOUS_TIMEOUT_SECONDS` to a
+positive value only when you explicitly want a limit. Project discovery is cached for 10 minutes by default,
 so the dashboard's polling does not repeat the full GraphQL discovery.
 When `BEEHAIIVE_CODEX_EXECUTABLE` is a bare command such as `codex`, the
 autonomous runner resolves the native Windows executable before launching it.

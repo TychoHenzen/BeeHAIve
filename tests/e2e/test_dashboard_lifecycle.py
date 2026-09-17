@@ -240,6 +240,11 @@ def test_session_tab_and_transcript_survive_refresh(dashboard_page) -> None:
                     "worker_id": "worker-1",
                     "task": "Implement the selected PBI",
                     "state": "running",
+                    "process": {
+                        "state": "running",
+                        "pid": 1234,
+                        "timeout_seconds": None,
+                    },
                     "events": [
                         {"kind": "message", "text": f"event-{index}"}
                         for index in range(10)
@@ -266,6 +271,9 @@ def test_session_tab_and_transcript_survive_refresh(dashboard_page) -> None:
     inspector = page.locator("#details-pane")
     inspector.get_by_test_id("detail-tab-session").click()
     expect(inspector).to_contain_text("Current skill: next-ticket")
+    expect(inspector).to_contain_text(
+        "Process alive · PID 1234 · no output yet · no timeout configured"
+    )
     expect(inspector.locator(".session-transcript")).to_contain_text("event-0")
     expect(inspector.locator(".session-transcript")).to_contain_text("event-9")
     expect(inspector.locator(".session-transcript")).to_contain_text(
@@ -277,6 +285,53 @@ def test_session_tab_and_transcript_survive_refresh(dashboard_page) -> None:
     )
     expect(inspector.locator(".session-transcript")).to_contain_text("event-0")
     expect(inspector.locator(".session-transcript")).to_contain_text("event-9")
+
+
+@pytest.mark.e2e
+def test_dashboard_distinguishes_a_timed_out_process(dashboard_page) -> None:
+    page, base_url = dashboard_page
+    state = {
+        "project_id": "owner:1",
+        "name": "Server project",
+        "updated_at": "now",
+        "repositories": [{
+            "name": "owner/app",
+            "active": True,
+            "pbis": [{
+                "number": 1,
+                "title": "Timed out work",
+                "stage": "implement",
+                "status": "failed",
+                "run_id": "run-1",
+                "autonomous_status": "blocked",
+                "agent_session": {
+                    "worker_id": "autonomous",
+                    "state": "failed",
+                    "process": {
+                        "state": "timed_out",
+                        "pid": 1234,
+                        "timeout_seconds": 1800,
+                        "returncode": -9,
+                    },
+                    "events": [],
+                },
+            }],
+        }],
+        "actions": [],
+    }
+    page.route("**/projects/**", lambda route: route.fulfill(
+        status=200,
+        content_type="application/json",
+        body=json.dumps(state),
+    ))
+    page.goto(f"{base_url}/dashboard?project=owner:1")
+    item = work_item(page, "Timed out work")
+    item.get_by_test_id("inspect-work").click()
+    inspector = page.locator("#details-pane")
+    inspector.get_by_test_id("detail-tab-session").click()
+    expect(inspector).to_contain_text(
+        "Timed out after 30m 0s · process terminated · PID 1234"
+    )
 
 
 @pytest.mark.e2e

@@ -91,6 +91,7 @@ def test_autonomous_runtime_reports_launch_context_for_missing_executable(
     skill_path.parent.mkdir()
     skill_path.write_text("# test skill\n", encoding="utf-8")
     missing = tmp_path / "missing-codex.exe"
+    process_events: list[dict[str, object]] = []
 
     def launch(_command, _environment):
         raise FileNotFoundError(2, "The system cannot find the file specified", missing)
@@ -100,7 +101,9 @@ def test_autonomous_runtime_reports_launch_context_for_missing_executable(
     )
 
     with pytest.raises(RuntimeError) as error:
-        CodexSkillExecutor(tmp_path, str(missing)).execute(
+        CodexSkillExecutor(
+            tmp_path, str(missing), on_process=process_events.append
+        ).execute(
             SkillStep("runtime", str(skill_path), "Exercise diagnostics"),
             {"repository": "owner/api"},
             {},
@@ -111,6 +114,8 @@ def test_autonomous_runtime_reports_launch_context_for_missing_executable(
     assert "missing-codex.exe" in message
     assert "errno=2" in message
     assert "cwd=" in message
+    assert process_events[0]["state"] == "launch_failed"
+    assert "missing-codex.exe" in str(process_events[0]["error"])
 
 
 def test_autonomous_runtime_accepts_pretty_printed_json_handover(
@@ -153,6 +158,45 @@ def test_autonomous_runtime_accepts_pretty_printed_json_handover(
     assert '"status":"succeeded"' in result["session_output"]
     assert any("progress" in output for output in outputs)
     assert any("log" in output for output in outputs)
+
+
+def test_autonomous_runtime_reports_process_activity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    skill_path = tmp_path / "skill" / "SKILL.md"
+    skill_path.parent.mkdir()
+    skill_path.write_text("# test skill\n", encoding="utf-8")
+    process_events: list[dict[str, object]] = []
+
+    def launch(_command, _environment):
+        return subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "print('{\"status\":\"succeeded\",\"summary\":\"done\"}', flush=True)",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    monkeypatch.setattr(
+        autonomous.CodexProcessMixin, "_start_process", staticmethod(launch)
+    )
+
+    result = CodexSkillExecutor(
+        tmp_path, "codex.exe", on_process=process_events.append
+    ).execute(
+        SkillStep("runtime", str(skill_path), "Exercise process diagnostics"),
+        {"repository": "owner/api"},
+        {},
+    )
+
+    assert result["status"] == "succeeded"
+    assert [event["state"] for event in process_events] == ["running", "exited"]
+    assert process_events[0]["pid"]
+    assert process_events[0]["cwd"] == str(tmp_path.resolve())
+    assert process_events[0]["timeout_seconds"] is None
+    assert process_events[1]["returncode"] == 0
 
 
 def test_autonomous_runtime_timeout_preserves_live_session_tail(

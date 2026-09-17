@@ -153,13 +153,24 @@ def _dashboard_state(
                 pbi["autonomous_status"] = live.get("status")
                 pbi["autonomous_current_step"] = live.get("current_step")
                 pbi["autonomous_handoffs"] = live.get("handoffs", [])
+                pbi["autonomous_process"] = live.get("process")
                 live_events = live.get("session_events", [])
-                if isinstance(live_events, list) and live_events:
+                if (
+                    (isinstance(live_events, list) and live_events)
+                    or live.get("current_step")
+                    or live.get("process")
+                ):
                     pbi["agent_session"] = {
                         "worker_id": "autonomous",
                         "task": f"Running skill: {live.get('current_step', 'unknown')}",
                         "state": "active",
                         "events": live_events,
+                        "activity_state": live.get("status"),
+                        "started_at": live.get("started_at"),
+                        "step_started_at": live.get("step_started_at"),
+                        "last_output_at": live.get("last_output_at"),
+                        "last_output": live.get("last_output"),
+                        "process": live.get("process"),
                     }
     if workflow_service is not None:
         repositories = cast(list[dict[str, object]], dashboard["repositories"])
