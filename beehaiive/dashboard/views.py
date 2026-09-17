@@ -135,6 +135,15 @@ def pbi_view(
         ),
         None,
     )
+    requeue_action = next(
+        (
+            action
+            for action in matching_actions
+            if action.get("kind") == "requeue"
+            and action.get("status") == "succeeded"
+        ),
+        None,
+    )
     provider_completed = _provider_completion_confirmed(
         planning_status, metadata.get("issue_state"), pull_requests
     )
@@ -178,6 +187,15 @@ def pbi_view(
                 or autonomous_result.get("error")
                 or last_error
             )
+    if requeue_action is not None and not provider_completed:
+        status = "idle"
+        run_id = None
+        active = bool(raw_pbi.get("active"))
+        archived = False
+        claimable = True
+        autonomous_status = None
+        last_error = None
+        result = None
     autonomous_handoffs: list[dict[str, object]] = []
     for action in reversed(matching_actions):
         if not str(action.get("kind", "")).startswith("skill:"):

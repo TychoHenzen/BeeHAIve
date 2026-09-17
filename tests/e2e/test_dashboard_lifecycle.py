@@ -406,6 +406,26 @@ def test_agents_exposes_retry_for_blocked_autonomous_work(dashboard_page) -> Non
     }
 
     def api(route) -> None:
+        if route.request.method == "POST":
+            pbi = state["repositories"][0]["pbis"][0]
+            pbi.update(
+                {
+                    "status": "idle",
+                    "autonomous_status": None,
+                    "claimable": True,
+                    "run_id": None,
+                }
+            )
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({
+                    "action": {"kind": "requeue", "status": "succeeded"},
+                    "result": {"pbi": {"claimable": True}},
+                    "state": state,
+                }),
+            )
+            return
         route.fulfill(
             status=200,
             content_type="application/json",
@@ -415,10 +435,57 @@ def test_agents_exposes_retry_for_blocked_autonomous_work(dashboard_page) -> Non
     page.route("**/projects/**", api)
     page.goto(f"{base_url}/dashboard?project=owner:1")
     page.get_by_role("button", name="Agents", exact=True).click()
-    expect(page.locator("#agents-output")).to_contain_text("Blocked autonomous work")
-    expect(
-        page.locator("#agents-output").get_by_test_id("retry-lifecycle")
-    ).to_be_visible()
+    expect(page.locator("#agents-output")).to_have_text("No active agents.")
+    page.get_by_role("button", name="Queue", exact=True).click()
+    item = work_item(page, "Blocked autonomous work")
+    expect(item.get_by_test_id("requeue-work")).to_have_attribute(
+        "title",
+        "Put this blocked PBI back into the claimable queue without starting work.",
+    )
+    item.get_by_test_id("requeue-work").click()
+    expect(item.get_by_test_id("start-work")).to_be_visible()
+
+
+@pytest.mark.e2e
+def test_queue_orders_running_work_before_claimable_work(dashboard_page) -> None:
+    page, base_url = dashboard_page
+    state = {
+        "project_id": "owner:1",
+        "name": "Server project",
+        "updated_at": "now",
+        "repositories": [{
+            "name": "owner/app",
+            "active": True,
+            "writer": {"status": "active", "current_pbi": 1},
+            "pbis": [
+                {
+                    "number": 2,
+                    "title": "Claimable work",
+                    "status": "idle",
+                    "claimable": True,
+                    "active": True,
+                },
+                {
+                    "number": 1,
+                    "title": "Running work",
+                    "status": "active",
+                    "run_id": "run-1",
+                    "active": True,
+                },
+            ],
+        }],
+        "actions": [],
+    }
+
+    page.route("**/projects/**", lambda route: route.fulfill(
+        status=200,
+        content_type="application/json",
+        body=json.dumps(state),
+    ))
+    page.goto(f"{base_url}/dashboard?project=owner:1#queue")
+    expect(page.locator('[data-testid="work-item"]').first).to_contain_text(
+        "Running work"
+    )
 
 
 @pytest.mark.e2e
@@ -558,6 +625,15 @@ def test_real_mode_wires_autonomous_lifecycle_endpoint(dashboard_page) -> None:
     page.route("**/projects/**", api)
     page.goto(f"{base_url}/dashboard?project=owner:1")
     item = work_item(page, "Autonomous lifecycle work")
+    expect(item.get_by_test_id("run-lifecycle")).to_have_attribute(
+        "title",
+        "Run the full server lifecycle: refine, implement, publish, review, fix, "
+        "and complete.",
+    )
+    expect(item.get_by_test_id("start-work")).to_have_attribute(
+        "title",
+        "Claim only the current PBI stage for one interactive worker.",
+    )
     item.get_by_test_id("run-lifecycle").click()
     expect(item).to_contain_text("Running")
     expect(page.locator("#activity-output")).to_contain_text(

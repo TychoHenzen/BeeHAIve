@@ -5,15 +5,18 @@ import os
 import subprocess
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock, Thread
 from typing import Protocol, cast
 from uuid import uuid4
 
+from beehaiive.agent_parts.codex_process_mixin import CodexProcessMixin
 from beehaiive.agent_parts.values import resolve_executable
 from beehaiive.agent_parts.worker_text import (
     format_worker_exception,
     redact_worker_text,
+    safe_worker_environment,
     worker_secret_values,
 )
 
@@ -362,6 +365,7 @@ class AutonomousLifecycleRunner:
                 raw_result = {
                     "status": "blocked",
                     "summary": format_worker_exception(error),
+                    "session_output": getattr(error, "session_output", ""),
                 }
             result = _mapping(raw_result)
             status = _skill_status(result.get("status"))
@@ -455,10 +459,12 @@ class CodexSkillExecutor:
         repository: str | Path,
         executable: str = "codex",
         timeout_seconds: float = 900.0,
+        on_output: Callable[[str], None] | None = None,
     ) -> None:
         self.repository = Path(repository).resolve()
         self.executable = resolve_executable(executable)
         self.timeout_seconds = timeout_seconds
+        self.on_output = on_output
 
     def execute(
         self,
@@ -515,16 +521,19 @@ class CodexSkillExecutor:
         if step.model:
             command.extend(("--model", step.model))
         command.append(prompt)
+        started_at = datetime.now(UTC).isoformat()
+        process = None
         try:
-            result = subprocess.run(
+            process = CodexProcessMixin._start_process(
                 command,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                stdin=subprocess.DEVNULL,
-                timeout=self.timeout_seconds,
-                check=False,
+                safe_worker_environment(),
+            )
+            stdout, stderr, timed_out = CodexProcessMixin._communicate_bounded(
+                process,
+                self.timeout_seconds,
+                self.on_output,
+                stderr_line_handler=self.on_output,
+                terminate_descendants=True,
             )
         except FileNotFoundError as error:
             raise RuntimeError(
@@ -532,20 +541,25 @@ class CodexSkillExecutor:
                 f"cwd={str(self.repository)!r}; details:\n"
                 f"{format_worker_exception(error)}"
             ) from error
-        except subprocess.TimeoutExpired as error:
-            raise RuntimeError(
-                f"Codex timed out after {self.timeout_seconds:g}s: "
-                f"executable={self.executable!r}; cwd={str(self.repository)!r}; "
-                f"stdout_tail={_output_tail(error.stdout).strip() or '<none>'!r}; "
-                f"stderr_tail={_output_tail(error.stderr).strip() or '<none>'!r}; "
-                f"details:\n{format_worker_exception(error)}"
-            ) from error
         except OSError as error:
             raise RuntimeError(
                 f"Codex launch failed: executable={self.executable!r}; "
                 f"cwd={str(self.repository)!r}; details:\n"
                 f"{format_worker_exception(error)}"
             ) from error
+        session_output = _session_output(stdout, stderr)
+        if timed_out:
+            error = RuntimeError(
+                f"Codex timed out after {self.timeout_seconds:g}s: "
+                f"started_at={started_at!r}; executable={self.executable!r}; "
+                f"cwd={str(self.repository)!r}; "
+                f"session_tail={_output_tail(session_output).strip() or '<none>'!r}"
+            )
+            error.session_output = session_output  # type: ignore[attr-defined]
+            raise error
+        result = subprocess.CompletedProcess(
+            command, process.returncode, stdout, stderr
+        )
         if result.returncode != 0:
             detail = _output_tail(result.stderr or result.stdout).strip()
             raise RuntimeError(
@@ -557,7 +571,7 @@ class CodexSkillExecutor:
         if value is not None:
             return {
                 **value,
-                "session_output": _session_output(result.stdout, result.stderr),
+                "session_output": session_output,
             }
         raise RuntimeError(
             f"Codex skill context returned no JSON handover: "
@@ -644,6 +658,7 @@ class AutonomousLifecycleService:
                 "status": "running",
                 "current_step": None,
                 "handoffs": [],
+                "session_events": [],
                 "action_id": action["id"],
             }
         Thread(
@@ -729,7 +744,7 @@ class AutonomousLifecycleService:
     ) -> set[tuple[str, int]]:
         latest: dict[tuple[str, int], Mapping[str, object]] = {}
         for action in actions:
-            if action.get("kind") != "autonomous_start":
+            if action.get("kind") not in {"autonomous_start", "requeue"}:
                 continue
             repository = action.get("repository")
             pbi_number = action.get("pbi_number")
@@ -737,6 +752,8 @@ class AutonomousLifecycleService:
                 latest.setdefault((repository, pbi_number), action)
         excluded: set[tuple[str, int]] = set()
         for key, action in latest.items():
+            if action.get("kind") == "requeue" and action.get("status") == "succeeded":
+                continue
             result = _mapping(action.get("result"))
             if (
                 action.get("status") in {"pending", "failed"}
@@ -756,6 +773,23 @@ class AutonomousLifecycleService:
                 current = self._runs.get(run_id)
                 if current is not None:
                     current["current_step"] = step
+
+        def record_output(line: str) -> None:
+            if not line.strip():
+                return
+            event = {
+                "kind": "output",
+                "source_type": "codex",
+                "text": redact_worker_text(line, worker_secret_values()),
+                "created_at": datetime.now(UTC).isoformat(),
+            }
+            with self._lock:
+                current = self._runs.get(run_id)
+                if current is not None:
+                    current["session_events"] = [
+                        *cast(list[dict[str, object]], current["session_events"]),
+                        event,
+                    ][-100:]
 
         def record(handoff: SkillHandoff) -> None:
             pbi_number = context.get("pbi_number")
@@ -789,8 +823,8 @@ class AutonomousLifecycleService:
         try:
             workspace_context = self._prepare_workspace(run_id, workspace_context)
             workspace_created = "workspace_path" in workspace_context
-            executor = self._executor_for(workspace_context)
-            advisor = self._advisor_for(workspace_context)
+            executor = self._executor_for(workspace_context, record_output)
+            advisor = self._advisor_for(workspace_context, record_output)
             runner = AutonomousLifecycleRunner(
                 executor, advisor, record, on_step=record_step
             )
@@ -916,7 +950,11 @@ class AutonomousLifecycleService:
                         format_worker_exception(error)
                     )[:4_000]
 
-    def _executor_for(self, context: Mapping[str, object]) -> SkillExecutor:
+    def _executor_for(
+        self,
+        context: Mapping[str, object],
+        on_output: Callable[[str], None] | None = None,
+    ) -> SkillExecutor:
         if self._executor is not None:
             return self._executor
         mode = os.environ.get("BEEHAIIVE_AUTONOMOUS_MODE", "codex").strip().lower()
@@ -936,16 +974,21 @@ class AutonomousLifecycleService:
                         str(DEFAULT_AUTONOMOUS_TIMEOUT_SECONDS),
                     )
                 ),
+                on_output=on_output,
             )
         del context
         return PlaceholderSkillExecutor()
 
-    def _advisor_for(self, context: Mapping[str, object]) -> SkillExecutor | None:
+    def _advisor_for(
+        self,
+        context: Mapping[str, object],
+        on_output: Callable[[str], None] | None = None,
+    ) -> SkillExecutor | None:
         if self._advisor is not None:
             return self._advisor
         if (
             os.environ.get("BEEHAIIVE_AUTONOMOUS_MODE", "codex").strip().lower()
             == "codex"
         ):
-            return self._executor_for(context)
+            return self._executor_for(context, on_output)
         return PlaceholderSkillExecutor()

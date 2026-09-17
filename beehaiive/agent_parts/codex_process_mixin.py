@@ -136,6 +136,7 @@ class CodexProcessMixin:
         timeout: float,
         stdout_line_handler: Callable[[str], None] | None = None,
         *,
+        stderr_line_handler: Callable[[str], None] | None = None,
         terminate_descendants: bool = False,
     ) -> tuple[str, str, bool]:
         from .executor import CodexExecModelExecutor
@@ -209,7 +210,7 @@ class CodexProcessMixin:
                 args=(
                     stream,
                     buffer,
-                    stdout_line_handler if index == 0 else None,
+                    stdout_line_handler if index == 0 else stderr_line_handler,
                 ),
                 name="beehaiive-agent-output",
                 daemon=True,

@@ -52,6 +52,7 @@ from beehaiive.api.models import DashboardClarifyRequest as DashboardClarifyRequ
 from beehaiive.api.models import (
     DashboardCommitPushRequest as DashboardCommitPushRequest,
 )
+from beehaiive.api.models import DashboardRequeueRequest as DashboardRequeueRequest
 from beehaiive.api.models import DashboardRetryRequest as DashboardRetryRequest
 from beehaiive.api.models import DashboardStartRequest as DashboardStartRequest
 from beehaiive.api.models import DashboardStopRequest as DashboardStopRequest
@@ -399,6 +400,7 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
                 DashboardAnswerQuestionRequest,
                 DashboardClarifyRequest,
                 DashboardRetryRequest,
+                DashboardRequeueRequest,
                 DashboardCommitPushRequest,
             ),
         ):
@@ -454,6 +456,7 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
                     DashboardAnswerQuestionRequest,
                     DashboardClarifyRequest,
                     DashboardRetryRequest,
+                    DashboardRequeueRequest,
                     DashboardCommitPushRequest,
                 ),
             )
@@ -470,6 +473,7 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
                     DashboardAnswerQuestionRequest,
                     DashboardClarifyRequest,
                     DashboardRetryRequest,
+                    DashboardRequeueRequest,
                     DashboardCommitPushRequest,
                 ),
             )

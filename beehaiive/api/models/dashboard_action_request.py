@@ -10,6 +10,7 @@ from .dashboard_graph_request import (
     DashboardGraphRollbackRequest,
     DashboardGraphSafetyRequest,
 )
+from .dashboard_requeue_request import DashboardRequeueRequest
 from .dashboard_retry_request import DashboardRetryRequest
 from .dashboard_start_request import DashboardStartRequest
 from .dashboard_stop_request import DashboardStopRequest
@@ -22,6 +23,7 @@ DashboardActionRequest = Annotated[
     | DashboardSynchronizeRequest
     | DashboardAdvanceRequest
     | DashboardRetryRequest
+    | DashboardRequeueRequest
     | DashboardAnswerQuestionRequest
     | DashboardStopRequest
     | DashboardApproveRequest

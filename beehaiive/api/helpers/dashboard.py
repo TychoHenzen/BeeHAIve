@@ -31,6 +31,7 @@ from beehaiive.api.models import (
 from beehaiive.api.models import (
     DashboardGraphSafetyRequest as DashboardGraphSafetyRequest,
 )
+from beehaiive.api.models import DashboardRequeueRequest as DashboardRequeueRequest
 from beehaiive.api.models import DashboardRetryRequest as DashboardRetryRequest
 from beehaiive.api.models import DashboardStartRequest as DashboardStartRequest
 from beehaiive.api.models import DashboardStopRequest as DashboardStopRequest
@@ -60,6 +61,7 @@ DASHBOARD_ACTION_OWNERS = {
     "clarify": "action_log",
     "answer_question": "orchestrator",
     "retry": "agent_worker",
+    "requeue": "orchestrator",
     "commit_push": "agent_worker",
     "deliver": "agent_worker",
     "graph_evaluate": "graph_safety",
@@ -151,6 +153,14 @@ def _dashboard_state(
                 pbi["autonomous_status"] = live.get("status")
                 pbi["autonomous_current_step"] = live.get("current_step")
                 pbi["autonomous_handoffs"] = live.get("handoffs", [])
+                live_events = live.get("session_events", [])
+                if isinstance(live_events, list) and live_events:
+                    pbi["agent_session"] = {
+                        "worker_id": "autonomous",
+                        "task": f"Running skill: {live.get('current_step', 'unknown')}",
+                        "state": "active",
+                        "events": live_events,
+                    }
     if workflow_service is not None:
         repositories = cast(list[dict[str, object]], dashboard["repositories"])
         for repository in repositories:
@@ -665,6 +675,34 @@ def _execute_retry(
     )
 
 
+def _execute_requeue(
+    orchestrator: Orchestrator,
+    project_id: str,
+    request: DashboardActionRequest,
+    agent_worker: AgentWorkerManager | None,
+    secret_values: tuple[str, ...],
+) -> dict[str, object]:
+    del agent_worker, secret_values
+    if not isinstance(request, DashboardRequeueRequest):
+        raise StoreError(f"No dashboard handler for action: {request.action}")
+    actions = orchestrator.store.actions_for_project(project_id)
+    blocked = any(
+        action.get("kind") == "autonomous_start"
+        and action.get("repository") == request.repository
+        and action.get("pbi_number") == request.pbi_number
+        and action.get("run_id") == request.run_id
+        and action.get("status") == "failed"
+        for action in actions
+    )
+    if not blocked:
+        raise StoreError("Only a blocked autonomous run can be made claimable")
+    return {
+        "pbi": orchestrator.store.set_pbi_claimable(
+            project_id, request.repository, request.pbi_number
+        )
+    }
+
+
 def _execute_advance(
     orchestrator: Orchestrator,
     project_id: str,
@@ -863,6 +901,7 @@ DASHBOARD_ACTION_DISPATCH: dict[str, DashboardActionHandler] = {
     "clarify": _execute_clarify,
     "answer_question": _execute_answer_question,
     "retry": _execute_retry,
+    "requeue": _execute_requeue,
     "commit_push": _execute_delivery,
     "deliver": _execute_delivery,
     "graph_evaluate": _execute_graph_safety,

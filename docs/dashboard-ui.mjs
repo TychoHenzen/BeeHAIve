@@ -54,6 +54,7 @@ const ACTION_LABELS = {
   retry: "Work retried",
   start: "Work started",
   stop: "Work stopped",
+  requeue: "PBI made claimable",
 };
 
 function actionLabel(action) {
@@ -165,10 +166,10 @@ function actionSpec(item, demo) {
   const identity = { repository, pbi_number: pbi.number, run_id: pbi.run_id };
   if (pbi.autonomous_status === "blocked") {
     return {
-      label: "Retry lifecycle",
-      testid: "retry-lifecycle",
-      autonomous: true,
-      payload: { repository, pbi_number: pbi.number },
+      label: "Make claimable",
+      testid: "requeue-work",
+      description: "Put this blocked PBI back into the claimable queue without starting work.",
+      payload: { action: "requeue", repository, pbi_number: pbi.number, run_id: pbi.run_id },
     };
   }
   if (pbi.autonomous_status === "running") return null;
@@ -182,7 +183,7 @@ function actionSpec(item, demo) {
   if (pbi.status === "failed") {
     if (pbi.claimable && pbi.run_id) return { label: "Retry work", testid: "retry-work", payload: { action: "retry", ...identity } };
   }
-  if (pbi.claimable && !pbi.run_id && !isCompleted(pbi)) return { label: "Start work", testid: "start-work", payload: { action: "start", repository, pbi_number: pbi.number } };
+  if (pbi.claimable && !pbi.run_id && !isCompleted(pbi)) return { label: "Start work", testid: "start-work", description: "Claim only the current PBI stage for one interactive worker.", payload: { action: "start", repository, pbi_number: pbi.number } };
   if (!demo) return null;
   if (demo && stageId(pbi) === "pull_request" && pbi.run_id === null) return { label: "Approve review", testid: "approve-review", payload: { action: "approve", ...identity } };
   if (pbi.status !== "active" || !pbi.run_id) return null;
@@ -236,6 +237,7 @@ export function createDashboardUi({
     const node = element("button", label, className);
     node.type = "button";
     node.dataset.testid = spec.testid;
+    if (spec.description) node.title = spec.description;
     node.addEventListener("click", (event) => {
       event.stopPropagation();
       void (spec.autonomous ? runAutonomous(spec.payload) : runAction(spec.payload));
@@ -613,6 +615,7 @@ export function createDashboardUi({
       controls.append(actionButton(autonomousLabel, {
         autonomous: true,
         testid: "run-lifecycle",
+        description: "Run the full server lifecycle: refine, implement, publish, review, fix, and complete.",
         payload: { repository: item.repository, pbi_number: pbi.number },
       }, "primary"));
     }
@@ -666,6 +669,7 @@ export function createDashboardUi({
       controls.append(actionButton(autonomousLabel, {
         autonomous: true,
         testid: "run-lifecycle",
+        description: "Run the full server lifecycle: refine, implement, publish, review, fix, and complete.",
         payload: { repository, pbi_number: pbi.number },
       }, "primary"));
     }
@@ -686,7 +690,7 @@ export function createDashboardUi({
   function renderQueue(items) {
     renderFilters(items);
     const visible = filterItems(items, currentFilter).sort((left, right) => {
-      const rank = (item) => needsAttention(item.pbi) ? 0 : item.pbi.claimable ? 1 : item.pbi.status === "active" ? 2 : isCompleted(item.pbi) ? 4 : 3;
+      const rank = (item) => item.pbi.status === "active" && item.pbi.run_id ? 0 : needsAttention(item.pbi) ? 1 : item.pbi.claimable ? 2 : isCompleted(item.pbi) ? 4 : 3;
       return rank(left) - rank(right);
     });
     queueTable.replaceChildren();
@@ -707,7 +711,7 @@ export function createDashboardUi({
 
   function renderAgents(items) {
     agentsOutput.replaceChildren();
-    const active = items.filter((item) => isAgentActive(item) || item.pbi.autonomous_status);
+    const active = items.filter((item) => isAgentActive(item) || item.pbi.autonomous_status === "running");
     const scheduler = map(currentState?.scheduler);
     const showScheduler = scheduler.enabled === true
       && (scheduler.running === true || scheduler.last_poll_at || scheduler.last_error || Number(scheduler.active_workers) > 0);

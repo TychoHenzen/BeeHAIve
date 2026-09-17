@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -39,21 +40,21 @@ def test_autonomous_runtime_resolves_bare_codex_before_windows_launch(
         lambda command: str(resolved_executable) if command == "codex.exe" else None,
     )
 
-    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        del kwargs
+    def launch(command: list[str], _environment: dict[str, str]):
         launches.append(command)
-        if command[0] == "codex":
-            raise FileNotFoundError(
-                "[WinError 2] The system cannot find the file specified"
-            )
-        return subprocess.CompletedProcess(
-            command,
-            0,
-            '{"status":"succeeded","summary":"launched"}\n',
-            "",
+        return subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "print('{\"status\":\"succeeded\",\"summary\":\"launched\"}')",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
 
-    monkeypatch.setattr(autonomous.subprocess, "run", run)
+    monkeypatch.setattr(
+        autonomous.CodexProcessMixin, "_start_process", staticmethod(launch)
+    )
     step = SkillStep("runtime", str(skill_path), "Exercise the runtime launch")
     monkeypatch.setattr(autonomous, "AUTONOMOUS_STEPS", (step,))
 
@@ -90,12 +91,12 @@ def test_autonomous_runtime_reports_launch_context_for_missing_executable(
     skill_path.parent.mkdir()
     skill_path.write_text("# test skill\n", encoding="utf-8")
     missing = tmp_path / "missing-codex.exe"
+
+    def launch(_command, _environment):
+        raise FileNotFoundError(2, "The system cannot find the file specified", missing)
+
     monkeypatch.setattr(
-        autonomous.subprocess,
-        "run",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            FileNotFoundError(2, "The system cannot find the file specified", missing)
-        ),
+        autonomous.CodexProcessMixin, "_start_process", staticmethod(launch)
     )
 
     with pytest.raises(RuntimeError) as error:
@@ -118,19 +119,29 @@ def test_autonomous_runtime_accepts_pretty_printed_json_handover(
     skill_path = tmp_path / "skill" / "SKILL.md"
     skill_path.parent.mkdir()
     skill_path.write_text("# test skill\n", encoding="utf-8")
-    monkeypatch.setattr(
-        autonomous.subprocess,
-        "run",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess(
-            [],
-            0,
-            'log\n{"status":"succeeded","summary":"pretty",\n'
-            ' "handover":{"step":"next"}}\n',
-            "",
-        ),
+    outputs: list[str] = []
+    script = (
+        "import sys\n"
+        "print('progress', file=sys.stderr)\n"
+        "print('log')\n"
+        "print('{\"status\":\"succeeded\",\"summary\":\"pretty\", "
+        "\"handover\":{\"step\":\"next\"}}')\n"
     )
 
-    result = CodexSkillExecutor(tmp_path, "codex.exe").execute(
+    def launch(_command, _environment):
+        return subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    monkeypatch.setattr(
+        autonomous.CodexProcessMixin, "_start_process", staticmethod(launch)
+    )
+
+    result = CodexSkillExecutor(
+        tmp_path, "codex.exe", on_output=outputs.append
+    ).execute(
         SkillStep("runtime", str(skill_path), "Exercise JSON parsing"),
         {"repository": "owner/api"},
         {},
@@ -140,3 +151,34 @@ def test_autonomous_runtime_accepts_pretty_printed_json_handover(
     assert result["handover"] == {"step": "next"}
     assert "log" in result["session_output"]
     assert '"status":"succeeded"' in result["session_output"]
+    assert any("progress" in output for output in outputs)
+    assert any("log" in output for output in outputs)
+
+
+def test_autonomous_runtime_timeout_preserves_live_session_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    skill_path = tmp_path / "skill" / "SKILL.md"
+    skill_path.parent.mkdir()
+    skill_path.write_text("# test skill\n", encoding="utf-8")
+    script = "import time; print('doing work', flush=True); time.sleep(2)"
+
+    def launch(_command, _environment):
+        return subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    monkeypatch.setattr(
+        autonomous.CodexProcessMixin, "_start_process", staticmethod(launch)
+    )
+
+    with pytest.raises(RuntimeError, match="Codex timed out after 0.2s") as error:
+        CodexSkillExecutor(tmp_path, "codex.exe", timeout_seconds=0.2).execute(
+            SkillStep("runtime", str(skill_path), "Exercise timeout diagnostics"),
+            {"repository": "owner/api"},
+            {},
+        )
+
+    assert "doing work" in str(error.value)

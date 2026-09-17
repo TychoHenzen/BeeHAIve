@@ -11,6 +11,35 @@ from .helpers.lease_helpers import _now as _now
 
 
 class ProjectClaimMixin:
+    def set_pbi_claimable(
+        self: Any, project_id: str, repository: str, pbi_number: int
+    ) -> dict[str, object]:
+        with self._transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT stage, active, archived
+                FROM pbis
+                WHERE project_id = ? AND repository_name = ? AND number = ?
+                """,
+                (project_id, repository, pbi_number),
+            ).fetchone()
+            if row is None or not bool(row["active"]):
+                raise StoreError("PBI is not available for requeue")
+            if row["stage"] == Stage.PULL_REQUEST.value:
+                raise StoreError("A pull-request PBI cannot be requeued")
+            connection.execute(
+                """
+                UPDATE pbis
+                SET claimable = 1, last_error = NULL, archived = 0
+                WHERE project_id = ? AND repository_name = ? AND number = ?
+                """,
+                (project_id, repository, pbi_number),
+            )
+        return {
+            "repository": repository,
+            "pbi_number": pbi_number,
+            "claimable": True,
+        }
     def claim_next(
         self: Any,
         project_id: str,
