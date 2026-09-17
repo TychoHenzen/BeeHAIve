@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import re
 
+from beehaiive.session_evidence import (
+    SESSION_PROGRESS_EVENTS as _SESSION_PROGRESS_EVENTS,
+)
+
 DEMO_TASK_NAME = "bounded repository inventory"
 
 DEFAULT_DEMO_TASK = (
@@ -56,18 +60,6 @@ _SAFE_ENVIRONMENT_NAMES = frozenset(
 )
 
 _ROUTING_MODEL_ALIASES = frozenset({"luna", "terra", "sol", "astra", "human"})
-
-_SESSION_PROGRESS_EVENTS = frozenset(
-    {
-        "thread.started",
-        "turn.started",
-        "turn.completed",
-        "turn.failed",
-        "item.started",
-        "item.updated",
-        "item.completed",
-    }
-)
 
 _SECRET_ASSIGNMENT = re.compile(
     r"\b((?:[\w-]+[_-])?(?:access[_-]?token|refresh[_-]?token|token|"

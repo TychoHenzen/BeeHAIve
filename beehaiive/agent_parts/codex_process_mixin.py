@@ -123,6 +123,7 @@ class CodexProcessMixin:
         timeout: float,
         stdout_line_handler: Callable[[str], None] | None = None,
         *,
+        capture_gap_handler: Callable[[str], None] | None = None,
         terminate_descendants: bool = False,
     ) -> tuple[str, str, bool]:
         from .executor import CodexExecModelExecutor
@@ -130,6 +131,13 @@ class CodexProcessMixin:
         buffers = [bytearray(), bytearray()]
         streams = [process.stdout, process.stderr]
         handler_errors: list[Exception] = []
+
+        def capture_gap(reason: str) -> None:
+            if capture_gap_handler is not None and not handler_errors:
+                try:
+                    capture_gap_handler(reason)
+                except Exception as exc:
+                    handler_errors.append(exc)
 
         def collect(
             stream: Any,
@@ -152,12 +160,16 @@ class CodexProcessMixin:
                     newline = line_buffer.find(b"\n")
                     if newline < 0:
                         if len(line_buffer) > MAX_AGENT_OUTPUT_BYTES:
+                            capture_gap("oversized")
                             line_buffer.clear()
                             dropping_line = True
                         return
                     line = bytes(line_buffer[:newline])
                     del line_buffer[: newline + 1]
-                    if len(line) > MAX_AGENT_OUTPUT_BYTES or handler_errors:
+                    if len(line) > MAX_AGENT_OUTPUT_BYTES:
+                        capture_gap("oversized")
+                        continue
+                    if handler_errors:
                         continue
                     try:
                         assert line_handler is not None
@@ -188,6 +200,7 @@ class CodexProcessMixin:
                     except Exception as exc:
                         handler_errors.append(exc)
             except (OSError, ValueError):
+                capture_gap("interrupted")
                 return
 
         readers = [
@@ -218,6 +231,7 @@ class CodexProcessMixin:
         ):
             reader.join(timeout=POST_TERMINATION_GRACE_SECONDS)
             if reader.is_alive():
+                capture_gap("interrupted")
                 with suppress(OSError, ValueError):
                     stream.close()
         if handler_errors:

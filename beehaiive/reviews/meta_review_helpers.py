@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import cast
 
 from ..agent import redact_worker_text
+from ..session_evidence import transcript_projection
 from ..storage import (
     MAX_META_REVIEW_SUGGESTIONS,
     MAX_META_REVIEW_TEXT_LENGTH,
@@ -111,7 +112,13 @@ def normalize_suggestions(
 def safe_record(
     source_record: Mapping[str, object], attempts: Sequence[Mapping[str, object]]
 ) -> dict[str, object]:
-    source_id = str(source_record["source_id"])
+    source_id = safe_review_text(source_record["source_id"], 124)
+    raw_transcript = source_record.get("transcript")
+    transcript: Mapping[str, object] = (
+        cast(Mapping[str, object], raw_transcript)
+        if isinstance(raw_transcript, Mapping)
+        else {}
+    )
     events = [
         {
             "event_id": event.get("id"),
@@ -152,6 +159,11 @@ def safe_record(
         "updated_at": safe_review_text(source_record.get("updated_at"), 80),
         "events": events,
         "routing_attempts": safe_attempts,
+        "transcript": transcript_projection(
+            source_id.removeprefix("run:"),
+            transcript.get("events"),
+            transcript.get("gaps"),
+        ),
     }
 
 
@@ -192,6 +204,15 @@ def source_run_id(reference: str) -> str | None:
         return None
     parts = reference.split(":")
     if len(parts) == 2 and parts[1]:
+        return parts[1]
+    if (
+        len(parts) == 4
+        and parts[2] == "transcript"
+        and parts[1]
+        and parts[3].isascii()
+        and parts[3].isdigit()
+        and int(parts[3]) > 0
+    ):
         return parts[1]
     if len(parts) == 4 and parts[2] in {"event", "attempt"} and parts[1] and parts[3]:
         return parts[1]

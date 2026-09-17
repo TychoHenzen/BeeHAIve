@@ -3,7 +3,13 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
+from beehaiive.contract_types.validation import _redact_text
 from beehaiive.models import RunState, RunStatus
+from beehaiive.session_evidence import (
+    CAPTURE_GAPS,
+    allowed_session_event,
+    transcript_projection,
+)
 
 from .constants import MAX_AGENT_SESSION_EVENT_LENGTH as MAX_AGENT_SESSION_EVENT_LENGTH
 from .constants import MAX_AGENT_SESSION_EVENTS as MAX_AGENT_SESSION_EVENTS
@@ -72,6 +78,7 @@ class AgentSessionsMixin:
                         "result": row["last_result"],
                         "error": row["last_error"],
                         "updated_at": row["updated_at"],
+                        "transcript": self._transcript_for_run(row["run_id"]),
                         "events": [
                             {
                                 "id": event["event_id"],
@@ -88,6 +95,22 @@ class AgentSessionsMixin:
                     }
                 )
             return tuple(records)
+
+    def _transcript_for_run(self: Any, run_id: str) -> dict[str, object]:
+        session = self._connection.execute(
+            "SELECT capture_flags FROM agent_sessions WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if session is None:
+            return transcript_projection(run_id, None)
+        events = self._connection.execute(
+            """SELECT sequence, kind, source_type, role, text, timestamp
+               FROM agent_session_events WHERE run_id = ?
+               ORDER BY sequence DESC LIMIT ?""",
+            (run_id, MAX_AGENT_SESSION_EVENTS),
+        ).fetchall()
+        flags = session["capture_flags"]
+        gaps = [name for name, flag in CAPTURE_GAPS.items() if flags & flag]
+        return transcript_projection(run_id, [dict(event) for event in events], gaps)
 
     @staticmethod
     def _upsert_agent_session(
@@ -134,9 +157,11 @@ class AgentSessionsMixin:
         role: str | None,
         text: str,
     ) -> None:
-        if kind not in {"progress", "message"} or not source_type.strip():
+        is_gap = kind == "gap" and source_type in CAPTURE_GAPS
+        if not is_gap and not allowed_session_event(kind, source_type, role):
             raise StoreError("An agent event kind and source type are required")
-        event_text = text[:MAX_AGENT_SESSION_EVENT_LENGTH]
+        safe_text = _redact_text(text, len(text)) if kind == "message" else source_type
+        event_text = safe_text[:MAX_AGENT_SESSION_EVENT_LENGTH]
         with self._transaction() as connection:
             run = self._run_for_id(connection, run_id)
             if run is None or run.status is not RunStatus.ACTIVE:
@@ -149,6 +174,11 @@ class AgentSessionsMixin:
                 is None
             ):
                 raise StoreError("Agent session has not been started")
+            if is_gap:
+                self._mark_capture_gap(connection, run_id, source_type)
+                return
+            if len(safe_text) > MAX_AGENT_SESSION_EVENT_LENGTH:
+                self._mark_capture_gap(connection, run_id, "truncated")
             sequence = int(
                 connection.execute(
                     """
@@ -192,6 +222,7 @@ class AgentSessionsMixin:
                 or total_bytes > MAX_AGENT_SESSION_TEXT_BYTES
             ):
                 oldest = history.pop(0)
+                self._mark_capture_gap(connection, run_id, "trimmed")
                 total_bytes -= int(oldest["text_bytes"])
                 connection.execute(
                     """
@@ -200,6 +231,16 @@ class AgentSessionsMixin:
                     """,
                     (run_id, oldest["sequence"]),
                 )
+
+    @staticmethod
+    def _mark_capture_gap(
+        connection: sqlite3.Connection, run_id: str, reason: str
+    ) -> None:
+        connection.execute(
+            "UPDATE agent_sessions SET capture_flags = capture_flags | ? "
+            "WHERE run_id = ?",
+            (CAPTURE_GAPS[reason], run_id),
+        )
 
     def get_agent_session(self: Any, run_id: str) -> dict[str, object] | None:
         with self._lock:
