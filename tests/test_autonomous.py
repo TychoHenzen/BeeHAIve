@@ -178,6 +178,9 @@ def test_runner_normalizes_completed_skill_status() -> None:
 
 def test_runner_normalizes_published_skill_status() -> None:
     assert autonomous._skill_status("published") == "succeeded"
+    assert autonomous._skill_status("reviewed") == "succeeded"
+    assert autonomous._skill_status("fixed") == "succeeded"
+    assert autonomous._skill_status("merged") == "succeeded"
 
 
 def test_runner_keeps_bounded_skill_session_output() -> None:
