@@ -869,6 +869,21 @@ class AutonomousLifecycleService:
         actions: Sequence[Mapping[str, object]], repository: str, pbi_number: int
     ) -> dict[str, object]:
         step_names = [step.name for step in AUTONOMOUS_STEPS]
+        known_handover: dict[str, object] = {}
+        for action in actions:
+            if (
+                action.get("repository") != repository
+                or action.get("pbi_number") != pbi_number
+            ):
+                continue
+            for source in (
+                _mapping(_mapping(action.get("result")).get("handover")),
+                _mapping(_mapping(action.get("request")).get("handover")),
+            ):
+                for key in ("branch", "pr", "pull_request", "head", "head_commit"):
+                    value = source.get(key)
+                    if key not in known_handover and isinstance(value, (str, int)):
+                        known_handover[key] = value
         for action in actions:
             if (
                 action.get("repository") != repository
@@ -887,7 +902,11 @@ class AutonomousLifecycleService:
                 "review_complete"
             ) is True
             if review_complete:
-                handover = {**_mapping(result.get("summary")), **handover}
+                handover = {
+                    **known_handover,
+                    **_mapping(result.get("summary")),
+                    **handover,
+                }
             published = step == "submit-draft-pr" and (
                 handover.get("draft") is False
                 or bool(handover.get("pull_request"))

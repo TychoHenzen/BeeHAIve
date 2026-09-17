@@ -137,15 +137,24 @@ def test_autonomous_resume_fixes_findings_after_a_completed_review() -> None:
             "pbi_number": 1,
             "result": {
                 "status": "blocked",
-                "summary": {
-                    "branch": "codex/fixture",
-                    "pull_request": 9,
-                    "head_commit": "b" * 40,
-                    "findings": [{"severity": "MAJOR"}],
-                },
+                "summary": "review-pr-branch completed",
                 "handover": {"review_complete": True},
             },
-        }
+        },
+        {
+            "kind": "skill:submit-draft-pr",
+            "status": "failed",
+            "repository": "owner/api",
+            "pbi_number": 1,
+            "result": {
+                "status": "published",
+                "handover": {
+                    "branch": "codex/fixture",
+                    "pull_request": 9,
+                    "head": "b" * 40,
+                },
+            },
+        },
     ]
 
     resume = AutonomousLifecycleService._resume_context(actions, "owner/api", 1)
@@ -156,7 +165,7 @@ def test_autonomous_resume_fixes_findings_after_a_completed_review() -> None:
         "branch": "codex/fixture",
         "workspace_branch": "codex/fixture",
         "pull_request": 9,
-        "head_commit": "b" * 40,
+        "head": "b" * 40,
     }
 
 
