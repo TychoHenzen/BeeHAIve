@@ -304,6 +304,7 @@ def _skill_status(value: object) -> str:
             "completed",
             "done",
             "passed",
+            "published",
             "success",
             "succeeded",
         }

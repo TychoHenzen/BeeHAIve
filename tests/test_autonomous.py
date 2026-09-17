@@ -138,6 +138,10 @@ def test_runner_normalizes_completed_skill_status() -> None:
     assert steps == [step.name for step in AUTONOMOUS_STEPS[1:]]
 
 
+def test_runner_normalizes_published_skill_status() -> None:
+    assert autonomous._skill_status("published") == "succeeded"
+
+
 def test_runner_keeps_bounded_skill_session_output() -> None:
     class SessionExecutor:
         def execute(self, step, _context, handover):
