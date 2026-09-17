@@ -37,7 +37,10 @@ def test_session_event_parser_ignores_non_message_payloads(tmp_path: Path) -> No
         json.dumps({"type": "agent_message", "text": "top-level message"}), record
     )
 
-    assert events == [("message", "agent_message", "assistant", "top-level message")]
+    assert events == [
+        ("gap", "malformed", None, ""),
+        ("message", "agent_message", "assistant", "top-level message"),
+    ]
 
 
 def test_agent_session_round_trips_through_project_state(tmp_path: Path) -> None:
