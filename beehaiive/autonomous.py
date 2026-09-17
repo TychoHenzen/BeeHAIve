@@ -528,6 +528,14 @@ class CodexSkillExecutor:
             f"PBI context: {json.dumps(dict(context), sort_keys=True)}\n"
             f"Handover: {json.dumps(dict(handover), sort_keys=True)}"
         )
+        if step.name == "next-ticket":
+            prompt += (
+                "\nThis is one stage inside a larger autonomous lifecycle. The outer "
+                "runner invokes the separate review-pr-branch stage after this "
+                "one. Do not invoke collab, spawn a nested reviewer, or wait for "
+                "that review here. Complete implementation, verification, commit, "
+                "and push, then return the handover."
+            )
         command = [
             self.executable,
             "--approve-for-me",
