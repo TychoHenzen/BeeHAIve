@@ -187,7 +187,12 @@ def pbi_view(
                 or autonomous_result.get("error")
                 or last_error
             )
-    if requeue_action is not None and not provider_completed:
+    requeue_is_latest = requeue_action is not None and (
+        autonomous_action is None
+        or str(requeue_action.get("created_at", ""))
+        > str(autonomous_action.get("created_at", ""))
+    )
+    if requeue_is_latest and not provider_completed:
         status = "idle"
         run_id = None
         active = bool(raw_pbi.get("active"))

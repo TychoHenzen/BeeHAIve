@@ -177,7 +177,7 @@ export function createDashboardClient({
       const result = await readJson(response);
       if (result.status === "running" && result.run_id) {
         onStatus("autonomous lifecycle running on server...", "pending");
-        return await waitForAutonomous(result, actionProject);
+        return await waitForAutonomous(result, actionProject, actionWorkflow);
       }
       onStatus(`autonomous lifecycle ${result.status || "started"}.`, "success");
       return result;
@@ -193,9 +193,25 @@ export function createDashboardClient({
     }
   }
 
-  async function waitForAutonomous(started, project) {
-    for (let attempt = 0; attempt < 60; attempt += 1) {
-      await new Promise((resolve) => window.setTimeout(resolve, 1000));
+  async function refreshAutonomousState(project, workflow) {
+    const query = new URLSearchParams();
+    if (archived()) query.set("archived", "true");
+    if (workflow) query.set("workflow_id", workflow);
+    const queryString = query.toString();
+    try {
+      const response = await fetcher(
+        `/projects/${encodeURIComponent(project)}/dashboard${queryString ? `?${queryString}` : ""}`,
+        { cache: "no-store" },
+      );
+      onState(await readJson(response));
+    } catch (error) {
+      onStatus(`autonomous dashboard update unavailable: ${error.message}`, "failure");
+    }
+  }
+
+  async function waitForAutonomous(started, project, workflow) {
+    for (let attempt = 0; ; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 2000));
       try {
         const response = await fetcher(
           `/projects/${encodeURIComponent(project)}/autonomous-runs/${encodeURIComponent(started.run_id)}`,
@@ -203,17 +219,17 @@ export function createDashboardClient({
         );
         const status = await readJson(response);
         if (status.status !== "running") {
+          await refreshAutonomousState(project, workflow);
           onStatus(`autonomous lifecycle ${status.status || "finished"}.`, status.status === "completed" ? "success" : "failure");
           return status;
         }
+        if (attempt % 2 === 0) await refreshAutonomousState(project, workflow);
         onStatus(`autonomous lifecycle running on server${status.current_step ? ` · ${status.current_step}` : "..."}`, "pending");
       } catch (error) {
         onStatus(`autonomous lifecycle status unavailable: ${error.message}`, "failure");
         return started;
       }
     }
-    onStatus("autonomous lifecycle is still running on the server. Inspect Agents for its state.", "pending");
-    return started;
   }
 
   async function configureScheduler(config) {
