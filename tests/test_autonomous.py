@@ -108,7 +108,7 @@ def test_autonomous_resume_starts_after_a_published_pull_request() -> None:
                 "status": "published",
                 "handover": {
                     "branch": "codex/fixture",
-                    "pr": 9,
+                    "pull_request": 9,
                     "draft": False,
                     "head": "a" * 40,
                 },
@@ -123,7 +123,7 @@ def test_autonomous_resume_starts_after_a_published_pull_request() -> None:
         "resume_existing_workspace": True,
         "branch": "codex/fixture",
         "workspace_branch": "codex/fixture",
-        "pr": 9,
+        "pull_request": 9,
         "head": "a" * 40,
     }
 
