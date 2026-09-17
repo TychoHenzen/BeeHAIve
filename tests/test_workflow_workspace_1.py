@@ -60,6 +60,7 @@ def test_worktree_path_identity_preserves_internal_whitespace(tmp_path: Path) ->
     manager = GitWorktreeManager(repository, store)
     worktree = tmp_path / "worktree  with  spaces"
 
+    assert manager.git_timeout_seconds is None
     lease = manager.acquire("agent", "codex/spaces", worktree)
 
     assert lease.worktree_path == str(worktree.resolve())

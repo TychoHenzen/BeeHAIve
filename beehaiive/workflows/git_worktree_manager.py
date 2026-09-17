@@ -53,12 +53,12 @@ class GitWorktreeManager:
         self,
         repository: str | Path,
         store: WorkflowStore,
-        git_timeout_seconds: float = 60.0,
+        git_timeout_seconds: float | None = None,
     ) -> None:
         self.repository = Path(repository).resolve()
         self.store = store
         self._git_executable = _resolve_git_executable()
-        if git_timeout_seconds <= 0:
+        if git_timeout_seconds is not None and git_timeout_seconds <= 0:
             raise WorkflowError("Git timeout must be positive")
         self.git_timeout_seconds = git_timeout_seconds
         if not self.repository.exists():
@@ -234,7 +234,7 @@ class GitWorktreeManager:
         return result.stdout.strip()
 
     def run_git(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        """Run one bounded, no-shell Git command for WorkflowService."""
+        """Run one no-shell Git command for WorkflowService."""
 
         return self._run_git(*arguments)
 
@@ -249,8 +249,13 @@ class GitWorktreeManager:
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
+            timeout = (
+                "an unlimited wait"
+                if self.git_timeout_seconds is None
+                else f"{self.git_timeout_seconds:g} seconds"
+            )
             raise WorkflowError(
-                f"git command timed out after {self.git_timeout_seconds:g} seconds"
+                f"git command timed out after {timeout}"
             ) from exc
         return result
 
