@@ -150,27 +150,28 @@ def _dashboard_state(
                 live = status_for_work_item(project_id, repository_name, number)
                 if not isinstance(live, Mapping):
                     continue
-                pbi["autonomous_status"] = live.get("status")
-                pbi["autonomous_current_step"] = live.get("current_step")
-                pbi["autonomous_handoffs"] = live.get("handoffs", [])
-                pbi["autonomous_process"] = live.get("process")
-                live_events = live.get("session_events", [])
+                live_values = cast(Mapping[str, object], live)
+                pbi["autonomous_status"] = live_values.get("status")
+                pbi["autonomous_current_step"] = live_values.get("current_step")
+                pbi["autonomous_handoffs"] = live_values.get("handoffs", [])
+                pbi["autonomous_process"] = live_values.get("process")
+                live_events = live_values.get("session_events", [])
                 if (
                     (isinstance(live_events, list) and live_events)
-                    or live.get("current_step")
-                    or live.get("process")
+                    or live_values.get("current_step")
+                    or live_values.get("process")
                 ):
                     pbi["agent_session"] = {
                         "worker_id": "autonomous",
-                        "task": f"Running skill: {live.get('current_step', 'unknown')}",
+                        "task": f"Running skill: {live_values.get('current_step', 'unknown')}",
                         "state": "active",
                         "events": live_events,
-                        "activity_state": live.get("status"),
-                        "started_at": live.get("started_at"),
-                        "step_started_at": live.get("step_started_at"),
-                        "last_output_at": live.get("last_output_at"),
-                        "last_output": live.get("last_output"),
-                        "process": live.get("process"),
+                        "activity_state": live_values.get("status"),
+                        "started_at": live_values.get("started_at"),
+                        "step_started_at": live_values.get("step_started_at"),
+                        "last_output_at": live_values.get("last_output_at"),
+                        "last_output": live_values.get("last_output"),
+                        "process": live_values.get("process"),
                     }
     if workflow_service is not None:
         repositories = cast(list[dict[str, object]], dashboard["repositories"])
@@ -570,7 +571,7 @@ def _start_dashboard_worker(
         agent_worker.start(run)
     except Exception as exc:
         failure = redact_worker_text(
-            f"Agent worker failed to start:\n{format_worker_exception(exc)}",
+            f"Agent worker failed to start: {format_worker_exception(exc)}",
             secret_values,
             max_length=MAX_AGENT_OUTPUT_LENGTH,
         )
@@ -649,7 +650,7 @@ def _execute_start(
         agent_worker.start(run)
     except Exception as exc:
         failure = redact_worker_text(
-            f"Agent worker failed to start:\n{format_worker_exception(exc)}",
+            f"Agent worker failed to start: {format_worker_exception(exc)}",
             secret_values,
             max_length=MAX_AGENT_OUTPUT_LENGTH,
         )

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import re
-import traceback
 
 from beehaiive.contract_types.validation import _redact_text as _redact_text
 from beehaiive.workflow import GateResult
@@ -41,10 +40,9 @@ def redact_worker_text(
 
 
 def format_worker_exception(error: Exception) -> str:
-    details = "".join(
-        traceback.format_exception(type(error), error, error.__traceback__)
-    )
+    details = str(error)
     if isinstance(error, FileNotFoundError):
+        details = f"{type(error).__name__}: {details}"
         details += (
             "\nMissing path details: "
             f"filename={error.filename!r}; "

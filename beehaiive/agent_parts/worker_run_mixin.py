@@ -247,7 +247,7 @@ class WorkerRunMixin:
                 and run.lease_token == lease_token
             ):
                 failure = redact_worker_text(
-                    f"Agent worker failed:\n{format_worker_exception(exc)}"
+                    f"Agent worker failed: {format_worker_exception(exc)}"
                 )
                 try:
                     self.orchestrator.store.fail_agent_run(run_id, failure, lease_token)

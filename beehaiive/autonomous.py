@@ -19,6 +19,31 @@ from beehaiive.agent_parts.worker_text import (
     safe_worker_environment,
     worker_secret_values,
 )
+from beehaiive.workflow import WorkspaceLease
+
+
+class _GitProbe(Protocol):
+    returncode: int
+
+
+class _WorktreeService(Protocol):
+    repository: Path
+
+    def run_git(self, *arguments: str) -> _GitProbe: ...
+
+    def clean(self, worktree: str | Path) -> bool: ...
+
+
+class _WorkflowWorkspaceService(Protocol):
+    worktrees: _WorktreeService
+
+    def acquire_workspace(
+        self, agent_id: str, branch: str, worktree: Path, base_ref: str
+    ) -> WorkspaceLease: ...
+
+    def release_workspace(self, lease_id: str) -> object: ...
+
+    def retain_workspace(self, lease_id: str, lease_token: str | None) -> object: ...
 
 __all__ = [
     "ADVISOR_STEP",
@@ -334,7 +359,7 @@ def _context_for_step(
 
 
 def _session_output(stdout: str, stderr: str) -> str:
-    sections = []
+    sections: list[str] = []
     if stdout.strip():
         sections.append(f"[stdout]\n{stdout.strip()}")
     if stderr.strip():
@@ -555,10 +580,10 @@ class CodexSkillExecutor:
         command.extend(("--model", DEFAULT_AUTONOMOUS_MODEL))
         command.append(prompt)
         started_at = _now_iso()
-        process = None
+        process: subprocess.Popen[bytes] | None = None
         try:
             try:
-                process = CodexProcessMixin._start_process(
+                process = CodexProcessMixin._start_process(  # pyright: ignore[reportPrivateUsage]
                     command,
                     safe_worker_environment(),
                 )
@@ -575,6 +600,7 @@ class CodexSkillExecutor:
                         }
                     )
                 raise
+            assert process is not None
             if self.on_process is not None:
                 self.on_process(
                     {
@@ -590,7 +616,7 @@ class CodexSkillExecutor:
             timed_out = False
             process_state = "running"
             try:
-                stdout, stderr, timed_out = CodexProcessMixin._communicate_bounded(
+                stdout, stderr, timed_out = CodexProcessMixin._communicate_bounded(  # pyright: ignore[reportPrivateUsage]
                     process,
                     self.timeout_seconds,
                     self.on_output,
@@ -599,7 +625,7 @@ class CodexSkillExecutor:
                 )
                 process_state = "timed_out" if timed_out else "exited"
             except subprocess.TimeoutExpired:
-                CodexProcessMixin._terminate_process(process)
+                CodexProcessMixin._terminate_process(process)  # pyright: ignore[reportPrivateUsage]
                 stdout, stderr = "", ""
                 timed_out = True
                 process_state = "timed_out"
@@ -686,7 +712,7 @@ class AutonomousLifecycleService:
         self._executor = executor
         self._advisor = advisor
         self._workflow_service = workflow_service
-        self._workspaces: dict[str, object] = {}
+        self._workspaces: dict[str, WorkspaceLease] = {}
 
     def start(
         self,
@@ -1030,14 +1056,15 @@ class AutonomousLifecycleService:
         workspace_id = uuid4().hex
         branch = f"codex/beehaiive-autonomous-{run_id[:12]}"
         base_ref = os.environ.get("BEEHAIIVE_AUTONOMOUS_BASE_REF", "origin/master")
-        run_git = getattr(worktrees, "run_git", None)
-        if callable(run_git):
-            try:
-                if run_git("rev-parse", "--verify", base_ref).returncode != 0:
-                    base_ref = "HEAD"
-            except Exception:
+        typed_worktrees = cast(_WorktreeService, worktrees)
+        try:
+            if typed_worktrees.run_git(
+                "rev-parse", "--verify", base_ref
+            ).returncode != 0:
                 base_ref = "HEAD"
-        lease = acquire(
+        except Exception:
+            base_ref = "HEAD"
+        lease = cast(_WorkflowWorkspaceService, service).acquire_workspace(
             f"dashboard-run:{run_id}",
             branch,
             workspace_root / workspace_id,
@@ -1065,14 +1092,16 @@ class AutonomousLifecycleService:
         ):
             return
         try:
-            clean = bool(worktrees.clean(lease.worktree_path))
+            clean = bool(cast(_WorktreeService, worktrees).clean(lease.worktree_path))
         except Exception:
             clean = False
         try:
             if clean:
-                service.release_workspace(lease_id)
+                cast(_WorkflowWorkspaceService, service).release_workspace(lease_id)
             elif callable(getattr(service, "retain_workspace", None)):
-                service.retain_workspace(lease_id, lease_token)
+                cast(_WorkflowWorkspaceService, service).retain_workspace(
+                    lease_id, lease_token
+                )
         except Exception as error:
             with self._lock:
                 current = self._runs.get(run_id)

@@ -66,24 +66,40 @@ class WorkflowServiceDeliveryMixin:
                 return "The leased worktree path is unavailable or not isolated."
             prefix = git_text("-C", str(workspace), "rev-parse", "--show-prefix")
             if prefix is None:
+                git_pointer = workspace / ".git"
+                if git_pointer.is_file():
+                    pointer = git_pointer.read_text(encoding="utf-8").strip()
+                    if pointer.casefold().startswith("gitdir:"):
+                        worktree_git_path = Path(pointer[7:].strip())
+                        if not worktree_git_path.is_absolute():
+                            worktree_git_path = workspace / worktree_git_path
+                        root_common = git_text("rev-parse", "--git-common-dir")
+                        if root_common is not None:
+                            root_common_path = Path(root_common)
+                            if not root_common_path.is_absolute():
+                                root_common_path = (
+                                    self.worktrees.repository / root_common_path
+                                )
+                            if root_common_path.resolve() not in worktree_git_path.resolve().parents:
+                                return "The leased worktree belongs to a different repository."
                 return "The leased worktree could not be opened as a Git worktree."
             if prefix:
                 return "The exact leased worktree could not be verified."
-            root_common = git_text(
-                "rev-parse", "--path-format=absolute", "--git-common-dir"
-            )
+            root_common = git_text("rev-parse", "--git-common-dir")
             worktree_common = git_text(
-                "-C",
-                str(workspace),
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-common-dir",
+                "-C", str(workspace), "rev-parse", "--git-common-dir"
             )
             if root_common is None or worktree_common is None:
                 return "The leased worktree repository could not be verified."
+            root_common_path = Path(root_common)
+            if not root_common_path.is_absolute():
+                root_common_path = self.worktrees.repository / root_common_path
+            worktree_common_path = Path(worktree_common)
+            if not worktree_common_path.is_absolute():
+                worktree_common_path = workspace / worktree_common_path
             if (
-                root_common.replace("\\", "/").casefold()
-                != worktree_common.replace("\\", "/").casefold()
+                root_common_path.resolve().as_posix().casefold()
+                != worktree_common_path.resolve().as_posix().casefold()
             ):
                 return "The leased worktree belongs to a different repository."
             branch = git_text("-C", str(workspace), "branch", "--show-current")

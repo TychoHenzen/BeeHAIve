@@ -401,7 +401,9 @@ class AgentScheduler:
             if isinstance(value, str)
         )
         return redact_worker_text(
-            format_worker_exception(error), secret_values, max_length=16_000
+            f"{type(error).__name__}: {format_worker_exception(error)}",
+            secret_values,
+            max_length=16_000,
         )
 
     def _run(self) -> None:
