@@ -48,6 +48,7 @@ const ACTION_LABELS = {
   autonomous_start: "Autonomous lifecycle started",
   answer_question: "Operator answer recorded",
   approve: "Approval recorded",
+  capture_idea: "Idea capture started",
   clarify: "Clarification requested",
   commit_push: "Delivery retried",
   deliver: "Delivery completed",
@@ -739,8 +740,58 @@ export function createDashboardUi({
     return row;
   }
 
+  function renderWorkflowQueues(items) {
+    const queues = list(currentState?.queues);
+    if (!queues.length) return false;
+    const grouped = new Map(queues.map((queue) => [String(queue.id), []]));
+    filterItems(items, currentFilter).forEach((item) => {
+      const queueId = map(item.pbi.workflow_queue).id;
+      if (typeof queueId === "string" && grouped.has(queueId)) {
+        grouped.get(queueId).push(item);
+      }
+    });
+    queueTable.className = "queue-table workflow-queues";
+    queueTable.replaceChildren();
+    queues.forEach((queue) => {
+      const section = element("section", undefined, "workflow-queue");
+      section.dataset.testid = "workflow-queue-" + text(queue.id, "unknown");
+      const heading = element("div", undefined, "workflow-queue-heading");
+      const queueItems = grouped.get(String(queue.id)) || [];
+      heading.append(
+        element("h3", text(queue.label, text(queue.id, "Queue"))),
+        element("span", text(queueItems.length, "0"), "workflow-queue-count"),
+        element("p", "Owner: " + text(queue.owner, "No next skill")),
+      );
+      section.append(heading);
+      const itemList = element("div", undefined, "workflow-queue-items");
+      if (!queueItems.length) {
+        itemList.append(
+          element(
+            "div",
+            currentFilter === "all" ? "Queue empty." : "Nothing matches this filter.",
+            "workflow-queue-empty",
+          ),
+        );
+      } else {
+        queueItems.forEach((item) => itemList.append(renderRow(item)));
+      }
+      section.append(itemList);
+      queueTable.append(section);
+    });
+    if (selectedKey) {
+      const selected = filterItems(items, currentFilter).find(
+        (item) => item.repository + ":" + item.pbi.number === selectedKey,
+      );
+      if (selected) renderInspector(selected);
+      else closeInspector();
+    }
+    return true;
+  }
+
   function renderQueue(items) {
     renderFilters(items);
+    if (renderWorkflowQueues(items)) return;
+    queueTable.className = "queue-table";
     const visible = filterItems(items, currentFilter).sort((left, right) => {
       const rank = (item) => item.pbi.status === "active" && item.pbi.run_id ? 0 : needsAttention(item.pbi) ? 1 : item.pbi.claimable ? 2 : isCompleted(item.pbi) ? 4 : 3;
       return rank(left) - rank(right);

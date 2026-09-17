@@ -40,6 +40,362 @@ def test_dashboard_projection_exposes_autonomous_handoffs_from_actions() -> None
     ]
 
 
+def test_dashboard_projection_assigns_each_delivery_queue_from_live_evidence() -> None:
+    def pull_request(review_decision: str | None = None) -> dict[str, object]:
+        value: dict[str, object] = {"number": 9, "state": "open"}
+        if review_decision is not None:
+            value["review_decision"] = review_decision
+        return value
+
+    state = {
+        "project_id": "project-1",
+        "name": "Planning",
+        "repositories": [
+            {
+                "name": "owner/api",
+                "pbis": [
+                    {"number": 1, "title": "Backlog", "planning_status": "Backlog"},
+                    {"number": 2, "title": "Todo", "planning_status": "Todo"},
+                    {
+                        "number": 3,
+                        "title": "Publish",
+                        "stage": "implement",
+                        "planning_status": "In Progress",
+                        "branch": "codex/3-publish",
+                    },
+                    {
+                        "number": 4,
+                        "title": "Review",
+                        "stage": "pull_request",
+                        "planning_status": "In Progress",
+                        "metadata": {
+                            "pull_requests": [pull_request()],
+                            "checks": {"verdict": "passing"},
+                        },
+                    },
+                    {
+                        "number": 5,
+                        "title": "Repair",
+                        "stage": "pull_request",
+                        "planning_status": "In Progress",
+                        "metadata": {
+                            "pull_requests": [pull_request("changes_requested")],
+                            "checks": {"verdict": "passing"},
+                        },
+                    },
+                    {
+                        "number": 6,
+                        "title": "Complete",
+                        "stage": "pull_request",
+                        "planning_status": "In Progress",
+                        "metadata": {
+                            "pull_requests": [
+                                {**pull_request("approved"), "head_sha": "head-6"}
+                            ],
+                            "checks": {"verdict": "passing"},
+                        },
+                    },
+                    {
+                        "number": 7,
+                        "title": "Blocked",
+                        "stage": "implement",
+                        "planning_status": "In Progress",
+                        "status": "failed",
+                    },
+                    {
+                        "number": 8,
+                        "title": "Completed",
+                        "planning_status": "Done",
+                        "archived": True,
+                    },
+                ],
+            }
+        ],
+    }
+
+    view = build_dashboard_state(
+        state,
+        [
+            {
+                "kind": "skill:next-ticket",
+                "status": "succeeded",
+                "repository": "owner/api",
+                "pbi_number": 3,
+                "result": {"status": "succeeded"},
+            },
+            {
+                "kind": "skill:submit-draft-pr",
+                "status": "succeeded",
+                "repository": "owner/api",
+                "pbi_number": 4,
+                "result": {"status": "published"},
+            },
+            {
+                "kind": "skill:review-pr-branch",
+                "status": "succeeded",
+                "repository": "owner/api",
+                "pbi_number": 6,
+                "result": {
+                    "status": "succeeded",
+                    "handover": {"pull_request": 9, "head": "head-6"},
+                },
+            },
+        ],
+    )
+
+    queue_ids = [queue["id"] for queue in view["queues"]]
+    assert queue_ids == [
+        "refinement",
+        "implementation",
+        "publish",
+        "review",
+        "repair",
+        "completion",
+        "blocked",
+        "completed",
+    ]
+    assert {queue["id"]: queue["count"] for queue in view["queues"]} == {
+        "refinement": 1,
+        "implementation": 1,
+        "publish": 1,
+        "review": 1,
+        "repair": 1,
+        "completion": 1,
+        "blocked": 1,
+        "completed": 0,
+    }
+    active = {pbi["number"]: pbi for pbi in view["repositories"][0]["pbis"]}
+    assert active[1]["workflow_queue"]["id"] == "refinement"
+    assert active[2]["workflow_queue"]["next_skill"] == "next-ticket"
+    assert active[3]["workflow_queue"]["id"] == "publish"
+    assert active[4]["workflow_queue"]["id"] == "review"
+    assert active[5]["workflow_queue"]["id"] == "repair"
+    assert active[6]["workflow_queue"]["id"] == "completion"
+    assert active[7]["workflow_queue"]["id"] == "blocked"
+    archived = build_dashboard_state(state, include_archived=True)
+    assert {queue["id"]: queue["count"] for queue in archived["queues"]}[
+        "completed"
+    ] == 1
+
+
+def test_old_review_head_does_not_complete_new_pull_request() -> None:
+    view = build_dashboard_state(
+        {
+            "project_id": "project-1",
+            "name": "Planning",
+            "repositories": [
+                {
+                    "name": "owner/api",
+                    "pbis": [
+                        {
+                            "number": 1,
+                            "title": "New pull request",
+                            "stage": "pull_request",
+                            "planning_status": "In Progress",
+                            "metadata": {
+                                "pull_requests": [
+                                    {
+                                        "number": 9,
+                                        "state": "open",
+                                        "head_sha": "new-head",
+                                    }
+                                ],
+                                "checks": {"verdict": "passing"},
+                            },
+                        }
+                    ],
+                }
+            ],
+        },
+        [
+            {
+                "kind": "skill:review-pr-branch",
+                "status": "succeeded",
+                "repository": "owner/api",
+                "pbi_number": 1,
+                "result": {
+                    "status": "succeeded",
+                    "handover": {
+                        "pull_request": 9,
+                        "head": "old-head",
+                    },
+                },
+            }
+        ],
+    )
+
+    pbi = view["repositories"][0]["pbis"][0]
+    assert pbi["workflow_queue"]["id"] == "review"
+    assert pbi["workflow_queue"]["reason"].startswith(
+        "A published pull request is waiting"
+    )
+
+
+def test_provider_and_requeue_state_beat_old_actions() -> None:
+    old_complete = {
+        "kind": "skill:complete-pr",
+        "status": "succeeded",
+        "repository": "owner/api",
+        "pbi_number": 1,
+        "result": {
+            "status": "succeeded",
+            "handover": {
+                "pull_request": 9,
+                "head": "old-head",
+            },
+        },
+    }
+    state = {
+        "project_id": "project-1",
+        "name": "Planning",
+        "repositories": [
+            {
+                "name": "owner/api",
+                "pbis": [
+                    {
+                        "number": 1,
+                        "title": "Still in Backlog",
+                        "planning_status": "Backlog",
+                        "archived": False,
+                    }
+                ],
+            }
+        ],
+    }
+
+    view = build_dashboard_state(state, [old_complete])
+    pbi = view["repositories"][0]["pbis"][0]
+    assert pbi["status"] == "idle"
+    assert pbi["archived"] is False
+    assert pbi["workflow_queue"]["id"] == "refinement"
+
+    requeued = build_dashboard_state(
+        {
+            **state,
+            "repositories": [
+                {
+                    "name": "owner/api",
+                    "pbis": [
+                        {
+                            "number": 1,
+                            "title": "Requeued work",
+                            "stage": "implement",
+                            "planning_status": "In Progress",
+                            "archived": False,
+                        }
+                    ],
+                }
+            ],
+        },
+        [
+            {
+                "kind": "requeue",
+                "status": "succeeded",
+                "repository": "owner/api",
+                "pbi_number": 1,
+            },
+            old_complete,
+        ],
+    )
+    assert requeued["repositories"][0]["pbis"][0]["workflow_queue"]["id"] == (
+        "implementation"
+    )
+
+
+def test_dashboard_projection_requires_review_and_repair_evidence() -> None:
+    open_pull_request = {
+        "number": 9,
+        "state": "open",
+        "head_sha": "head-9",
+        "review_decision": "approved",
+    }
+    base = {
+        "project_id": "project-1",
+        "name": "Planning",
+        "repositories": [
+            {
+                "name": "owner/api",
+                "pbis": [
+                    {
+                        "number": 1,
+                        "title": "Needs evidence",
+                        "stage": "pull_request",
+                        "planning_status": "In Progress",
+                        "metadata": {
+                            "pull_requests": [open_pull_request],
+                            "checks": {"verdict": "passing"},
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+    without_review = build_dashboard_state(base)
+    assert without_review["repositories"][0]["pbis"][0]["workflow_queue"]["id"] == (
+        "review"
+    )
+    unbound_review = build_dashboard_state(
+        base,
+        [
+            {
+                "kind": "skill:review-pr-branch",
+                "status": "succeeded",
+                "repository": "owner/api",
+                "pbi_number": 1,
+                "result": {"status": "succeeded", "handover": {}},
+            }
+        ],
+    )
+    assert unbound_review["repositories"][0]["pbis"][0]["workflow_queue"]["id"] == (
+        "blocked"
+    )
+    no_checks = build_dashboard_state(
+        {
+            **base,
+            "repositories": [
+                {
+                    "name": "owner/api",
+                    "pbis": [
+                        {
+                            **base["repositories"][0]["pbis"][0],
+                            "metadata": {"pull_requests": [open_pull_request]},
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    assert no_checks["repositories"][0]["pbis"][0]["workflow_queue"]["id"] == (
+        "blocked"
+    )
+    repair = build_dashboard_state(
+        base,
+        [
+            {
+                "kind": "skill:review-pr-branch",
+                "status": "succeeded",
+                "repository": "owner/api",
+                "pbi_number": 1,
+                "result": {
+                    "status": "succeeded",
+                    "handover": {
+                        "pull_request": 9,
+                        "head": "head-9",
+                        "findings": [{"id": "one"}, {"id": "two"}],
+                    },
+                },
+            }
+        ],
+    )
+    evidence = repair["repositories"][0]["pbis"][0]["workflow_queue"]["evidence"]
+    assert repair["repositories"][0]["pbis"][0]["workflow_queue"]["id"] == "repair"
+    assert evidence["finding_count"] == 2
+    assert evidence["finding_ids"] == ["one", "two"]
+    assert evidence["all_findings_selected"] is True
+    assert evidence["re_review"] is False
+
+
 def test_dashboard_projection_overlays_autonomous_run_state_until_sync() -> None:
     state = {
         "project_id": "project-1",
@@ -72,8 +428,11 @@ def test_dashboard_projection_overlays_autonomous_run_state_until_sync() -> None
             }
         ],
     )
-    assert completed["repositories"][0]["pbis"] == []
-    assert completed["recent_deliveries"][0]["pbi"]["status"] == "completed"
+    completed_pbi = completed["repositories"][0]["pbis"][0]
+    assert completed_pbi["status"] == "idle"
+    assert completed_pbi["autonomous_status"] == "completed"
+    assert completed_pbi["workflow_queue"]["id"] == "blocked"
+    assert completed["recent_deliveries"][0]["pbi"]["result"] == "Delivered."
 
 
 def test_provider_completion_clears_old_autonomous_failure() -> None:

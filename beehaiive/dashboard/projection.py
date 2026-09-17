@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 
 from .values import mapping, mappings, sequence
-from .views import pbi_view, repository_view
+from .views import pbi_view, queue_definitions, repository_view
 
 
 def build_dashboard_state(
@@ -16,10 +16,28 @@ def build_dashboard_state(
     repositories: list[dict[str, object]] = []
     all_pbis: list[dict[str, object]] = []
     recent_deliveries: list[dict[str, object]] = []
+    queue_items: dict[str, list[dict[str, object]]] = {
+        str(queue["id"]): [] for queue in queue_definitions()
+    }
     for raw_repository in mappings(state.get("repositories")):
         repository = repository_view(raw_repository, actions, include_archived)
         repositories.append(repository)
-        all_pbis.extend(mappings(repository.get("pbis")))
+        visible_pbis = mappings(repository.get("pbis"))
+        all_pbis.extend(visible_pbis)
+        for pbi in visible_pbis:
+            queue = mapping(pbi.get("workflow_queue"))
+            queue_id = queue.get("id")
+            if isinstance(queue_id, str) and queue_id in queue_items:
+                queue_items[queue_id].append(
+                    {
+                        "repository": raw_repository.get("name"),
+                        "pbi_number": pbi.get("number"),
+                        "title": pbi.get("title"),
+                        "reason": queue.get("reason"),
+                        "evidence": dict(mapping(queue.get("evidence"))),
+                        "next_skill": queue.get("next_skill"),
+                    }
+                )
         for raw_pbi in mappings(raw_repository.get("pbis")):
             pbi = pbi_view(raw_pbi, raw_repository.get("name"), actions)
             if (
@@ -83,4 +101,12 @@ def build_dashboard_state(
         "repositories": repositories,
         "recent_deliveries": recent_deliveries[-100:],
         "actions": [dict(action) for action in actions],
+        "queues": [
+            {
+                **queue,
+                "count": len(queue_items[str(queue["id"])]),
+                "items": queue_items[str(queue["id"])],
+            }
+            for queue in queue_definitions()
+        ],
     }

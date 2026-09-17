@@ -141,6 +141,31 @@ def test_guided_demo_recovers_from_operator_question(dashboard_page) -> None:
 
 
 @pytest.mark.e2e
+def test_dashboard_shows_staged_queues_and_quick_idea_entry(dashboard_page) -> None:
+    page, base_url = dashboard_page
+    page.goto(f"{base_url}/dashboard?demo=true")
+
+    expect(page.get_by_test_id("workflow-queue-refinement")).to_contain_text(
+        "Add account recovery"
+    )
+    expect(page.get_by_test_id("workflow-queue-review")).to_contain_text(
+        "Harden session expiry"
+    )
+    expect(page.get_by_test_id("workflow-queue-blocked")).to_contain_text(
+        "Choose deployment target"
+    )
+    expect(page.locator("#idea-project")).to_have_value("demo:1")
+
+    page.locator("#idea-text").fill("Capture a new dashboard idea")
+    page.locator("#idea-form").get_by_role("button", name="Capture idea").click()
+
+    expect(page.locator("#idea-feedback")).to_contain_text("Idea capture completed.")
+    expect(page.get_by_test_id("workflow-queue-refinement")).to_contain_text(
+        "Capture a new dashboard idea"
+    )
+
+
+@pytest.mark.e2e
 def test_real_mode_uses_server_owned_auth_for_actions(dashboard_page) -> None:
     page, base_url = dashboard_page
     state = {

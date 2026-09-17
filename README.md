@@ -126,6 +126,17 @@ retained in the action log and appears in the run inspector. The advisor runs
 once for a blocker, and the run pauses for operator-directed resolution rather
 than guessing how to apply advice.
 
+The Queue view separates Refinement, Implementation, Publish, Review, Repair,
+Completion, Blocked, and Completed work. The server assigns each PBI one queue
+from Project Status and current handoff evidence, so the browser and scheduler
+use the same next-skill decision.
+
+Quick idea entry accepts bounded text and an allowlisted Project selection, then
+starts one add-backlog-idea context. Its pending, succeeded, or failed action
+appears in the dashboard, and a successful capture is visible in that
+Project's Backlog. The read-only dashboard config endpoint supplies the
+allowlisted Project IDs.
+
 ## Create a PBI through the API
 
 Send an authenticated request for a repository linked to the configured

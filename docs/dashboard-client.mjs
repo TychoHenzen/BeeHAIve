@@ -134,6 +134,8 @@ export function createDashboardClient({
       }
       if (result.action.status === "failed") {
         onStatus(`${payload.action} failed: ${result.action.error}`, "failure");
+      } else if (result.action.status === "pending") {
+        onStatus(payload.action + " pending...", "pending");
       } else {
         onStatus(`${payload.action} succeeded.`, "success");
       }

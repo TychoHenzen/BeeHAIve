@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
+import tempfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -19,6 +21,7 @@ from beehaiive.agent_parts.worker_text import (
     safe_worker_environment,
     worker_secret_values,
 )
+from beehaiive.dashboard.values import safe_dashboard_value
 from beehaiive.workflow import WorkspaceLease
 
 
@@ -49,6 +52,7 @@ class _WorkflowWorkspaceService(Protocol):
 __all__ = [
     "ADVISOR_STEP",
     "AUTONOMOUS_STEPS",
+    "IDEA_CAPTURE_STEP",
     "AutonomousLifecycleRunner",
     "AutonomousLifecycleService",
     "AutonomousRunResult",
@@ -109,6 +113,36 @@ def _last_json_mapping(output: str) -> Mapping[str, object] | None:
     return best
 
 
+def _session_result(output: object) -> Mapping[str, object]:
+    if not isinstance(output, str) or not output.startswith("[stdout]\n"):
+        return {}
+    stdout = output[len("[stdout]\n") :].split("\n\n[stderr]", 1)[0].lstrip()
+    try:
+        value, _ = json.JSONDecoder().raw_decode(stdout)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return _mapping(value)
+
+
+def _review_handover(result: Mapping[str, object]) -> dict[str, object]:
+    handover = _handover(result.get("handover"))
+    if handover.get("review_complete") is not True:
+        return handover
+    summary = _mapping(result.get("summary"))
+    if not summary:
+        summary = _mapping(_session_result(result.get("session_output")).get("summary"))
+    for key in ("branch", "pr", "pull_request", "head", "head_commit"):
+        value = summary.get(key)
+        if isinstance(value, (str, int)):
+            handover[key] = value
+    findings = summary.get("findings")
+    if isinstance(findings, Sequence) and not isinstance(
+        findings, (str, bytes, bytearray)
+    ):
+        handover["review_findings"] = list(cast(Sequence[object], findings))
+    return handover
+
+
 @dataclass(frozen=True, slots=True)
 class SkillStep:
     name: str
@@ -155,6 +189,12 @@ ADVISOR_STEP = SkillStep(
     _skill_path("codex-advisor"),
     "Give one bounded second opinion for a blocker without mutating the repository.",
     model="gpt-5.6-luna",
+)
+
+IDEA_CAPTURE_STEP = SkillStep(
+    "add-backlog-idea",
+    _skill_path("add-backlog-idea"),
+    "Parse one operator idea into a concise Backlog issue for the selected Project.",
 )
 
 DEFAULT_AUTONOMOUS_MODEL = "gpt-5.6-luna"
@@ -208,6 +248,10 @@ class AutonomousOrchestrator(Protocol):
     @property
     def store(self) -> AutonomousStore: ...
 
+    def synchronize(
+        self, project_id: str, *, force_refresh: bool = False
+    ) -> dict[str, object]: ...
+
 
 @dataclass(frozen=True, slots=True)
 class SkillHandoff:
@@ -257,6 +301,44 @@ def _text(value: object, fallback: str = "") -> str:
     return value.strip() if isinstance(value, str) and value.strip() else fallback
 
 
+def _idea_issue_references(
+    handover: Mapping[str, object],
+) -> list[Mapping[str, object]]:
+    references: list[Mapping[str, object]] = [handover]
+    for key in ("issues", "created_issues", "features"):
+        value = handover.get(key)
+        if isinstance(value, Sequence) and not isinstance(
+            value, (str, bytes, bytearray)
+        ):
+            references.extend(
+                cast(Mapping[str, object], item)
+                for item in cast(Sequence[object], value)
+                if isinstance(item, Mapping)
+            )
+    return references
+
+
+def _idea_handover_is_valid(handover: Mapping[str, object], project_id: str) -> bool:
+    for reference in _idea_issue_references(handover):
+        number = reference.get("issue_number") or reference.get("number")
+        project = (
+            reference.get("project_id")
+            or reference.get("target_project")
+            or _mapping(reference.get("project")).get("id")
+        )
+        status = reference.get("project_status") or _mapping(
+            reference.get("project")
+        ).get("status")
+        if (
+            type(number) is int
+            and number > 0
+            and str(status or "").casefold() == "backlog"
+            and (project is None or project == project_id)
+        ):
+            return True
+    return False
+
+
 def _pbi_candidates(
     repositories: Iterable[object], *, include_in_progress: bool = False
 ) -> list[dict[str, object]]:
@@ -304,12 +386,29 @@ def select_work_item(repositories: Iterable[object]) -> dict[str, object] | None
 def _candidate_sort_key(item: Mapping[str, object]) -> tuple[int, int]:
     raw_number = item.get("pbi_number")
     number = raw_number if type(raw_number) is int else 2_147_483_647
-    return (0 if item.get("planning_status") == "todo" else 1, number)
+    priority = {"todo": 0, "in progress": 1, "backlog": 2}.get(
+        _text(item.get("planning_status")).casefold(), 3
+    )
+    return priority, number
 
 
 def _start_index(context: Mapping[str, object]) -> int:
+    requested_step = _text(context.get("resume_step")).casefold()
+    if requested_step:
+        for index, step in enumerate(AUTONOMOUS_STEPS):
+            if step.name == requested_step:
+                return index
     planning_status = _text(context.get("planning_status")).casefold()
-    return 0 if planning_status == "backlog" else 1
+    if planning_status == "backlog":
+        return 0
+    stage = _text(context.get("stage")).casefold()
+    if stage in {"pull_request", "review"}:
+        return 3
+    if stage == "merge":
+        return 5
+    if stage == "implement" and context.get("branch"):
+        return 2
+    return 1
 
 
 def _handover(value: object) -> dict[str, object]:
@@ -534,15 +633,40 @@ class CodexSkillExecutor:
                 "and branch for every lifecycle step. Do not create another "
                 "checkout or branch, and do not modify the server checkout.\n"
             )
+        subject = (
+            f"The scheduler already assigned PBI #{context.get('pbi_number')}."
+            if context.get("pbi_number") is not None
+            else (
+                "The dashboard selected Project "
+                f"{context.get('project_id')!r} for this idea."
+            )
+        )
+        scope = (
+            "Do not create a branch, edit files, create subtasks, or modify the "
+            "checkout. Use the target repository and Project supplied in context. "
+            "For success, return issue_number or an issues list with issue numbers, "
+            "project_status Backlog, and the selected project ID after readback."
+            if step.name == "add-backlog-idea"
+            else (
+                "Keep all linked subtasks on the same branch. Submit the pull "
+                "request published, not draft. Do not re-run review after applying "
+                "selected fixes."
+            )
+        )
         prompt = (
             "You are one autonomous BeeHAIve lifecycle context. Read and follow "
             f"this skill file exactly: {step.skill_path}\n"
             f"Stage purpose: {step.purpose}\n"
-            "Use the supplied PBI context and handover. Keep all linked subtasks "
-            "on the same branch. Submit the pull request published, not draft. "
-            "Do not re-run review after applying selected fixes. Return one JSON "
+            "Use the supplied context and handover. "
+            f"{scope} "
+            + (
+                "Do not re-run review after applying selected fixes. "
+                if step.name != "add-backlog-idea"
+                else ""
+            )
+            + "Return one JSON "
             "object with status, summary, and handover. Do not include secrets. "
-            f"The scheduler already assigned PBI #{context.get('pbi_number')}. "
+            f"{subject} "
             "Do not ask the operator to choose another PBI. This context is "
             "unattended. Never ask for input or wait for approval. The JSON is "
             "an internal handover after doing the stage work, not a substitute "
@@ -734,21 +858,43 @@ class AutonomousLifecycleService:
             ):
                 raise ValueError("Requested PBI is outside the configured checkout")
             state = self.orchestrator.store.project_state(project_id)
+            actions = self.orchestrator.store.actions_for_project(project_id)
+            resumable = self._resumable_items(actions)
+            eligible_in_progress = resumable | self._requeued_items(actions)
             excluded: set[tuple[str, int]] = (
                 set()
                 if pbi_number is not None
-                else self._completed_or_blocked_items(
-                    self.orchestrator.store.actions_for_project(project_id)
-                )
+                else self._completed_or_blocked_items(actions)
             )
-            selected = self._select(state, selected_repository, pbi_number, excluded)
+            selected = self._select(
+                state,
+                selected_repository,
+                pbi_number,
+                excluded,
+                eligible_in_progress,
+            )
             if selected is None:
-                raise ValueError("No eligible Todo or Backlog PBI is available")
+                raise ValueError("No eligible lifecycle PBI is available")
             selected_number = selected.get("pbi_number")
             if type(selected_number) is not int or selected_number <= 0:
                 raise ValueError("Selected PBI number is invalid")
             run_id = str(uuid4())
             context = {"project_id": project_id, **selected, "run_id": run_id}
+            if (
+                pbi_number is not None
+                or (
+                    str(selected["repository"]),
+                    selected_number,
+                )
+                in resumable
+            ):
+                context.update(
+                    self._resume_context(
+                        actions,
+                        str(selected["repository"]),
+                        selected_number,
+                    )
+                )
             action = self.orchestrator.store.begin_action(
                 project_id,
                 "autonomous_start",
@@ -778,6 +924,56 @@ class AutonomousLifecycleService:
             target=self._run,
             args=(run_id, context, str(action["id"])),
             name=f"beehaiive-autonomous-{run_id[:8]}",
+            daemon=True,
+        ).start()
+        return self.status(run_id)
+
+    def capture_idea(
+        self, project_id: str, idea: str, action_id: str
+    ) -> dict[str, object]:
+        if not idea.strip():
+            raise ValueError("An idea is required")
+        if len(idea) > 8_000:
+            raise ValueError("An idea must be at most 8000 characters")
+        with self._lock:
+            if project_id in self._active_projects:
+                raise ValueError("An autonomous lifecycle is already running")
+            if len(self._active_projects) >= self._max_concurrency:
+                raise ValueError("Autonomous worker capacity is full")
+            if self._executor is None and not self._configured_repository:
+                raise ValueError("Idea capture requires a configured target repository")
+            run_id = str(uuid4())
+            repository = self._configured_repository or "configured repository"
+            context = {
+                "project_id": project_id,
+                "repository": repository,
+                "target_project": project_id,
+                "target_repository": repository,
+                "idea": idea.strip(),
+                "run_id": run_id,
+            }
+            self._active_projects.add(project_id)
+            self._runs[run_id] = {
+                "run_id": run_id,
+                "project_id": project_id,
+                "repository": repository,
+                "pbi_number": None,
+                "kind": "idea_capture",
+                "status": "running",
+                "current_step": IDEA_CAPTURE_STEP.name,
+                "started_at": _now_iso(),
+                "step_started_at": _now_iso(),
+                "last_output_at": None,
+                "last_output": None,
+                "process": {"state": "starting"},
+                "handoffs": [],
+                "session_events": [],
+                "action_id": action_id,
+            }
+        Thread(
+            target=self._run_idea,
+            args=(run_id, context, action_id),
+            name=f"beehaiive-idea-{run_id[:8]}",
             daemon=True,
         ).start()
         return self.status(run_id)
@@ -821,12 +1017,15 @@ class AutonomousLifecycleService:
         for project_id in project_ids:
             for action in self.orchestrator.store.actions_for_project(project_id):
                 if (
-                    action.get("kind") != "autonomous_start"
+                    action.get("kind") not in {"autonomous_start", "capture_idea"}
                     or action.get("status") != "pending"
                 ):
                     continue
                 detail = (
                     "Autonomous run did not survive the server restart; "
+                    "no live worker process is attached."
+                    if action.get("kind") == "autonomous_start"
+                    else "Idea capture did not survive the server restart; "
                     "no live worker process is attached."
                 )
                 self.orchestrator.store.finish_action(
@@ -844,6 +1043,7 @@ class AutonomousLifecycleService:
         repository: str | None,
         pbi_number: int | None,
         excluded: set[tuple[str, int]],
+        resumable: set[tuple[str, int]] | None = None,
     ) -> dict[str, object] | None:
         raw_repositories = state.get("repositories", ())
         repositories = (
@@ -852,9 +1052,22 @@ class AutonomousLifecycleService:
             and not isinstance(raw_repositories, (str, bytes, bytearray))
             else ()
         )
+        resumable = resumable or set()
         candidates = _pbi_candidates(
-            repositories, include_in_progress=pbi_number is not None
+            repositories,
+            include_in_progress=pbi_number is not None or bool(resumable),
         )
+        if pbi_number is None:
+            candidates = [
+                item
+                for item in candidates
+                if item["planning_status"] != "in progress"
+                or (
+                    isinstance(item.get("repository"), str)
+                    and type(item.get("pbi_number")) is int
+                    and (item["repository"], item["pbi_number"]) in resumable
+                )
+            ]
         if repository is not None:
             candidates = [
                 item for item in candidates if item["repository"] == repository
@@ -876,6 +1089,143 @@ class AutonomousLifecycleService:
         return candidates[0] if candidates else None
 
     @staticmethod
+    def _resumable_items(
+        actions: Sequence[Mapping[str, object]],
+    ) -> set[tuple[str, int]]:
+        resumable: set[tuple[str, int]] = set()
+        for action in actions:
+            if (
+                action.get("kind") != "autonomous_start"
+                or action.get("status") != "failed"
+            ):
+                continue
+            repository = action.get("repository")
+            pbi_number = action.get("pbi_number")
+            if (
+                isinstance(repository, str)
+                and type(pbi_number) is int
+                and AutonomousLifecycleService._resume_context(
+                    actions, repository, pbi_number
+                )
+            ):
+                resumable.add((repository, pbi_number))
+        return resumable
+
+    @staticmethod
+    def _resume_context(
+        actions: Sequence[Mapping[str, object]], repository: str, pbi_number: int
+    ) -> dict[str, object]:
+        step_names = [step.name for step in AUTONOMOUS_STEPS]
+        scoped_actions = [
+            action
+            for action in actions
+            if action.get("repository") == repository
+            and action.get("pbi_number") == pbi_number
+        ]
+        requeue_index = next(
+            (
+                index
+                for index, action in enumerate(scoped_actions)
+                if action.get("kind") == "requeue"
+                and action.get("status") == "succeeded"
+            ),
+            None,
+        )
+        if requeue_index is not None:
+            scoped_actions = scoped_actions[: requeue_index + 1]
+        known_handover: dict[str, object] = {}
+        for action in scoped_actions:
+            for source in (
+                _mapping(_mapping(action.get("result")).get("handover")),
+                _mapping(_mapping(action.get("request")).get("handover")),
+            ):
+                if not isinstance(
+                    source.get("branch") or source.get("workspace_branch"), str
+                ):
+                    continue
+                known_handover = {
+                    key: value
+                    for key, value in source.items()
+                    if key in {"branch", "pr", "pull_request", "head", "head_commit"}
+                    and isinstance(value, (str, int))
+                }
+                break
+            if known_handover:
+                break
+        for action in scoped_actions:
+            kind = _text(action.get("kind"))
+            if not kind.startswith("skill:") or kind == "skill:codex-advisor":
+                continue
+            step = kind[6:]
+            if step not in step_names:
+                continue
+            result = _mapping(action.get("result"))
+            handover = _review_handover(result)
+            review_complete = (
+                step == "review-pr-branch" and handover.get("review_complete") is True
+            )
+            if review_complete:
+                stable_handover = {
+                    key: value
+                    for key, value in known_handover.items()
+                    if key in {"branch", "workspace_branch", "pr", "pull_request"}
+                }
+                handover = {**stable_handover, **handover}
+            published = step == "submit-draft-pr" and (
+                handover.get("draft") is False or bool(handover.get("pull_request"))
+            )
+            successful = (
+                action.get("status") == "succeeded"
+                or _skill_status(result.get("status")) == "succeeded"
+                or published
+            )
+            if not successful and not review_complete:
+                if not handover.get("branch") and not handover.get("workspace_branch"):
+                    continue
+                if step != "complete-pr":
+                    return {}
+            next_index = step_names.index(step) + 1
+            if next_index >= len(step_names):
+                if step != "complete-pr":
+                    return {}
+                next_index = step_names.index(step)
+            resume: dict[str, object] = {
+                "resume_step": step_names[next_index],
+                "resume_existing_workspace": True,
+            }
+            for key in ("branch", "pr", "pull_request", "head", "head_commit"):
+                value = handover.get(key)
+                if isinstance(value, (str, int)):
+                    resume[key] = value
+                    if key == "branch":
+                        resume["workspace_branch"] = value
+            findings = handover.get("review_findings")
+            if isinstance(findings, Sequence) and not isinstance(
+                findings, (str, bytes, bytearray)
+            ):
+                resume["review_findings"] = list(cast(Sequence[object], findings))
+            return resume
+        return {}
+
+    @staticmethod
+    def _requeued_items(
+        actions: Sequence[Mapping[str, object]],
+    ) -> set[tuple[str, int]]:
+        latest: dict[tuple[str, int], Mapping[str, object]] = {}
+        for action in actions:
+            if action.get("kind") not in {"autonomous_start", "requeue"}:
+                continue
+            repository = action.get("repository")
+            pbi_number = action.get("pbi_number")
+            if isinstance(repository, str) and type(pbi_number) is int:
+                latest.setdefault((repository, pbi_number), action)
+        return {
+            key
+            for key, action in latest.items()
+            if action.get("kind") == "requeue" and action.get("status") == "succeeded"
+        }
+
+    @staticmethod
     def _completed_or_blocked_items(
         actions: Sequence[Mapping[str, object]],
     ) -> set[tuple[str, int]]:
@@ -888,14 +1238,14 @@ class AutonomousLifecycleService:
             if isinstance(repository, str) and type(pbi_number) is int:
                 latest.setdefault((repository, pbi_number), action)
         excluded: set[tuple[str, int]] = set()
+        resumable = AutonomousLifecycleService._resumable_items(actions)
         for key, action in latest.items():
             if action.get("kind") == "requeue" and action.get("status") == "succeeded":
                 continue
             result = _mapping(action.get("result"))
             if (
-                action.get("status") in {"pending", "failed"}
-                or result.get("status") == "completed"
-            ):
+                action.get("status") in {"pending", "failed"} and key not in resumable
+            ) or result.get("status") == "completed":
                 excluded.add(key)
         return excluded
 
@@ -1028,6 +1378,211 @@ class AutonomousLifecycleService:
             with self._lock:
                 self._active_projects.discard(str(context["project_id"]))
 
+    def _run_idea(
+        self,
+        run_id: str,
+        context: Mapping[str, object],
+        action_id: str,
+    ) -> None:
+        def record_process(process: Mapping[str, object]) -> None:
+            with self._lock:
+                current = self._runs.get(run_id)
+                if current is not None:
+                    current["process"] = {
+                        **_mapping(current.get("process")),
+                        **dict(process),
+                    }
+
+        def record_output(line: str) -> None:
+            if not line.strip():
+                return
+            event = {
+                "kind": "output",
+                "source_type": "codex",
+                "text": redact_worker_text(line, worker_secret_values()),
+                "created_at": _now_iso(),
+            }
+            with self._lock:
+                current = self._runs.get(run_id)
+                if current is not None:
+                    current["last_output_at"] = event["created_at"]
+                    current["last_output"] = event["text"]
+                    current["session_events"] = [
+                        *cast(list[dict[str, object]], current["session_events"]),
+                        event,
+                    ][-100:]
+
+        idea_workspace: Path | None = None
+        try:
+            mode = os.environ.get("BEEHAIIVE_AUTONOMOUS_MODE", "codex").strip().lower()
+            if self._executor is None and mode == "codex":
+                idea_workspace = self._create_idea_workspace()
+            executor = self._idea_executor(
+                record_output, record_process, idea_workspace
+            )
+            raw = _mapping(
+                executor.execute(
+                    IDEA_CAPTURE_STEP,
+                    context,
+                    {
+                        "run_id": run_id,
+                        "project_id": context["project_id"],
+                        "target_repository": context["target_repository"],
+                        "single_step": True,
+                    },
+                )
+            )
+            raw_status = raw.get("status")
+            status = _skill_status(raw_status) if raw_status is not None else "blocked"
+            handover = _handover(raw.get("handover"))
+            summary = _text(raw.get("summary"), "Idea capture completed")[:4_000]
+            if status == "succeeded" and not _idea_handover_is_valid(
+                handover, str(context["project_id"])
+            ):
+                status = "blocked"
+                summary = (
+                    "Idea capture returned no verified Backlog issue for the "
+                    "selected Project."
+                )
+            if status == "succeeded" and not self._idea_backlog_verified(
+                str(context["project_id"]), handover
+            ):
+                status = "blocked"
+                summary = (
+                    "Idea capture returned an issue that was not read back in "
+                    "the selected Project Backlog."
+                )
+            result = safe_dashboard_value(
+                {
+                    "status": status,
+                    "summary": summary,
+                    "handover": handover,
+                },
+                worker_secret_values(),
+            )
+            safe_result = cast(dict[str, object], result)
+            self.orchestrator.store.finish_action(
+                action_id,
+                "succeeded" if status == "succeeded" else "failed",
+                safe_result,
+                None if status == "succeeded" else summary,
+            )
+            with self._lock:
+                current = self._runs.get(run_id)
+                if current is not None:
+                    current.update(
+                        {
+                            "status": "completed"
+                            if status == "succeeded"
+                            else "blocked",
+                            "current_step": None,
+                            "handoffs": [safe_result],
+                            "result": safe_result,
+                            "error": None if status == "succeeded" else summary,
+                            "finished_at": _now_iso(),
+                        }
+                    )
+        except Exception as error:
+            detail = redact_worker_text(
+                format_worker_exception(error), worker_secret_values()
+            )[:4_000]
+            self.orchestrator.store.finish_action(
+                action_id, "failed", {"status": "blocked", "error": detail}, detail
+            )
+            with self._lock:
+                current = self._runs.get(run_id)
+                if current is not None:
+                    current.update(
+                        {
+                            "status": "blocked",
+                            "current_step": None,
+                            "error": detail,
+                            "finished_at": _now_iso(),
+                        }
+                    )
+        finally:
+            if idea_workspace is not None:
+                shutil.rmtree(idea_workspace, ignore_errors=True)
+            with self._lock:
+                self._active_projects.discard(str(context["project_id"]))
+
+    def _idea_executor(
+        self,
+        on_output: Callable[[str], None],
+        on_process: Callable[[Mapping[str, object]], None],
+        repository: Path | None,
+    ) -> SkillExecutor:
+        if self._executor is not None:
+            return self._executor
+        mode = os.environ.get("BEEHAIIVE_AUTONOMOUS_MODE", "codex").strip().lower()
+        if mode != "codex":
+            return PlaceholderSkillExecutor()
+        if not isinstance(repository, Path):
+            raise RuntimeError(
+                "Idea capture requires an isolated workspace; no checkout was touched"
+            )
+        return CodexSkillExecutor(
+            repository,
+            os.environ.get("BEEHAIIVE_CODEX_EXECUTABLE", "codex"),
+            _autonomous_timeout(),
+            on_output=on_output,
+            on_process=on_process,
+        )
+
+    def _idea_backlog_verified(
+        self, project_id: str, handover: Mapping[str, object]
+    ) -> bool:
+        state = self.orchestrator.synchronize(project_id, force_refresh=True)
+        raw_repositories = state.get("repositories", [])
+        if not isinstance(raw_repositories, Sequence) or isinstance(
+            raw_repositories, (str, bytes, bytearray)
+        ):
+            return False
+        for reference in _idea_issue_references(handover):
+            number = reference.get("issue_number") or reference.get("number")
+            if type(number) is not int or number <= 0:
+                continue
+            expected_repository = (
+                reference.get("repository") or self._configured_repository
+            )
+            for raw_repository in cast(Sequence[object], raw_repositories):
+                repository = _mapping(raw_repository)
+                if (
+                    isinstance(expected_repository, str)
+                    and expected_repository
+                    and repository.get("name") != expected_repository
+                ):
+                    continue
+                raw_pbis = repository.get("pbis", [])
+                for raw_pbi in (
+                    cast(Sequence[object], raw_pbis)
+                    if isinstance(raw_pbis, Sequence)
+                    and not isinstance(raw_pbis, (str, bytes, bytearray))
+                    else ()
+                ):
+                    pbi = _mapping(raw_pbi)
+                    if (
+                        pbi.get("number") == number
+                        and _text(pbi.get("planning_status")).casefold() == "backlog"
+                    ):
+                        return True
+        return False
+
+    @staticmethod
+    def _create_idea_workspace() -> Path:
+        workspace = Path(tempfile.mkdtemp(prefix="beehaiive-idea-"))
+        try:
+            subprocess.run(
+                ("git", "init", "--initial-branch", "master"),
+                cwd=workspace,
+                check=True,
+                capture_output=True,
+            )
+        except Exception:
+            shutil.rmtree(workspace, ignore_errors=True)
+            raise
+        return workspace
+
     def _prepare_workspace(
         self, run_id: str, context: dict[str, object]
     ) -> dict[str, object]:
@@ -1053,7 +1608,10 @@ class AutonomousLifecycleService:
         )
         workspace_root.mkdir(parents=True, exist_ok=True)
         workspace_id = uuid4().hex
-        branch = f"codex/beehaiive-autonomous-{run_id[:12]}"
+        branch = _text(
+            context.get("workspace_branch"),
+            f"codex/beehaiive-autonomous-{run_id[:12]}",
+        )
         base_ref = os.environ.get("BEEHAIIVE_AUTONOMOUS_BASE_REF", "origin/master")
         typed_worktrees = cast(_WorktreeService, worktrees)
         try:
@@ -1064,12 +1622,36 @@ class AutonomousLifecycleService:
                 base_ref = "HEAD"
         except Exception:
             base_ref = "HEAD"
-        lease = cast(_WorkflowWorkspaceService, service).acquire_workspace(
-            f"dashboard-run:{run_id}",
-            branch,
-            workspace_root / workspace_id,
-            base_ref,
-        )
+        workspace_path = workspace_root / workspace_id
+        if context.get("resume_existing_workspace"):
+            existing_loader = getattr(
+                getattr(worktrees, "store", None), "get_lease_for_branch", None
+            )
+            existing = existing_loader(branch) if callable(existing_loader) else None
+            if existing is not None:
+                status = getattr(getattr(existing, "status", None), "value", "")
+                if status != "retained":
+                    raise RuntimeError(
+                        "Autonomous resume found an active branch workspace"
+                    )
+                lease = cast(WorkspaceLease, existing)
+            else:
+                acquire_existing = getattr(worktrees, "acquire_existing", None)
+                if not callable(acquire_existing):
+                    raise RuntimeError(
+                        "Autonomous resume requires an existing-branch worktree manager"
+                    )
+                lease = cast(
+                    WorkspaceLease,
+                    acquire_existing(f"dashboard-run:{run_id}", branch, workspace_path),
+                )
+        else:
+            lease = cast(_WorkflowWorkspaceService, service).acquire_workspace(
+                f"dashboard-run:{run_id}",
+                branch,
+                workspace_path,
+                base_ref,
+            )
         with self._lock:
             self._workspaces[run_id] = lease
         return {
