@@ -965,10 +965,13 @@ class AutonomousLifecycleService:
                     "workspace_branch"
                 ):
                     continue
-                return {}
+                if step != "complete-pr":
+                    return {}
             next_index = step_names.index(step) + 1
             if next_index >= len(step_names):
-                return {}
+                if step != "complete-pr":
+                    return {}
+                next_index = step_names.index(step)
             resume: dict[str, object] = {
                 "resume_step": step_names[next_index],
                 "resume_existing_workspace": True,
