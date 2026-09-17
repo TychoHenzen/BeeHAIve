@@ -218,6 +218,86 @@ def test_real_mode_uses_server_owned_auth_for_actions(dashboard_page) -> None:
 
 
 @pytest.mark.e2e
+def test_evidence_log_shows_latest_server_actions(dashboard_page) -> None:
+    page, base_url = dashboard_page
+    actions = [
+        {
+            "kind": "start",
+            "status": "failed",
+            "repository": "owner/app",
+            "pbi_number": index,
+            "created_at": f"2026-09-09T20:00:{index:02d}Z",
+            "error": "latest launch detail" if index == 9 else f"old-{index}",
+        }
+        for index in range(9, 0, -1)
+    ]
+    state = {
+        "project_id": "owner:1",
+        "name": "Server project",
+        "updated_at": "now",
+        "counts": {},
+        "repositories": [],
+        "actions": actions,
+    }
+
+    def api(route) -> None:
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(state),
+        )
+
+    page.route("**/projects/**", api)
+    page.goto(f"{base_url}/dashboard?project=owner:1")
+    page.get_by_role("button", name="Evidence log", exact=True).click()
+    expect(page.locator("#activity-output")).to_contain_text("latest launch detail")
+    expect(page.locator("#activity-output")).not_to_contain_text("old-1")
+
+
+@pytest.mark.e2e
+def test_agents_exposes_retry_for_blocked_autonomous_work(dashboard_page) -> None:
+    page, base_url = dashboard_page
+    state = {
+        "project_id": "owner:1",
+        "name": "Server project",
+        "updated_at": "now",
+        "counts": {},
+        "repositories": [
+            {
+                "name": "owner/app",
+                "active": True,
+                "writer": {"status": "idle"},
+                "pbis": [
+                    {
+                        "number": 1,
+                        "title": "Blocked autonomous work",
+                        "status": "failed",
+                        "autonomous_status": "blocked",
+                        "last_error": "Launch failed with context",
+                    }
+                ],
+            }
+        ],
+        "actions": [],
+    }
+
+    def api(route) -> None:
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(state),
+        )
+
+    page.route("**/projects/**", api)
+    page.goto(f"{base_url}/dashboard?project=owner:1")
+    page.get_by_role("button", name="Agents", exact=True).click()
+    expect(page.locator("#agents-output")).to_contain_text("Blocked autonomous work")
+    expect(
+        page.locator("#agents-output").get_by_test_id("retry-lifecycle")
+    ).to_be_visible()
+
+
+@pytest.mark.e2e
 def test_real_mode_wires_autonomous_lifecycle_endpoint(dashboard_page) -> None:
     page, base_url = dashboard_page
     state = {

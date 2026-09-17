@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -10,6 +9,8 @@ from pathlib import Path
 from threading import RLock, Thread
 from typing import Protocol, cast
 from uuid import uuid4
+
+from beehaiive.agent_parts.values import resolve_executable
 
 __all__ = [
     "ADVISOR_STEP",
@@ -43,13 +44,6 @@ def _skill_root() -> Path:
 
 def _skill_path(name: str) -> str:
     return str(_skill_root() / name / "SKILL.md")
-
-
-def _resolve_executable(executable: str) -> str:
-    configured = executable.strip()
-    if Path(configured).suffix.lower() in {".bat", ".cmd", ".exe"}:
-        return shutil.which(configured) or configured
-    return shutil.which(f"{configured}.exe") or shutil.which(configured) or configured
 
 
 def _output_tail(value: object) -> str:
@@ -389,7 +383,7 @@ class CodexSkillExecutor:
         timeout_seconds: float = 900.0,
     ) -> None:
         self.repository = Path(repository).resolve()
-        self.executable = _resolve_executable(executable)
+        self.executable = resolve_executable(executable)
         self.timeout_seconds = timeout_seconds
 
     def execute(

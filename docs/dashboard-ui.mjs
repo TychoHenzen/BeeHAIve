@@ -29,6 +29,12 @@ const ACTION_LABELS = {
   stop: "Work stopped",
 };
 
+function actionLabel(action) {
+  const kind = String(action.kind || "");
+  if (kind.startsWith("skill:")) return `Skill handoff · ${kind.slice(6)}`;
+  return ACTION_LABELS[kind] || text(kind, "Action");
+}
+
 function text(value, fallback = "Unavailable") {
   return value === undefined || value === null || value === "" ? fallback : String(value);
 }
@@ -692,6 +698,8 @@ export function createDashboardUi({
       inspect.type = "button";
       inspect.addEventListener("click", () => openInspector(item));
       controls.append(inspect);
+      const spec = actionSpec(item, demo);
+      if (spec) controls.append(actionButton(spec.label, spec, "primary"));
       if (pbi.run_id && pbi.autonomous_status !== "running" && pbi.autonomous_status !== "blocked") {
         const stop = { label: "Stop", testid: "stop-work", payload: { action: "stop", repository: item.repository, run_id: pbi.run_id } };
         controls.append(actionButton(stop.label, stop, "danger"));
@@ -886,7 +894,7 @@ export function createDashboardUi({
 
   function renderActivity(state) {
     activityOutput.replaceChildren();
-    const actions = list(state.actions).slice(-8).reverse();
+    const actions = list(state.actions).slice(0, 8);
     if (!actions.length) {
       activityOutput.append(element("div", "No operator actions yet.", "empty"));
       return;
@@ -895,7 +903,7 @@ export function createDashboardUi({
     actions.forEach((action) => {
       const row = element("li");
       const copy = element("span");
-      copy.append(element("span", `${ACTION_LABELS[action.kind] || text(action.kind, "Action")} · ${text(action.status, "unknown")}${action.repository ? ` · ${action.repository}` : ""}${action.pbi_number ? `#${action.pbi_number}` : ""}`, "activity-main"), element("span", activityDetail(action), "activity-detail"));
+      copy.append(element("span", `${actionLabel(action)} · ${text(action.status, "unknown")}${action.repository ? ` · ${action.repository}` : ""}${action.pbi_number ? `#${action.pbi_number}` : ""}`, "activity-main"), element("span", activityDetail(action), "activity-detail"));
       row.append(element("time", text(action.created_at, "Recent")), copy);
       listNode.append(row);
     });

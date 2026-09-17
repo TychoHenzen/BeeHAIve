@@ -25,6 +25,7 @@ from .constants import (
 )
 from .values import _nonnegative_int as _nonnegative_int
 from .values import _text_value as _text_value
+from .values import resolve_executable as resolve_executable
 from .worker_text import redact_worker_text as redact_worker_text
 from .worker_text import safe_worker_environment as safe_worker_environment
 
@@ -63,7 +64,7 @@ class CodexExecModelExecutor(
         if not task.strip():
             raise ValueError("Agent task is required")
         self.repository = resolved_repository
-        self.executable = executable.strip()
+        self.executable = resolve_executable(executable)
         self.timeout_seconds = timeout_seconds
         self.model = model.strip() if model and model.strip() else None
         self.task = task.strip()

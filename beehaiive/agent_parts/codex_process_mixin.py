@@ -18,21 +18,34 @@ class CodexProcessMixin:
     def _start_process(
         command: list[str], environment: dict[str, str]
     ) -> subprocess.Popen[Any]:
+        cwd = str(Path(command[command.index("--cd") + 1]))
         common: dict[str, Any] = {
-            "cwd": str(Path(command[command.index("--cd") + 1])),
+            "cwd": cwd,
             "env": environment,
             "stdin": subprocess.DEVNULL,
             "stdout": subprocess.PIPE,
             "stderr": subprocess.PIPE,
             "text": False,
         }
-        if os.name == "nt":
-            return subprocess.Popen(
-                command,
-                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-                **common,
-            )
-        return subprocess.Popen(command, start_new_session=True, **common)
+        try:
+            if os.name == "nt":
+                return subprocess.Popen(
+                    command,
+                    creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+                    **common,
+                )
+            return subprocess.Popen(command, start_new_session=True, **common)
+        except FileNotFoundError as error:
+            raise RuntimeError(
+                f"Codex launch failed: executable={command[0]!r}; cwd={cwd!r}; "
+                f"filename={error.filename!r}; errno={error.errno}; "
+                f"message={error.strerror or str(error)}"
+            ) from error
+        except OSError as error:
+            raise RuntimeError(
+                f"Codex launch failed: executable={command[0]!r}; cwd={cwd!r}; "
+                f"errno={error.errno}; message={error.strerror or str(error)}"
+            ) from error
 
     @staticmethod
     def _terminate_process(process: subprocess.Popen[Any]) -> None:
