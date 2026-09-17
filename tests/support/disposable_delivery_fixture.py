@@ -40,9 +40,9 @@ class DisposableDeliveryFixture:
     """Deterministic double for the complete local delivery lifecycle."""
 
     failure: str | None = None
-    events: list[FixtureEvent] = field(default_factory=list)
-    artifacts: dict[str, str] = field(default_factory=dict)
-    attempts: dict[str, int] = field(default_factory=dict)
+    events: list[FixtureEvent] = field(default_factory=lambda: list[FixtureEvent]())
+    artifacts: dict[str, str] = field(default_factory=lambda: dict[str, str]())
+    attempts: dict[str, int] = field(default_factory=lambda: dict[str, int]())
     completed: bool = False
     cleaned: bool = False
 
