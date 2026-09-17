@@ -85,6 +85,7 @@ _STRUCTURAL_DASHBOARD_KEYS = frozenset(
         "lease_expires_at",
         "lease_id",
         "message",
+        "model",
         "metadata",
         "name",
         "nodes",

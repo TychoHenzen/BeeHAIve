@@ -98,6 +98,7 @@ function runActivity(pbi) {
   const elapsed = timestampAgeSeconds(startedAt);
   const elapsedText = elapsed === null ? "elapsed unknown" : `elapsed ${durationLabel(elapsed)}`;
   const pid = process.pid ? ` · PID ${process.pid}` : "";
+  const model = process.model ? ` · model ${process.model}` : "";
   const latest = String(session.last_output || "").replace(/\s+/g, " ").trim().slice(-240);
   if (processState === "running") {
     const lastOutputAt = session.last_output_at;
@@ -110,12 +111,12 @@ function runActivity(pbi) {
     const timeout = process.timeout_seconds === null || process.timeout_seconds === undefined
       ? "no timeout configured"
       : `timeout ${durationLabel(process.timeout_seconds)}`;
-    return `Process alive${pid} · ${outputText} · ${timeout} · ${elapsedText}${latest ? ` · latest: ${latest}` : ""}`;
+    return `Process alive${pid} · ${outputText} · ${timeout} · ${elapsedText}${model}${latest ? ` · latest: ${latest}` : ""}`;
   }
   if (processState === "starting") return `Starting Codex process · ${elapsedText}`;
-  if (processState === "launch_failed") return `Codex process failed to start${process.error ? `: ${process.error}` : ""}`;
+  if (processState === "launch_failed") return `Codex process failed to start${model}${process.error ? `: ${process.error}` : ""}`;
   if (processState === "timed_out") {
-    return `Timed out after ${durationLabel(process.timeout_seconds)} · process terminated${pid}`;
+    return `Timed out after ${durationLabel(process.timeout_seconds)} · process terminated${pid}${model}`;
   }
   if (processState === "error") return `Process ended with an error${pid}`;
   if (processState === "exited") {

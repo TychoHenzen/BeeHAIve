@@ -239,11 +239,12 @@ def test_session_tab_and_transcript_survive_refresh(dashboard_page) -> None:
                     "agent_session": {
                     "worker_id": "worker-1",
                     "task": "Implement the selected PBI",
-                    "state": "running",
-                    "process": {
                         "state": "running",
-                        "pid": 1234,
-                        "timeout_seconds": None,
+                        "process": {
+                            "state": "running",
+                            "pid": 1234,
+                            "model": "gpt-5.6-luna",
+                            "timeout_seconds": None,
                     },
                     "events": [
                         {"kind": "message", "text": f"event-{index}"}
@@ -274,6 +275,7 @@ def test_session_tab_and_transcript_survive_refresh(dashboard_page) -> None:
     expect(inspector).to_contain_text(
         "Process alive · PID 1234 · no output yet · no timeout configured"
     )
+    expect(inspector).to_contain_text("model gpt-5.6-luna")
     expect(inspector.locator(".session-transcript")).to_contain_text("event-0")
     expect(inspector.locator(".session-transcript")).to_contain_text("event-9")
     expect(inspector.locator(".session-transcript")).to_contain_text(
@@ -310,6 +312,7 @@ def test_dashboard_distinguishes_a_timed_out_process(dashboard_page) -> None:
                     "process": {
                         "state": "timed_out",
                         "pid": 1234,
+                        "model": "gpt-5.6-luna",
                         "timeout_seconds": 1800,
                         "returncode": -9,
                     },

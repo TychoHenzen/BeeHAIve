@@ -27,6 +27,7 @@ __all__ = [
     "AutonomousLifecycleService",
     "AutonomousRunResult",
     "CodexSkillExecutor",
+    "DEFAULT_AUTONOMOUS_MODEL",
     "DEFAULT_AUTONOMOUS_TIMEOUT_SECONDS",
     "PlaceholderSkillExecutor",
     "SkillHandoff",
@@ -130,6 +131,7 @@ ADVISOR_STEP = SkillStep(
     model="gpt-5.6-luna",
 )
 
+DEFAULT_AUTONOMOUS_MODEL = "gpt-5.6-luna"
 DEFAULT_AUTONOMOUS_TIMEOUT_SECONDS: float | None = None
 
 
@@ -550,8 +552,7 @@ class CodexSkillExecutor:
             "--cd",
             str(self.repository),
         ]
-        if step.model:
-            command.extend(("--model", step.model))
+        command.extend(("--model", DEFAULT_AUTONOMOUS_MODEL))
         command.append(prompt)
         started_at = _now_iso()
         process = None
@@ -569,6 +570,7 @@ class CodexSkillExecutor:
                             "finished_at": _now_iso(),
                             "executable": self.executable,
                             "cwd": str(self.repository),
+                            "model": DEFAULT_AUTONOMOUS_MODEL,
                             "error": format_worker_exception(error),
                         }
                     )
@@ -581,6 +583,7 @@ class CodexSkillExecutor:
                         "started_at": started_at,
                         "executable": self.executable,
                         "cwd": str(self.repository),
+                        "model": DEFAULT_AUTONOMOUS_MODEL,
                         "timeout_seconds": self.timeout_seconds,
                     }
                 )
