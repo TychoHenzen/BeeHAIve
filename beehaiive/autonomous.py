@@ -283,8 +283,7 @@ def _candidate_sort_key(item: Mapping[str, object]) -> tuple[int, int]:
 
 def _start_index(context: Mapping[str, object]) -> int:
     planning_status = _text(context.get("planning_status")).casefold()
-    stage = _text(context.get("stage"), "backlog").casefold()
-    return 0 if planning_status == "backlog" and stage == "backlog" else 1
+    return 0 if planning_status == "backlog" else 1
 
 
 def _handover(value: object) -> dict[str, object]:

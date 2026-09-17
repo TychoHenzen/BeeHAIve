@@ -78,6 +78,18 @@ def test_autonomous_explicit_resume_accepts_an_in_progress_pbi() -> None:
         store.close()
 
 
+def test_autonomous_backlog_always_starts_with_refinement() -> None:
+    assert autonomous._start_index(
+        {"planning_status": "Backlog", "stage": "refine"}
+    ) == 0
+    assert autonomous._start_index(
+        {"planning_status": "Backlog", "stage": "implement"}
+    ) == 0
+    assert autonomous._start_index(
+        {"planning_status": "Todo", "stage": "backlog"}
+    ) == 1
+
+
 def test_placeholder_runner_passes_one_branch_handover_through_all_skills() -> None:
     runner = AutonomousLifecycleRunner(PlaceholderSkillExecutor())
 
