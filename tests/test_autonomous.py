@@ -217,6 +217,33 @@ def test_autonomous_service_persists_skill_handoffs() -> None:
         store.close()
 
 
+def test_autonomous_service_marks_orphaned_pending_runs_after_restart() -> None:
+    store = OrchestratorStore()
+    service = Orchestrator(store, FakeProvider(dashboard_snapshot()))
+    service.synchronize("project-1")
+    action = store.begin_action(
+        "project-1",
+        "autonomous_start",
+        {"repository": "owner/api", "pbi_number": 1},
+        "owner/api",
+        1,
+        "orphaned-run",
+    )
+    automation = AutonomousLifecycleService(service, PlaceholderSkillExecutor())
+
+    try:
+        assert automation.recover_pending(("project-1",)) == 1
+        recovered = next(
+            item
+            for item in store.actions_for_project("project-1")
+            if item["id"] == action["id"]
+        )
+        assert recovered["status"] == "failed"
+        assert "did not survive the server restart" in recovered["error"]
+    finally:
+        store.close()
+
+
 def test_codex_autonomous_run_uses_a_server_worktree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -228,7 +255,7 @@ def test_codex_autonomous_run_uses_a_server_worktree(
     workspaces: list[Path] = []
 
     class RecordingExecutor:
-        def __init__(self, path, *_args) -> None:
+        def __init__(self, path, *_args, **_kwargs) -> None:
             self.repository = Path(path)
 
         def execute(self, _step, context, handover):

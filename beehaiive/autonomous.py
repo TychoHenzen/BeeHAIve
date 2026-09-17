@@ -717,6 +717,28 @@ class AutonomousLifecycleService:
         with self._lock:
             self._max_concurrency = maximum
 
+    def recover_pending(self, project_ids: Iterable[str]) -> int:
+        recovered = 0
+        for project_id in project_ids:
+            for action in self.orchestrator.store.actions_for_project(project_id):
+                if (
+                    action.get("kind") != "autonomous_start"
+                    or action.get("status") != "pending"
+                ):
+                    continue
+                detail = (
+                    "Autonomous run did not survive the server restart; "
+                    "no live worker process is attached."
+                )
+                self.orchestrator.store.finish_action(
+                    str(action["id"]),
+                    "failed",
+                    {"status": "blocked", "error": detail},
+                    detail,
+                )
+                recovered += 1
+        return recovered
+
     def _select(
         self,
         state: Mapping[str, object],

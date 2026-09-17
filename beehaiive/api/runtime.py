@@ -218,6 +218,9 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
         )
 
     configured_projects = _configured_project_ids(allowed_project_ids)
+    recover_pending = getattr(autonomous_service, "recover_pending", None)
+    if callable(recover_pending):
+        recover_pending(configured_projects)
     scheduler = None
     if scheduler_config.enabled and agent_worker is None:
         raise ValueError("The scheduler requires a configured dashboard agent worker")
