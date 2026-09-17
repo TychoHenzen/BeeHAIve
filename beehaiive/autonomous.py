@@ -883,11 +883,16 @@ class AutonomousLifecycleService:
                 continue
             result = _mapping(action.get("result"))
             handover = _mapping(result.get("handover"))
+            review_complete = step == "review-pr-branch" and handover.get(
+                "review_complete"
+            ) is True
+            if review_complete:
+                handover = {**_mapping(result.get("summary")), **handover}
             published = step == "submit-draft-pr" and (
                 handover.get("draft") is False
                 or bool(handover.get("pull_request"))
             )
-            if action.get("status") != "succeeded" and not (
+            if action.get("status") != "succeeded" and not review_complete and not (
                 _skill_status(result.get("status")) == "succeeded" or published
             ):
                 if not handover.get("branch") and not handover.get(

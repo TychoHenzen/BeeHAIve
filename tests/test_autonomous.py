@@ -128,6 +128,38 @@ def test_autonomous_resume_starts_after_a_published_pull_request() -> None:
     }
 
 
+def test_autonomous_resume_fixes_findings_after_a_completed_review() -> None:
+    actions = [
+        {
+            "kind": "skill:review-pr-branch",
+            "status": "failed",
+            "repository": "owner/api",
+            "pbi_number": 1,
+            "result": {
+                "status": "blocked",
+                "summary": {
+                    "branch": "codex/fixture",
+                    "pull_request": 9,
+                    "head_commit": "b" * 40,
+                    "findings": [{"severity": "MAJOR"}],
+                },
+                "handover": {"review_complete": True},
+            },
+        }
+    ]
+
+    resume = AutonomousLifecycleService._resume_context(actions, "owner/api", 1)
+
+    assert resume == {
+        "resume_step": "fix-pr-review",
+        "resume_existing_workspace": True,
+        "branch": "codex/fixture",
+        "workspace_branch": "codex/fixture",
+        "pull_request": 9,
+        "head_commit": "b" * 40,
+    }
+
+
 def test_placeholder_runner_passes_one_branch_handover_through_all_skills() -> None:
     runner = AutonomousLifecycleRunner(PlaceholderSkillExecutor())
 
