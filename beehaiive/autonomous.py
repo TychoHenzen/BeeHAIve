@@ -291,6 +291,27 @@ def _skill_status(value: object) -> str:
     )
 
 
+def _context_for_step(
+    context: Mapping[str, object], handover: Mapping[str, object]
+) -> dict[str, object]:
+    updated = dict(context)
+    project_status = _text(handover.get("project_status"))
+    if project_status:
+        updated["planning_status"] = project_status
+    next_stage = _text(handover.get("next_stage")).casefold()
+    stage = {
+        "implementation": "implement",
+        "implement": "implement",
+        "review": "review",
+        "pull_request": "pull_request",
+        "merge": "merge",
+        "ship": "merge",
+    }.get(next_stage)
+    if stage:
+        updated["stage"] = stage
+    return updated
+
+
 def _session_output(stdout: str, stderr: str) -> str:
     sections = []
     if stdout.strip():
@@ -334,8 +355,9 @@ class AutonomousLifecycleRunner:
         for step in steps:
             if self.on_step is not None:
                 self.on_step(step.name)
+            step_context = _context_for_step(context, handover)
             try:
-                raw_result = self.executor.execute(step, context, handover)
+                raw_result = self.executor.execute(step, step_context, handover)
             except Exception as error:
                 raw_result = {
                     "status": "blocked",
@@ -358,7 +380,7 @@ class AutonomousLifecycleRunner:
             if status != "succeeded":
                 if self.advisor is not None:
                     advisor_context = {
-                        **context,
+                        **step_context,
                         "failed_step": step.name,
                         "failure": summary[:4_000],
                         "completed_steps": [item.step for item in handoffs],

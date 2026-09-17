@@ -120,6 +120,37 @@ def test_runner_keeps_bounded_skill_session_output() -> None:
     )
 
 
+def test_runner_passes_the_previous_handover_into_the_next_context() -> None:
+    contexts: dict[str, dict[str, object]] = {}
+
+    class HandoverExecutor:
+        def execute(self, step, context, handover):
+            contexts[step.name] = dict(context)
+            return {
+                "status": "succeeded",
+                "summary": "stage completed",
+                "handover": {
+                    **handover,
+                    "project_status": "Todo",
+                    "next_stage": "implementation",
+                },
+            }
+
+    result = AutonomousLifecycleRunner(HandoverExecutor()).run(
+        {
+            "project_id": "project-1",
+            "repository": "owner/api",
+            "pbi_number": 1,
+            "planning_status": "Backlog",
+            "stage": "backlog",
+        }
+    )
+
+    assert result.status == "completed"
+    assert contexts["next-ticket"]["planning_status"] == "Todo"
+    assert contexts["next-ticket"]["stage"] == "implement"
+
+
 def test_blocker_calls_the_advisor_once() -> None:
     class Blocker:
         def __init__(self) -> None:
