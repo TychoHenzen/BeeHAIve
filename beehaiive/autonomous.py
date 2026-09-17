@@ -880,10 +880,19 @@ class AutonomousLifecycleService:
                 _mapping(_mapping(action.get("result")).get("handover")),
                 _mapping(_mapping(action.get("request")).get("handover")),
             ):
-                for key in ("branch", "pr", "pull_request", "head", "head_commit"):
-                    value = source.get(key)
-                    if key not in known_handover and isinstance(value, (str, int)):
-                        known_handover[key] = value
+                if not isinstance(
+                    source.get("branch") or source.get("workspace_branch"), str
+                ):
+                    continue
+                known_handover = {
+                    key: value
+                    for key, value in source.items()
+                    if key in {"branch", "pr", "pull_request", "head", "head_commit"}
+                    and isinstance(value, (str, int))
+                }
+                break
+            if known_handover:
+                break
         for action in actions:
             if (
                 action.get("repository") != repository

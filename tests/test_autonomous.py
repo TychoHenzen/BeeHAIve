@@ -155,6 +155,20 @@ def test_autonomous_resume_fixes_findings_after_a_completed_review() -> None:
                 },
             },
         },
+        {
+            "kind": "skill:submit-draft-pr",
+            "status": "failed",
+            "repository": "owner/api",
+            "pbi_number": 1,
+            "result": {
+                "status": "published",
+                "handover": {
+                    "branch": "codex/older",
+                    "pr": "https://github.com/owner/api/pull/8",
+                    "head": "c" * 40,
+                },
+            },
+        },
     ]
 
     resume = AutonomousLifecycleService._resume_context(actions, "owner/api", 1)
