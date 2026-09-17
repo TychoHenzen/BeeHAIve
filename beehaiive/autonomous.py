@@ -282,6 +282,11 @@ def _candidate_sort_key(item: Mapping[str, object]) -> tuple[int, int]:
 
 
 def _start_index(context: Mapping[str, object]) -> int:
+    requested_step = _text(context.get("resume_step")).casefold()
+    if requested_step:
+        for index, step in enumerate(AUTONOMOUS_STEPS):
+            if step.name == requested_step:
+                return index
     planning_status = _text(context.get("planning_status")).casefold()
     return 0 if planning_status == "backlog" else 1
 
@@ -722,6 +727,14 @@ class AutonomousLifecycleService:
                 raise ValueError("Selected PBI number is invalid")
             run_id = str(uuid4())
             context = {"project_id": project_id, **selected, "run_id": run_id}
+            if pbi_number is not None:
+                context.update(
+                    self._resume_context(
+                        self.orchestrator.store.actions_for_project(project_id),
+                        str(selected["repository"]),
+                        selected_number,
+                    )
+                )
             action = self.orchestrator.store.begin_action(
                 project_id,
                 "autonomous_start",
@@ -847,6 +860,46 @@ class AutonomousLifecycleService:
         ]
         candidates.sort(key=lambda item: _candidate_sort_key(item))
         return candidates[0] if candidates else None
+
+    @staticmethod
+    def _resume_context(
+        actions: Sequence[Mapping[str, object]], repository: str, pbi_number: int
+    ) -> dict[str, object]:
+        step_names = [step.name for step in AUTONOMOUS_STEPS]
+        for action in actions:
+            if (
+                action.get("repository") != repository
+                or action.get("pbi_number") != pbi_number
+            ):
+                continue
+            kind = _text(action.get("kind"))
+            if not kind.startswith("skill:") or kind == "skill:codex-advisor":
+                continue
+            step = kind[6:]
+            if step not in step_names:
+                continue
+            result = _mapping(action.get("result"))
+            handover = _mapping(result.get("handover"))
+            published = step == "submit-draft-pr" and handover.get("draft") is False
+            if action.get("status") != "succeeded" and not (
+                _skill_status(result.get("status")) == "succeeded" or published
+            ):
+                return {}
+            next_index = step_names.index(step) + 1
+            if next_index >= len(step_names):
+                return {}
+            resume: dict[str, object] = {
+                "resume_step": step_names[next_index],
+                "resume_existing_workspace": True,
+            }
+            for key in ("branch", "pr", "pull_request", "head", "head_commit"):
+                value = handover.get(key)
+                if isinstance(value, (str, int)):
+                    resume[key] = value
+                    if key == "branch":
+                        resume["workspace_branch"] = value
+            return resume
+        return {}
 
     @staticmethod
     def _completed_or_blocked_items(
@@ -1028,7 +1081,10 @@ class AutonomousLifecycleService:
         )
         workspace_root.mkdir(parents=True, exist_ok=True)
         workspace_id = uuid4().hex
-        branch = f"codex/beehaiive-autonomous-{run_id[:12]}"
+        branch = _text(
+            context.get("workspace_branch"),
+            f"codex/beehaiive-autonomous-{run_id[:12]}",
+        )
         base_ref = os.environ.get("BEEHAIIVE_AUTONOMOUS_BASE_REF", "origin/master")
         run_git = getattr(worktrees, "run_git", None)
         if callable(run_git):
@@ -1037,12 +1093,21 @@ class AutonomousLifecycleService:
                     base_ref = "HEAD"
             except Exception:
                 base_ref = "HEAD"
-        lease = acquire(
-            f"dashboard-run:{run_id}",
-            branch,
-            workspace_root / workspace_id,
-            base_ref,
-        )
+        workspace_path = workspace_root / workspace_id
+        if context.get("resume_existing_workspace"):
+            acquire_existing = getattr(worktrees, "acquire_existing", None)
+            if not isinstance(branch, str) or not callable(acquire_existing):
+                raise RuntimeError(
+                    "Autonomous resume requires an existing branch and worktree "
+                    "manager"
+                )
+            lease = acquire_existing(
+                f"dashboard-run:{run_id}", branch, workspace_path
+            )
+        else:
+            lease = acquire(
+                f"dashboard-run:{run_id}", branch, workspace_path, base_ref
+            )
         with self._lock:
             self._workspaces[run_id] = lease
         return {

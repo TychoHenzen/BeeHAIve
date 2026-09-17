@@ -90,6 +90,37 @@ def test_autonomous_backlog_always_starts_with_refinement() -> None:
     ) == 1
 
 
+def test_autonomous_resume_starts_after_a_published_pull_request() -> None:
+    actions = [
+        {
+            "kind": "skill:submit-draft-pr",
+            "status": "failed",
+            "repository": "owner/api",
+            "pbi_number": 1,
+            "result": {
+                "status": "published",
+                "handover": {
+                    "branch": "codex/fixture",
+                    "pr": 9,
+                    "draft": False,
+                    "head": "a" * 40,
+                },
+            },
+        }
+    ]
+
+    resume = AutonomousLifecycleService._resume_context(actions, "owner/api", 1)
+
+    assert resume == {
+        "resume_step": "review-pr-branch",
+        "resume_existing_workspace": True,
+        "branch": "codex/fixture",
+        "workspace_branch": "codex/fixture",
+        "pr": 9,
+        "head": "a" * 40,
+    }
+
+
 def test_placeholder_runner_passes_one_branch_handover_through_all_skills() -> None:
     runner = AutonomousLifecycleRunner(PlaceholderSkillExecutor())
 

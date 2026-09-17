@@ -104,6 +104,33 @@ class GitWorktreeManager:
             raise
         return lease
 
+    def acquire_existing(
+        self, agent_id: str, branch: str, worktree: str | Path
+    ) -> WorkspaceLease:
+        branch = require_text(branch, "branch")
+        path = Path(worktree).resolve()
+        lease = self.store.acquire_lease(agent_id, branch, str(path))
+        try:
+            result = self._run_git("worktree", "add", str(path), branch)
+            if result.returncode != 0:
+                result = self._run_git(
+                    "worktree", "add", "-b", branch, str(path), f"origin/{branch}"
+                )
+            if result.returncode != 0:
+                message = (result.stderr or result.stdout).strip()
+                raise WorkflowError(
+                    message or f"Could not open existing branch: {branch}"
+                )
+        except Exception:
+            try:
+                self._cleanup_stopped_worktree(str(path))
+            except WorkflowError:
+                pass
+            finally:
+                self.store.release_lease(lease.lease_id)
+            raise
+        return lease
+
     def release(self, lease_id: str) -> WorkspaceLease:
         lease = self.store.get_lease(lease_id)
         if lease is None:
