@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 from threading import Event
@@ -136,6 +137,35 @@ def test_autonomous_selection_resumes_after_a_published_pull_request() -> None:
         assert autonomous._start_index({**selected, **resume}) == 3
     finally:
         store.close()
+
+
+def test_autonomous_resume_retries_a_draft_publication() -> None:
+    actions = [
+        {
+            "kind": "skill:submit-draft-pr",
+            "status": "succeeded",
+            "repository": "owner/api",
+            "pbi_number": 1,
+            "result": {
+                "status": "succeeded",
+                "handover": {
+                    "branch": "codex/draft",
+                    "pull_request": 9,
+                    "head": "head-9",
+                    "draft": True,
+                },
+            },
+        }
+    ]
+
+    assert AutonomousLifecycleService._resume_context(actions, "owner/api", 1) == {
+        "resume_step": "submit-draft-pr",
+        "resume_existing_workspace": True,
+        "branch": "codex/draft",
+        "workspace_branch": "codex/draft",
+        "pull_request": 9,
+        "head": "head-9",
+    }
 
 
 def test_autonomous_start_resumes_the_next_lifecycle_skill() -> None:
@@ -402,6 +432,40 @@ def test_autonomous_service_persists_skill_handoffs() -> None:
             for action in actions
             if str(action["kind"]).startswith("skill:")
         } == {f"skill:{step.name}" for step in AUTONOMOUS_STEPS}
+    finally:
+        store.close()
+
+
+def test_autonomous_service_redacts_persisted_model_output() -> None:
+    class LeakyExecutor:
+        def execute(self, _step, _context, handover):
+            return {
+                "status": "succeeded",
+                "summary": "stage completed",
+                "handover": {
+                    **handover,
+                    "api_token": "secret-token",
+                    "branch": "codex/safe",
+                },
+                "session_output": "raw model output",
+            }
+
+    store = OrchestratorStore()
+    service = Orchestrator(store, FakeProvider(dashboard_snapshot()))
+    service.synchronize("project-1")
+    automation = AutonomousLifecycleService(service, LeakyExecutor())
+
+    try:
+        started = automation.start("project-1")
+        deadline = time.monotonic() + 3
+        current = automation.status(str(started["run_id"]))
+        while current["status"] == "running" and time.monotonic() < deadline:
+            time.sleep(0.01)
+            current = automation.status(str(started["run_id"]))
+        assert current["status"] == "completed"
+        persisted = json.dumps(store.actions_for_project("project-1"))
+        assert "raw model output" not in persisted
+        assert "secret-token" not in persisted
     finally:
         store.close()
 

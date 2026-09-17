@@ -124,6 +124,25 @@ function setIdeaFeedback(message, kind = "") {
   ideaFeedback.className = "settings-status " + kind;
 }
 
+async function waitForIdeaAction(actionId, project) {
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => window.setTimeout(resolve, 2_000));
+    if (settingsProjectInput.value.trim() !== project) return;
+    const state = await client.refresh();
+    const action = state?.actions?.find((value) => value.id === actionId);
+    if (!action || action.status === "pending") continue;
+    if (action.status === "succeeded") {
+      setIdeaFeedback("Idea capture completed.", "success");
+      ideaTextInput.value = "";
+    } else {
+      setIdeaFeedback("Idea capture failed: " + (action.error || "unknown error"), "failure");
+    }
+    return;
+  }
+  setIdeaFeedback("Idea capture is still pending; see Evidence log.", "pending");
+}
+
 function setIdeaProjects(projects) {
   const values = [...new Set((projects || []).filter((value) => typeof value === "string" && value.trim()))];
   const current = ideaProjectInput.value;
@@ -364,6 +383,7 @@ ideaForm.addEventListener("submit", (event) => {
     }
     if (result.action?.status === "pending") {
       setIdeaFeedback("Idea capture is running. The action log will update when it finishes.", "pending");
+      if (result.action.id) void waitForIdeaAction(result.action.id, project);
     } else if (result.action?.status === "failed") {
       setIdeaFeedback("Idea capture failed: " + (result.action.error || "unknown error"), "failure");
     } else {

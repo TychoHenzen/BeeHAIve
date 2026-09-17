@@ -473,6 +473,27 @@ def _session_output(stdout: str, stderr: str) -> str:
     return f"{output[:half]}\n...[session output truncated]...\n{output[-half:]}"
 
 
+def _without_session_output(value: object, depth: int = 0) -> object:
+    if depth >= 12:
+        return "[truncated]"
+    if isinstance(value, Mapping):
+        mapping_value = cast(Mapping[object, object], value)
+        return {
+            str(key): _without_session_output(item, depth + 1)
+            for key, item in mapping_value.items()
+            if key != "session_output"
+        }
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        sequence_value = cast(Sequence[object], value)
+        return [_without_session_output(item, depth + 1) for item in sequence_value]
+    return value
+
+
+def _persisted_action_value(value: object) -> dict[str, object]:
+    safe = safe_dashboard_value(_without_session_output(value), worker_secret_values())
+    return dict(cast(Mapping[str, object], safe)) if isinstance(safe, Mapping) else {}
+
+
 class AutonomousLifecycleRunner:
     def __init__(
         self,
@@ -1174,17 +1195,28 @@ class AutonomousLifecycleService:
             published = step == "submit-draft-pr" and (
                 handover.get("draft") is False or bool(handover.get("pull_request"))
             )
+            draft = handover.get("draft")
             successful = (
-                action.get("status") == "succeeded"
-                or _skill_status(result.get("status")) == "succeeded"
-                or published
+                False
+                if step == "submit-draft-pr" and draft is True
+                else (
+                    action.get("status") == "succeeded"
+                    or _skill_status(result.get("status")) == "succeeded"
+                    or published
+                )
             )
             if not successful and not review_complete:
-                if not handover.get("branch") and not handover.get("workspace_branch"):
-                    continue
-                if step != "complete-pr":
-                    return {}
+                draft_publication = step == "submit-draft-pr" and draft is True
+                if not draft_publication:
+                    if not handover.get("branch") and not handover.get(
+                        "workspace_branch"
+                    ):
+                        continue
+                    if step != "complete-pr":
+                        return {}
             next_index = step_names.index(step) + 1
+            if step == "submit-draft-pr" and draft is True:
+                next_index = step_names.index(step)
             if next_index >= len(step_names):
                 if step != "complete-pr":
                     return {}
@@ -1297,10 +1329,11 @@ class AutonomousLifecycleService:
             pbi_number = context.get("pbi_number")
             if type(pbi_number) is not int or pbi_number <= 0:
                 raise ValueError("Autonomous handoff has an invalid PBI number")
+            safe_handoff = _persisted_action_value(handoff.as_dict())
             step_action = self.orchestrator.store.begin_action(
                 str(context["project_id"]),
                 f"skill:{handoff.step}",
-                handoff.as_dict(),
+                safe_handoff,
                 str(context["repository"]),
                 pbi_number,
                 run_id,
@@ -1308,8 +1341,14 @@ class AutonomousLifecycleService:
             self.orchestrator.store.finish_action(
                 str(step_action["id"]),
                 "succeeded" if handoff.status == "succeeded" else "failed",
-                handoff.as_dict(),
-                None if handoff.status == "succeeded" else handoff.summary,
+                safe_handoff,
+                None
+                if handoff.status == "succeeded"
+                else redact_worker_text(
+                    handoff.summary,
+                    worker_secret_values(),
+                    max_length=4_000,
+                ),
             )
             with self._lock:
                 current = self._runs.get(run_id)
@@ -1317,7 +1356,7 @@ class AutonomousLifecycleService:
                     current["current_step"] = handoff.step
                     current["handoffs"] = [
                         *cast(list[dict[str, object]], current["handoffs"]),
-                        handoff.as_dict(),
+                        safe_handoff,
                     ]
 
         workspace_context = dict(context)
@@ -1338,11 +1377,21 @@ class AutonomousLifecycleService:
             if workspace_created:
                 self._release_workspace(run_id)
                 workspace_created = False
+            safe_result = _persisted_action_value(result.as_dict())
+            safe_error = (
+                None
+                if result.error is None
+                else redact_worker_text(
+                    result.error,
+                    worker_secret_values(),
+                    max_length=4_000,
+                )
+            )
             self.orchestrator.store.finish_action(
                 action_id,
                 "succeeded" if result.status == "completed" else "failed",
-                result.as_dict(),
-                result.error,
+                safe_result,
+                safe_error,
             )
             with self._lock:
                 current = self._runs.get(run_id)
@@ -1350,7 +1399,7 @@ class AutonomousLifecycleService:
                     recorded_handoffs = cast(
                         list[dict[str, object]], current["handoffs"]
                     )
-                    current.update(result.as_dict())
+                    current.update(safe_result)
                     current["handoffs"] = recorded_handoffs
                     current["current_step"] = None
                     current["finished_at"] = _now_iso()
@@ -1461,11 +1510,20 @@ class AutonomousLifecycleService:
                 worker_secret_values(),
             )
             safe_result = cast(dict[str, object], result)
+            safe_error = (
+                None
+                if status == "succeeded"
+                else redact_worker_text(
+                    summary,
+                    worker_secret_values(),
+                    max_length=4_000,
+                )
+            )
             self.orchestrator.store.finish_action(
                 action_id,
                 "succeeded" if status == "succeeded" else "failed",
                 safe_result,
-                None if status == "succeeded" else summary,
+                safe_error,
             )
             with self._lock:
                 current = self._runs.get(run_id)

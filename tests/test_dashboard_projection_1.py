@@ -158,8 +158,8 @@ def test_dashboard_projection_assigns_each_delivery_queue_from_live_evidence() -
         "refinement": 1,
         "implementation": 1,
         "publish": 1,
-        "review": 1,
-        "repair": 1,
+        "review": 2,
+        "repair": 0,
         "completion": 1,
         "blocked": 1,
         "completed": 0,
@@ -169,7 +169,7 @@ def test_dashboard_projection_assigns_each_delivery_queue_from_live_evidence() -
     assert active[2]["workflow_queue"]["next_skill"] == "next-ticket"
     assert active[3]["workflow_queue"]["id"] == "publish"
     assert active[4]["workflow_queue"]["id"] == "review"
-    assert active[5]["workflow_queue"]["id"] == "repair"
+    assert active[5]["workflow_queue"]["id"] == "review"
     assert active[6]["workflow_queue"]["id"] == "completion"
     assert active[7]["workflow_queue"]["id"] == "blocked"
     archived = build_dashboard_state(state, include_archived=True)
@@ -820,3 +820,188 @@ def test_dashboard_projection_separates_project_and_local_statuses(
     assert pbi["status"] == expected_status
     assert pbi["stage_label"] == expected_stage_label
     assert pbi["planning_status"] == raw_pbi["planning_status"]
+
+
+def test_dashboard_projection_ignores_handoffs_from_a_previous_run() -> None:
+    view = build_dashboard_state(
+        {
+            "project_id": "project-1",
+            "name": "Planning",
+            "repositories": [
+                {
+                    "name": "owner/api",
+                    "pbis": [
+                        {
+                            "number": 1,
+                            "title": "New run",
+                            "stage": "pull_request",
+                            "status": "active",
+                            "run_id": "new-run",
+                            "planning_status": "In Progress",
+                            "metadata": {
+                                "pull_requests": [
+                                    {
+                                        "number": 9,
+                                        "state": "open",
+                                        "head_sha": "new-head",
+                                    }
+                                ],
+                                "checks": {"verdict": "passing"},
+                            },
+                        }
+                    ],
+                }
+            ],
+        },
+        [
+            {
+                "kind": "skill:complete-pr",
+                "status": "succeeded",
+                "repository": "owner/api",
+                "pbi_number": 1,
+                "run_id": "old-run",
+                "result": {
+                    "status": "completed",
+                    "handover": {
+                        "pull_request": 9,
+                        "head": "new-head",
+                    },
+                },
+            },
+            {
+                "kind": "autonomous_start",
+                "status": "pending",
+                "repository": "owner/api",
+                "pbi_number": 1,
+                "run_id": "new-run",
+            },
+        ],
+    )
+
+    assert view["repositories"][0]["pbis"][0]["workflow_queue"]["id"] == "review"
+
+
+def test_dashboard_projection_blocks_completion_without_a_live_pull_request() -> None:
+    view = build_dashboard_state(
+        {
+            "project_id": "project-1",
+            "name": "Planning",
+            "repositories": [
+                {
+                    "name": "owner/api",
+                    "pbis": [
+                        {
+                            "number": 1,
+                            "stage": "merge",
+                            "planning_status": "In Progress",
+                        }
+                    ],
+                }
+            ],
+        },
+        [
+            {
+                "kind": "skill:complete-pr",
+                "status": "succeeded",
+                "repository": "owner/api",
+                "pbi_number": 1,
+                "result": {
+                    "status": "completed",
+                    "handover": {"pull_request": 9, "head": "head-9"},
+                },
+            }
+        ],
+    )
+
+    assert view["repositories"][0]["pbis"][0]["workflow_queue"]["id"] == "blocked"
+
+
+def test_dashboard_projection_requires_branch_review_before_repair() -> None:
+    view = build_dashboard_state(
+        {
+            "project_id": "project-1",
+            "name": "Planning",
+            "repositories": [
+                {
+                    "name": "owner/api",
+                    "pbis": [
+                        {
+                            "number": 1,
+                            "stage": "pull_request",
+                            "planning_status": "In Progress",
+                            "metadata": {
+                                "pull_requests": [
+                                    {
+                                        "number": 9,
+                                        "state": "open",
+                                        "head_sha": "head-9",
+                                        "review_decision": "changes_requested",
+                                    }
+                                ],
+                                "checks": {"verdict": "passing"},
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert view["repositories"][0]["pbis"][0]["workflow_queue"]["id"] == "review"
+
+
+def test_dashboard_projection_keeps_draft_pull_requests_in_publish_queue() -> None:
+    view = build_dashboard_state(
+        {
+            "project_id": "project-1",
+            "name": "Planning",
+            "repositories": [
+                {
+                    "name": "owner/api",
+                    "pbis": [
+                        {
+                            "number": 1,
+                            "stage": "pull_request",
+                            "planning_status": "In Progress",
+                            "metadata": {
+                                "pull_requests": [
+                                    {
+                                        "number": 9,
+                                        "state": "open",
+                                        "head_sha": "head-9",
+                                        "is_draft": True,
+                                    }
+                                ],
+                                "checks": {"verdict": "passing"},
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert view["repositories"][0]["pbis"][0]["workflow_queue"]["id"] == "publish"
+
+
+def test_dashboard_projection_blocks_pull_request_stage_without_evidence() -> None:
+    view = build_dashboard_state(
+        {
+            "project_id": "project-1",
+            "name": "Planning",
+            "repositories": [
+                {
+                    "name": "owner/api",
+                    "pbis": [
+                        {
+                            "number": 1,
+                            "stage": "pull_request",
+                            "planning_status": "In Progress",
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert view["repositories"][0]["pbis"][0]["workflow_queue"]["id"] == "blocked"

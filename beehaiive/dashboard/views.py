@@ -83,25 +83,28 @@ def _handoff_matches_pull_request(
     action: Mapping[str, object] | None,
     pull_requests: Sequence[Mapping[str, object]],
 ) -> bool:
-    if action is None or not pull_requests:
+    if action is None:
         return True
+    if not pull_requests:
+        return False
     current = pull_requests[-1]
     handover = mapping(mapping(action.get("result")).get("handover"))
     expected_number = handover.get("pull_request") or handover.get("pr")
-    if (
-        isinstance(expected_number, int)
-        and isinstance(current.get("number"), int)
-        and expected_number != current["number"]
-    ):
+    actual_number = current.get("number")
+    expected_number_text = str(expected_number).strip()
+    actual_number_text = str(actual_number).strip()
+    if not expected_number_text or not actual_number_text:
+        return False
+    if expected_number_text != actual_number_text:
         return False
     expected_head = handover.get("head") or handover.get("head_commit")
     actual_head = current.get("head_sha")
-    return not (
+    return (
         isinstance(expected_head, str)
+        and bool(expected_head.strip())
         and isinstance(actual_head, str)
-        and expected_head
-        and actual_head
-        and expected_head != actual_head
+        and bool(actual_head.strip())
+        and expected_head == actual_head
     )
 
 
@@ -112,7 +115,7 @@ def _handoff_is_bound(action: Mapping[str, object] | None) -> bool:
     number = handover.get("pull_request") or handover.get("pr")
     head = handover.get("head") or handover.get("head_commit")
     number_bound = (type(number) is int and number > 0) or (
-        isinstance(number, str) and bool(number.strip())
+        isinstance(number, str) and number.strip().isdigit() and int(number.strip()) > 0
     )
     return number_bound and isinstance(head, str) and bool(head.strip())
 
@@ -243,6 +246,28 @@ def queue_for_pbi(
                 {"planning_status": planning_status},
             )
 
+    draft_pull_request = next(
+        (
+            pull_request
+            for pull_request in open_pull_requests
+            if any(
+                pull_request.get(key) is True
+                for key in ("is_draft", "draft", "isDraft")
+            )
+        ),
+        None,
+    )
+    if draft_pull_request is not None:
+        return _queue_result(
+            "publish",
+            "The pull request is still a draft and needs publication.",
+            {
+                "skill": "submit-draft-pr",
+                "pull_request": draft_pull_request.get("number"),
+                "draft": True,
+            },
+        )
+
     complete = _latest_skill(actions, "complete-pr")
     if complete is not None and not _handoff_is_bound(complete):
         return _queue_result(
@@ -250,10 +275,16 @@ def queue_for_pbi(
             "Completion evidence is missing its pull request and head binding.",
             {"skill": "complete-pr"},
         )
+    if complete is not None and not open_pull_requests:
+        return _queue_result(
+            "blocked",
+            "Completion evidence has no current pull request to verify.",
+            {"skill": "complete-pr"},
+        )
     if not _handoff_matches_pull_request(complete, open_pull_requests):
         complete = None
     if complete is not None:
-        if open_pull_requests and check_verdict != "passing":
+        if check_verdict != "passing":
             return _queue_result(
                 "blocked",
                 "Completion evidence has no passing check result for the "
@@ -274,10 +305,16 @@ def queue_for_pbi(
             "Repair evidence is missing its pull request and head binding.",
             {"skill": "fix-pr-review"},
         )
+    if fixed is not None and not open_pull_requests:
+        return _queue_result(
+            "blocked",
+            "Repair evidence has no current pull request to verify.",
+            {"skill": "fix-pr-review"},
+        )
     if not _handoff_matches_pull_request(fixed, open_pull_requests):
         fixed = None
     if fixed is not None:
-        if open_pull_requests and check_verdict != "passing":
+        if check_verdict != "passing":
             return _queue_result(
                 "blocked",
                 "Repair evidence has no passing check result for the "
@@ -296,6 +333,12 @@ def queue_for_pbi(
         return _queue_result(
             "blocked",
             "Review evidence is missing its pull request and head binding.",
+            {"skill": "review-pr-branch"},
+        )
+    if review is not None and not open_pull_requests:
+        return _queue_result(
+            "blocked",
+            "Review evidence has no current pull request to verify.",
             {"skill": "review-pr-branch"},
         )
     if not _handoff_matches_pull_request(review, open_pull_requests):
@@ -320,6 +363,14 @@ def queue_for_pbi(
                 "current pull request.",
                 {"skill": "review-pr-branch", "checks": check_verdict or "unavailable"},
             )
+        decision = str(open_pull_requests[-1].get("review_decision") or "").casefold()
+        if decision in {"changes_requested", "request_changes"}:
+            return _queue_result(
+                "blocked",
+                "The provider requested changes without matching branch-review "
+                "findings.",
+                {"skill": "review-pr-branch", "review_decision": decision},
+            )
         if _has_findings(review):
             return _queue_result(
                 "repair",
@@ -342,9 +393,13 @@ def queue_for_pbi(
         decision = str(pull_request.get("review_decision") or "").casefold()
         if decision in {"changes_requested", "request_changes"}:
             return _queue_result(
-                "repair",
-                "The pull request has requested changes.",
-                {"review_decision": decision},
+                "review",
+                "The published pull request needs the required branch review "
+                "before provider changes can be repaired.",
+                {
+                    "skill": "review-pr-branch",
+                    "review_decision": decision,
+                },
             )
         return _queue_result(
             "review",
@@ -366,6 +421,22 @@ def queue_for_pbi(
                 "blocked",
                 "Publication evidence is missing its pull request and head binding.",
                 {"skill": "submit-draft-pr"},
+            )
+        if not open_pull_requests:
+            return _queue_result(
+                "blocked",
+                "Publication evidence has no current pull request to verify.",
+                {"skill": "submit-draft-pr"},
+            )
+        submitted_handover = mapping(mapping(submitted.get("result")).get("handover"))
+        if any(
+            submitted_handover.get(key) is True
+            for key in ("draft", "is_draft", "isDraft")
+        ):
+            return _queue_result(
+                "publish",
+                "The publication handoff still reports a draft pull request.",
+                {"skill": "submit-draft-pr", "draft": True},
             )
         return _queue_result(
             "review" if _successful(submitted) else "blocked",
@@ -421,11 +492,17 @@ def queue_for_pbi(
             "Project Status is Todo and the PBI is ready for implementation.",
             {"planning_status": planning_status},
         )
-    if branch or stage in {"pull_request", "review"}:
+    if branch:
         return _queue_result(
             "publish",
             "Implementation has a branch but no published pull request evidence.",
             {"branch": bool(branch), "stage": stage},
+        )
+    if stage in {"pull_request", "review"}:
+        return _queue_result(
+            "blocked",
+            "The pull-request stage has no branch or pull-request evidence.",
+            {"branch": False, "stage": stage},
         )
     if normalized_planning == "in progress" or stage == "implement":
         return _queue_result(
@@ -651,11 +728,23 @@ def pbi_view(
     display_stage_value = display_stage(
         raw_stage, status, planning_status, pull_requests
     )
-    queue_actions = (
-        matching_actions[: requeue_index + 1]
-        if requeue_is_latest and requeue_index is not None
-        else matching_actions
-    )
+    queue_actions = matching_actions
+    if status in {"active", "awaiting_operator"} and isinstance(run_id, str):
+        queue_actions = [
+            action for action in matching_actions if action.get("run_id") == run_id
+        ]
+    if requeue_is_latest:
+        queue_requeue_index = next(
+            (
+                index
+                for index, action in enumerate(queue_actions)
+                if action.get("kind") == "requeue"
+                and action.get("status") == "succeeded"
+            ),
+            None,
+        )
+        if queue_requeue_index is not None:
+            queue_actions = queue_actions[: queue_requeue_index + 1]
     workflow_queue = queue_for_pbi(
         status,
         planning_status,
