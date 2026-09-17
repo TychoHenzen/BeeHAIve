@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -358,7 +359,8 @@ class CodexSkillExecutor:
         timeout_seconds: float = 900.0,
     ) -> None:
         self.repository = Path(repository).resolve()
-        self.executable = executable.strip()
+        configured_executable = executable.strip()
+        self.executable = shutil.which(configured_executable) or configured_executable
         self.timeout_seconds = timeout_seconds
 
     def execute(

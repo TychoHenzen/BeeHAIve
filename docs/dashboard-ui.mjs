@@ -77,10 +77,10 @@ function readiness(pbi) {
 }
 
 function agentLabel(item) {
-  if (item.pbi.autonomous_status === "running") return "autonomous";
   const session = map(item.pbi.agent_session);
-  if (session.worker_id) return session.worker_id;
   const writer = map(item.repositoryState?.writer);
+  if (item.pbi.autonomous_status === "running" || (item.pbi.status === "active" && item.pbi.run_id && !session.worker_id && writer.status !== "active")) return "autonomous";
+  if (session.worker_id) return session.worker_id;
   if (writer.status === "active" && writer.current_pbi === item.pbi.number) return "writer";
   return "-";
 }
@@ -89,6 +89,28 @@ function isAgentActive(item) {
   const writer = map(item.repositoryState?.writer);
   return (['active', 'awaiting_operator'].includes(item.pbi.status) && item.pbi.run_id)
     || (writer.status === "active" && writer.current_pbi === item.pbi.number);
+}
+
+function activityDetail(action) {
+  const kind = String(action.kind || "");
+  const request = map(action.request);
+  const result = map(action.result);
+  const run = map(result.run);
+  if (action.error) return `Failure: ${action.error}`;
+  if (kind.startsWith("skill:")) return text(result.summary, "Skill context completed.");
+  if (kind === "scheduler_configure") {
+    return `${request.enabled === true ? "Polling enabled" : "Polling disabled"} · ${text(request.max_concurrency, "?")} workers · every ${text(request.poll_interval_seconds, "?")} seconds.`;
+  }
+  if (kind === "stop") return `Reason: ${text(request.reason, "Stopped by operator")}`;
+  if (kind === "retry") return `Resumed ${text(request.repository, "the repository")}#${text(request.pbi_number, "?")} at attempt ${text(run.attempt, "?")}.`;
+  if (kind === "start") return `Started ${text(request.repository, "the repository")}#${text(request.pbi_number, "?")} at ${text(run.stage, "the current stage")}.`;
+  if (kind === "autonomous_start") return `Selected ${text(request.repository, "the repository")}#${text(request.pbi_number, "?")} for the autonomous lifecycle.`;
+  if (kind === "autonomous_complete") return text(result.summary, "All autonomous lifecycle handoffs completed.");
+  if (kind === "answer_question") return `Answered operator question ${text(request.question_id, "the pending question")} and resumed the run.`;
+  if (kind === "clarify") return "Clarification was sent to the active worker.";
+  if (kind === "synchronize" || kind === "sync") return "Read the provider and refreshed the local read model.";
+  if (run.run_id) return `Run ${run.run_id} · stage ${text(run.stage, "unknown")}.`;
+  return text(result.message, "No additional detail recorded.");
 }
 
 function allItems(state) {
@@ -185,6 +207,8 @@ export function createDashboardUi({
     });
     return node;
   }
+
+  const autonomousLabel = demo ? "Run placeholder lifecycle" : "Run lifecycle on server";
 
   function filterItems(items, filter) {
     return items.filter(({ pbi }) => {
@@ -536,7 +560,7 @@ export function createDashboardUi({
     selectTab("lifecycle");
     const controls = element("div", undefined, "detail-actions");
     if (runAutonomous && pbi.claimable && !pbi.run_id && !isCompleted(pbi)) {
-      controls.append(actionButton("Run lifecycle", {
+      controls.append(actionButton(autonomousLabel, {
         autonomous: true,
         testid: "run-lifecycle",
         payload: { repository: item.repository, pbi_number: pbi.number },
@@ -588,7 +612,7 @@ export function createDashboardUi({
     const agent = element("span", agentLabel(item), "row-agent");
     const controls = element("div", undefined, "row-controls");
     if (runAutonomous && pbi.claimable && !pbi.run_id && !isCompleted(pbi)) {
-      controls.append(actionButton("Run lifecycle", {
+      controls.append(actionButton(autonomousLabel, {
         autonomous: true,
         testid: "run-lifecycle",
         payload: { repository, pbi_number: pbi.number },
@@ -632,17 +656,31 @@ export function createDashboardUi({
 
   function renderAgents(items) {
     agentsOutput.replaceChildren();
-    const active = items.filter(isAgentActive);
-    if (!active.length) {
+    const active = items.filter((item) => isAgentActive(item) || item.pbi.autonomous_status);
+    const scheduler = map(currentState?.scheduler);
+    const showScheduler = scheduler.enabled === true
+      && (scheduler.running === true || scheduler.last_poll_at || scheduler.last_error || Number(scheduler.active_workers) > 0);
+    if (!active.length && !showScheduler) {
       agentsOutput.append(element("div", "No active agents.", "empty"));
       return;
     }
+    if (showScheduler) {
+      const schedulerCard = element("section", undefined, "agent-card");
+      const heading = element("div", undefined, "agent-heading");
+      heading.append(element("span", "", "status-dot"), element("strong", "scheduler"), element("span", scheduler.running === true ? "Polling" : "Configured", "tag accent"));
+      schedulerCard.append(heading, element("p", `Last poll ${text(scheduler.last_poll_at, "not observed")} · ${text(scheduler.active_workers, "0")} of ${text(scheduler.max_concurrency, "?")} workers leased.`));
+      if (scheduler.last_started_run_ids?.length) schedulerCard.append(element("p", `Last admitted run: ${scheduler.last_started_run_ids.at(-1)}`, "activity-detail"));
+      if (scheduler.last_error) schedulerCard.append(element("p", `Failure: ${scheduler.last_error}`, "activity-detail"));
+      agentsOutput.append(schedulerCard);
+    }
     active.forEach((item) => {
       const { pbi } = item;
-      const card = element("section", undefined, "agent-card");
+      const stateLabel = pbi.autonomous_status === "running" ? "Running" : pbi.autonomous_status === "blocked" ? "Blocked" : pbi.status === "awaiting_operator" ? "Waiting on you" : pbi.status === "active" ? "Implementing" : "Completed";
+      const card = element("section", undefined, `agent-card ${pbi.autonomous_status === "blocked" ? "blocked" : ""}`);
       const heading = element("div", undefined, "agent-heading");
-      heading.append(element("span", "", "status-dot"), element("strong", agentLabel(item)), element("span", pbi.status === "awaiting_operator" ? "Waiting on you" : "Implementing", `tag ${pbi.status === "awaiting_operator" ? "accent" : ""}`));
+      heading.append(element("span", "", "status-dot"), element("strong", agentLabel(item)), element("span", stateLabel, `tag ${pbi.autonomous_status === "blocked" || pbi.status === "failed" ? "warn" : "accent"}`));
       card.append(heading, element("p", `${item.repository}#${text(pbi.number, "?")} · ${text(pbi.title, "Untitled work item")}`));
+      if (pbi.last_error) card.append(element("p", `Failure: ${pbi.last_error}`, "activity-detail"));
       const events = list(map(pbi.agent_session).events).slice(-3);
       if (events.length) {
         const eventList = element("div", undefined, "agent-events");
@@ -654,7 +692,7 @@ export function createDashboardUi({
       inspect.type = "button";
       inspect.addEventListener("click", () => openInspector(item));
       controls.append(inspect);
-      if (pbi.run_id) {
+      if (pbi.run_id && pbi.autonomous_status !== "running" && pbi.autonomous_status !== "blocked") {
         const stop = { label: "Stop", testid: "stop-work", payload: { action: "stop", repository: item.repository, run_id: pbi.run_id } };
         controls.append(actionButton(stop.label, stop, "danger"));
       }
@@ -705,6 +743,21 @@ export function createDashboardUi({
         .filter((key) => source[key] !== undefined)
         .map((key) => [key, source[key]]),
     );
+  }
+
+  function definitionFixtures(definition) {
+    const result = {
+      outcome: "pass",
+      evidence: {},
+      artifact_refs: [],
+      question: null,
+      required_action: null,
+      validation_reason: null,
+      answer: null,
+    };
+    return {
+      dashboard: Object.fromEntries(list(map(definition).nodes).map((node) => [map(node).node_id, result])),
+    };
   }
 
   function renderGraphPage(state) {
@@ -764,7 +817,7 @@ export function createDashboardUi({
       }
       const actions = element("div", undefined, "settings-actions");
       if (current === latest) {
-        const base = { workflow_id: workflowId, candidate: actionDefinition, fixtures: {} };
+        const base = { workflow_id: workflowId, candidate: actionDefinition, fixtures: definitionFixtures(actionDefinition) };
         actions.append(actionButton("Evaluate draft", { testid: "graph-evaluate", payload: { action: "graph_evaluate", ...base } }, "secondary"));
         actions.append(actionButton("Record review", { testid: "graph-review", payload: { action: "graph_review", ...base } }, "secondary"));
         actions.append(actionButton("Activate reviewed draft", { testid: "graph-activate", payload: { action: "graph_activate", ...base } }, "primary"));
@@ -841,7 +894,9 @@ export function createDashboardUi({
     const listNode = element("ul", undefined, "activity-list");
     actions.forEach((action) => {
       const row = element("li");
-      row.append(element("time", text(action.created_at, "Recent")), element("span", `${ACTION_LABELS[action.kind] || text(action.kind, "Action")} · ${text(action.status, "unknown")}${action.repository ? ` · ${action.repository}` : ""}${action.error ? ` · ${action.error}` : ""}`));
+      const copy = element("span");
+      copy.append(element("span", `${ACTION_LABELS[action.kind] || text(action.kind, "Action")} · ${text(action.status, "unknown")}${action.repository ? ` · ${action.repository}` : ""}${action.pbi_number ? `#${action.pbi_number}` : ""}`, "activity-main"), element("span", activityDetail(action), "activity-detail"));
+      row.append(element("time", text(action.created_at, "Recent")), copy);
       listNode.append(row);
     });
     activityOutput.append(listNode);

@@ -164,6 +164,7 @@ function initialState() {
       last_error: null,
     },
     graph: demoGraph(),
+    graphs: { "demo-flow": demoGraph() },
   };
 }
 
@@ -177,6 +178,8 @@ export function createDemoClient({ onState, onStatus, onBusy, archived = () => f
   function visibleState() {
     const snapshot = clone(state);
     const selectedWorkflow = workflowId().trim();
+    const selectedGraph = state.graphs?.[selectedWorkflow];
+    if (selectedGraph) snapshot.graph = clone(selectedGraph);
     snapshot.archived = Boolean(archived());
     snapshot.recent_deliveries = state.repositories.flatMap((repository) => repository.pbis
       .filter((item) => Boolean(item.archived) || item.status === "completed" || item.pull_requests?.length || item.delivery)
@@ -206,11 +209,14 @@ export function createDemoClient({ onState, onStatus, onBusy, archived = () => f
     return target ? { repository, pbi: target } : null;
   }
 
-  function record(payload, status = "succeeded") {
+  function record(payload, status = "succeeded", result = null) {
     state.actions.push({
       kind: payload.action,
       status,
       repository: payload.repository,
+      pbi_number: payload.pbi_number,
+      request: { ...payload },
+      result,
       created_at: now(),
     });
     state.updated_at = now();
@@ -230,7 +236,25 @@ export function createDemoClient({ onState, onStatus, onBusy, archived = () => f
     onBusy(true);
     onStatus(`${payload.action} pending...`, "pending");
     if (payload.action.startsWith("graph_")) {
-      const graph = state.graph;
+      let graph = state.graphs?.[payload.workflow_id] || state.graph;
+      if (payload.action === "graph_evaluate" && payload.workflow_id && payload.workflow_id !== graph.workflow_id) {
+        const candidate = clone(payload.candidate || {});
+        graph = {
+          workflow_id: payload.workflow_id,
+          definitions: [{
+            ...candidate,
+            definition_hash: `demo-${payload.workflow_id}-1`,
+            active: false,
+            review: false,
+            safety_evidence: { evidence: { safety: { passed: true, checks: [{ name: "reachability", status: "pass", reason: "All nodes are reachable." }] } } },
+          }],
+          active: null,
+          empty: false,
+        };
+        state.graph = graph;
+        state.graphs[payload.workflow_id] = graph;
+        if (!state.workflow_ids.includes(payload.workflow_id)) state.workflow_ids.push(payload.workflow_id);
+      }
       const latest = graph.definitions[graph.definitions.length - 1];
       if (payload.action === "graph_evaluate" && latest) {
         latest.safety_evidence = {
@@ -249,6 +273,8 @@ export function createDemoClient({ onState, onStatus, onBusy, archived = () => f
       } else if (payload.action === "graph_rollback") {
         graph.active = { workflow_id: graph.workflow_id, revision: payload.revision };
       }
+      state.graphs[graph.workflow_id] = graph;
+      state.graph = graph;
       record(payload);
       onState(visibleState());
       onStatus(`${payload.action} succeeded.`, "success");

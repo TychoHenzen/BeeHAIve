@@ -292,6 +292,8 @@ def test_real_mode_wires_autonomous_lifecycle_endpoint(dashboard_page) -> None:
     expect(page.locator("#activity-output")).to_contain_text(
         "Autonomous lifecycle started"
     )
+    page.get_by_role("button", name="Agents", exact=True).click()
+    expect(page.locator("#agents-output")).to_contain_text("autonomous")
     assert len(observed) == 1
     assert observed[0]["body"] == {
         "repository": "owner/app",
@@ -320,6 +322,10 @@ def test_guided_demo_can_stop_and_retry_work(dashboard_page) -> None:
     expect(item).to_contain_text("Blocked")
     expect(inspector).to_contain_text("Failure")
     expect(inspector).to_contain_text("Stopped by operator")
+    page.get_by_role("button", name="Evidence log", exact=True).click()
+    expect(page.locator("#activity-output")).to_contain_text(
+        "Reason: Stopped by operator"
+    )
     page.locator("#details-pane").get_by_test_id("retry-work").click()
     expect(item).to_contain_text("Running")
 
@@ -358,7 +364,13 @@ def test_sidebar_pages_and_settings_are_real_views(dashboard_page) -> None:
     page.get_by_role("button", name="Workflow graphs", exact=True).click()
     expect(page.locator("#graph-output")).to_contain_text("Revision 1")
     expect(page.locator("#graph-output")).to_contain_text("claim")
-    assert page.locator("#workflow-select option").count() == 2
+    page.locator("#workflow-create-id").fill("new-flow")
+    page.get_by_role("button", name="Create workflow draft", exact=True).click()
+    expect(page.locator("#workflow-create-feedback")).to_contain_text(
+        "Workflow draft created and evaluated."
+    )
+    assert page.locator("#workflow-select option").count() == 3
+    expect(page.locator("#graph-output")).to_contain_text("new-flow")
     page.locator("#workflow-select").select_option("demo-flow")
     assert page.locator("#graph-output textarea").count() == 0
     for testid in ("graph-evaluate", "graph-review", "graph-activate"):

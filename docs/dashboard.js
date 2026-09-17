@@ -1,6 +1,6 @@
-import { createDashboardClient } from "/dashboard-client.mjs?v=4";
-import { createDemoClient } from "/dashboard-demo.mjs?v=4";
-import { createDashboardUi } from "/dashboard-ui.mjs?v=4";
+import { createDashboardClient } from "/dashboard-client.mjs?v=5";
+import { createDemoClient } from "/dashboard-demo.mjs?v=5";
+import { createDashboardUi } from "/dashboard-ui.mjs?v=5";
 
 const settingsProjectInput = document.querySelector("#settings-project-id");
 const settingsWorkflowInput = document.querySelector("#settings-workflow-id");
@@ -12,6 +12,9 @@ const schedulerFeedback = document.querySelector("#scheduler-feedback");
 const settingsForm = document.querySelector("#settings-form");
 const settingsFeedback = document.querySelector("#settings-feedback");
 const workflowSelector = document.querySelector("#workflow-select");
+const workflowCreateForm = document.querySelector("#workflow-create-form");
+const workflowCreateId = document.querySelector("#workflow-create-id");
+const workflowCreateFeedback = document.querySelector("#workflow-create-feedback");
 const statusOutput = document.querySelector("#state-status");
 const projectContext = document.querySelector("#project-context");
 const pageTitle = document.querySelector("#page-title");
@@ -57,6 +60,34 @@ function setSettingsFeedback(message, kind = "") {
 function setSchedulerFeedback(message, kind = "") {
   schedulerFeedback.textContent = message;
   schedulerFeedback.className = `settings-status ${kind}`;
+}
+
+function setWorkflowCreateFeedback(message, kind = "") {
+  workflowCreateFeedback.textContent = message;
+  workflowCreateFeedback.className = `settings-status ${kind}`;
+}
+
+function workflowDraft(workflowId) {
+  const result = {
+    outcome: "pass",
+    evidence: {},
+    artifact_refs: [],
+    question: null,
+    required_action: null,
+    validation_reason: null,
+    answer: null,
+  };
+  return {
+    workflow_id: workflowId,
+    revision: 1,
+    schema_version: 1,
+    nodes: [
+      { node_id: "start", kind: "prompt", reference: { reference_id: "prompt/start" } },
+      { node_id: "work", kind: "skill", reference: { reference_id: "skill/work" } },
+    ],
+    edges: [{ source: "start", target: "work", condition: "pass" }],
+    fixtures: { happy: { start: result, work: result } },
+  };
 }
 
 function showApp() {
@@ -230,7 +261,40 @@ schedulerSave.addEventListener("click", () => {
     if (result) {
       schedulerSettingsDirty = false;
       setSchedulerFeedback("Scheduler settings applied.", "success");
+    } else {
+      setSchedulerFeedback("Scheduler settings failed. See the status above.", "failure");
     }
+  });
+});
+workflowCreateForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const workflowId = workflowCreateId.value.trim();
+  const project = settingsProjectInput.value.trim();
+  if (!project) {
+    setWorkflowCreateFeedback("Choose a project in Settings first.", "failure");
+    setPage("settings");
+    return;
+  }
+  if (!workflowCreateForm.checkValidity()) {
+    setWorkflowCreateFeedback("Use a lowercase workflow ID such as delivery-flow.", "failure");
+    workflowCreateId.focus();
+    return;
+  }
+  const draft = workflowDraft(workflowId);
+  settingsWorkflowInput.value = workflowId;
+  updateUrl(project, workflowId, demo);
+  void client.runAction({
+    action: "graph_evaluate",
+    workflow_id: workflowId,
+    candidate: draft,
+    fixtures: draft.fixtures,
+  }).then((result) => {
+    if (!result) {
+      setWorkflowCreateFeedback("The workflow draft could not be created. See the status above.", "failure");
+      return;
+    }
+    setWorkflowCreateFeedback("Workflow draft created and evaluated.", "success");
+    workflowCreateId.value = "";
   });
 });
 workflowSelector.addEventListener("change", () => {

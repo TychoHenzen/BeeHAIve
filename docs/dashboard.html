@@ -166,9 +166,11 @@
       .agent-panel, .delivery-panel { display: grid; gap: 10px; }
       .activity-panel { display: grid; gap: 10px; margin-top: 22px; }
       .activity-list { display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; }
-      .activity-list li { display: flex; gap: 10px; color: #9b9fae; font-size: .72rem; }
+      .activity-list li { display: grid; grid-template-columns: 118px minmax(0, 1fr); gap: 10px; color: #9b9fae; font-size: .72rem; }
       .activity-list time { min-width: 118px; color: #777b8d; }
+      .activity-detail { display: block; margin-top: 2px; color: #777b8d; font-size: .68rem; }
       .agent-card, .delivery-card { display: grid; gap: 6px; padding: 12px; border-radius: 10px; background: var(--surface); box-shadow: 0 4px 18px #0002; }
+      .agent-card.blocked { border: 1px solid #8d3f4c; background: #2b1821; }
       .agent-heading, .delivery-heading { display: flex; align-items: center; gap: 8px; }
       .agent-heading strong, .delivery-heading strong { color: #dedfe6; font: .76rem ui-monospace, SFMono-Regular, Consolas, monospace; }
       .agent-card p, .delivery-card p { margin: 0; color: #9b9fae; font-size: .72rem; }
@@ -183,6 +185,9 @@
       .structured-list li span, .structured-card p { margin: 0; color: #9b9fae; font-size: .74rem; }
       .graph-summary, .settings-grid, .project-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
       .graph-definition, .settings-card, .project-card { display: grid; gap: 12px; padding: 16px; border-radius: 10px; background: var(--surface); box-shadow: 0 4px 18px #0002; }
+      .workflow-create { display: grid; gap: 10px; padding: 14px; border: 1px solid var(--divider); border-radius: 10px; background: var(--surface-raised); }
+      .workflow-create form { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; }
+      .workflow-create .field { flex: 1 1 260px; }
       .graph-definition h3, .settings-card h3, .project-card h3 { margin: 0; }
       .graph-meta { display: flex; flex-wrap: wrap; gap: 7px; color: #9b9fae; font-size: .72rem; }
       .graph-nodes { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
@@ -323,6 +328,15 @@
 
           <section id="workflow-page" class="page-panel" data-page-content="workflow-graphs" hidden aria-labelledby="workflow-page-title">
             <div class="panel-heading"><h2 id="workflow-page-title">Workflow graphs</h2><p>Read, review, and activate the workflow that governs runs.</p></div>
+            <section class="workflow-create" aria-labelledby="workflow-create-title">
+              <h3 id="workflow-create-title">Create a workflow</h3>
+              <p class="page-panel-copy">Start with a safe two-step draft. Add review and activation after the service evaluates it.</p>
+              <form id="workflow-create-form">
+                <div class="field"><label for="workflow-create-id">Workflow ID</label><input id="workflow-create-id" required pattern="[a-z][a-z0-9]*(?:[._/-][a-z0-9]+)*" placeholder="delivery-flow" autocomplete="off"></div>
+                <button class="primary" type="submit">Create workflow draft</button>
+              </form>
+              <p id="workflow-create-feedback" class="settings-status" role="status" aria-live="polite"></p>
+            </section>
             <div class="field"><label for="workflow-select">Workflow</label><select id="workflow-select"><option value="">No workflows available</option></select></div>
             <div id="graph-output"></div>
           </section>
@@ -351,6 +365,7 @@
               </section>
               <section id="scheduler-settings" class="settings-card">
                 <h3>Autonomous workers</h3>
+                <div class="status-row"><span>Production execution</span><strong>Server process</strong></div>
                 <div class="field"><label for="settings-scheduler-enabled">Polling</label><select id="settings-scheduler-enabled"><option value="false">Off</option><option value="true">On</option></select></div>
                 <div class="field"><label for="settings-max-workers">Worker capacity</label><input id="settings-max-workers" type="number" min="1" max="64" step="1" inputmode="numeric"></div>
                 <div class="field"><label for="settings-poll-interval">Poll interval (seconds)</label><input id="settings-poll-interval" type="number" min="1" step="1" inputmode="decimal"></div>
@@ -367,6 +382,6 @@
     <aside id="details-pane" class="details-pane" aria-label="Run inspector" aria-hidden="true">
       <div id="details-output"></div>
     </aside>
-    <script type="module" src="/dashboard.js?v=4"></script>
+    <script type="module" src="/dashboard.js?v=5"></script>
   </body>
 </html>
