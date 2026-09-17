@@ -204,6 +204,9 @@ class MetaReviewService:
                 if not attempts:
                     missing.append(f"{source_id}: routing attempts unavailable")
             record = safe_record(source_record, attempts)
+            transcript = cast(dict[str, object], record["transcript"])
+            for gap in cast(list[str], transcript["gaps"]):
+                missing.append(f"{record['source_id']}: transcript {gap}")
             record_tokens = estimate_tokens(record)
             if input_tokens + record_tokens > input_token_limit:
                 missing.append("Input token limit reached")
