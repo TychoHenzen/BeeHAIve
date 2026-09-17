@@ -106,3 +106,31 @@ def test_autonomous_runtime_reports_launch_context_for_missing_executable(
     assert "missing-codex.exe" in message
     assert "errno=2" in message
     assert "cwd=" in message
+
+
+def test_autonomous_runtime_accepts_pretty_printed_json_handover(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    skill_path = tmp_path / "skill" / "SKILL.md"
+    skill_path.parent.mkdir()
+    skill_path.write_text("# test skill\n", encoding="utf-8")
+    monkeypatch.setattr(
+        autonomous.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [],
+            0,
+            'log\n{"status":"succeeded","summary":"pretty",\n'
+            ' "handover":{"step":"next"}}\n',
+            "",
+        ),
+    )
+
+    result = CodexSkillExecutor(tmp_path, "codex.exe").execute(
+        SkillStep("runtime", str(skill_path), "Exercise JSON parsing"),
+        {"repository": "owner/api"},
+        {},
+    )
+
+    assert result["status"] == "succeeded"
+    assert result["handover"] == {"step": "next"}

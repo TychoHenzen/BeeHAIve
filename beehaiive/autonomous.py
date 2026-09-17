@@ -58,6 +58,23 @@ def _output_tail(value: object) -> str:
     return str(value or "")[-2_000:]
 
 
+def _last_json_mapping(output: str) -> Mapping[str, object] | None:
+    decoder = json.JSONDecoder()
+    best: Mapping[str, object] | None = None
+    best_end = -1
+    for index, character in enumerate(output):
+        if character != "{":
+            continue
+        try:
+            value, end = decoder.raw_decode(output[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, Mapping) and index + end > best_end:
+            best = cast(Mapping[str, object], value)
+            best_end = index + end
+    return best
+
+
 @dataclass(frozen=True, slots=True)
 class SkillStep:
     name: str
@@ -451,13 +468,9 @@ class CodexSkillExecutor:
                 f"cwd={str(self.repository)!r}; exit_code={result.returncode}; "
                 f"output_tail={detail or '<none>'!r}"
             )
-        for line in reversed(result.stdout.splitlines()):
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, Mapping):
-                return cast(Mapping[str, object], value)
+        value = _last_json_mapping(result.stdout)
+        if value is not None:
+            return value
         raise RuntimeError(
             f"Codex skill context returned no JSON handover: "
             f"executable={self.executable!r}; cwd={str(self.repository)!r}; "
