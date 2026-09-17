@@ -118,7 +118,7 @@ class CodexProcessMixin:
     @staticmethod
     def communicate_bounded(
         process: subprocess.Popen[Any],
-        timeout: float,
+        timeout: float | None,
         *,
         terminate_descendants: bool = False,
     ) -> tuple[str, str, bool]:
@@ -133,7 +133,7 @@ class CodexProcessMixin:
     @staticmethod
     def _communicate_bounded(
         process: subprocess.Popen[Any],
-        timeout: float,
+        timeout: float | None,
         stdout_line_handler: Callable[[str], None] | None = None,
         *,
         stderr_line_handler: Callable[[str], None] | None = None,

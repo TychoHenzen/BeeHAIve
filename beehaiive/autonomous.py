@@ -126,7 +126,15 @@ ADVISOR_STEP = SkillStep(
     model="gpt-5.6-luna",
 )
 
-DEFAULT_AUTONOMOUS_TIMEOUT_SECONDS = 1_800.0
+DEFAULT_AUTONOMOUS_TIMEOUT_SECONDS: float | None = None
+
+
+def _autonomous_timeout() -> float | None:
+    raw = os.environ.get("BEEHAIIVE_AUTONOMOUS_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_AUTONOMOUS_TIMEOUT_SECONDS
+    value = float(raw)
+    return value if value > 0 else None
 
 
 class SkillExecutor(Protocol):
@@ -321,9 +329,13 @@ def _session_output(stdout: str, stderr: str) -> str:
         sections.append(f"[stdout]\n{stdout.strip()}")
     if stderr.strip():
         sections.append(f"[stderr]\n{stderr.strip()}")
-    return redact_worker_text(
-        "\n\n".join(sections), worker_secret_values(), max_length=16_000
+    output = redact_worker_text(
+        "\n\n".join(sections), worker_secret_values(), max_length=None
     )
+    if len(output) <= 16_000:
+        return output
+    half = 8_000
+    return f"{output[:half]}\n...[session output truncated]...\n{output[-half:]}"
 
 
 class AutonomousLifecycleRunner:
@@ -458,12 +470,14 @@ class CodexSkillExecutor:
         self,
         repository: str | Path,
         executable: str = "codex",
-        timeout_seconds: float = 900.0,
+        timeout_seconds: float | None = None,
         on_output: Callable[[str], None] | None = None,
     ) -> None:
         self.repository = Path(repository).resolve()
         self.executable = resolve_executable(executable)
-        self.timeout_seconds = timeout_seconds
+        self.timeout_seconds = (
+            timeout_seconds if timeout_seconds and timeout_seconds > 0 else None
+        )
         self.on_output = on_output
 
     def execute(
@@ -968,12 +982,7 @@ class AutonomousLifecycleService:
             return CodexSkillExecutor(
                 repository,
                 os.environ.get("BEEHAIIVE_CODEX_EXECUTABLE", "codex"),
-                float(
-                    os.environ.get(
-                        "BEEHAIIVE_AUTONOMOUS_TIMEOUT_SECONDS",
-                        str(DEFAULT_AUTONOMOUS_TIMEOUT_SECONDS),
-                    )
-                ),
+                _autonomous_timeout(),
                 on_output=on_output,
             )
         del context

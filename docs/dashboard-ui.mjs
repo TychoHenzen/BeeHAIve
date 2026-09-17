@@ -245,7 +245,7 @@ export function createDashboardUi({
     return node;
   }
 
-  const autonomousLabel = demo ? "Run placeholder lifecycle" : "Run lifecycle on server";
+  const autonomousLabel = demo ? "Run placeholder lifecycle" : "Run full lifecycle";
 
   function filterItems(items, filter) {
     return items.filter(({ pbi }) => {

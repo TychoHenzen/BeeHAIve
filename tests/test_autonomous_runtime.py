@@ -182,3 +182,14 @@ def test_autonomous_runtime_timeout_preserves_live_session_tail(
         )
 
     assert "doing work" in str(error.value)
+
+
+def test_autonomous_timeout_is_unlimited_unless_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("BEEHAIIVE_AUTONOMOUS_TIMEOUT_SECONDS", raising=False)
+    assert autonomous._autonomous_timeout() is None
+    monkeypatch.setenv("BEEHAIIVE_AUTONOMOUS_TIMEOUT_SECONDS", "0")
+    assert autonomous._autonomous_timeout() is None
+    monkeypatch.setenv("BEEHAIIVE_AUTONOMOUS_TIMEOUT_SECONDS", "12")
+    assert autonomous._autonomous_timeout() == 12
