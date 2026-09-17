@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -11,7 +13,37 @@ from .workflow_error import WorkflowError
 
 if TYPE_CHECKING:
     from .workflow_store import WorkflowStore
-    from .workspace_lease import WorkspaceLease
+from .workspace_lease import WorkspaceLease
+
+
+def _resolve_git_executable() -> str:
+    configured = os.environ.get("BEEHAIIVE_GIT_EXECUTABLE", "").strip()
+    if configured:
+        return configured
+    discovered = shutil.which("git")
+    if discovered and not any(
+        marker in discovered.casefold() for marker in ("msys", "devkitpro")
+    ):
+        return discovered
+    candidates = (
+        Path(os.environ.get("PROGRAMFILES", r"C:\Program Files"))
+        / "Git"
+        / "cmd"
+        / "git.exe",
+        Path.home()
+        / ".cache"
+        / "codex-runtimes"
+        / "codex-primary-runtime"
+        / "dependencies"
+        / "native"
+        / "git"
+        / "cmd"
+        / "git.exe",
+    )
+    return next(
+        (str(candidate) for candidate in candidates if candidate.is_file()),
+        discovered or "git",
+    )
 
 
 class GitWorktreeManager:
@@ -25,6 +57,7 @@ class GitWorktreeManager:
     ) -> None:
         self.repository = Path(repository).resolve()
         self.store = store
+        self._git_executable = _resolve_git_executable()
         if git_timeout_seconds <= 0:
             raise WorkflowError("Git timeout must be positive")
         self.git_timeout_seconds = git_timeout_seconds
@@ -208,7 +241,7 @@ class GitWorktreeManager:
     def _run_git(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         try:
             result = subprocess.run(
-                ("git", *arguments),
+                (self._git_executable, *arguments),
                 cwd=self.repository,
                 capture_output=True,
                 text=True,

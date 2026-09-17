@@ -68,6 +68,22 @@ def test_worktree_path_identity_preserves_internal_whitespace(tmp_path: Path) ->
     store.close()
 
 
+def test_worktree_gitdir_uses_the_host_path(tmp_path: Path) -> None:
+    repository = make_repository(tmp_path)
+    store = WorkflowStore()
+    manager = GitWorktreeManager(repository, store)
+    worktree = tmp_path / "host-path-worktree"
+
+    lease = manager.acquire("agent", "codex/host-path", worktree)
+
+    marker = (worktree / ".git").read_text(encoding="utf-8").strip()
+    expected = (repository / ".git" / "worktrees" / worktree.name).resolve()
+    assert marker == f"gitdir: {expected.as_posix()}"
+    assert manager.clean(worktree)
+    manager.release(lease.lease_id)
+    store.close()
+
+
 def test_successful_run_workspace_is_retained_until_explicit_release(
     tmp_path: Path,
 ) -> None:
