@@ -14,6 +14,33 @@ const FILTERS = [
   ["archived", "Archived"],
 ];
 const TERMINAL_PLANNING_STATUSES = new Set(["done", "completed", "closed", "merged"]);
+const DEFAULT_WORKFLOW_SKILLS = [
+  ["skill/refine-backlog-item", "Refine backlog item"],
+  ["skill/next-ticket", "Implement next ticket"],
+  ["skill/submit-draft-pr", "Submit pull request"],
+  ["skill/review-pr-branch", "Review pull request branch"],
+  ["skill/fix-pr-review", "Fix pull request review"],
+  ["skill/complete-pr", "Complete pull request"],
+  ["skill/codex-advisor", "Ask Codex advisor"],
+];
+const WORKFLOW_TOOLS = [
+  ["read_project", "Read project"],
+  ["read_repository", "Read repository"],
+  ["read_pull_request", "Read pull request"],
+  ["run_checks", "Run checks"],
+  ["request_operator", "Request operator input"],
+];
+const WORKFLOW_CONDITIONS = [
+  ["always", "Always"],
+  ["pass", "Success / pass"],
+  ["fail", "Failure"],
+  ["blocked", "Blocked"],
+  ["question", "Question"],
+  ["confused", "Confused / evidence"],
+  ["needs_operator", "Needs operator / evidence"],
+  ["checks_failed", "Checks failed / evidence"],
+  ["review_required", "Review required / evidence"],
+];
 
 const ACTION_LABELS = {
   advance: "Moved to implementation",
@@ -797,6 +824,19 @@ export function createDashboardUi({
     return { field, input };
   }
 
+  function editorTextArea(labelText, value, id, onInput) {
+    const field = element("div", undefined, "field");
+    const label = element("label", labelText);
+    label.htmlFor = id;
+    const textarea = element("textarea");
+    textarea.id = id;
+    textarea.rows = 4;
+    textarea.value = text(value, "");
+    textarea.addEventListener("input", () => onInput(textarea.value));
+    field.append(label, textarea);
+    return { field, textarea };
+  }
+
   function editorSelect(labelText, value, id, options, onChange) {
     const field = element("div", undefined, "field");
     const label = element("label", labelText);
@@ -814,14 +854,117 @@ export function createDashboardUi({
     return { field, select };
   }
 
+  function withCurrentOption(options, value) {
+    return value && !options.some(([optionValue]) => optionValue === value)
+      ? [[value, `${value} (current)`], ...options]
+      : options;
+  }
+
+  function workflowSkills() {
+    const ids = list(currentState?.workflow_skill_ids)
+      .filter((value) => typeof value === "string" && value.startsWith("skill/"))
+      .map((value) => [value, value.slice(6).replaceAll("-", " ")]);
+    return ids.length ? ids : DEFAULT_WORKFLOW_SKILLS;
+  }
+
+  function defaultReference(kind, nodeId) {
+    if (kind === "tool") return WORKFLOW_TOOLS[0][0];
+    if (kind === "skill") return workflowSkills()[0][0];
+    return `prompt/${nodeId || "node"}`;
+  }
+
+  function graphVisual(definition) {
+    const nodes = list(map(definition).nodes).map(map).filter((node) => text(node.node_id, ""));
+    const edges = list(map(definition).edges).map(map);
+    const fallback = element("div", undefined, "workflow-graph-fallback");
+    nodes.forEach((node) => fallback.append(element("span", `${text(node.node_id, "?")} (${text(node.kind, "step")})`)));
+    if (!nodes.length || typeof document.createElementNS !== "function") return fallback;
+
+    const width = Math.max(640, Math.min(960, nodes.length * 190));
+    const columns = Math.min(4, Math.max(2, Math.ceil(Math.sqrt(nodes.length))));
+    const rows = Math.ceil(nodes.length / columns);
+    const height = Math.max(190, rows * 100 + 70);
+    const xGap = (width - 140) / Math.max(columns - 1, 1);
+    const positions = new Map();
+    nodes.forEach((node, index) => {
+      positions.set(text(node.node_id, ""), {
+        x: 70 + (index % columns) * xGap,
+        y: 45 + Math.floor(index / columns) * 100,
+      });
+    });
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.classList.add("workflow-graph-visual");
+    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", `Workflow graph for ${text(definition.workflow_id, "workflow")}`);
+    const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+    const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
+    marker.id = "workflow-arrow";
+    marker.setAttribute("markerWidth", "8");
+    marker.setAttribute("markerHeight", "8");
+    marker.setAttribute("refX", "7");
+    marker.setAttribute("refY", "4");
+    marker.setAttribute("orient", "auto");
+    const arrow = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    arrow.setAttribute("d", "M0,0 L8,4 L0,8 z");
+    arrow.classList.add("workflow-graph-arrow");
+    marker.append(arrow);
+    defs.append(marker);
+    svg.append(defs);
+    edges.forEach((edge) => {
+      const source = positions.get(text(edge.source, ""));
+      const target = positions.get(text(edge.target, ""));
+      if (!source || !target) return;
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      const middle = (source.x + target.x) / 2;
+      path.setAttribute("d", `M ${source.x} ${source.y} C ${middle} ${source.y}, ${middle} ${target.y}, ${target.x} ${target.y}`);
+      path.setAttribute("marker-end", "url(#workflow-arrow)");
+      path.classList.add("workflow-graph-edge");
+      svg.append(path);
+      const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      label.setAttribute("x", String(middle));
+      label.setAttribute("y", String((source.y + target.y) / 2 - 6));
+      label.classList.add("workflow-graph-edge-label");
+      label.textContent = text(edge.condition, "always");
+      svg.append(label);
+    });
+    nodes.forEach((node) => {
+      const position = positions.get(text(node.node_id, ""));
+      const group = document.createElementNS("http://www.w3.org/2000/svg", "g");
+      group.classList.add("workflow-graph-node");
+      const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      rect.setAttribute("x", String(position.x - 65));
+      rect.setAttribute("y", String(position.y - 25));
+      rect.setAttribute("width", "130");
+      rect.setAttribute("height", "50");
+      rect.setAttribute("rx", "8");
+      group.append(rect);
+      const title = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      title.setAttribute("x", String(position.x));
+      title.setAttribute("y", String(position.y - 2));
+      title.classList.add("workflow-graph-node-title");
+      title.textContent = text(node.node_id, "Unnamed node");
+      group.append(title);
+      const kind = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      kind.setAttribute("x", String(position.x));
+      kind.setAttribute("y", String(position.y + 14));
+      kind.classList.add("workflow-graph-node-kind");
+      kind.textContent = text(node.kind, "step");
+      group.append(kind);
+      svg.append(group);
+    });
+    fallback.replaceChildren(svg);
+    return fallback;
+  }
+
   function renderGraphEditor(workflowId, latest) {
     const draft = graphDraft(workflowId, latest);
     const editor = element("section", undefined, "workflow-editor");
     editor.dataset.testid = "graph-editor";
     const heading = element("div", undefined, "panel-heading");
     heading.append(element("h3", `Edit next revision ${draft.revision}`));
-    heading.append(element("p", "Change nodes and transitions here. The service evaluates the draft before review or activation."));
-    editor.append(heading);
+    heading.append(element("p", "Build the run path from prompts, Codex skills, and safe tools. Save the draft to evaluate it."));
+    editor.append(heading, graphVisual(draft));
 
     const nodeHeading = element("div", undefined, "editor-heading");
     nodeHeading.append(element("h4", "Nodes"));
@@ -834,7 +977,8 @@ export function createDashboardUi({
       draft.nodes.push({
         node_id: `node-${index}`,
         kind: "skill",
-        reference: { reference_id: `skill/node-${index}` },
+        reference: { reference_id: defaultReference("skill", `node-${index}`) },
+        metadata: { context: "" },
       });
       draft.dirty = true;
       renderGraphPage(currentState);
@@ -844,9 +988,18 @@ export function createDashboardUi({
     const nodeList = element("div", undefined, "workflow-editor-list");
     draft.nodes.forEach((rawNode, index) => {
       const node = map(rawNode);
-      const reference = map(node.reference);
-      const row = element("div", undefined, "workflow-editor-row");
       const oldId = text(node.node_id, "");
+      const kindValue = text(node.kind, "skill");
+      const metadata = node.metadata && typeof node.metadata === "object" && !Array.isArray(node.metadata)
+        ? node.metadata
+        : {};
+      node.metadata = metadata;
+      const reference = node.reference && typeof node.reference === "object" && !Array.isArray(node.reference)
+        ? node.reference
+        : { reference_id: defaultReference(kindValue, oldId) };
+      node.reference = reference;
+      reference.reference_id = text(reference.reference_id, defaultReference(kindValue, oldId));
+      const row = element("div", undefined, "workflow-editor-row");
       let previousId = oldId;
       const nodeId = editorField("Node ID", oldId, `graph-node-id-${index}`, (value) => {
         const nextId = value.trim();
@@ -858,24 +1011,34 @@ export function createDashboardUi({
         previousId = nextId;
         draft.dirty = true;
       });
-      const kind = editorSelect(
-        "Kind",
-        text(node.kind, "skill"),
-        `graph-node-kind-${index}`,
-        [["prompt", "Prompt"], ["skill", "Skill"], ["tool", "Tool"]],
-        (value) => {
-          node.kind = value;
-          if (value === "tool" && !["read_project", "read_repository", "read_pull_request", "run_checks", "request_operator"].includes(reference.reference_id)) {
-            reference.reference_id = "read_repository";
-            referenceInput.input.value = "read_repository";
-          }
-          draft.dirty = true;
-        },
-      );
-      const referenceInput = editorField("Reference", reference.reference_id, `graph-node-reference-${index}`, (value) => {
-        reference.reference_id = value.trim();
+      const kind = editorSelect("Kind", kindValue, `graph-node-kind-${index}`, [["prompt", "Prompt"], ["skill", "Skill"], ["tool", "Tool"]], (value) => {
+        node.kind = value;
+        reference.reference_id = defaultReference(value, node.node_id);
         draft.dirty = true;
+        renderGraphPage(currentState);
       });
+      let referenceControl;
+      if (kindValue === "prompt") {
+        referenceControl = editorTextArea("Prompt / reference", metadata.prompt || reference.reference_id, `graph-node-reference-${index}`, (value) => {
+          metadata.prompt = value;
+          draft.dirty = true;
+        });
+      } else {
+        const options = kindValue === "tool"
+          ? withCurrentOption(WORKFLOW_TOOLS, reference.reference_id)
+          : withCurrentOption(workflowSkills(), reference.reference_id);
+        referenceControl = editorSelect(kindValue === "tool" ? "Tool" : "Skill", reference.reference_id, `graph-node-reference-${index}`, options, (value) => {
+          reference.reference_id = value;
+          draft.dirty = true;
+        });
+      }
+      const context = kindValue === "prompt"
+        ? null
+        : editorTextArea(kindValue === "skill" ? "Prompt / context" : "Context", metadata.context, `graph-node-context-${index}`, (value) => {
+          metadata.context = value;
+          draft.dirty = true;
+        });
+      context?.field.classList.add("editor-context");
       const remove = element("button", "Remove", "danger");
       remove.type = "button";
       remove.dataset.testid = "graph-remove-node";
@@ -886,7 +1049,9 @@ export function createDashboardUi({
         draft.dirty = true;
         renderGraphPage(currentState);
       });
-      row.append(nodeId.field, kind.field, referenceInput.field, remove);
+      row.append(nodeId.field, kind.field, referenceControl.field);
+      if (context) row.append(context.field);
+      row.append(remove);
       nodeList.append(row);
     });
     editor.append(nodeList);
@@ -921,8 +1086,8 @@ export function createDashboardUi({
         edge.target = value;
         draft.dirty = true;
       });
-      const condition = editorField("Condition", edge.condition, `graph-edge-condition-${index}`, (value) => {
-        edge.condition = value.trim();
+      const condition = editorSelect("Outcome", text(edge.condition, "always"), `graph-edge-condition-${index}`, withCurrentOption(WORKFLOW_CONDITIONS, text(edge.condition, "always")), (value) => {
+        edge.condition = value;
         draft.dirty = true;
       });
       const remove = element("button", "Remove", "danger");
@@ -984,11 +1149,11 @@ export function createDashboardUi({
     if (!graphOutput) return;
     graphOutput.replaceChildren();
     const graph = map(state.graph);
-    if (!graph.workflow_id) {
+    const workflowId = text(graph.workflow_id, settingsWorkflowInput?.value || "");
+    if (!workflowId) {
       graphOutput.append(element("div", "Choose a workflow ID in Settings to view its graph.", "empty"));
       return;
     }
-    const workflowId = String(graph.workflow_id);
     const active = map(graph.active);
     const definitions = list(graph.definitions).slice(-8).reverse();
     const summary = element("div", undefined, "graph-summary");
@@ -998,13 +1163,11 @@ export function createDashboardUi({
       summary.append(card);
     });
     graphOutput.append(summary);
-    if (!definitions.length) {
-      graphOutput.append(element("div", text(graph.message, "No graph definition is available for this workflow."), "empty"));
-      return;
-    }
-    const latest = map(definitions[0]);
-    const actionDefinition = definitionDocument(latest);
+    const latest = definitions.length ? map(definitions[0]) : null;
+    if (!latest) graphOutput.append(element("div", "No saved revision yet. Start with the editable draft below.", "empty"));
+    const actionDefinition = latest ? definitionDocument(latest) : null;
     graphOutput.append(renderGraphEditor(workflowId, latest));
+    if (!latest) return;
     definitions.forEach((definition) => {
       const current = map(definition);
       const revision = current.revision ?? "?";
@@ -1018,6 +1181,7 @@ export function createDashboardUi({
       const safety = map(map(current.safety_evidence).evidence?.safety || map(current.safety_evidence).safety);
       meta.append(element("span", `Safety: ${safety.passed === true ? "passing" : safety.passed === false ? "blocking" : "unavailable"}`));
       card.append(meta);
+      card.append(graphVisual(current));
       const nodes = list(current.nodes);
       const nodeGrid = element("div", undefined, "graph-nodes");
       nodes.forEach((node) => {

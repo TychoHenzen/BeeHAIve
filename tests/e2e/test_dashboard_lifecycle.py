@@ -524,7 +524,10 @@ def test_sidebar_pages_and_settings_are_real_views(dashboard_page) -> None:
     editor.get_by_test_id("graph-add-node").click()
     expect(editor.get_by_label("Node ID")).to_have_count(3)
     editor.get_by_test_id("graph-add-edge").click()
-    expect(editor.get_by_label("Condition")).to_have_count(2)
+    expect(editor.get_by_label("Outcome")).to_have_count(2)
+    expect(editor.locator("#graph-node-reference-0")).to_have_attribute("rows", "4")
+    expect(editor.locator("#graph-node-reference-1")).to_have_value(re.compile(r"^skill/"))
+    expect(editor.locator("svg.workflow-graph-visual")).to_be_visible()
     editor.get_by_test_id("graph-save-draft").click()
     expect(page.locator("#state-status")).to_contain_text(
         "graph_evaluate succeeded."
@@ -532,7 +535,8 @@ def test_sidebar_pages_and_settings_are_real_views(dashboard_page) -> None:
     expect(page.locator("#graph-output")).to_contain_text("Revision 2")
     expect(page.locator("#graph-output")).to_contain_text("begin")
     page.locator("#workflow-select").select_option("demo-flow")
-    assert page.locator("#graph-output textarea").count() == 0
+    expect(page.locator(".workflow-editor")).to_be_visible()
+    expect(page.locator("#graph-output svg.workflow-graph-visual")).to_have_count(2)
     for testid in ("graph-evaluate", "graph-review", "graph-activate"):
         page.get_by_test_id(testid).click()
         expect(page.locator("#state-status")).to_contain_text(

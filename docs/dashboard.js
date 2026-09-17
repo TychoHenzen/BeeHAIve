@@ -1,6 +1,6 @@
-import { createDashboardClient } from "/dashboard-client.mjs?v=6";
-import { createDemoClient } from "/dashboard-demo.mjs?v=6";
-import { createDashboardUi } from "/dashboard-ui.mjs?v=6";
+import { createDashboardClient } from "/dashboard-client.mjs?v=7";
+import { createDemoClient } from "/dashboard-demo.mjs?v=7";
+import { createDashboardUi } from "/dashboard-ui.mjs?v=7";
 
 const settingsProjectInput = document.querySelector("#settings-project-id");
 const settingsWorkflowInput = document.querySelector("#settings-workflow-id");

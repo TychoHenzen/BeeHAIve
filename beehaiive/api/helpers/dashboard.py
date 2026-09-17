@@ -1,4 +1,6 @@
+import os
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import cast
 
 from fastapi import HTTPException
@@ -34,6 +36,7 @@ from beehaiive.api.models import DashboardStopRequest as DashboardStopRequest
 from beehaiive.api.models import (
     DashboardSynchronizeRequest as DashboardSynchronizeRequest,
 )
+from beehaiive.autonomous import ADVISOR_STEP, AUTONOMOUS_STEPS
 from beehaiive.dashboard import build_dashboard_state
 from beehaiive.dashboard.values import safe_dashboard_value
 from beehaiive.graph import GraphDefinition
@@ -66,6 +69,26 @@ DASHBOARD_ACTION_OWNERS = {
 DASHBOARD_ACTION_READBACK = {
     action: "action,state" for action in DASHBOARD_ACTION_OWNERS
 }
+
+
+def _workflow_skill_ids() -> list[str]:
+    roots = [Path.home() / ".codex" / "skills", Path.home() / ".agents" / "skills"]
+    configured = os.environ.get("BEEHAIIVE_DOD_GUARD_SKILLS", "").strip()
+    if configured:
+        roots.append(Path(configured))
+    known = {
+        f"skill/{Path(step.skill_path).parent.name}"
+        for step in (*AUTONOMOUS_STEPS, ADVISOR_STEP)
+        if Path(step.skill_path).is_file()
+    }
+    known.update(
+        f"skill/{skill_file.parent.name}"
+        for root in roots
+        if root.is_dir()
+        for skill_file in root.glob("*/SKILL.md")
+        if skill_file.is_file()
+    )
+    return sorted(known)
 
 
 def _dashboard_state(
@@ -108,6 +131,7 @@ def _dashboard_state(
         orchestrator, workflow_id, graph_safety_service
     )
     dashboard["workflow_ids"] = list(orchestrator.store.graph_workflow_ids())
+    dashboard["workflow_skill_ids"] = _workflow_skill_ids()
     if workflow_service is not None:
         repositories = cast(list[dict[str, object]], dashboard["repositories"])
         for repository in repositories:

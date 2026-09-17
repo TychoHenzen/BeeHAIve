@@ -195,18 +195,31 @@
       .editor-heading h4 { margin: 0; color: #dedfe6; }
       .workflow-editor-list { display: grid; gap: 8px; }
       .workflow-editor-row { display: grid; grid-template-columns: minmax(130px, 1fr) 150px minmax(160px, 1.4fr) auto; gap: 8px; align-items: end; padding: 10px; border: 1px solid var(--divider); border-radius: 8px; background: var(--surface-raised); }
+      .workflow-editor-row .editor-context { grid-column: 1 / -1; }
+      .workflow-editor-row:not(.edge) > button { grid-column: 4; grid-row: 1; }
       .workflow-editor-row.edge { grid-template-columns: minmax(130px, 1fr) minmax(130px, 1fr) minmax(150px, 1fr) auto; }
       .workflow-editor-row button { min-height: 36px; }
-      @media (max-width: 760px) { .workflow-editor-row, .workflow-editor-row.edge { grid-template-columns: 1fr 1fr; } .workflow-editor-row button { grid-column: 2; } }
+      @media (max-width: 760px) { .workflow-editor-row, .workflow-editor-row.edge { grid-template-columns: 1fr 1fr; } .workflow-editor-row button { grid-column: 2; grid-row: auto; } }
       .graph-definition h3, .settings-card h3, .project-card h3 { margin: 0; }
       .graph-meta { display: flex; flex-wrap: wrap; gap: 7px; color: #9b9fae; font-size: .72rem; }
       .graph-nodes { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
       .graph-node { display: grid; gap: 4px; padding: 10px; border: 1px solid var(--divider); border-radius: 8px; background: var(--surface-raised); }
       .graph-node strong { color: #dedfe6; font-size: .78rem; }
       .graph-node span { color: #9b9fae; font: .67rem ui-monospace, SFMono-Regular, Consolas, monospace; }
+      .workflow-graph-fallback { overflow-x: auto; }
+      .workflow-graph-fallback > span { display: block; padding: 8px 10px; color: #b7b0e8; font: .72rem ui-monospace, SFMono-Regular, Consolas, monospace; }
+      .workflow-graph-visual { display: block; width: 100%; min-height: 190px; border: 1px solid var(--divider); border-radius: 8px; background: var(--surface-raised); }
+      .workflow-graph-edge { fill: none; stroke: #77709f; stroke-width: 2; }
+      .workflow-graph-arrow { fill: #77709f; }
+      .workflow-graph-edge-label { fill: #b7b0e8; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; text-anchor: middle; }
+      .workflow-graph-node rect { fill: #252538; stroke: #9184d9; stroke-width: 1.5; }
+      .workflow-graph-node-title, .workflow-graph-node-kind { fill: #dedfe6; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; text-anchor: middle; }
+      .workflow-graph-node-title { font-size: 12px; }
+      .workflow-graph-node-kind { fill: #9b9fae; font-size: 10px; }
       .field { display: grid; gap: 5px; }
       .field label { color: #9b9fae; font-size: .74rem; }
-      .field input, .field select { width: 100%; padding: 9px 10px; border: 1px solid var(--divider); border-radius: 7px; color: var(--text); background: var(--surface-raised); font: .75rem ui-monospace, SFMono-Regular, Consolas, monospace; }
+      .field input, .field select, .field textarea { width: 100%; padding: 9px 10px; border: 1px solid var(--divider); border-radius: 7px; color: var(--text); background: var(--surface-raised); font: .75rem ui-monospace, SFMono-Regular, Consolas, monospace; }
+      .field textarea { min-height: 96px; resize: vertical; line-height: 1.45; }
       .settings-note { margin: 0; color: #777b8d; font-size: .72rem; line-height: 1.5; }
       .settings-status { min-height: 20px; margin: 0; color: var(--muted); font-size: .74rem; }
       .settings-status.success { color: var(--green); }
@@ -392,6 +405,6 @@
     <aside id="details-pane" class="details-pane" aria-label="Run inspector" aria-hidden="true">
       <div id="details-output"></div>
     </aside>
-    <script type="module" src="/dashboard.js?v=6"></script>
+    <script type="module" src="/dashboard.js?v=7"></script>
   </body>
 </html>

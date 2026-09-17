@@ -116,6 +116,7 @@ _STRUCTURAL_DASHBOARD_KEYS = frozenset(
         "updated_at",
         "workflow_id",
         "workflow_ids",
+        "workflow_skill_ids",
         "writer",
     }
 )
@@ -231,6 +232,7 @@ def safe_dashboard_value(
                         "supported_actions",
                         "supported_action_owners",
                         "supported_action_readback",
+                        "workflow_skill_ids",
                     },
                     max_items=item_limit,
                     max_bytes=MAX_DASHBOARD_BYTES if raw_key == "graph_trace" else None,

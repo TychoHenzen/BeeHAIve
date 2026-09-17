@@ -95,6 +95,7 @@ function initialState() {
     name: "Guided delivery demo",
     projects: ["beehaive", "omelette", "nocturne"],
     workflow_ids: ["demo-flow"],
+    workflow_skill_ids: AUTONOMOUS_SKILLS.map((skill) => `skill/${skill}`).concat("skill/codex-advisor"),
     updated_at: now(),
     repositories: [
       {
