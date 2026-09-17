@@ -70,6 +70,8 @@ take precedence. `BEEHAIIVE_AGENT_REPOSITORY_NAME` must match the repository
 selected in the Project. The timeout must be finite and no greater than 900
 seconds. Project discovery is cached for 10 minutes by default, so the
 dashboard's five-second polling does not repeat the full GraphQL discovery.
+When `BEEHAIIVE_CODEX_EXECUTABLE` is a bare command such as `codex`, the
+autonomous runner resolves the native Windows executable before launching it.
 Set `BEEHAIIVE_GITHUB_DISCOVERY_CACHE_SECONDS` to a finite non-negative number
 to change that interval. Do not commit `.env` or place its values in screenshots.
 Production review reads use `GITHUB_TOKEN` or `GH_TOKEN` with repository
@@ -108,12 +110,13 @@ lifecycle. Demo actions stay in the browser and make no external changes.
 
 ## Autonomous lifecycle
 
-Select **Run lifecycle** on a claimable PBI. BeeHAIve starts one background
-run and hands the PBI through `refine-backlog-item`, `next-ticket`, published
+Select **Run lifecycle on server** on a claimable PBI. BeeHAIve starts one
+server-side background run and hands the PBI through `refine-backlog-item`, `next-ticket`, published
 `submit-draft-pr`, `review-pr-branch`, `fix-pr-review`, and `complete-pr`.
 Each skill runs in its own Codex context and receives the previous handover.
 Set `BEEHAIIVE_AUTONOMOUS_MODE=placeholder` for the deterministic browser
-proof. The default `codex` mode invokes the named local skill files.
+proof. The default `codex` mode invokes the named local skill files. The
+guided demo is the only browser-local placeholder path and is labeled as such.
 
 The scheduler applies the configured worker capacity to autonomous runs and
 does not start a second lifecycle for the same project. Handover evidence is

@@ -278,6 +278,22 @@ def test_real_mode_wires_autonomous_lifecycle_endpoint(dashboard_page) -> None:
                 ),
             )
             return
+        if request.url.endswith("/autonomous-runs/auto-1"):
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps(
+                    {
+                        "run_id": "auto-1",
+                        "project_id": "owner:1",
+                        "repository": "owner/app",
+                        "pbi_number": 1,
+                        "status": "completed",
+                        "current_step": None,
+                    }
+                ),
+            )
+            return
         route.fulfill(
             status=200,
             content_type="application/json",

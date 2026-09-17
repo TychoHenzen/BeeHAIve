@@ -45,6 +45,19 @@ def _skill_path(name: str) -> str:
     return str(_skill_root() / name / "SKILL.md")
 
 
+def _resolve_executable(executable: str) -> str:
+    configured = executable.strip()
+    if Path(configured).suffix.lower() in {".bat", ".cmd", ".exe"}:
+        return shutil.which(configured) or configured
+    return shutil.which(f"{configured}.exe") or shutil.which(configured) or configured
+
+
+def _output_tail(value: object) -> str:
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")[-2_000:]
+    return str(value or "")[-2_000:]
+
+
 @dataclass(frozen=True, slots=True)
 class SkillStep:
     name: str
@@ -359,8 +372,7 @@ class CodexSkillExecutor:
         timeout_seconds: float = 900.0,
     ) -> None:
         self.repository = Path(repository).resolve()
-        configured_executable = executable.strip()
-        self.executable = shutil.which(configured_executable) or configured_executable
+        self.executable = _resolve_executable(executable)
         self.timeout_seconds = timeout_seconds
 
     def execute(
@@ -378,7 +390,10 @@ class CodexSkillExecutor:
             "Use the supplied PBI context and handover. Keep all linked subtasks "
             "on the same branch. Submit the pull request published, not draft. "
             "Do not re-run review after applying selected fixes. Return one JSON "
-            "object with status, summary, and handover. Do not include secrets.\n"
+            "object with status, summary, and handover. Do not include secrets. "
+            "This context is unattended. Never ask for input or wait for approval. "
+            "If a material blocker remains, return blocked JSON with its exact "
+            "reason.\n"
             f"PBI context: {json.dumps(dict(context), sort_keys=True)}\n"
             f"Handover: {json.dumps(dict(handover), sort_keys=True)}"
         )
@@ -399,19 +414,42 @@ class CodexSkillExecutor:
         if step.model:
             command.extend(("--model", step.model))
         command.append(prompt)
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=self.timeout_seconds,
-            check=False,
-        )
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout).strip()
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdin=subprocess.DEVNULL,
+                timeout=self.timeout_seconds,
+                check=False,
+            )
+        except FileNotFoundError as error:
             raise RuntimeError(
-                detail or f"Codex exited with status {result.returncode}"
+                f"Codex launch failed: executable={self.executable!r}; "
+                f"cwd={str(self.repository)!r}; filename={error.filename!r}; "
+                f"errno={error.errno}; message={error.strerror or str(error)}"
+            ) from error
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(
+                f"Codex timed out after {self.timeout_seconds:g}s: "
+                f"executable={self.executable!r}; cwd={str(self.repository)!r}; "
+                f"stdout_tail={_output_tail(error.stdout).strip() or '<none>'!r}; "
+                f"stderr_tail={_output_tail(error.stderr).strip() or '<none>'!r}"
+            ) from error
+        except OSError as error:
+            raise RuntimeError(
+                f"Codex launch failed: executable={self.executable!r}; "
+                f"cwd={str(self.repository)!r}; errno={error.errno}; "
+                f"message={error.strerror or str(error)}"
+            ) from error
+        if result.returncode != 0:
+            detail = _output_tail(result.stderr or result.stdout).strip()
+            raise RuntimeError(
+                f"Codex process failed: executable={self.executable!r}; "
+                f"cwd={str(self.repository)!r}; exit_code={result.returncode}; "
+                f"output_tail={detail or '<none>'!r}"
             )
         for line in reversed(result.stdout.splitlines()):
             try:
@@ -420,7 +458,11 @@ class CodexSkillExecutor:
                 continue
             if isinstance(value, Mapping):
                 return cast(Mapping[str, object], value)
-        raise RuntimeError("Codex skill context returned no JSON handover")
+        raise RuntimeError(
+            f"Codex skill context returned no JSON handover: "
+            f"executable={self.executable!r}; cwd={str(self.repository)!r}; "
+            f"output_tail={_output_tail(result.stdout).strip() or '<none>'!r}"
+        )
 
 
 class AutonomousLifecycleService:

@@ -367,8 +367,8 @@
                 <h3>Autonomous workers</h3>
                 <div class="status-row"><span>Production execution</span><strong>Server process</strong></div>
                 <div class="field"><label for="settings-scheduler-enabled">Polling</label><select id="settings-scheduler-enabled"><option value="false">Off</option><option value="true">On</option></select></div>
-                <div class="field"><label for="settings-max-workers">Worker capacity</label><input id="settings-max-workers" type="number" min="1" max="64" step="1" inputmode="numeric"></div>
-                <div class="field"><label for="settings-poll-interval">Poll interval (seconds)</label><input id="settings-poll-interval" type="number" min="1" step="1" inputmode="decimal"></div>
+                <div class="field"><label for="settings-max-workers">Worker capacity</label><input id="settings-max-workers" type="number" min="1" max="64" step="1" inputmode="numeric" value="1"></div>
+                <div class="field"><label for="settings-poll-interval">Poll interval (seconds)</label><input id="settings-poll-interval" type="number" min="1" step="1" inputmode="decimal" value="600"></div>
                 <p class="settings-note">Each worker runs one PBI lifecycle at a time. Apply changes to this server process. Set the same values in `.env` to keep them after restart.</p>
                 <div class="settings-actions"><button id="scheduler-save" class="primary" type="button" data-testid="scheduler-configure">Apply scheduler settings</button></div>
                 <p id="scheduler-feedback" class="settings-status" role="status" aria-live="polite"></p>

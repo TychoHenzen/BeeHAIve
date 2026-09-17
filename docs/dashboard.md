@@ -57,6 +57,10 @@ Settings also exposes the scheduler switch, poll interval, and autonomous
 worker capacity. Applying those values updates the running server when a
 workflow-backed agent worker exists. Put the same values in `.env` to retain
 them after a restart.
+Production lifecycle buttons call the server autonomous-run endpoint. The
+guided demo is the only browser-local placeholder and is labeled in its
+buttons and status message. Recent activity includes the action reason,
+selected PBI, run stage, scheduler settings, and bounded failure details.
 In documented demo mode, start work claims one PBI and runs the bounded
 repository-inventory worker. A completed result is shown in the work-item row
 and run inspector. Every action is recorded as `pending`, `succeeded`, or `failed`; a

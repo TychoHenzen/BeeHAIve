@@ -10,6 +10,7 @@ import pytest
 import beehaiive.autonomous as autonomous
 from beehaiive.autonomous import (
     AutonomousLifecycleService,
+    CodexSkillExecutor,
     SkillStep,
 )
 from beehaiive.orchestrator import Orchestrator
@@ -24,15 +25,19 @@ def test_autonomous_runtime_resolves_bare_codex_before_windows_launch(
     skill_path = tmp_path / "skill" / "SKILL.md"
     skill_path.parent.mkdir()
     skill_path.write_text("# test skill\n", encoding="utf-8")
-    resolved_executable = tmp_path / "codex.cmd"
-    resolved_executable.write_text("@echo off\n", encoding="utf-8")
+    resolved_executable = tmp_path / "codex.exe"
+    resolved_executable.write_bytes(b"native executable placeholder")
     launches: list[list[str]] = []
 
     monkeypatch.setenv("BEEHAIIVE_AUTONOMOUS_MODE", "codex")
     monkeypatch.setenv("BEEHAIIVE_AGENT_REPOSITORY", str(tmp_path))
     monkeypatch.setenv("BEEHAIIVE_AGENT_REPOSITORY_NAME", "owner/api")
     monkeypatch.setenv("BEEHAIIVE_CODEX_EXECUTABLE", "codex")
-    monkeypatch.setattr(shutil, "which", lambda _command: str(resolved_executable))
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda command: str(resolved_executable) if command == "codex.exe" else None,
+    )
 
     def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         del kwargs
@@ -72,3 +77,32 @@ def test_autonomous_runtime_resolves_bare_codex_before_windows_launch(
         assert launches[0][0] == str(resolved_executable)
     finally:
         store.close()
+
+
+def test_autonomous_runtime_reports_launch_context_for_missing_executable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    skill_path = tmp_path / "skill" / "SKILL.md"
+    skill_path.parent.mkdir()
+    skill_path.write_text("# test skill\n", encoding="utf-8")
+    missing = tmp_path / "missing-codex.exe"
+    monkeypatch.setattr(
+        autonomous.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            FileNotFoundError(2, "The system cannot find the file specified", missing)
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as error:
+        CodexSkillExecutor(tmp_path, str(missing)).execute(
+            SkillStep("runtime", str(skill_path), "Exercise diagnostics"),
+            {"repository": "owner/api"},
+            {},
+        )
+
+    message = str(error.value)
+    assert "Codex launch failed" in message
+    assert "missing-codex.exe" in message
+    assert "errno=2" in message
+    assert "cwd=" in message
