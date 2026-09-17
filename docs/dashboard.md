@@ -29,6 +29,19 @@ systems so the complete
 Plan, Refine, Implement, Pull request, Review, and Ship journey can be
 exercised without GitHub or Codex changes.
 
+The live Queue view groups work into Refinement, Implementation, Publish,
+Review, Repair, Completion, Blocked, and Completed queues. Queue assignment is
+computed by the server from Project Status and current run, branch, pull
+request, check, review, and handoff evidence. The browser displays that
+assignment; it does not invent a second lifecycle. Select Archived to inspect
+the Completed queue.
+
+Quick idea entry accepts bounded text and an allowlisted Project selection. It
+sends one authenticated capture action to the add-backlog-idea skill context.
+The action log shows pending, succeeded, or failed state and the created issue
+returns to the selected Project's Backlog. The read-only dashboard config
+endpoint at /dashboard/config supplies the Project IDs for that selector.
+
 On Windows, copy `.env.example` to `.env`, fill in the required values, and run
 the tracked `start_dashboard.bat` launcher. The launcher reads `.env` before
 validating the configuration. Direct server commands still need environment

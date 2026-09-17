@@ -14,6 +14,7 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
     require_mutation_access = context["require_mutation_access"]
     require_routing_run_access = context["require_routing_run_access"]
     routing_service = context["routing_service"]
+    configured_projects = context["configured_projects"]
     docs_directory = Path(__file__).resolve().parents[3] / "docs"
     dashboard_view_modules = {
         "actions",
@@ -67,6 +68,10 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
             docs_directory / "dashboard.html",
             media_type="text/html",
         )
+
+    @app.get("/dashboard/config")
+    def dashboard_config() -> dict[str, object]:
+        return {"projects": sorted(configured_projects)}
 
     @app.get("/dashboard.js", response_class=FileResponse)
     def dashboard_script() -> FileResponse:  # pyright: ignore[reportUnusedFunction]

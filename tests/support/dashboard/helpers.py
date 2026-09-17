@@ -49,7 +49,9 @@ def configure_dashboard_remote(repository: Path, root: Path) -> Path:
 
 
 def dashboard_snapshot(
-    project_id: str = "project-1", api_title: str = "API one"
+    project_id: str = "project-1",
+    api_title: str = "API one",
+    extra_pbis: tuple[PbiSnapshot, ...] = (),
 ) -> ProjectSnapshot:
     return ProjectSnapshot(
         project_id,
@@ -81,6 +83,7 @@ def dashboard_snapshot(
                         },
                     ),
                     PbiSnapshot("owner/api", 4, "API four"),
+                    *extra_pbis,
                 ),
             ),
             RepositorySnapshot(

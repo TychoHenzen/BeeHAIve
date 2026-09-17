@@ -141,6 +141,31 @@ def test_guided_demo_recovers_from_operator_question(dashboard_page) -> None:
 
 
 @pytest.mark.e2e
+def test_dashboard_shows_staged_queues_and_quick_idea_entry(dashboard_page) -> None:
+    page, base_url = dashboard_page
+    page.goto(f"{base_url}/dashboard?demo=true")
+
+    expect(page.get_by_test_id("workflow-queue-refinement")).to_contain_text(
+        "Add account recovery"
+    )
+    expect(page.get_by_test_id("workflow-queue-review")).to_contain_text(
+        "Harden session expiry"
+    )
+    expect(page.get_by_test_id("workflow-queue-blocked")).to_contain_text(
+        "Choose deployment target"
+    )
+    expect(page.locator("#idea-project")).to_have_value("demo:1")
+
+    page.locator("#idea-text").fill("Capture a new dashboard idea")
+    page.locator("#idea-form").get_by_role("button", name="Capture idea").click()
+
+    expect(page.locator("#idea-feedback")).to_contain_text("Idea capture completed.")
+    expect(page.get_by_test_id("workflow-queue-refinement")).to_contain_text(
+        "Capture a new dashboard idea"
+    )
+
+
+@pytest.mark.e2e
 def test_real_mode_uses_server_owned_auth_for_actions(dashboard_page) -> None:
     page, base_url = dashboard_page
     state = {
@@ -215,6 +240,79 @@ def test_real_mode_uses_server_owned_auth_for_actions(dashboard_page) -> None:
     headers = observed_headers[0]
     assert headers.get("x-beehaive-dashboard") == "1"
     assert "x-api-key" not in headers
+
+
+@pytest.mark.e2e
+def test_real_mode_reads_async_idea_capture_completion(dashboard_page) -> None:
+    page, base_url = dashboard_page
+    state = {
+        "project_id": "owner:1",
+        "name": "Server project",
+        "updated_at": "now",
+        "repositories": [
+            {
+                "name": "owner/app",
+                "active": True,
+                "writer": {"status": "idle"},
+                "pbis": [],
+            }
+        ],
+        "actions": [],
+    }
+    dashboard_reads = 0
+
+    def api(route) -> None:
+        nonlocal dashboard_reads
+        request = route.request
+        if request.method == "POST":
+            body = request.post_data_json
+            assert body["action"] == "capture_idea"
+            payload = {
+                "action": {"id": "idea-1", "kind": "capture_idea", "status": "pending"},
+                "result": {"status": "running"},
+                "state": {
+                    **state,
+                    "actions": [
+                        {"id": "idea-1", "kind": "capture_idea", "status": "pending"}
+                    ],
+                },
+            }
+        else:
+            dashboard_reads += 1
+            payload = {
+                **state,
+                "actions": [
+                    {
+                        "id": "idea-1",
+                        "kind": "capture_idea",
+                        "status": "succeeded",
+                    }
+                ]
+                if dashboard_reads > 1
+                else [],
+            }
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(payload),
+        )
+
+    page.route(
+        "**/dashboard/config",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"projects": ["owner:1"]}),
+        ),
+    )
+    page.route("**/projects/**", api)
+    page.goto(f"{base_url}/dashboard?project=owner:1")
+    page.locator("#idea-text").fill("Async idea")
+    page.locator("#idea-form").get_by_role("button", name="Capture idea").click()
+
+    expect(page.locator("#idea-feedback")).to_contain_text(
+        "Idea capture completed.", timeout=5_000
+    )
 
 
 @pytest.mark.e2e

@@ -160,6 +160,9 @@ def _dashboard_metadata(issue: Mapping[str, Any]) -> dict[str, object]:
         merged = raw_pull_request.get("merged")
         if isinstance(merged, bool):
             pull_request["merged"] = merged
+        is_draft = raw_pull_request.get("isDraft")
+        if isinstance(is_draft, bool):
+            pull_request["is_draft"] = is_draft
         source_branch = raw_pull_request.get("headRefName")
         has_source_branch = isinstance(source_branch, str) and bool(
             source_branch.strip()

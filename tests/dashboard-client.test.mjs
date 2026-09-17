@@ -157,6 +157,19 @@ test("actions expose pending, success, and failure states", async () => {
   assert.match(failed.statuses.at(-1).message, /rejected/);
 });
 
+test("pending action readback stays visibly pending", async () => {
+  const { client, statuses } = harness(async () => response({
+    action: { status: "pending" },
+    result: { status: "running" },
+    state: { actions: [] },
+  }));
+
+  await client.runAction({ action: "capture_idea" });
+
+  assert.equal(statuses.at(-1).kind, "pending");
+  assert.match(statuses.at(-1).message, /capture_idea pending/);
+});
+
 test("clearing the project invalidates an in-flight refresh", async () => {
   let currentProject = "owner:7";
   let resolveRequest;

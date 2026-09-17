@@ -116,6 +116,14 @@
       .queue-filter { min-height: 27px; padding: 0 8px; border-color: transparent; background: transparent; color: #85899a; font-size: .67rem; }
       .queue-filter[aria-pressed="true"] { border-color: var(--accent); color: #d8d0ff; }
       .queue-table { overflow: hidden; border-radius: 10px; background: var(--surface); box-shadow: 0 4px 18px #0002; }
+      .workflow-queues { display: grid; gap: 12px; overflow: visible; background: transparent; box-shadow: none; }
+      .workflow-queue { display: grid; gap: 8px; padding: 12px; border: 1px solid var(--divider); border-radius: 10px; background: var(--surface); }
+      .workflow-queue-heading { display: flex; align-items: baseline; gap: 8px; }
+      .workflow-queue-heading h3 { margin: 0; }
+      .workflow-queue-heading p { margin: 0; color: #777b8d; font-size: .68rem; }
+      .workflow-queue-count { margin-left: auto; color: #d8d0ff; font: .72rem ui-monospace, SFMono-Regular, Consolas, monospace; }
+      .workflow-queue-items { display: grid; gap: 1px; overflow: hidden; border-radius: 8px; background: var(--divider); }
+      .workflow-queue-empty { padding: 14px; color: #777b8d; font-size: .72rem; text-align: center; }
       .queue-row { display: grid; grid-template-columns: 20px minmax(180px, 2fr) 100px 105px 135px 90px 88px; gap: 9px; align-items: center; min-height: 61px; padding: 8px 12px; border-bottom: 1px solid var(--divider); color: #bfc1cd; font-size: .74rem; }
       .queue-row:last-child { border-bottom: 0; }
       .queue-header { min-height: 34px; color: #777b8d; font-size: .65rem; letter-spacing: .06em; text-transform: uppercase; }
@@ -207,7 +215,7 @@
       .workflow-editor-row:not(.edge) > button { grid-column: 4; grid-row: 1; }
       .workflow-editor-row.edge { grid-template-columns: minmax(130px, 1fr) minmax(130px, 1fr) minmax(150px, 1fr) auto; }
       .workflow-editor-row button { min-height: 36px; }
-      @media (max-width: 760px) { .workflow-editor-row, .workflow-editor-row.edge { grid-template-columns: 1fr 1fr; } .workflow-editor-row button { grid-column: 2; grid-row: auto; } }
+      @media (max-width: 760px) { .workflow-editor-row, .workflow-editor-row.edge { grid-template-columns: 1fr 1fr; } .workflow-editor-row button { grid-column: 2; grid-row: auto; } .idea-form { grid-template-columns: 1fr; } }
       .graph-definition h3, .settings-card h3, .project-card h3 { margin: 0; }
       .graph-meta { display: flex; flex-wrap: wrap; gap: 7px; color: #9b9fae; font-size: .72rem; }
       .graph-nodes { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
@@ -233,6 +241,8 @@
       .settings-status.success { color: var(--green); }
       .settings-status.failure { color: var(--red); }
       .settings-actions { display: flex; flex-wrap: wrap; gap: 7px; }
+      .idea-entry { margin-top: 22px; }
+      .idea-form { display: grid; grid-template-columns: minmax(150px, .35fr) minmax(260px, 1fr) auto; align-items: end; gap: 8px; }
       .status-row { display: flex; align-items: center; gap: 8px; min-height: 34px; padding: 8px 10px; border-radius: 7px; background: var(--surface-raised); color: #bfc1cd; font-size: .74rem; }
       .status-row strong { margin-left: auto; color: var(--green); font-weight: 500; }
       .page-content-hidden { display: none !important; }
@@ -330,6 +340,26 @@
         <main id="mission" class="main" hidden>
           <section id="metrics" class="metrics" data-page-content="mission queue" aria-label="Mission summary"></section>
           <section id="attention" class="attention" data-page-content="mission" hidden aria-labelledby="attention-title"></section>
+          <section id="idea-entry" class="idea-entry workflow-create" data-page-content="mission queue" aria-labelledby="idea-entry-title">
+            <div class="panel-heading">
+              <h2 id="idea-entry-title">Quick idea entry</h2>
+              <p>Send one idea to add-backlog-idea.</p>
+            </div>
+            <form id="idea-form" class="idea-form">
+              <div class="field">
+                <label for="idea-project">Project</label>
+                <select id="idea-project" required>
+                  <option value="">No Project selected</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="idea-text">Idea</label>
+                <textarea id="idea-text" maxlength="8000" required rows="3" placeholder="Describe the outcome you want captured."></textarea>
+              </div>
+              <button id="idea-submit" class="primary" type="submit">Capture idea</button>
+            </form>
+            <p id="idea-feedback" class="settings-status" role="status" aria-live="polite"></p>
+          </section>
 
           <div class="board" data-page-content="mission queue agents">
             <section id="queue" data-page-content="mission queue" aria-labelledby="queue-title">
@@ -413,6 +443,6 @@
     <aside id="details-pane" class="details-pane" aria-label="Run inspector" aria-hidden="true">
       <div id="details-output"></div>
     </aside>
-    <script type="module" src="/dashboard.js?v=11"></script>
+    <script type="module" src="/dashboard.js?v=12"></script>
   </body>
 </html>

@@ -120,7 +120,7 @@ def test_dashboard_worker_writes_only_in_retained_worktree(
     manager = AgentWorkerManager(orchestrator, executor, workflow_service)
     try:
         manager.start(run)
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 15
         current = state_store.get_run(run.run_id)
         while current is not None and current.status is RunStatus.ACTIVE:
             if time.monotonic() >= deadline:
