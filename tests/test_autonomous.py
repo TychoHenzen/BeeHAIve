@@ -47,6 +47,37 @@ def test_select_work_item_prefers_todo_over_backlog_and_skips_active() -> None:
     }
 
 
+def test_autonomous_explicit_resume_accepts_an_in_progress_pbi() -> None:
+    store = OrchestratorStore()
+    service = Orchestrator(store, FakeProvider(dashboard_snapshot()))
+    automation = AutonomousLifecycleService(service, PlaceholderSkillExecutor())
+
+    try:
+        selected = automation._select(
+            {
+                "repositories": [
+                    {
+                        "name": "owner/api",
+                        "active": True,
+                        "pbis": [
+                            {
+                                "number": 1,
+                                "planning_status": "In Progress",
+                                "stage": "implement",
+                            }
+                        ],
+                    }
+                ]
+            },
+            "owner/api",
+            1,
+            set(),
+        )
+        assert selected is not None and selected["pbi_number"] == 1
+    finally:
+        store.close()
+
+
 def test_placeholder_runner_passes_one_branch_handover_through_all_skills() -> None:
     runner = AutonomousLifecycleRunner(PlaceholderSkillExecutor())
 

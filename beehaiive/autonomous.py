@@ -225,7 +225,9 @@ def _text(value: object, fallback: str = "") -> str:
     return value.strip() if isinstance(value, str) and value.strip() else fallback
 
 
-def _pbi_candidates(repositories: Iterable[object]) -> list[dict[str, object]]:
+def _pbi_candidates(
+    repositories: Iterable[object], *, include_in_progress: bool = False
+) -> list[dict[str, object]]:
     candidates: list[dict[str, object]] = []
     for raw_repository in repositories:
         repository = _mapping(raw_repository)
@@ -244,7 +246,9 @@ def _pbi_candidates(repositories: Iterable[object]) -> list[dict[str, object]]:
             if _text(pbi.get("status")).casefold() in {"active", "awaiting_operator"}:
                 continue
             planning_status = _text(pbi.get("planning_status"), "backlog").casefold()
-            if planning_status not in {"todo", "backlog"}:
+            if planning_status not in {"todo", "backlog"} and not (
+                include_in_progress and planning_status == "in progress"
+            ):
                 continue
             candidates.append(
                 {
@@ -753,7 +757,9 @@ class AutonomousLifecycleService:
             and not isinstance(raw_repositories, (str, bytes, bytearray))
             else ()
         )
-        candidates = _pbi_candidates(repositories)
+        candidates = _pbi_candidates(
+            repositories, include_in_progress=pbi_number is not None
+        )
         if repository is not None:
             candidates = [
                 item for item in candidates if item["repository"] == repository
