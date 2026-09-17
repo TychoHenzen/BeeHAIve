@@ -1,6 +1,8 @@
 import json
+import subprocess
 
 import scripts.dashboard_smoke as dashboard_smoke
+import scripts.dashboard_smoke_report as dashboard_smoke_report
 from scripts.dashboard_smoke import (
     redact_project_id,
     redact_text,
@@ -97,3 +99,18 @@ def test_write_report_fails_closed_when_sanitization_leaves_a_secret(
         "report_values_redacted": False,
         "result": "failed",
     }
+
+
+def test_smoke_checks_do_not_impose_a_wall_clock_timeout(monkeypatch) -> None:
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(kwargs)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(dashboard_smoke_report.subprocess, "run", run)
+
+    results = dashboard_smoke_report.run_checks((), "owner:1")
+
+    assert len(results) == 6
+    assert all("timeout" not in kwargs for kwargs in calls)
