@@ -69,6 +69,23 @@ def test_worktree_path_identity_preserves_internal_whitespace(tmp_path: Path) ->
     store.close()
 
 
+def test_existing_branch_can_be_reopened_in_a_new_worktree(tmp_path: Path) -> None:
+    repository = make_repository(tmp_path)
+    store = WorkflowStore()
+    manager = GitWorktreeManager(repository, store)
+    first_path = tmp_path / "first-worktree"
+    second_path = tmp_path / "second-worktree"
+
+    first = manager.acquire("agent", "codex/existing", first_path)
+    manager.release(first.lease_id)
+    second = manager.acquire_existing("agent", "codex/existing", second_path)
+
+    assert second.branch == "codex/existing"
+    assert manager.head(second_path) == manager.head(repository)
+    manager.release(second.lease_id)
+    store.close()
+
+
 def test_worktree_gitdir_uses_the_host_path(tmp_path: Path) -> None:
     repository = make_repository(tmp_path)
     store = WorkflowStore()

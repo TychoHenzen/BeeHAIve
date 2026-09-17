@@ -100,13 +100,15 @@ def test_bounded_communicator_skips_oversized_lines_and_flushes_final_line() -> 
         stderr=subprocess.PIPE,
     )
     lines: list[str] = []
+    gaps: list[str] = []
 
     _, _, timed_out = CodexExecModelExecutor._communicate_bounded(
-        process, 5, lines.append
+        process, 5, lines.append, capture_gap_handler=gaps.append
     )
 
     assert not timed_out
     assert lines == [payload]
+    assert gaps == ["oversized", "oversized"]
 
 
 def test_bounded_communicator_persists_flushed_event_before_process_exit(

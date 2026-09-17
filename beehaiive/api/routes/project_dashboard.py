@@ -1,5 +1,6 @@
+import hashlib
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, Literal, cast
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
@@ -51,6 +52,9 @@ from beehaiive.api.models import DashboardApproveRequest as DashboardApproveRequ
 from beehaiive.api.models import DashboardClarifyRequest as DashboardClarifyRequest
 from beehaiive.api.models import (
     DashboardCommitPushRequest as DashboardCommitPushRequest,
+)
+from beehaiive.api.models import (
+    DashboardIdeaCaptureRequest as DashboardIdeaCaptureRequest,
 )
 from beehaiive.api.models import DashboardRequeueRequest as DashboardRequeueRequest
 from beehaiive.api.models import DashboardRetryRequest as DashboardRetryRequest
@@ -354,6 +358,16 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
                     )
                 }
             )
+        elif isinstance(request, DashboardIdeaCaptureRequest):
+            request = request.model_copy(
+                update={
+                    "idea": redact_worker_text(
+                        request.idea,
+                        dashboard_secret_values,
+                        max_length=8_000,
+                    )
+                }
+            )
         repository = getattr(request, "repository", None)
         if (
             isinstance(request, DashboardStartRequest)
@@ -508,6 +522,44 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
             )
         if isinstance(request, DashboardAnswerQuestionRequest):
             action_request["answer"] = "[redacted]"
+        if isinstance(request, DashboardIdeaCaptureRequest):
+            idea_key = hashlib.sha256(
+                (project_id + "\0" + request.idea).encode("utf-8")
+            ).hexdigest()
+            action_request["idea_key"] = idea_key
+            existing = next(
+                (
+                    item
+                    for item in orchestrator.store.actions_for_project(project_id)
+                    if item.get("kind") == "capture_idea"
+                    and item.get("status") in {"pending", "succeeded"}
+                    and isinstance(item.get("request"), Mapping)
+                    and item["request"].get("idea_key") == idea_key
+                ),
+                None,
+            )
+            if existing is not None:
+                safe_existing = cast(
+                    dict[str, object],
+                    safe_dashboard_value(existing, dashboard_secret_values),
+                )
+                return {
+                    "action": safe_existing,
+                    "result": safe_existing.get("result"),
+                    "state": _dashboard_state_or_none(
+                        orchestrator,
+                        project_id,
+                        DEFAULT_EVENT_LIMIT,
+                        archived,
+                        workflow_service,
+                        scheduler,
+                        scheduler_config,
+                        agent_worker,
+                        dashboard_secret_values,
+                        graph_safety_service,
+                        workflow_id,
+                    ),
+                }
         action = orchestrator.store.begin_action(
             project_id,
             request.action,
@@ -525,6 +577,8 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
                 agent_worker,
                 dashboard_secret_values,
                 graph_safety_service,
+                autonomous_service,
+                str(action["id"]),
             )
         except (ProviderError, StoreError, WorkflowError) as exc:
             error = redact_worker_text(
@@ -584,6 +638,30 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
             }
         safe_result = safe_dashboard_value(result, dashboard_secret_values)
         safe_result_mapping = cast(dict[str, object], safe_result)
+        if (
+            request.action == "capture_idea"
+            and safe_result_mapping.get("status") == "running"
+        ):
+            safe_action = cast(
+                dict[str, object], safe_dashboard_value(action, dashboard_secret_values)
+            )
+            return {
+                "action": safe_action,
+                "result": safe_result_mapping,
+                "state": _dashboard_state_or_none(
+                    orchestrator,
+                    project_id,
+                    DEFAULT_EVENT_LIMIT,
+                    archived,
+                    workflow_service,
+                    scheduler,
+                    scheduler_config,
+                    agent_worker,
+                    dashboard_secret_values,
+                    graph_safety_service,
+                    workflow_id,
+                ),
+            }
         action_status = "succeeded"
         action_error: str | None = None
         delivery = cast(dict[str, object] | None, safe_result_mapping.get("delivery"))

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +57,7 @@ class CodexExecutionMixin:
                     failure_context="Agent stopped by operator",
                 )
         process: subprocess.Popen[str] | None = None
+        capture_succeeded = False
         try:
             checkout = (
                 self._safe_checkout()
@@ -94,8 +95,14 @@ class CodexExecutionMixin:
                         def record_line(line: str) -> None:
                             self._record_session_line(line, event_handler)
 
+                        def record_gap(reason: str) -> None:
+                            event_handler("gap", reason, None, "")
+
                         stdout, stderr, timed_out = self._communicate_bounded(
-                            process, self.timeout_seconds, record_line
+                            process,
+                            self.timeout_seconds,
+                            record_line,
+                            capture_gap_handler=record_gap,
                         )
                 except subprocess.TimeoutExpired:
                     self._terminate_process(process)
@@ -168,6 +175,7 @@ class CodexExecutionMixin:
                             failure_context=reason,
                             task_result=TaskResult.invalid(reason),
                         )
+                capture_succeeded = True
                 return ModelExecution(
                     AttemptOutcome.SUCCESS,
                     input_tokens=input_tokens,
@@ -176,6 +184,9 @@ class CodexExecutionMixin:
                     task_result=task_result,
                 )
         finally:
+            if event_handler is not None and not capture_succeeded:
+                with suppress(Exception):
+                    event_handler("gap", "interrupted", None, "")
             with self._lock:
                 if process is not None:
                     self._processes.pop(problem_id, None)

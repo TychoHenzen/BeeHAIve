@@ -32,6 +32,19 @@ class WorkflowStoreLeaseReadMixin:
             ).fetchone()
         return None if row is None else self._lease_from_row(row)
 
+    def get_lease_for_branch(self: Any, branch: str) -> WorkspaceLease | None:
+        with self._transaction() as connection:
+            row = connection.execute(
+                """
+                    SELECT * FROM workflow_leases
+                    WHERE branch = ? AND status IN (?, ?)
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                (branch, LeaseStatus.ACTIVE.value, LeaseStatus.RETAINED.value),
+            ).fetchone()
+        return None if row is None else self._lease_from_row(row)
+
     def dashboard_run_leases(self: Any) -> tuple[WorkspaceLease, ...]:
         with self._transaction() as connection:
             rows = connection.execute(

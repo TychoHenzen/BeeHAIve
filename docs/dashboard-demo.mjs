@@ -16,6 +16,17 @@ const AUTONOMOUS_SKILLS = [
   "complete-pr",
 ];
 
+const WORKFLOW_QUEUES = [
+  ["refinement", "Refinement", "refine-backlog-item"],
+  ["implementation", "Implementation", "next-ticket"],
+  ["publish", "Publish", "submit-draft-pr"],
+  ["review", "Review", "review-pr-branch"],
+  ["repair", "Repair", "fix-pr-review"],
+  ["completion", "Completion", "complete-pr"],
+  ["blocked", "Blocked", "codex-advisor"],
+  ["completed", "Completed", null],
+];
+
 function progress(stage, completed = false) {
   const current = STAGES.findIndex(([id]) => id === stage);
   return STAGES.map(([id, label], index) => ({
@@ -173,6 +184,16 @@ function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function demoQueue(item) {
+  if (item.archived || item.status === "completed") return "completed";
+  if (["failed", "awaiting_operator"].includes(item.status)) return "blocked";
+  if (item.stage === "backlog" || item.stage === "refine") return "refinement";
+  if (item.stage === "implement") return "implementation";
+  if (item.stage === "pull_request" || item.stage === "review") return "review";
+  if (item.stage === "merge") return "completion";
+  return "blocked";
+}
+
 export function createDemoClient({ onState, onStatus, onBusy, archived = () => false, workflowId = () => "" }) {
   let state = initialState();
 
@@ -182,11 +203,49 @@ export function createDemoClient({ onState, onStatus, onBusy, archived = () => f
     const selectedGraph = state.graphs?.[selectedWorkflow];
     if (selectedGraph) snapshot.graph = clone(selectedGraph);
     snapshot.archived = Boolean(archived());
+    const queues = new Map(WORKFLOW_QUEUES.map(([id]) => [id, []]));
+    snapshot.repositories.forEach((repository) => {
+      repository.pbis.forEach((item) => {
+        const queueId = demoQueue(item);
+        const definition = WORKFLOW_QUEUES.find(([id]) => id === queueId);
+        item.workflow_queue = {
+          id: queueId,
+          label: definition?.[1] || "Blocked",
+          owner: definition?.[2] || null,
+          next_skill: definition?.[2] || null,
+          reason: "Demo lifecycle state.",
+          evidence: {},
+        };
+        queues.get(queueId)?.push({
+          repository: repository.name,
+          project: repository.project,
+          pbi_number: item.number,
+          title: item.title,
+          reason: "Demo lifecycle state.",
+          next_skill: WORKFLOW_QUEUES.find(([id]) => id === queueId)?.[2] || null,
+        });
+      });
+    });
+    snapshot.queues = WORKFLOW_QUEUES.map(([id, label, owner]) => ({
+      id,
+      label,
+      owner,
+      next_skill: owner,
+      count: queues.get(id)?.length || 0,
+      items: queues.get(id) || [],
+    }));
     snapshot.recent_deliveries = state.repositories.flatMap((repository) => repository.pbis
       .filter((item) => Boolean(item.archived) || item.status === "completed" || item.pull_requests?.length || item.delivery)
       .map((item) => ({ repository: repository.name, project: repository.project, pbi: clone(item) })));
     snapshot.repositories.forEach((repository) => {
       repository.pbis = repository.pbis.filter((item) => Boolean(item.archived) === Boolean(archived()));
+    });
+    snapshot.queues = snapshot.queues.map((queue) => {
+      const visible = snapshot.archived
+        ? queue.id === "completed"
+        : queue.id !== "completed";
+      const items = visible ? queue.items : [];
+      return { ...queue, count: items.length, items };
     });
     if (selectedWorkflow && selectedWorkflow !== snapshot.graph.workflow_id) {
       snapshot.graph = {
@@ -290,6 +349,20 @@ export function createDemoClient({ onState, onStatus, onBusy, archived = () => f
       onStatus(`${payload.action} succeeded.`, "success");
       onBusy(false);
       return { action: { kind: payload.action, status: "succeeded" }, state: visibleState() };
+    }
+    if (payload.action === "capture_idea") {
+      const repository = state.repositories[0];
+      const nextNumber = Math.max(...state.repositories.flatMap((value) => value.pbis.map((item) => item.number))) + 1;
+      repository.pbis.push(pbi(nextNumber, payload.idea, "backlog", "idle", { claimable: true }));
+      record(payload, "succeeded", {
+        status: "completed",
+        summary: "Placeholder add-backlog-idea created a Backlog item.",
+        handover: { issue_number: nextNumber, project_status: "Backlog" },
+      });
+      onState(visibleState());
+      onStatus("capture_idea succeeded.", "success");
+      onBusy(false);
+      return { action: { kind: "capture_idea", status: "succeeded" }, state: visibleState() };
     }
     const item = findItem(payload);
     if (!item && payload.action !== "sync") {

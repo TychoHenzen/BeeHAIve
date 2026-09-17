@@ -79,6 +79,6 @@ def test_worker_manager_recovers_when_failure_lease_is_lost() -> None:
     assert orchestrator.store.recovery is not None
     assert orchestrator.store.recovery[0] == run.run_id
     assert "Agent worker failed:" in orchestrator.store.recovery[1]
-    assert "RuntimeError: worker exploded" in orchestrator.store.recovery[1]
-    assert "Traceback" in orchestrator.store.recovery[1]
+    assert "worker exploded" in orchestrator.store.recovery[1]
+    assert "Traceback" not in orchestrator.store.recovery[1]
     assert orchestrator.store.recovery[2] == "lease-1"

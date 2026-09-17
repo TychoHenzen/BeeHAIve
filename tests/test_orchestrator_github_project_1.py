@@ -65,6 +65,7 @@ def test_github_provider_maps_live_dashboard_metadata() -> None:
                                                     "url": "https://example.test/pull/9",
                                                     "state": "CLOSED",
                                                     "merged": True,
+                                                    "isDraft": False,
                                                     "reviewDecision": (
                                                         "CHANGES_REQUESTED"
                                                     ),
@@ -161,6 +162,7 @@ def test_github_provider_maps_live_dashboard_metadata() -> None:
     pull_request = metadata["pull_requests"][0]  # type: ignore[index]
     assert pull_request["state"] == "closed"  # type: ignore[index]
     assert pull_request["merged"] is True  # type: ignore[index]
+    assert pull_request["is_draft"] is False  # type: ignore[index]
     assert metadata["escalation"] == {
         "current": 2,
         "consecutive": 2,

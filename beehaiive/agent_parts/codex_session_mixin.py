@@ -4,6 +4,8 @@ import json
 from collections.abc import Callable, Mapping
 from typing import Any, cast
 
+from beehaiive.session_evidence import SESSION_MESSAGE_SOURCES
+
 from .constants import _SESSION_PROGRESS_EVENTS
 from .values import _nonnegative_int as _nonnegative_int
 from .values import _text_value as _text_value
@@ -16,15 +18,28 @@ class CodexSessionMixin:
         line: str,
         handler: Callable[[str, str, str | None, str], None],
     ) -> None:
+        try:
+            raw: object = json.loads(line)
+        except json.JSONDecodeError:
+            raw = None
+        if not isinstance(raw, dict):
+            handler("gap", "malformed", None, "")
+            return
+        payload = cast(dict[str, object], raw)
+        if not isinstance(payload.get("type"), str):
+            handler("gap", "malformed", None, "")
+            return
         event = self._session_event(line)
         if event is None:
+            if payload.get("type") == "agent_message":
+                handler("gap", "malformed", None, "")
             return
         kind, source_type, role, text = event
         handler(
             kind,
             source_type,
             role,
-            redact_worker_text(text, self._secret_values),
+            redact_worker_text(text, self._secret_values, max_length=None),
         )
 
     @staticmethod
@@ -43,15 +58,17 @@ class CodexSessionMixin:
         item = (
             cast(dict[str, object], item_value) if isinstance(item_value, dict) else {}
         )
-        if item.get("type") == "agent_message":
-            message = _text_value(item.get("text", item.get("content")))
+        if (
+            item.get("type") == "agent_message"
+            and isinstance(event_type, str)
+            and event_type in SESSION_MESSAGE_SOURCES
+        ):
+            message = _session_message(item.get("text", item.get("content")))
             if message:
-                source_type = (
-                    event_type if isinstance(event_type, str) else "agent_message"
-                )
-                return "message", source_type, "assistant", message
+                return "message", event_type, "assistant", message
+            return "gap", "malformed", None, ""
         if event_type == "agent_message":
-            message = _text_value(event.get("text", event.get("content")))
+            message = _session_message(event.get("text", event.get("content")))
             if message:
                 return "message", "agent_message", "assistant", message
         if isinstance(event_type, str) and event_type in _SESSION_PROGRESS_EVENTS:
@@ -108,3 +125,21 @@ class CodexSessionMixin:
 
 
 __all__ = ["CodexSessionMixin"]
+
+
+def _session_message(value: object) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts: list[str] = []
+        for raw in cast(list[object], value):
+            if not isinstance(raw, dict):
+                continue
+            part = cast(dict[str, object], raw)
+            if part.get("type") not in ("text", "output_text"):
+                continue
+            text = part.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+        return "\n".join(parts).strip()
+    return ""

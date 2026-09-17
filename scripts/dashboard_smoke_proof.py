@@ -577,7 +577,6 @@ def response_backed_dashboard_fields(
     rendered_metadata = snapshot.get("metadata_values")
     expected_metadata = response_metadata_lines(payload)
     updated = str(snapshot.get("updated", ""))
-    status = str(snapshot.get("status", ""))
     updated_at = payload.get("updated_at")
     return {
         "project_id": payload.get("project_id") == project_id,
@@ -589,9 +588,7 @@ def response_backed_dashboard_fields(
         "metadata": bool(rendered_metadata) == bool(expected_metadata),
         "pull_requests": rendered_pull_request_states(payload, snapshot),
         "updated_at": (
-            isinstance(updated_at, str)
-            and updated.endswith(f"Updated: {updated_at}")
-            and status == f"Updated {updated_at}."
+            isinstance(updated_at, str) and updated.endswith(f"Updated: {updated_at}")
         ),
     }
 
@@ -695,7 +692,7 @@ def run_fixture_actions(
     _repository, _pbi_number, run_id, _attempt = action_run_target(
         start_response, "start_writer"
     )
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + 15
     workspace = None
     while time.monotonic() < deadline:
         workspace = workflow_service.workspace_for_run(run_id)
@@ -743,7 +740,7 @@ def run_fixture_actions(
     if not click_button(devtools, "Stop run"):
         raise SmokeFailure("The dashboard stop action was not rendered")
     record_action(devtools, outcomes, "stop", "succeeded.", before)
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + 15
     preserved = None
     while time.monotonic() < deadline:
         preserved = workflow_service.workspace_for_run(run_id)
@@ -1060,11 +1057,11 @@ def run_browser_smoke(
   const candidate = successful.at(-1);
   const pageStartedAt = window.__beehaiiveSmokePageStartedAt || 0;
   const delay = candidate ? candidate.started_at - pageStartedAt : 0;
-  return records > {polling_baseline} && delay >= 4500 ? delay : 0;
+  return records > {polling_baseline} && delay >= 14000 ? delay : 0;
 }})()
 """,
         "dashboard polling refresh",
-        timeout=8.0,
+        timeout=20.0,
     )
     if not isinstance(polling_delay, (int, float)):
         raise SmokeFailure("The dashboard polling timestamp was not recorded")

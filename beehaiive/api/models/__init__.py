@@ -25,6 +25,9 @@ from .dashboard_graph_request import (
 from .dashboard_graph_request import (
     DashboardGraphSafetyRequest as DashboardGraphSafetyRequest,
 )
+from .dashboard_idea_capture_request import (
+    DashboardIdeaCaptureRequest as DashboardIdeaCaptureRequest,
+)
 from .dashboard_requeue_request import (
     DashboardRequeueRequest as DashboardRequeueRequest,
 )
@@ -124,6 +127,7 @@ __all__ = [
     "DashboardCommitPushRequest",
     "DashboardGraphRollbackRequest",
     "DashboardGraphSafetyRequest",
+    "DashboardIdeaCaptureRequest",
     "DashboardRetryRequest",
     "DashboardRequeueRequest",
     "DashboardStartRequest",

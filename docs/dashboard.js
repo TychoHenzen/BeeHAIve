@@ -1,6 +1,6 @@
-import { createDashboardClient } from "/dashboard-client.mjs?v=11";
-import { createDemoClient } from "/dashboard-demo.mjs?v=11";
-import { createDashboardUi } from "/dashboard-ui.mjs?v=11";
+import { createDashboardClient } from "/dashboard-client.mjs?v=12";
+import { createDemoClient } from "/dashboard-demo.mjs?v=12";
+import { createDashboardUi } from "/dashboard-ui.mjs?v=12";
 
 const settingsProjectInput = document.querySelector("#settings-project-id");
 const settingsWorkflowInput = document.querySelector("#settings-workflow-id");
@@ -15,6 +15,11 @@ const workflowSelector = document.querySelector("#workflow-select");
 const workflowCreateForm = document.querySelector("#workflow-create-form");
 const workflowCreateId = document.querySelector("#workflow-create-id");
 const workflowCreateFeedback = document.querySelector("#workflow-create-feedback");
+const ideaForm = document.querySelector("#idea-form");
+const ideaProjectInput = document.querySelector("#idea-project");
+const ideaTextInput = document.querySelector("#idea-text");
+const ideaSubmit = document.querySelector("#idea-submit");
+const ideaFeedback = document.querySelector("#idea-feedback");
 const statusOutput = document.querySelector("#state-status");
 const connectionState = document.querySelector("#connection-state");
 const projectContext = document.querySelector("#project-context");
@@ -114,6 +119,69 @@ function workflowDraft(workflowId) {
   };
 }
 
+function setIdeaFeedback(message, kind = "") {
+  ideaFeedback.textContent = message;
+  ideaFeedback.className = "settings-status " + kind;
+}
+
+async function waitForIdeaAction(actionId, project) {
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => window.setTimeout(resolve, 2_000));
+    if (settingsProjectInput.value.trim() !== project) return;
+    const state = await client.refresh();
+    const action = state?.actions?.find((value) => value.id === actionId);
+    if (!action || action.status === "pending") continue;
+    if (action.status === "succeeded") {
+      setIdeaFeedback("Idea capture completed.", "success");
+      ideaTextInput.value = "";
+    } else {
+      setIdeaFeedback("Idea capture failed: " + (action.error || "unknown error"), "failure");
+    }
+    return;
+  }
+  setIdeaFeedback("Idea capture is still pending; see Evidence log.", "pending");
+}
+
+function setIdeaProjects(projects) {
+  const values = [...new Set((projects || []).filter((value) => typeof value === "string" && value.trim()))];
+  const current = ideaProjectInput.value;
+  ideaProjectInput.replaceChildren();
+  if (!values.length) {
+    const option = document.createElement("option");
+    option.textContent = "No Projects available";
+    option.value = "";
+    option.disabled = true;
+    option.selected = true;
+    ideaProjectInput.append(option);
+    return;
+  }
+  values.forEach((project) => {
+    const option = document.createElement("option");
+    option.textContent = project;
+    option.value = project;
+    option.selected = project === current;
+    ideaProjectInput.append(option);
+  });
+  if (!values.includes(current)) ideaProjectInput.value = values[0];
+}
+
+async function loadIdeaProjects() {
+  if (demo) {
+    setIdeaProjects(["demo:1"]);
+    return;
+  }
+  try {
+    const response = await fetch("/dashboard/config", { cache: "no-store" });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.detail || "Request failed (" + response.status + ")");
+    setIdeaProjects(payload.projects);
+  } catch (error) {
+    setIdeaProjects(settingsProjectInput.value.trim() ? [settingsProjectInput.value.trim()] : []);
+    setIdeaFeedback("Project list unavailable: " + error.message, "failure");
+  }
+}
+
 function showApp() {
   welcome.hidden = true;
   mission.hidden = false;
@@ -187,6 +255,7 @@ function setPage(page, updateHash = true) {
 function handleState(state) {
   showApp();
   const project = state.project_id || settingsProjectInput.value.trim();
+  setIdeaProjects([...(state.available_projects || []), project]);
   projectContext.textContent = state.name ? `${state.name} · ${project}` : project || "No project selected";
   const scheduler = state.scheduler;
   if (scheduler && !schedulerSettingsDirty) {
@@ -207,6 +276,9 @@ function toggleBusy(disabled) {
   settingsMaxWorkers.disabled = disabled;
   settingsPollInterval.disabled = disabled;
   schedulerSave.disabled = disabled;
+  ideaProjectInput.disabled = disabled;
+  ideaTextInput.disabled = disabled;
+  ideaSubmit.disabled = disabled;
 }
 
 if (demo) {
@@ -293,6 +365,34 @@ schedulerSave.addEventListener("click", () => {
     }
   });
 });
+ideaForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const project = ideaProjectInput.value.trim();
+  const idea = ideaTextInput.value.trim();
+  if (!project || !idea) {
+    setIdeaFeedback("Choose a Project and enter an idea.", "failure");
+    return;
+  }
+  settingsProjectInput.value = project;
+  updateUrl(project, settingsWorkflowInput.value.trim(), demo);
+  setIdeaFeedback("Sending idea to add-backlog-idea...", "pending");
+  void client.runAction({ action: "capture_idea", idea }).then((result) => {
+    if (!result) {
+      setIdeaFeedback("Idea capture failed.", "failure");
+      return;
+    }
+    if (result.action?.status === "pending") {
+      setIdeaFeedback("Idea capture is running. The action log will update when it finishes.", "pending");
+      if (result.action.id) void waitForIdeaAction(result.action.id, project);
+    } else if (result.action?.status === "failed") {
+      setIdeaFeedback("Idea capture failed: " + (result.action.error || "unknown error"), "failure");
+    } else {
+      setIdeaFeedback("Idea capture completed.", "success");
+      ideaTextInput.value = "";
+    }
+  });
+});
+
 workflowCreateForm.addEventListener("submit", (event) => {
   event.preventDefault();
   const workflowId = workflowCreateId.value.trim();
@@ -349,4 +449,5 @@ document.addEventListener("keydown", (event) => {
 setPage(window.location.hash || "mission", false);
 if (demo || settingsProjectInput.value.trim()) openProject(false);
 else showWelcome();
+void loadIdeaProjects();
 if (!demo) window.setInterval(() => void client.refresh(), 15000);

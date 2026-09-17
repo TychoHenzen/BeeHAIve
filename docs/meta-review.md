@@ -2,8 +2,29 @@
 
 The meta-review reads only completed BeeHAIve runs persisted in the state
 store. A source record is identified by `run:<run_id>` and includes the final
-result or error, lifecycle events, and routing attempts. It does not read Codex
-transcripts, credentials, private files, or active runs.
+result or error, lifecycle events, routing attempts, and bounded worker transcript
+excerpts. Transcript sources include assistant messages and fixed progress names
+only. Task prompts, tool arguments/results, raw stdout/stderr, private reasoning,
+environment values, and tool-supplied file contents are excluded.
+
+Session storage retains the latest 100 events, at most 4,000 characters each and
+64,000 UTF-8 text bytes per run. Oldest events are evicted first. Known worker
+secrets and credential patterns are redacted before truncation and persistence.
+The existing session rows keep their current database lifetime. There is no
+second archive, backfill, or time-based expiry. These are per-run limits.
+
+Analysis selects the newest 20 allowed events in ascending persisted sequence,
+with at most 500 characters per redacted excerpt. References use
+`run:<run_id>:transcript:<sequence>` and remain stable across trimming and restart.
+They identify evidence observed during review, not permanent full transcripts.
+Pattern redaction and field limits are reapplied before analysis. All transcript
+fields count toward the existing token estimate and whole-record admission limit.
+
+Missing, malformed, oversized, trimmed, truncated, and interrupted evidence is
+reported where observable. Every projection reports that capture is partial.
+Legacy completed runs without sessions remain usable with a transcript gap.
+Failed, cancelled, timed-out, and active runs remain excluded. Retained failed
+attempts within a later completed run are diagnostic evidence, not proof of success.
 
 The review is explicit and bounded. The API accepts at most 25 records and
 8,000 estimated input tokens. Results, errors, event details, analyzer text,

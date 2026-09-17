@@ -470,10 +470,15 @@ def wait_for_status(
     label: str,
     timeout: float = 15.0,
 ) -> dict[str, str]:
+    if fragment == "Updated ":
+        expression = "(document.querySelector('#refresh-age')?.textContent || '')"
+        expression += ".startsWith('refreshed ')"
+    else:
+        expression = "(document.querySelector('#state-status')?.textContent || '')"
+        expression += f".includes({json.dumps(fragment)})"
     wait_until(
         devtools,
-        "(document.querySelector('#state-status')?.textContent || '')"
-        f".includes({json.dumps(fragment)})",
+        expression,
         label,
         timeout=timeout,
     )

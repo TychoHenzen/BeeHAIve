@@ -40,6 +40,7 @@ class ProjectClaimMixin:
             "pbi_number": pbi_number,
             "claimable": True,
         }
+
     def claim_next(
         self: Any,
         project_id: str,

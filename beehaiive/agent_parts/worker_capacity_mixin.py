@@ -272,7 +272,7 @@ class WorkerCapacityMixin:
                         kind,
                         source_type,
                         role,
-                        redact_worker_text(text, secret_values),
+                        redact_worker_text(text, secret_values, max_length=None),
                     )
 
                 set_event_handler(run.run_id, record_event)

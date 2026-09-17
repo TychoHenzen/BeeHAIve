@@ -75,6 +75,7 @@ query($owner: String!, $number: Int!, $cursor: String) {
                   merged
                   headRefName
                   headRef { name }
+                  isDraft
                   reviewDecision
                   reviewRequests(first: 20) {
                     nodes {
@@ -185,6 +186,7 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
           merged
           headRefName
           headRef { name target { oid } }
+          isDraft
           reviewDecision
           reviewRequests(first: 100) {
             nodes {

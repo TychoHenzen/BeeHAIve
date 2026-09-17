@@ -31,6 +31,9 @@ from beehaiive.api.models import (
 from beehaiive.api.models import (
     DashboardGraphSafetyRequest as DashboardGraphSafetyRequest,
 )
+from beehaiive.api.models import (
+    DashboardIdeaCaptureRequest as DashboardIdeaCaptureRequest,
+)
 from beehaiive.api.models import DashboardRequeueRequest as DashboardRequeueRequest
 from beehaiive.api.models import DashboardRetryRequest as DashboardRetryRequest
 from beehaiive.api.models import DashboardStartRequest as DashboardStartRequest
@@ -40,7 +43,8 @@ from beehaiive.api.models import (
 )
 from beehaiive.autonomous import ADVISOR_STEP, AUTONOMOUS_STEPS
 from beehaiive.dashboard import build_dashboard_state
-from beehaiive.dashboard.values import safe_dashboard_value
+from beehaiive.dashboard.values import mapping, safe_dashboard_value
+from beehaiive.dashboard.views import queue_for_skill
 from beehaiive.graph import GraphDefinition
 from beehaiive.graph_safety import GraphSafetyService, graph_definition_hash
 from beehaiive.models import RunState, RunStatus
@@ -68,6 +72,7 @@ DASHBOARD_ACTION_OWNERS = {
     "graph_review": "graph_safety",
     "graph_activate": "graph_safety",
     "graph_rollback": "graph_safety",
+    "capture_idea": "autonomous_service",
 }
 DASHBOARD_ACTION_READBACK = {
     action: "action,state" for action in DASHBOARD_ACTION_OWNERS
@@ -150,27 +155,35 @@ def _dashboard_state(
                 live = status_for_work_item(project_id, repository_name, number)
                 if not isinstance(live, Mapping):
                     continue
-                pbi["autonomous_status"] = live.get("status")
-                pbi["autonomous_current_step"] = live.get("current_step")
-                pbi["autonomous_handoffs"] = live.get("handoffs", [])
-                pbi["autonomous_process"] = live.get("process")
-                live_events = live.get("session_events", [])
+                live_values = cast(Mapping[str, object], live)
+                pbi["autonomous_status"] = live_values.get("status")
+                pbi["autonomous_current_step"] = live_values.get("current_step")
+                pbi["autonomous_handoffs"] = live_values.get("handoffs", [])
+                pbi["autonomous_process"] = live_values.get("process")
+                if live_values.get("current_step"):
+                    pbi["workflow_queue"] = queue_for_skill(
+                        live_values.get("current_step"), live_values.get("status")
+                    )
+                live_events = live_values.get("session_events", [])
                 if (
                     (isinstance(live_events, list) and live_events)
-                    or live.get("current_step")
-                    or live.get("process")
+                    or live_values.get("current_step")
+                    or live_values.get("process")
                 ):
                     pbi["agent_session"] = {
                         "worker_id": "autonomous",
-                        "task": f"Running skill: {live.get('current_step', 'unknown')}",
+                        "task": (
+                            "Running skill: "
+                            f"{live_values.get('current_step', 'unknown')}"
+                        ),
                         "state": "active",
                         "events": live_events,
-                        "activity_state": live.get("status"),
-                        "started_at": live.get("started_at"),
-                        "step_started_at": live.get("step_started_at"),
-                        "last_output_at": live.get("last_output_at"),
-                        "last_output": live.get("last_output"),
-                        "process": live.get("process"),
+                        "activity_state": live_values.get("status"),
+                        "started_at": live_values.get("started_at"),
+                        "step_started_at": live_values.get("step_started_at"),
+                        "last_output_at": live_values.get("last_output_at"),
+                        "last_output": live_values.get("last_output"),
+                        "process": live_values.get("process"),
                     }
     if workflow_service is not None:
         repositories = cast(list[dict[str, object]], dashboard["repositories"])
@@ -186,7 +199,47 @@ def _dashboard_state(
                     delivery = _dashboard_delivery(workflow_service, run_id)
                     if delivery is not None:
                         pbi["delivery"] = delivery
+    dashboard["queues"] = _dashboard_queue_view(dashboard)
     return cast(dict[str, object], safe_dashboard_value(dashboard, secret_values))
+
+
+def _dashboard_queue_view(
+    dashboard: Mapping[str, object],
+) -> list[dict[str, object]]:
+    queue_values = {
+        str(queue["id"]): dict(queue)
+        for queue in cast(Sequence[Mapping[str, object]], dashboard.get("queues", []))
+        if isinstance(queue.get("id"), str)
+    }
+    items: dict[str, list[dict[str, object]]] = {
+        queue_id: [] for queue_id in queue_values
+    }
+    for repository in cast(
+        Sequence[Mapping[str, object]], dashboard.get("repositories", [])
+    ):
+        for pbi in cast(Sequence[Mapping[str, object]], repository.get("pbis", [])):
+            queue = mapping(pbi.get("workflow_queue"))
+            queue_id = queue.get("id")
+            if not isinstance(queue_id, str) or queue_id not in items:
+                continue
+            items[queue_id].append(
+                {
+                    "repository": repository.get("name"),
+                    "pbi_number": pbi.get("number"),
+                    "title": pbi.get("title"),
+                    "reason": queue.get("reason"),
+                    "evidence": dict(mapping(queue.get("evidence"))),
+                    "next_skill": queue.get("next_skill"),
+                }
+            )
+    return [
+        {
+            **queue_values[queue_id],
+            "count": len(items[queue_id]),
+            "items": items[queue_id],
+        }
+        for queue_id in queue_values
+    ]
 
 
 def _dashboard_state_or_none(
@@ -570,7 +623,7 @@ def _start_dashboard_worker(
         agent_worker.start(run)
     except Exception as exc:
         failure = redact_worker_text(
-            f"Agent worker failed to start:\n{format_worker_exception(exc)}",
+            f"Agent worker failed to start: {format_worker_exception(exc)}",
             secret_values,
             max_length=MAX_AGENT_OUTPUT_LENGTH,
         )
@@ -587,16 +640,25 @@ def _start_dashboard_worker(
     }
 
 
-DashboardActionHandler = Callable[
-    [
-        Orchestrator,
-        str,
-        DashboardActionRequest,
-        AgentWorkerManager | None,
-        tuple[str, ...],
-    ],
-    dict[str, object],
-]
+DashboardActionHandler = Callable[..., dict[str, object]]
+
+
+def _execute_capture_idea(
+    orchestrator: Orchestrator,
+    project_id: str,
+    request: DashboardActionRequest,
+    agent_worker: AgentWorkerManager | None,
+    secret_values: tuple[str, ...],
+    autonomous_service: object | None = None,
+    action_id: str | None = None,
+) -> dict[str, object]:
+    del orchestrator, agent_worker, secret_values
+    if not isinstance(request, DashboardIdeaCaptureRequest):
+        raise StoreError(f"No dashboard handler for action: {request.action}")
+    capture = getattr(autonomous_service, "capture_idea", None)
+    if not callable(capture) or action_id is None:
+        raise StoreError("Idea capture service is not configured")
+    return cast(dict[str, object], capture(project_id, request.idea, action_id))
 
 
 def _execute_synchronize(
@@ -649,7 +711,7 @@ def _execute_start(
         agent_worker.start(run)
     except Exception as exc:
         failure = redact_worker_text(
-            f"Agent worker failed to start:\n{format_worker_exception(exc)}",
+            f"Agent worker failed to start: {format_worker_exception(exc)}",
             secret_values,
             max_length=MAX_AGENT_OUTPUT_LENGTH,
         )
@@ -919,6 +981,7 @@ DASHBOARD_ACTION_DISPATCH: dict[str, DashboardActionHandler] = {
     "graph_review": _execute_graph_safety,
     "graph_activate": _execute_graph_safety,
     "graph_rollback": _execute_graph_rollback,
+    "capture_idea": _execute_capture_idea,
 }
 if (
     frozenset(DASHBOARD_ACTION_DISPATCH) != frozenset(DASHBOARD_ACTION_OWNERS)
@@ -935,6 +998,8 @@ def _execute_dashboard_action(
     agent_worker: AgentWorkerManager | None = None,
     secret_values: tuple[str, ...] = (),
     graph_safety_service: GraphSafetyService | None = None,
+    autonomous_service: object | None = None,
+    action_id: str | None = None,
 ) -> dict[str, object]:
     if isinstance(request, DashboardGraphSafetyRequest):
         return _execute_graph_safety(
@@ -957,6 +1022,16 @@ def _execute_dashboard_action(
     handler = DASHBOARD_ACTION_DISPATCH.get(request.action)
     if handler is None:
         raise StoreError(f"Unsupported dashboard action: {request.action}")
+    if request.action == "capture_idea":
+        return handler(
+            orchestrator,
+            project_id,
+            request,
+            agent_worker,
+            secret_values,
+            autonomous_service,
+            action_id,
+        )
     return handler(orchestrator, project_id, request, agent_worker, secret_values)
 
 
