@@ -83,6 +83,36 @@ def _last_json_mapping(output: str) -> Mapping[str, object] | None:
     return best
 
 
+def _session_result(output: object) -> Mapping[str, object]:
+    if not isinstance(output, str) or not output.startswith("[stdout]\n"):
+        return {}
+    stdout = output[len("[stdout]\n") :].split("\n\n[stderr]", 1)[0].lstrip()
+    try:
+        value, _ = json.JSONDecoder().raw_decode(stdout)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return _mapping(value)
+
+
+def _review_handover(result: Mapping[str, object]) -> dict[str, object]:
+    handover = _handover(result.get("handover"))
+    if handover.get("review_complete") is not True:
+        return handover
+    summary = _mapping(result.get("summary"))
+    if not summary:
+        summary = _mapping(_session_result(result.get("session_output")).get("summary"))
+    for key in ("branch", "pr", "pull_request", "head", "head_commit"):
+        value = summary.get(key)
+        if isinstance(value, (str, int)):
+            handover[key] = value
+    findings = summary.get("findings")
+    if isinstance(findings, Sequence) and not isinstance(
+        findings, (str, bytes, bytearray)
+    ):
+        handover["review_findings"] = list(findings)
+    return handover
+
+
 @dataclass(frozen=True, slots=True)
 class SkillStep:
     name: str
@@ -400,7 +430,7 @@ class AutonomousLifecycleRunner:
             result = _mapping(raw_result)
             status = _skill_status(result.get("status"))
             summary = _text(result.get("summary"), f"{step.name} completed")
-            handover = {**handover, **_handover(result.get("handover"))}
+            handover = {**handover, **_review_handover(result)}
             handoff = SkillHandoff(
                 step.name,
                 status,
@@ -534,7 +564,14 @@ class CodexSkillExecutor:
             "credentials, or a destructive policy choice that cannot be made safely. "
             "If a material blocker remains, return blocked JSON with its exact "
             "reason.\n"
-            f"{workspace_instruction}"
+            + (
+                "All findings in the prior review handover are selected for this "
+                "unattended run. Fix each once and do not ask the operator to "
+                "select findings.\n"
+                if step.name == "fix-pr-review"
+                else ""
+            )
+            + f"{workspace_instruction}"
             f"PBI context: {json.dumps(dict(context), sort_keys=True)}\n"
             f"Handover: {json.dumps(dict(handover), sort_keys=True)}"
         )
@@ -906,16 +943,17 @@ class AutonomousLifecycleService:
             if step not in step_names:
                 continue
             result = _mapping(action.get("result"))
-            handover = _mapping(result.get("handover"))
+            handover = _review_handover(result)
             review_complete = step == "review-pr-branch" and handover.get(
                 "review_complete"
             ) is True
             if review_complete:
-                handover = {
-                    **known_handover,
-                    **_mapping(result.get("summary")),
-                    **handover,
+                stable_handover = {
+                    key: value
+                    for key, value in known_handover.items()
+                    if key in {"branch", "workspace_branch", "pr", "pull_request"}
                 }
+                handover = {**stable_handover, **handover}
             published = step == "submit-draft-pr" and (
                 handover.get("draft") is False
                 or bool(handover.get("pull_request"))
@@ -941,6 +979,11 @@ class AutonomousLifecycleService:
                     resume[key] = value
                     if key == "branch":
                         resume["workspace_branch"] = value
+            findings = handover.get("review_findings")
+            if isinstance(findings, Sequence) and not isinstance(
+                findings, (str, bytes, bytearray)
+            ):
+                resume["review_findings"] = list(findings)
             return resume
         return {}
 

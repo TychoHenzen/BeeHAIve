@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 from threading import Event
@@ -139,6 +140,22 @@ def test_autonomous_resume_fixes_findings_after_a_completed_review() -> None:
                 "status": "blocked",
                 "summary": "review-pr-branch completed",
                 "handover": {"review_complete": True},
+                "session_output": (
+                    "[stdout]\n"
+                    + json.dumps(
+                        {
+                            "status": "blocked",
+                            "summary": {
+                                "branch": "codex/fixture",
+                                "pull_request": 9,
+                                "head_commit": "b" * 40,
+                                "findings": [{"severity": "MAJOR"}],
+                            },
+                            "handover": {"review_complete": True},
+                        }
+                    )
+                    + "\n\n[stderr]\n"
+                ),
             },
         },
         {
@@ -179,7 +196,8 @@ def test_autonomous_resume_fixes_findings_after_a_completed_review() -> None:
         "branch": "codex/fixture",
         "workspace_branch": "codex/fixture",
         "pull_request": 9,
-        "head": "b" * 40,
+        "head_commit": "b" * 40,
+        "review_findings": [{"severity": "MAJOR"}],
     }
 
 
