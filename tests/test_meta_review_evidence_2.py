@@ -54,12 +54,25 @@ def test_meta_review_helpers_keep_json_and_time_bounds() -> None:
         [
             {
                 "source_id": "run:1",
-                "routing_attempts": [{"attempt_id": 1, "outcome": "success"}],
-                "events": [{"event_id": 2}],
-            }
+                "run_id": "1",
+                "status": "completed",
+                "repository": "owner/api",
+                "routing_attempts": [
+                    {"attempt_id": 1, "problem_id": "1", "outcome": "failure"}
+                ],
+            },
+            {
+                "source_id": "run:2",
+                "run_id": "2",
+                "status": "completed",
+                "repository": "owner/api",
+                "routing_attempts": [
+                    {"attempt_id": 1, "problem_id": "2", "outcome": "failure"}
+                ],
+            },
         ]
     )
-    assert success[0]["suggestion_key"] == "completed-handoff:run:1"
+    assert success[0]["suggestion_key"] == "meta-review:v1:owner/api:routing-failure"
     normalized = _normalize_suggestions(
         "project-1",
         [

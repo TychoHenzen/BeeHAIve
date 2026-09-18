@@ -26,10 +26,11 @@ Legacy completed runs without sessions remain usable with a transcript gap.
 Failed, cancelled, timed-out, and active runs remain excluded. Retained failed
 attempts within a later completed run are diagnostic evidence, not proof of success.
 
-The review is explicit and bounded. The API accepts at most 25 records and
-8,000 estimated input tokens. Results, errors, event details, analyzer text,
-and evidence references are redacted and truncated before storage. A second
-review cannot overlap a running review for the same state store.
+The review is explicit and bounded. The API accepts at most 25 newest completed
+records and 8,000 estimated input tokens; an optional `since` timestamp is
+inclusive. Results, errors, event details, analyzer text, and evidence
+references are redacted and truncated before storage. A second review cannot
+overlap a running review for the same state store.
 
 Run a review with an API key:
 
@@ -53,11 +54,16 @@ curl.exe -X POST http://127.0.0.1:8000/projects/<project-id>/meta-review/suggest
   -d '{"decision":"accept"}'
 ```
 
-Suggestions use a stable identity per project and suggestion key. Repeating a
-review updates the evidence and keeps the operator decision. The analyzer is
-deterministic in this version. It proposes workflow outcomes from routing
-failures, missing routing evidence, or a completed handoff.
+Suggestions use a stable identity per Project, normalized repository, and
+versioned pattern family. A suggestion is emitted only when one structured
+family is present in at least two distinct completed runs admitted to this
+review. The supported families are routing failure, repair/retry, blocked
+operator question, and retained `turn.failed` execution evidence. Duplicate
+events, retries, transcript excerpts, repeated reviews, assistant prose, and
+analyzer-provided counts do not add support. Repeating a qualifying review
+updates the evidence and keeps the operator decision; a later non-qualifying
+review leaves the historical suggestion untouched.
 
-The meta-review API never creates GitHub issues, changes Project items, or
-mutates provider state. An operator must inspect and decide each suggestion
-through the API.
+Review, listing, and rejection do not call the provider. An operator must
+inspect and decide each suggestion through the API; explicit acceptance uses
+the existing validated, idempotent PBI-creation handoff.

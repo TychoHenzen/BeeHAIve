@@ -3,10 +3,7 @@ from collections.abc import Iterator
 
 import pytest
 
-from beehaiive.meta_review import (
-    MetaReviewError,
-    MetaReviewService,
-)
+from beehaiive.meta_review import MetaReviewService
 from beehaiive.models import PbiSnapshot, ProjectSnapshot, RepositorySnapshot
 from beehaiive.pbi_creation import PbiCreationRequest
 from beehaiive.routing import RoutingStore
@@ -88,15 +85,9 @@ def test_accept_rejects_unresolved_or_conflicting_run_evidence(
             }
         ],
     )
-    suggestion = service.run("project-1")["suggestions"][0]
+    result = service.run("project-1")
 
-    with pytest.raises(MetaReviewError):
-        service.decide(
-            "project-1",
-            str(suggestion["suggestion_id"]),
-            "accept",
-            pbi_creator=create_pbi,
-        )
+    assert result["suggestions"] == []
     assert calls == []
 
 
