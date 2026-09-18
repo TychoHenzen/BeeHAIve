@@ -291,6 +291,70 @@ def test_retry_and_recovery_use_admission():
     assert store.admission_state("p")["used"] == 1
 
 
+def test_expiry_recovery_retries_before_side_effect_then_quarantines():
+    store = OrchestratorStore(admission_capacity=1)
+    try:
+        seed(store)
+        run = store.claim_next("p", "owner/a", "w1")
+        expire(store, run.run_id)
+        first = store.recover_expired_admissions()
+        assert first[0]["action"] == "reclaim_retry"
+        replacement = store.claim_next("p", "owner/a", "w2")
+        assert replacement is not None
+        expire(store, replacement.run_id)
+        second = store.recover_expired_admissions()
+        assert second[0]["action"] == "quarantine"
+        failed = store.get_run(run.run_id)
+        assert failed is not None and failed.status.value == "failed"
+        assert store.admission_state("p")["used"] == 0
+        assert store.claim_next("p", "owner/a", "w3") is None
+        store.set_pbi_claimable("p", "owner/a", 1)
+        assert store.claim_next("p", "owner/a", "w3") is not None
+        assert len(store.admission_state("p")["recoveries"]) == 2
+    finally:
+        store.close()
+
+
+def test_expiry_after_persisted_task_result_quarantines() -> None:
+    store = OrchestratorStore(admission_capacity=1)
+    try:
+        seed(store)
+        run = store.claim_next("p", "owner/a", "w1")
+        contract = TaskContract("test", 1, "work", {}, (), (), tuple(TaskOutcome))
+        store.ensure_task_contract(run.run_id, contract, run.lease_token)
+        store.record_task_result(
+            run.run_id, TaskResult(TaskOutcome.PASS, {}), run.lease_token
+        )
+        expire(store, run.run_id)
+        recovered = store.recover_expired_admissions()
+        assert recovered[0]["action"] == "quarantine"
+        assert store.get_run(run.run_id).status.value == "failed"
+    finally:
+        store.close()
+
+
+def test_expiry_after_persisted_session_evidence_quarantines() -> None:
+    store = OrchestratorStore(admission_capacity=1)
+    try:
+        seed(store)
+        run = store.claim_next("p", "owner/a", "w1")
+        store.start_agent_session(run.run_id, "w1", "task", run.lease_token)
+        store.record_agent_session_event(
+            run.run_id,
+            run.lease_token,
+            "progress",
+            "turn.started",
+            None,
+            "turn.started",
+        )
+        expire(store, run.run_id)
+        recovered = store.recover_expired_admissions()
+        assert recovered[0]["action"] == "quarantine"
+        assert store.get_run(run.run_id).status.value == "failed"
+    finally:
+        store.close()
+
+
 def test_server_clock_expiry_reclaims_once(monkeypatch):
     from datetime import UTC, datetime, timedelta
 

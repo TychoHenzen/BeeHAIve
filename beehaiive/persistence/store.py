@@ -105,6 +105,8 @@ class OrchestratorStore(
         try:
             self._initialize()
             self._initialize_admission()
+            if self._admission_capacity is not None:
+                self.recover_expired_admissions()
         except Exception:
             self._connection.close()
             raise

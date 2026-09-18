@@ -64,6 +64,8 @@ class ProjectClaimMixin:
             not agent_session[0].strip() or not agent_session[1].strip()
         ):
             raise StoreError("An agent worker and task are required")
+        if self._admission_capacity is not None:
+            self.recover_expired_admissions()
         with self._transaction() as connection:
             active = connection.execute(
                 """

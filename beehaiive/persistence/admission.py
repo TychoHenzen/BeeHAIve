@@ -4,7 +4,7 @@ import sqlite3
 from typing import Any
 
 from beehaiive.contract_types.validation import _redact_text
-from beehaiive.models import RunState, RunStatus
+from beehaiive.models import RunState, RunStatus, Stage
 
 from .errors import StoreError
 from .helpers.lease_helpers import _now
@@ -42,6 +42,17 @@ class AdmissionMixin:
                 lease_token TEXT NOT NULL,
                 generation INTEGER NOT NULL,
                 expires_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS admission_recoveries (
+                recovery_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                repository TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                UNIQUE(run_id, generation, action)
             );
             CREATE TRIGGER IF NOT EXISTS release_run_admission
             AFTER UPDATE OF status, lease_token ON runs
@@ -194,6 +205,18 @@ class AdmissionMixin:
                    ORDER BY a.repository LIMIT 100""",
                 (project_id, now),
             ).fetchall()
+            recoveries = connection.execute(
+                """
+                SELECT run_id, repository, owner_id, generation, action,
+                       reason, observed_at
+                FROM admission_recoveries
+                WHERE run_id IN (
+                    SELECT run_id FROM runs WHERE project_id = ?
+                )
+                ORDER BY recovery_id DESC LIMIT 100
+                """,
+                (project_id,),
+            ).fetchall()
             return {
                 "enabled": True,
                 "capacity": self._admission_capacity,
@@ -206,4 +229,131 @@ class AdmissionMixin:
                     }
                     for row in rows
                 ],
+                "recoveries": [
+                    {
+                        **dict(row),
+                        "owner_id": _redact_text(str(row["owner_id"]), 200),
+                    }
+                    for row in recoveries
+                ],
             }
+
+    def recover_expired_admissions(self: Any) -> tuple[dict[str, object], ...]:
+        if self._admission_capacity is None:
+            return ()
+        recovered: list[dict[str, object]] = []
+        with self._transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT a.repository, a.run_id, a.owner_id, a.generation,
+                       r.project_id, r.repository_name, r.pbi_number,
+                       p.stage, r.execution_token, r.task_result_json,
+                       r.last_result,
+                       EXISTS(
+                           SELECT 1 FROM agent_session_events AS se
+                           WHERE se.run_id = r.run_id
+                       ) AS session_evidence
+                FROM admissions AS a
+                JOIN runs AS r ON r.run_id = a.run_id
+                JOIN pbis AS p
+                  ON p.project_id = r.project_id
+                 AND p.repository_name = r.repository_name
+                 AND p.number = r.pbi_number
+                WHERE a.expires_at <= ?
+                ORDER BY a.repository
+                """,
+                (_now(),),
+            ).fetchall()
+            for row in rows:
+                prior = connection.execute(
+                    """
+                    SELECT COUNT(*) FROM admission_recoveries
+                    WHERE run_id = ? AND action = 'reclaim_retry'
+                    """,
+                    (row["run_id"],),
+                ).fetchone()[0]
+                before_side_effect = (
+                    row["execution_token"] is None
+                    and row["task_result_json"] is None
+                    and row["last_result"] is None
+                    and not bool(row["session_evidence"])
+                )
+                retry = bool(before_side_effect and prior == 0)
+                action = "reclaim_retry" if retry else "quarantine"
+                reason = (
+                    "lease_expired_before_side_effect"
+                    if retry
+                    else "lease_expired_after_side_effect"
+                    if not before_side_effect
+                    else "repeated_lease_expiry"
+                )
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO admission_recoveries(
+                        run_id, repository, owner_id, generation, action,
+                        reason, observed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["run_id"],
+                        row["repository"],
+                        row["owner_id"],
+                        row["generation"],
+                        action,
+                        reason,
+                        _now(),
+                    ),
+                )
+                if not retry:
+                    connection.execute(
+                        """
+                        UPDATE runs
+                        SET status = 'failed', owner_id = NULL,
+                            lease_token = NULL, lease_expires_at = NULL,
+                            execution_token = NULL,
+                            last_error = ?, updated_at = ?
+                        WHERE run_id = ? AND status = 'active'
+                        """,
+                        (
+                            f"Worker recovery quarantined: {reason}",
+                            _now(),
+                            row["run_id"],
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE pbis SET claimable = 0, last_error = ?
+                        WHERE project_id = ? AND repository_name = ? AND number = ?
+                        """,
+                        (
+                            f"Worker recovery quarantined: {reason}",
+                            row["project_id"],
+                            row["repository_name"],
+                            row["pbi_number"],
+                        ),
+                    )
+                    self._record_event(
+                        connection,
+                        row["project_id"],
+                        row["repository_name"],
+                        row["pbi_number"],
+                        row["run_id"],
+                        "recovery_quarantined",
+                        Stage(str(row["stage"])),
+                        Stage(str(row["stage"])),
+                        {"reason": reason, "generation": row["generation"]},
+                    )
+                connection.execute(
+                    "DELETE FROM admissions WHERE run_id = ? AND generation = ?",
+                    (row["run_id"], row["generation"]),
+                )
+                recovered.append(
+                    {
+                        "run_id": row["run_id"],
+                        "repository": row["repository"],
+                        "generation": row["generation"],
+                        "action": action,
+                        "reason": reason,
+                    }
+                )
+        return tuple(recovered)
