@@ -308,6 +308,7 @@ class WorkerRunMixin:
                 current = self._threads.get(run_id)
                 if current is not None and current is current_thread():
                     self._threads.pop(run_id, None)
+                    self._run_lease_tokens.pop(run_id, None)
                 self._cancelled_runs.discard(run_id)
             if (
                 workspace_lease is not None

@@ -31,3 +31,4 @@ class RunState:
     task_contract: Mapping[str, object] | None = None
     task_result: Mapping[str, object] | None = None
     task_answer: str | None = None
+    admission_generation: int | None = None

@@ -23,6 +23,7 @@ def _run_dict(
         "task_contract": run.task_contract,
         "task_result": run.task_result,
         "task_answer": run.task_answer,
+        "admission_generation": run.admission_generation,
     }
     if routing is not None:
         result["routing"] = routing

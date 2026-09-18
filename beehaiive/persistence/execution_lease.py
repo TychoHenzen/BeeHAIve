@@ -43,7 +43,7 @@ class ExecutionLeaseMixin:
     def validate_execution(
         self: Any, run_id: str, lease_token: str, execution_token: str
     ) -> None:
-        with self._lock:
+        with self._transaction():
             run = self._run_for_id(self._connection, run_id)
             if run is None:
                 raise StoreError(f"Unknown run: {run_id}")
@@ -59,6 +59,10 @@ class ExecutionLeaseMixin:
         self: Any, run_id: str, lease_token: str, execution_token: str
     ) -> None:
         with self._transaction() as connection:
+            run = self._run_for_id(connection, run_id)
+            if run is None:
+                raise StoreError(f"Unknown run: {run_id}")
+            self._require_lease(run, lease_token)
             current = connection.execute(
                 """
                 SELECT status, lease_token, execution_token
@@ -78,6 +82,16 @@ class ExecutionLeaseMixin:
 
     def release_execution(self: Any, run_id: str, execution_token: str) -> None:
         with self._transaction() as connection:
+            if self._admission_capacity is not None:
+                run = self._run_for_id(connection, run_id)
+                if run is None:
+                    return
+                current = connection.execute(
+                    "SELECT execution_token FROM runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                if current is None or current["execution_token"] != execution_token:
+                    return
+                self._require_lease(run, run.lease_token or "")
             connection.execute(
                 """
                 UPDATE runs

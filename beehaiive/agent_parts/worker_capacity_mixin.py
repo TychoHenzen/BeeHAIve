@@ -43,6 +43,7 @@ class WorkerCapacityMixin:
         self.workflow_service = workflow_service
         self._lock = Lock()
         self._threads: dict[str, Thread] = {}
+        self._run_lease_tokens: dict[str, str] = {}
         self._max_concurrent_workers: int | None = None
         self._workspace_leases: dict[str, WorkspaceLease] = {}
         self._workspace_validators: dict[str, Callable[[], None]] = {}
@@ -236,6 +237,24 @@ class WorkerCapacityMixin:
         return tuple(recovered)
 
     def start(self: Any, run: RunState, *, model_override: str | None = None) -> None:
+        store = self.orchestrator.store
+        try:
+            if store.admission_enabled:
+                store.validate_lease(run.run_id, run.lease_token or "")
+            self._start(run, model_override=model_override)
+        except Exception:
+            with self._lock:
+                running = run.run_id in self._threads
+            if store.admission_enabled and not running:
+                with suppress(StoreError):
+                    store.fail_agent_run(
+                        run.run_id,
+                        "Agent worker failed to start",
+                        run.lease_token or "",
+                    )
+            raise
+
+    def _start(self: Any, run: RunState, *, model_override: str | None = None) -> None:
         if run.status is not RunStatus.ACTIVE or run.lease_token is None:
             raise StoreError("An active leased run is required")
         if self.workflow_service is None:
@@ -256,6 +275,7 @@ class WorkerCapacityMixin:
             )
             self._cancelled_runs.discard(run.run_id)
             self._threads[run.run_id] = thread
+            self._run_lease_tokens[run.run_id] = run.lease_token
         workspace_lease: WorkspaceLease | None = None
         executor_prepared = False
         try:
@@ -341,6 +361,7 @@ class WorkerCapacityMixin:
         except Exception as exc:
             with self._lock:
                 self._threads.pop(run.run_id, None)
+                self._run_lease_tokens.pop(run.run_id, None)
                 self._workspace_leases.pop(run.run_id, None)
                 self._workspace_validators.pop(run.run_id, None)
             if executor_prepared:

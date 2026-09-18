@@ -161,6 +161,7 @@ class WorkerDeliveryMixin:
             stop_host_heartbeat()
         with self._lock:
             items = list(self._threads.items())
+            lease_tokens = dict(self._run_lease_tokens)
         cancellation_error: Exception | None = None
         for run_id, _thread in items:
             try:
@@ -188,7 +189,14 @@ class WorkerDeliveryMixin:
             run = self.orchestrator.store.get_run(run_id)
             if run is not None and run.status is RunStatus.ACTIVE:
                 with suppress(StoreError):
-                    self.orchestrator.stop(run_id, "Agent worker shut down")
+                    if self.orchestrator.store.admission_enabled:
+                        self.orchestrator.store.fail_agent_run(
+                            run_id,
+                            "Agent worker shut down",
+                            lease_tokens.get(run_id, ""),
+                        )
+                    else:
+                        self.orchestrator.stop(run_id, "Agent worker shut down")
         if self.workflow_service is not None:
             for run_id, _thread in items:
                 self.workflow_service.cleanup_dashboard_run_workspaces(run_id)

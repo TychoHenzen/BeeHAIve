@@ -256,10 +256,17 @@ class AgentScheduler:
                     except Exception as exc:
                         error_summary = self._error_summary(exc)
                         try:
-                            self.orchestrator.stop(
-                                run.run_id,
-                                f"Scheduled worker failed to start: {error_summary}",
+                            failure = (
+                                f"Scheduled worker failed to start: {error_summary}"
                             )
+                            if getattr(
+                                self.orchestrator.store, "admission_enabled", False
+                            ):
+                                self.orchestrator.store.fail_agent_run(
+                                    run.run_id, failure, run.lease_token or ""
+                                )
+                            else:
+                                self.orchestrator.stop(run.run_id, failure)
                         except Exception as stop_error:
                             errors.append(self._error_summary(stop_error))
                         errors.append(error_summary)

@@ -7,6 +7,7 @@ from pathlib import Path
 from threading import RLock
 
 from .actions import ActionsMixin
+from .admission import AdmissionMixin
 from .agent_sessions import AgentSessionsMixin
 from .budget_evidence import BudgetEvidenceMixin
 from .canonical_lifecycle import CanonicalLifecycleMixin
@@ -42,6 +43,7 @@ from .worker_hosts import WorkerHostsMixin
 
 
 class OrchestratorStore(
+    AdmissionMixin,
     StorageSchemaMixin,
     StorageMigrationMixin,
     PbiRefinementStartMixin,
@@ -77,11 +79,20 @@ class OrchestratorStore(
     WorkerHostsMixin,
 ):
     def __init__(
-        self, database: str | Path = ":memory:", lease_seconds: int = 300
+        self,
+        database: str | Path = ":memory:",
+        lease_seconds: int = 300,
+        *,
+        admission_capacity: int | None = None,
     ) -> None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         self._lease_seconds = lease_seconds
+        if admission_capacity is not None and (
+            type(admission_capacity) is not int or admission_capacity <= 0
+        ):
+            raise ValueError("admission_capacity must be a positive integer")
+        self._admission_capacity = admission_capacity
         if database != ":memory:":
             Path(database).parent.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(
@@ -91,7 +102,12 @@ class OrchestratorStore(
         )
         self._connection.row_factory = sqlite3.Row
         self._lock = RLock()
-        self._initialize()
+        try:
+            self._initialize()
+            self._initialize_admission()
+        except Exception:
+            self._connection.close()
+            raise
 
     def close(self) -> None:
         with self._lock:
@@ -102,6 +118,7 @@ class OrchestratorStore(
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
             try:
+                self._check_admission_configuration(self._connection)
                 yield self._connection
             except Exception:
                 self._connection.rollback()

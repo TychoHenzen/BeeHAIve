@@ -149,6 +149,37 @@ appears in the dashboard, and a successful capture is visible in that
 Project's Backlog. The read-only dashboard config endpoint supplies the
 allowlisted Project IDs.
 
+## Shared worker admission
+
+Set `BEEHAIIVE_ADMISSION_ENABLED=true` to enable a central run budget.
+`BEEHAIIVE_ADMISSION_CAPACITY` is a positive integer and defaults to `1`.
+The server persists the cap in `BEEHAIIVE_STATE_DB`. All server processes must
+use the same local database and configuration. Conflicting configurations fail
+closed, including an older local-mode process after activation. Restart server
+processes together when enabling this mode. Activation accounts for existing
+active runs and rejects excess capacity or duplicate repository ownership.
+
+Worker hosts use the authenticated HTTP claim and run APIs. Do not share SQLite
+files across hosts. Separate databases are separate coordination domains. This
+provides admission primitives, not remote executor installation or recovery.
+
+A successful claim reserves a slot before execution starts. It also leases the
+case-insensitive repository identity across projects. Renewal retains that slot.
+Expiry permits reclamation during a subsequent claim. Heartbeat absence alone
+does not release capacity. Failure, completion, operator stop and start failure
+release the matching reservation. Repository generations survive release and
+restart. Each opaque lease token binds its owner to that generation. Stale or
+expired workers cannot mutate admitted run state or initiate a handoff.
+Fencing cannot undo filesystem or provider operations already in flight.
+
+`GET /projects/{project_id}/admission` requires `X-API-Key` and project access.
+It returns global capacity, used/free counts, and up to 100 current reservations
+for that project, including repository, run ID, generation and expiry. It never
+returns lease tokens. Claims return `admission_generation` alongside the private
+lease token. Enabled-mode claim denials return HTTP 409 with `detail.reason` of
+`capacity_exhausted` or `repository_owned`. Authority failures return HTTP 503
+with `admission_authority_unavailable`. Local mode remains the default.
+
 ## Create a PBI through the API
 
 Send an authenticated request for a repository linked to the configured

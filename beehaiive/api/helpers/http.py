@@ -1,9 +1,11 @@
+import sqlite3
 from collections.abc import Callable
 
 from fastapi import HTTPException
 
 from beehaiive.meta_review import MetaReviewError
 from beehaiive.pbi_creation import PbiCreationError
+from beehaiive.persistence.admission import AdmissionError
 from beehaiive.provider import ProviderError
 from beehaiive.review import ReviewAdapterError, ReviewError
 from beehaiive.storage import StoreError
@@ -31,6 +33,13 @@ def _required_header(value: str | None, name: str) -> str:
 def _handle_store_error[T](function: Callable[[], T]) -> T:
     try:
         return function()
+    except AdmissionError as exc:
+        status = 503 if exc.reason == "admission_authority_unavailable" else 409
+        raise HTTPException(status_code=status, detail={"reason": exc.reason}) from exc
+    except sqlite3.Error as exc:
+        raise HTTPException(
+            status_code=503, detail={"reason": "admission_authority_unavailable"}
+        ) from exc
     except StoreError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ProviderError as exc:

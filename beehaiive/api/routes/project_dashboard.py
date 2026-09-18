@@ -725,6 +725,15 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
             ),
         }
 
+    @app.get("/projects/{project_id}/admission")
+    def admission_state(  # pyright: ignore[reportUnusedFunction]
+        project_id: str,
+        _access: None = Depends(require_mutation_access),
+    ) -> dict[str, object]:
+        return _handle_store_error(
+            lambda: orchestrator.store.admission_state(project_id)
+        )
+
     @app.post("/projects/{project_id}/repositories/{repository:path}/claim")
     def claim(  # pyright: ignore[reportUnusedFunction]
         project_id: str,
