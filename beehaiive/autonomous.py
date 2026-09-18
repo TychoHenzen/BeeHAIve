@@ -260,6 +260,18 @@ class AutonomousStore(Protocol):
         self, project_id: str, limit: int = 100
     ) -> list[dict[str, object]]: ...
 
+    def mark_idea_capture_outcome_unknown(self, action_id: str) -> None: ...
+
+    def release_idea_capture(self, action_id: str) -> None: ...
+
+    def mark_idea_capture_started(self, action_id: str) -> bool | None: ...
+
+    def renew_idea_capture(self, action_id: str) -> bool: ...
+
+    def recover_idea_capture(self, action_id: str) -> bool: ...
+
+    def complete_idea_capture(self, action_id: str) -> None: ...
+
 
 class AutonomousOrchestrator(Protocol):
     @property
@@ -1145,8 +1157,18 @@ class AutonomousLifecycleService:
                     else "Idea capture did not survive the server restart; "
                     "no live worker process is attached."
                 )
-                result: dict[str, object] = {"status": "blocked", "error": detail}
-                if action.get("kind") == "autonomous_start":
+                if action.get("kind") == "capture_idea":
+                    retryable = self.orchestrator.store.recover_idea_capture(
+                        str(action["id"])
+                    )
+                    result: dict[str, object] = {
+                        "status": "failed" if retryable else "outcome_unknown",
+                        "error": detail,
+                    }
+                    if not retryable:
+                        result["operator_action"] = "Reconcile before retry."
+                else:
+                    result = {"status": "blocked", "error": detail}
                     result["resume_after_restart"] = True
                 self.orchestrator.store.finish_action(
                     str(action["id"]),
@@ -1647,7 +1669,12 @@ class AutonomousLifecycleService:
         context: Mapping[str, object],
         action_id: str,
     ) -> None:
+        process_started = False
+
         def record_process(process: Mapping[str, object]) -> None:
+            nonlocal process_started
+            if process.get("state") == "running":
+                process_started = True
             with self._lock:
                 current = self._runs.get(run_id)
                 if current is not None:
@@ -1676,6 +1703,9 @@ class AutonomousLifecycleService:
                     ][-100:]
 
         idea_workspace: Path | None = None
+        idea_heartbeat_stop = Event()
+        idea_heartbeat_thread: Thread | None = None
+        side_effect_started = False
         try:
             mode = os.environ.get("BEEHAIIVE_AUTONOMOUS_MODE", "codex").strip().lower()
             if self._executor is None and mode == "codex":
@@ -1683,6 +1713,25 @@ class AutonomousLifecycleService:
             executor = self._idea_executor(
                 record_output, record_process, idea_workspace
             )
+            if self.orchestrator.store.mark_idea_capture_started(action_id) is False:
+                raise RuntimeError("Idea capture claim was lost before launch")
+            side_effect_started = True
+
+            heartbeat_seconds = getattr(
+                self.orchestrator.store, "idea_capture_heartbeat_seconds", 1.0
+            )
+
+            def renew_claim() -> None:
+                while not idea_heartbeat_stop.wait(float(heartbeat_seconds)):
+                    if not self.orchestrator.store.renew_idea_capture(action_id):
+                        return
+
+            idea_heartbeat_thread = Thread(
+                target=renew_claim,
+                name=f"beehaiive-idea-heartbeat-{run_id[:8]}",
+                daemon=True,
+            )
+            idea_heartbeat_thread.start()
             raw = _mapping(
                 executor.execute(
                     IDEA_CAPTURE_STEP,
@@ -1715,15 +1764,29 @@ class AutonomousLifecycleService:
                     "Idea capture returned an issue that was not read back in "
                     "the selected Project Backlog."
                 )
-            result = safe_dashboard_value(
-                {
-                    "status": status,
-                    "summary": summary,
-                    "handover": handover,
-                },
-                worker_secret_values(),
+            safe_result = cast(
+                dict[str, object],
+                safe_dashboard_value(
+                    {
+                        "status": status,
+                        "summary": summary,
+                        "handover": handover,
+                    },
+                    worker_secret_values(),
+                ),
             )
-            safe_result = cast(dict[str, object], result)
+            if status != "succeeded":
+                safe_result = cast(
+                    dict[str, object],
+                    safe_dashboard_value(
+                        {
+                            **safe_result,
+                            "status": "outcome_unknown",
+                            "operator_action": "Reconcile before retry.",
+                        },
+                        worker_secret_values(),
+                    ),
+                )
             safe_error = (
                 None
                 if status == "succeeded"
@@ -1739,6 +1802,10 @@ class AutonomousLifecycleService:
                 safe_result,
                 safe_error,
             )
+            if status == "succeeded":
+                self.orchestrator.store.complete_idea_capture(action_id)
+            else:
+                self.orchestrator.store.mark_idea_capture_outcome_unknown(action_id)
             with self._lock:
                 current = self._runs.get(run_id)
                 if current is not None:
@@ -1758,9 +1825,21 @@ class AutonomousLifecycleService:
             detail = redact_worker_text(
                 format_worker_exception(error), worker_secret_values()
             )[:4_000]
-            self.orchestrator.store.finish_action(
-                action_id, "failed", {"status": "blocked", "error": detail}, detail
+            launch_failure = not process_started and (
+                "launch failed" in detail.casefold()
+                or isinstance(error, (FileNotFoundError, OSError))
             )
+            if side_effect_started and not launch_failure:
+                result: dict[str, object] = {
+                    "status": "outcome_unknown",
+                    "error": detail,
+                    "operator_action": "Reconcile before retry.",
+                }
+                self.orchestrator.store.mark_idea_capture_outcome_unknown(action_id)
+            else:
+                result = {"status": "failed", "retryable": True, "error": detail}
+                self.orchestrator.store.release_idea_capture(action_id)
+            self.orchestrator.store.finish_action(action_id, "failed", result, detail)
             with self._lock:
                 current = self._runs.get(run_id)
                 if current is not None:
@@ -1773,6 +1852,9 @@ class AutonomousLifecycleService:
                         }
                     )
         finally:
+            idea_heartbeat_stop.set()
+            if idea_heartbeat_thread is not None:
+                idea_heartbeat_thread.join(timeout=2)
             if idea_workspace is not None:
                 shutil.rmtree(idea_workspace, ignore_errors=True)
             with self._lock:
