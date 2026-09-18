@@ -8,7 +8,7 @@ from beehaiive.models import (
     Stage,
 )
 from beehaiive.orchestrator import Orchestrator
-from beehaiive.routing import RoutingStore
+from beehaiive.routing import ModelRouter, RoutingStore
 from beehaiive.storage import OrchestratorStore
 from main import create_app
 from tests.support.api_provider import ApiProvider
@@ -22,24 +22,39 @@ def test_accept_meta_review_uses_shared_pbi_creation_service() -> None:
         ProjectSnapshot(
             "owner:7",
             "Planning",
-            (RepositorySnapshot("owner/api", (PbiSnapshot("owner/api", 1, "PBI"),)),),
+            (
+                RepositorySnapshot(
+                    "owner/api",
+                    (
+                        PbiSnapshot("owner/api", 1, "PBI"),
+                        PbiSnapshot("owner/api", 2, "PBI 2"),
+                    ),
+                ),
+            ),
         )
     )
-    run = store.claim_next("owner:7", "owner/api", "worker-1")
-    assert run is not None
-    lease_token = run.lease_token or ""
-    implementation = store.advance(run.run_id, Stage.IMPLEMENT, lease_token)
-    store.ensure_task_contract(
-        run.run_id,
-        TaskContract.inventory("owner/api", 1, "PBI"),
-        implementation.lease_token or "",
-    )
-    store.record_task_result(
-        run.run_id,
-        TaskResult(TaskOutcome.PASS, {}),
-        implementation.lease_token or "",
-    )
-    store.complete_agent_run(run.run_id, "Completed the PBI.", lease_token)
+    run_ids: list[str] = []
+    for pbi_number, title in ((1, "PBI"), (2, "PBI 2")):
+        run = store.claim_next("owner:7", "owner/api", f"worker-{pbi_number}")
+        assert run is not None
+        lease_token = run.lease_token or ""
+        implementation = store.advance(run.run_id, Stage.IMPLEMENT, lease_token)
+        store.ensure_task_contract(
+            run.run_id,
+            TaskContract.inventory("owner/api", pbi_number, title),
+            implementation.lease_token or "",
+        )
+        store.record_task_result(
+            run.run_id,
+            TaskResult(TaskOutcome.PASS, {}),
+            implementation.lease_token or "",
+        )
+        store.complete_agent_run(run.run_id, "Completed the PBI.", lease_token)
+        run_ids.append(run.run_id)
+    router = ModelRouter(routing)
+    for run_id in run_ids:
+        router.begin(run_id)
+        router.record(run_id, "failure", failure_context="fixture failure")
     project_client = TestClient(
         create_app(
             orchestrator=Orchestrator(store, provider),

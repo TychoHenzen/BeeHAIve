@@ -17,11 +17,13 @@ from ..storage import (
 from .meta_review_creation import pbi_creation_request
 from .meta_review_error import MetaReviewError
 from .meta_review_helpers import (
+    bounded_diagnostics,
     deterministic_analyzer,
     estimate_tokens,
     mappings,
     normalize_since,
     normalize_suggestions,
+    recurrence_gate,
     review_result,
     safe_record,
     safe_review_text,
@@ -76,10 +78,20 @@ class MetaReviewService:
                     project_id, normalized_since, record_limit
                 )
                 records, missing_evidence, input_tokens = self._bounded_evidence(
-                    source_records, input_token_limit
+                    source_records, input_token_limit, project_id
                 )
                 selected_records = len(records)
                 suggestions = normalize_suggestions(project_id, self._analyzer(records))
+                suggestions, gate_diagnostics = recurrence_gate(
+                    project_id,
+                    records,
+                    suggestions,
+                    since=normalized_since,
+                    record_limit=record_limit,
+                )
+                missing_evidence = bounded_diagnostics(
+                    [*missing_evidence, *gate_diagnostics]
+                )
                 run, saved = self.store.complete_meta_review(
                     review_id,
                     selected_records,
@@ -163,6 +175,7 @@ class MetaReviewService:
         self,
         source_records: Sequence[object],
         input_token_limit: int,
+        project_id: str | None = None,
     ) -> tuple[list[dict[str, object]], list[str], int]:
         if not source_records:
             return [], ["No completed runs found"], 0
@@ -181,6 +194,12 @@ class MetaReviewService:
                 continue
             if not isinstance(run_id, str) or not run_id.strip():
                 missing.append(f"{source_id}: run identifier unavailable")
+                continue
+            if source_id != f"run:{run_id}":
+                missing.append(f"{source_id}: source/run identity mismatch")
+                continue
+            if project_id is not None and source_record.get("project_id") != project_id:
+                missing.append(f"{source_id}: Project ownership mismatch")
                 continue
             if not any(
                 isinstance(value, str) and value.strip()
@@ -204,6 +223,8 @@ class MetaReviewService:
                 if not attempts:
                     missing.append(f"{source_id}: routing attempts unavailable")
             record = safe_record(source_record, attempts)
+            if project_id is not None:
+                record["project_id"] = project_id
             transcript = cast(dict[str, object], record["transcript"])
             for gap in cast(list[str], transcript["gaps"]):
                 missing.append(f"{record['source_id']}: transcript {gap}")
@@ -213,4 +234,4 @@ class MetaReviewService:
                 break
             records.append(record)
             input_tokens += record_tokens
-        return records, missing, input_tokens
+        return records, bounded_diagnostics(missing), input_tokens

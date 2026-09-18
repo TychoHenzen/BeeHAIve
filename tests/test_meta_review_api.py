@@ -24,8 +24,13 @@ def test_meta_review_api_requires_key_and_never_calls_provider(
     meta_review_stores: tuple[OrchestratorStore, RoutingStore],
 ) -> None:
     store, routing = meta_review_stores
-    seed_meta_review(store)
-    complete_meta_review(store)
+    seed_meta_review(store, count=2)
+    first_run = complete_meta_review(store, 1)
+    second_run = complete_meta_review(store, 2)
+    router = ModelRouter(routing)
+    for run_id in (first_run, second_run):
+        router.begin(run_id)
+        router.record(run_id, "failure", failure_context="fixture failure")
     provider = FakeProvider(
         ProjectSnapshot(
             "project-1",

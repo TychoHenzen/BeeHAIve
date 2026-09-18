@@ -7,7 +7,7 @@ from beehaiive.meta_review import (
     MetaReviewService,
 )
 from beehaiive.pbi_creation import PbiCreationRequest
-from beehaiive.routing import RoutingStore
+from beehaiive.routing import ModelRouter, RoutingStore
 from beehaiive.storage import (
     OrchestratorStore,
 )
@@ -18,24 +18,34 @@ def test_review_redacts_bounds_and_preserves_operator_decision(
     meta_review_stores: tuple[OrchestratorStore, RoutingStore],
 ) -> None:
     store, routing = meta_review_stores
-    seed_meta_review(store)
-    complete_meta_review(store, result="token=worker-secret " + "x" * 2_000)
+    seed_meta_review(store, count=2)
+    first_run = complete_meta_review(
+        store, 1, result="token=worker-secret " + "x" * 2_000
+    )
+    second_run = complete_meta_review(store, 2)
+    router = ModelRouter(routing)
+    for run_id in (first_run, second_run):
+        router.begin(run_id)
+        router.record(run_id, "failure", failure_context="fixture failure")
     captured: list[dict[str, object]] = []
 
     def analyzer(records: list[dict[str, object]]) -> list[dict[str, object]]:
         captured.extend(records)
         return [
             {
-                "suggestion_key": "same-evidence",
+                "suggestion_key": "meta-review:v1:owner/api:routing-failure",
                 "proposed_outcome": "Document the bounded workflow.",
                 "rationale": "The completed run is reviewable.",
-                "evidence_refs": [records[0]["source_id"]],
+                "evidence_refs": [
+                    f"run:{first_run}:attempt:1",
+                    f"run:{second_run}:attempt:1",
+                ],
             },
             {
-                "suggestion_key": "same-evidence",
+                "suggestion_key": "meta-review:v1:owner/api:routing-failure",
                 "proposed_outcome": "Duplicate",
                 "rationale": "Duplicate",
-                "evidence_refs": [records[0]["source_id"]],
+                "evidence_refs": [f"run:{first_run}:attempt:1"],
             },
         ]
 
@@ -65,18 +75,25 @@ def test_review_redacts_bounds_and_preserves_operator_decision(
 
     assert second["suggestions"][0]["suggestion_id"] == suggestion["suggestion_id"]
     assert service.suggestions("project-1", "accepted")[0]["status"] == "accepted"
+    later = service.run("project-1", since="2999-01-01T00:00:00+00:00")
+    assert later["suggestions"] == []
+    assert service.suggestions("project-1", "accepted")[0]["status"] == "accepted"
 
 
 def test_accept_creates_bounded_pbi_and_reuses_suggestion_key(
     meta_review_stores: tuple[OrchestratorStore, RoutingStore],
 ) -> None:
     store, routing = meta_review_stores
-    seed_meta_review(store)
-    run_id = complete_meta_review(store)
+    seed_meta_review(store, count=2)
+    first_run = complete_meta_review(store, 1)
+    second_run = complete_meta_review(store, 2)
+    router = ModelRouter(routing)
+    for run_id in (first_run, second_run):
+        router.begin(run_id)
+        router.record(run_id, "failure", failure_context="fixture failure")
     evidence_refs = [
-        f"run:{run_id}",
-        f"run:{run_id}:event:4",
-        f"run:{run_id}:attempt:2",
+        f"run:{first_run}:attempt:1",
+        f"run:{second_run}:attempt:1",
         "artifact:review-1",
     ]
     calls: list[tuple[PbiCreationRequest, str]] = []
@@ -100,6 +117,11 @@ def test_accept_creates_bounded_pbi_and_reuses_suggestion_key(
     )
     suggestion = service.run("project-1")["suggestions"][0]
     suggestion_id = str(suggestion["suggestion_id"])
+    qualifying_refs = [
+        str(reference)
+        for reference in suggestion["evidence_refs"]
+        if ":attempt:" in str(reference)
+    ]
 
     first = service.decide("project-1", suggestion_id, "accept", pbi_creator=create_pbi)
     second = service.decide(
@@ -117,7 +139,10 @@ def test_accept_creates_bounded_pbi_and_reuses_suggestion_key(
     assert first_request.title == "Create the accepted PBI"
     assert first_request.labels == ()
     assert "The evidence supports this change." in first_request.body
-    assert all(reference in first_request.body for reference in evidence_refs)
+    assert any(first_run in reference for reference in qualifying_refs)
+    assert any(second_run in reference for reference in qualifying_refs)
+    assert all(reference in first_request.body for reference in qualifying_refs)
+    assert "artifact:review-1" not in first_request.body
     assert "Project ID: project-1" in first_request.body
     assert f"Suggestion ID: {suggestion_id}" in first_request.body
     assert first_key == second_key == f"meta-review:project-1:{suggestion_id}"
@@ -128,8 +153,13 @@ def test_non_accept_decisions_never_call_pbi_creator(
     meta_review_stores: tuple[OrchestratorStore, RoutingStore], decision: str
 ) -> None:
     store, routing = meta_review_stores
-    seed_meta_review(store)
-    complete_meta_review(store)
+    seed_meta_review(store, count=2)
+    first_run = complete_meta_review(store, 1)
+    second_run = complete_meta_review(store, 2)
+    router = ModelRouter(routing)
+    for run_id in (first_run, second_run):
+        router.begin(run_id)
+        router.record(run_id, "failure", failure_context="fixture failure")
     calls: list[tuple[PbiCreationRequest, str]] = []
 
     def create_pbi(request: PbiCreationRequest, key: str) -> dict[str, object]:
@@ -144,7 +174,10 @@ def test_non_accept_decisions_never_call_pbi_creator(
                 "suggestion_key": "do-not-create",
                 "proposed_outcome": "No PBI",
                 "rationale": "Not accepted.",
-                "evidence_refs": ["run:missing"],
+                "evidence_refs": [
+                    f"run:{first_run}:attempt:1",
+                    f"run:{second_run}:attempt:1",
+                ],
             }
         ],
     )

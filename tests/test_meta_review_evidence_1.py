@@ -37,10 +37,11 @@ def test_review_uses_routing_failures_and_since_bounds_records(
     store, routing = meta_review_stores
     seed_meta_review(store, count=2)
     first_run = complete_meta_review(store, 1)
-    complete_meta_review(store, 2)
+    second_run = complete_meta_review(store, 2)
     router = ModelRouter(routing)
-    router.begin(first_run)
-    router.record(first_run, "failure", failure_context="retry")
+    for run_id in (first_run, second_run):
+        router.begin(run_id)
+        router.record(run_id, "failure", failure_context="retry")
     assert routing.get_attempts(first_run)
     assert len(routing.get_attempts(first_run, limit=1)) == 1
     with pytest.raises(RoutingError, match="attempt limit"):
@@ -55,9 +56,9 @@ def test_review_uses_routing_failures_and_since_bounds_records(
     )
 
     assert result["selected_records"] == 2
-    assert any(
-        "workflow guard" in str(suggestion["proposed_outcome"])
-        for suggestion in result["suggestions"]
+    assert len(result["suggestions"]) == 1
+    assert result["suggestions"][0]["suggestion_key"] == (
+        "meta-review:v1:owner/api:routing-failure"
     )
     assert f"run:{first_run}: routing attempts unavailable" not in str(
         result["missing_evidence"]

@@ -12,14 +12,26 @@ from beehaiive.storage import OrchestratorStore, StoreError
 from tests.support.meta_review.helpers import complete_meta_review, seed_meta_review
 
 
-def start_session(store):
-    seed_meta_review(store)
-    run = store.claim_next("project-1", "owner/api", "worker")
+def start_session(store, pbi_number=1, *, count=1, seed=True):
+    if seed:
+        seed_meta_review(store, count=count)
+    run = store.claim_next("project-1", "owner/api", f"worker-{pbi_number}")
     assert run is not None
     store.start_agent_session(
         run.run_id, "worker", "private-task-fixture", run.lease_token
     )
     return run
+
+
+def execution_failure(store, run):
+    store.record_agent_session_event(
+        run.run_id,
+        run.lease_token,
+        "progress",
+        "turn.failed",
+        None,
+        "turn.failed",
+    )
 
 
 def finish_session(store, run):
@@ -223,10 +235,14 @@ def test_noncompleted_runs_never_enter_analysis(status):
 
 def test_transcript_reference_keeps_suggestion_identity_and_operator_decision():
     store = OrchestratorStore()
-    run = start_session(store)
-    message(store, run, "evidence")
+    run = start_session(store, count=2)
+    execution_failure(store, run)
     finish_session(store, run)
+    other = start_session(store, 2, seed=False)
+    execution_failure(store, other)
+    finish_session(store, other)
     reference = f"run:{run.run_id}:transcript:1"
+    other_reference = f"run:{other.run_id}:transcript:1"
 
     def analyzer(records):
         return [
@@ -234,7 +250,7 @@ def test_transcript_reference_keeps_suggestion_identity_and_operator_decision():
                 "suggestion_key": "transcript-guard",
                 "proposed_outcome": "Document evidence",
                 "rationale": "Observed bounded evidence",
-                "evidence_refs": [reference],
+                "evidence_refs": [reference, other_reference],
             }
         ]
 
