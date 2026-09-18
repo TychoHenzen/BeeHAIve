@@ -1145,19 +1145,19 @@ class AutonomousLifecycleService:
             resumed_workflow_id = resume_context.get("workflow_id")
             if selected_workflow_id is None and isinstance(resumed_workflow_id, str):
                 selected_workflow_id = resumed_workflow_id
-            workflow_step_names: tuple[str, ...] | None = None
+            workflow_step_names: tuple[str, ...]
             graph_store = cast(Any, self.orchestrator.store)
             if selected_workflow_id is None:
                 default_active = graph_store.active_graph_version(
                     DEFAULT_AUTOMATION_WORKFLOW_ID
                 )
-                if default_active is not None:
-                    selected_workflow_id = DEFAULT_AUTOMATION_WORKFLOW_ID
-            if selected_workflow_id is not None:
-                workflow_definition = _active_workflow_definition(
-                    cast(GraphSafetyStore, graph_store), selected_workflow_id
-                )
-                workflow_step_names = _workflow_step_names(workflow_definition)
+                if default_active is None:
+                    bootstrap_automation_workflow(cast(GraphSafetyStore, graph_store))
+                selected_workflow_id = DEFAULT_AUTOMATION_WORKFLOW_ID
+            workflow_definition = _active_workflow_definition(
+                cast(GraphSafetyStore, graph_store), selected_workflow_id
+            )
+            workflow_step_names = _workflow_step_names(workflow_definition)
             active_repository = str(selected["repository"])
             if active_repository in self._active_repositories:
                 raise ValueError("An autonomous lifecycle is already running")
@@ -1168,15 +1168,8 @@ class AutonomousLifecycleService:
                 "project_id": project_id,
                 **selected,
                 "run_id": run_id,
-                **(
-                    {
-                        "workflow_id": selected_workflow_id,
-                        "workflow_step_names": workflow_step_names,
-                    }
-                    if workflow_step_names is not None
-                    and selected_workflow_id is not None
-                    else {}
-                ),
+                "workflow_id": selected_workflow_id,
+                "workflow_step_names": workflow_step_names,
             }
             if resume_requested:
                 context.update(
@@ -1191,8 +1184,7 @@ class AutonomousLifecycleService:
                 "repository": selected["repository"],
                 "pbi_number": selected_number,
             }
-            if selected_workflow_id is not None:
-                action_request["workflow_id"] = selected_workflow_id
+            action_request["workflow_id"] = selected_workflow_id
             action = self.orchestrator.store.begin_action(
                 project_id,
                 "autonomous_start",
