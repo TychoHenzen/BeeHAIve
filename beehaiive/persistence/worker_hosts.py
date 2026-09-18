@@ -21,6 +21,13 @@ from .helpers.lease_helpers import _now
 
 
 class WorkerHostsMixin:
+    def configure_worker_host_liveness(
+        self: Any, heartbeat_seconds: float, stale_seconds: float
+    ) -> None:
+        _, interval, stale = _liveness_window(None, heartbeat_seconds, stale_seconds)
+        self.worker_host_heartbeat_seconds = interval
+        self.worker_host_stale_seconds = stale
+
     def register_worker_host(
         self: Any,
         host_id: str,
@@ -105,28 +112,34 @@ class WorkerHostsMixin:
         host_id: str,
         *,
         now: str | None = None,
-        heartbeat_seconds: float = DEFAULT_WORKER_HOST_HEARTBEAT_SECONDS,
-        stale_seconds: float = DEFAULT_WORKER_HOST_STALE_SECONDS,
+        heartbeat_seconds: float | None = None,
+        stale_seconds: float | None = None,
     ) -> dict[str, object]:
         normalized_id = _host_id(host_id)
+        configured_heartbeat, configured_stale = self._worker_host_timing(
+            heartbeat_seconds, stale_seconds
+        )
         current, interval, stale = _liveness_window(
-            now, heartbeat_seconds, stale_seconds
+            now, configured_heartbeat, configured_stale
         )
         with self._lock:
             row = self._connection.execute(
                 "SELECT * FROM worker_hosts WHERE host_id = ?", (normalized_id,)
             ).fetchone()
         if row is None:
-            return _unknown_host(normalized_id)
+            return _unknown_host(normalized_id, configured_heartbeat, configured_stale)
         return self._worker_host_from_row(row, current, stale, interval)
 
     def worker_host_records(
         self: Any,
         *,
         now: str | None = None,
-        heartbeat_seconds: float = DEFAULT_WORKER_HOST_HEARTBEAT_SECONDS,
-        stale_seconds: float = DEFAULT_WORKER_HOST_STALE_SECONDS,
+        heartbeat_seconds: float | None = None,
+        stale_seconds: float | None = None,
     ) -> tuple[dict[str, object], ...]:
+        heartbeat_seconds, stale_seconds = self._worker_host_timing(
+            heartbeat_seconds, stale_seconds
+        )
         current, interval, stale = _liveness_window(
             now, heartbeat_seconds, stale_seconds
         )
@@ -137,6 +150,23 @@ class WorkerHostsMixin:
         return tuple(
             self._worker_host_from_row(row, current, stale, interval) for row in rows
         )
+
+    def _worker_host_timing(
+        self: Any,
+        heartbeat_seconds: float | None,
+        stale_seconds: float | None,
+    ) -> tuple[float, float]:
+        configured_heartbeat = getattr(
+            self, "worker_host_heartbeat_seconds", DEFAULT_WORKER_HOST_HEARTBEAT_SECONDS
+        )
+        configured_stale = getattr(
+            self, "worker_host_stale_seconds", DEFAULT_WORKER_HOST_STALE_SECONDS
+        )
+        return _liveness_window(
+            None,
+            configured_heartbeat if heartbeat_seconds is None else heartbeat_seconds,
+            configured_stale if stale_seconds is None else stale_seconds,
+        )[1:]
 
     @staticmethod
     def _worker_host_from_row(
@@ -257,7 +287,9 @@ def _liveness_window(
     return current, float(heartbeat_seconds), float(stale_seconds)
 
 
-def _unknown_host(host_id: str) -> dict[str, object]:
+def _unknown_host(
+    host_id: str, heartbeat_seconds: float, stale_seconds: float
+) -> dict[str, object]:
     return {
         "host_id": host_id,
         "worker_slots": 0,
@@ -266,8 +298,8 @@ def _unknown_host(host_id: str) -> dict[str, object]:
         "registered_at": None,
         "heartbeat_at": None,
         "status_reason": "No registration record",
-        "heartbeat_interval_seconds": DEFAULT_WORKER_HOST_HEARTBEAT_SECONDS,
-        "stale_after_seconds": DEFAULT_WORKER_HOST_STALE_SECONDS,
+        "heartbeat_interval_seconds": heartbeat_seconds,
+        "stale_after_seconds": stale_seconds,
         "liveness": "unknown",
         "available_worker_slots": 0,
     }

@@ -140,6 +140,19 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
         set_capacity = getattr(autonomous_service, "set_max_concurrency", None)
         if callable(set_capacity):
             set_capacity(scheduler_config.max_concurrency)
+    worker_host_heartbeat_seconds = _worker_host_seconds(
+        "BEEHAIIVE_WORKER_HEARTBEAT_SECONDS",
+        DEFAULT_WORKER_HOST_HEARTBEAT_SECONDS,
+    )
+    worker_host_stale_seconds = _worker_host_seconds(
+        "BEEHAIIVE_WORKER_STALE_SECONDS",
+        DEFAULT_WORKER_HOST_STALE_SECONDS,
+    )
+    configure_worker_hosts = getattr(
+        orchestrator.store, "configure_worker_host_liveness", None
+    )
+    if callable(configure_worker_hosts):
+        configure_worker_hosts(worker_host_heartbeat_seconds, worker_host_stale_seconds)
     pbi_creation_service = PbiCreationService(
         orchestrator.store,
         cast(PbiCreationProvider, orchestrator.provider),
@@ -198,14 +211,8 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
                 host_id=os.environ.get("BEEHAIIVE_WORKER_HOST_ID"),
                 worker_slots=_worker_host_slots(scheduler_config.max_concurrency),
                 capabilities=_worker_host_capabilities(),
-                heartbeat_seconds=_worker_host_seconds(
-                    "BEEHAIIVE_WORKER_HEARTBEAT_SECONDS",
-                    DEFAULT_WORKER_HOST_HEARTBEAT_SECONDS,
-                ),
-                stale_seconds=_worker_host_seconds(
-                    "BEEHAIIVE_WORKER_STALE_SECONDS",
-                    DEFAULT_WORKER_HOST_STALE_SECONDS,
-                ),
+                heartbeat_seconds=worker_host_heartbeat_seconds,
+                stale_seconds=worker_host_stale_seconds,
             )
     if (
         review_service is not None

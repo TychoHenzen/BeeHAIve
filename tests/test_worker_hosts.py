@@ -83,6 +83,24 @@ def test_worker_host_liveness_is_store_time_based_and_fail_closed() -> None:
         store.close()
 
 
+def test_configured_liveness_thresholds_drive_readback() -> None:
+    store = OrchestratorStore()
+    try:
+        store.configure_worker_host_liveness(60, 300)
+        store.register_worker_host(
+            "host-a",
+            2,
+            (),
+            heartbeat_at="2026-01-01T00:00:00+00:00",
+        )
+        host = store.worker_host_records(now="2026-01-01T00:02:00+00:00")[0]
+        assert host["liveness"] == "active"
+        assert host["available_worker_slots"] == 2
+        assert host["stale_after_seconds"] == 300.0
+    finally:
+        store.close()
+
+
 def test_worker_host_validation_and_concurrent_refresh() -> None:
     store = OrchestratorStore()
     try:
