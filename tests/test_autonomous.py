@@ -287,7 +287,7 @@ def test_autonomous_resume_starts_after_a_published_pull_request() -> None:
                     "head": "a" * 40,
                 },
             },
-        }
+        },
     ]
 
     resume = AutonomousLifecycleService._resume_context(actions, "owner/api", 1)

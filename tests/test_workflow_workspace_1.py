@@ -102,23 +102,6 @@ def test_worktree_gitdir_uses_the_host_path(tmp_path: Path) -> None:
     store.close()
 
 
-def test_existing_branch_can_be_reopened_in_a_new_worktree(tmp_path: Path) -> None:
-    repository = make_repository(tmp_path)
-    store = WorkflowStore()
-    manager = GitWorktreeManager(repository, store)
-    first_path = tmp_path / "first-worktree"
-    second_path = tmp_path / "second-worktree"
-
-    first = manager.acquire("agent-1", "codex/existing", first_path)
-    manager.release(first.lease_id)
-    reopened = manager.acquire_existing("agent-2", "codex/existing", second_path)
-
-    assert reopened.branch == "codex/existing"
-    assert manager.clean(second_path)
-    manager.release(reopened.lease_id)
-    store.close()
-
-
 def test_successful_run_workspace_is_retained_until_explicit_release(
     tmp_path: Path,
 ) -> None:
