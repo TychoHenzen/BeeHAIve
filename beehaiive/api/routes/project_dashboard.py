@@ -1,6 +1,6 @@
 import hashlib
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from typing import Any, Literal, cast
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
@@ -522,52 +522,46 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
             )
         if isinstance(request, DashboardAnswerQuestionRequest):
             action_request["answer"] = "[redacted]"
+        claimed = True
         if isinstance(request, DashboardIdeaCaptureRequest):
             idea_key = hashlib.sha256(
                 (project_id + "\0" + request.idea).encode("utf-8")
             ).hexdigest()
             action_request["idea_key"] = idea_key
-            existing = next(
-                (
-                    item
-                    for item in orchestrator.store.actions_for_project(project_id)
-                    if item.get("kind") == "capture_idea"
-                    and item.get("status") in {"pending", "succeeded"}
-                    and isinstance(item.get("request"), Mapping)
-                    and item["request"].get("idea_key") == idea_key
-                ),
-                None,
+            action, claimed = orchestrator.store.begin_idea_capture(
+                project_id, idea_key, action_request, repository
             )
-            if existing is not None:
-                safe_existing = cast(
-                    dict[str, object],
-                    safe_dashboard_value(existing, dashboard_secret_values),
-                )
-                return {
-                    "action": safe_existing,
-                    "result": safe_existing.get("result"),
-                    "state": _dashboard_state_or_none(
-                        orchestrator,
-                        project_id,
-                        DEFAULT_EVENT_LIMIT,
-                        archived,
-                        workflow_service,
-                        scheduler,
-                        scheduler_config,
-                        agent_worker,
-                        dashboard_secret_values,
-                        graph_safety_service,
-                        workflow_id,
-                    ),
-                }
-        action = orchestrator.store.begin_action(
-            project_id,
-            request.action,
-            action_request,
-            repository,
-            pbi_number,
-            run_id,
-        )
+        else:
+            action = orchestrator.store.begin_action(
+                project_id,
+                request.action,
+                action_request,
+                repository,
+                pbi_number,
+                run_id,
+            )
+        if not claimed:
+            safe_existing = cast(
+                dict[str, object],
+                safe_dashboard_value(action, dashboard_secret_values),
+            )
+            return {
+                "action": safe_existing,
+                "result": safe_existing.get("result"),
+                "state": _dashboard_state_or_none(
+                    orchestrator,
+                    project_id,
+                    DEFAULT_EVENT_LIMIT,
+                    archived,
+                    workflow_service,
+                    scheduler,
+                    scheduler_config,
+                    agent_worker,
+                    dashboard_secret_values,
+                    graph_safety_service,
+                    workflow_id,
+                ),
+            }
         workflow_id = workflow_id or getattr(request, "workflow_id", None)
         try:
             result = _execute_dashboard_action(
@@ -587,6 +581,8 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
             failed = orchestrator.store.finish_action(
                 str(action["id"]), "failed", error=error
             )
+            if isinstance(request, DashboardIdeaCaptureRequest):
+                orchestrator.store.release_idea_capture(str(action["id"]))
             safe_action = cast(
                 dict[str, object],
                 safe_dashboard_value(failed, dashboard_secret_values),
@@ -615,6 +611,8 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
             failed = orchestrator.store.finish_action(
                 str(action["id"]), "failed", error=error
             )
+            if isinstance(request, DashboardIdeaCaptureRequest):
+                orchestrator.store.release_idea_capture(str(action["id"]))
             safe_action = cast(
                 dict[str, object],
                 safe_dashboard_value(failed, dashboard_secret_values),
@@ -678,6 +676,11 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
             result=safe_result_mapping,
             error=action_error,
         )
+        if (
+            isinstance(request, DashboardIdeaCaptureRequest)
+            and action_status == "succeeded"
+        ):
+            orchestrator.store.complete_idea_capture(str(action["id"]))
         safe_action = cast(
             dict[str, object], safe_dashboard_value(completed, dashboard_secret_values)
         )
