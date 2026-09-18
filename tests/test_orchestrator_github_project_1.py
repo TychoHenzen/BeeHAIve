@@ -27,6 +27,7 @@ def test_github_provider_maps_live_dashboard_metadata() -> None:
                                         "repository": {"nameWithOwner": "owner/api"},
                                         "labels": {
                                             "nodes": [
+                                                {"name": "Prio 1 - Planned"},
                                                 {"name": "bounces/2"},
                                                 {"name": "escalation/terra"},
                                             ]
@@ -144,6 +145,8 @@ def test_github_provider_maps_live_dashboard_metadata() -> None:
     discovered = provider.discover_project("owner:7")
 
     metadata = discovered.repositories[0].pbis[0].metadata
+    assert metadata["project_priority"] == 1
+    assert metadata["project_order"] == 0
     child = metadata["subtasks"][0]  # type: ignore[index]
     assert child["id"] == "#2"  # type: ignore[index]
     assert child["title"] == "API child"  # type: ignore[index]

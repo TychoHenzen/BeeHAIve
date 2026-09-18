@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import RLock, Thread
+from threading import Event, Lock, RLock, Thread
 from typing import Protocol, cast
 from uuid import uuid4
 
@@ -23,6 +23,7 @@ from beehaiive.agent_parts.worker_text import (
 )
 from beehaiive.dashboard.values import safe_dashboard_value
 from beehaiive.workflow import WorkspaceLease
+from beehaiive.workflows.helpers import repository_identity
 
 
 class _GitProbe(Protocol):
@@ -218,6 +219,22 @@ class SkillExecutor(Protocol):
     ) -> Mapping[str, object]: ...
 
 
+class _LeaseGuardedSkillExecutor:
+    def __init__(self, inner: SkillExecutor, lease_failed: Callable[[], bool]) -> None:
+        self._inner = inner
+        self._lease_failed = lease_failed
+
+    def execute(
+        self,
+        step: SkillStep,
+        context: Mapping[str, object],
+        handover: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        if self._lease_failed():
+            raise RuntimeError("Autonomous workspace lease heartbeat failed")
+        return self._inner.execute(step, context, handover)
+
+
 class AutonomousStore(Protocol):
     def project_state(self, project_id: str) -> dict[str, object]: ...
 
@@ -357,23 +374,44 @@ def _pbi_candidates(
             pbi = _mapping(raw_pbi)
             if pbi.get("archived") is True or pbi.get("active") is False:
                 continue
-            if _text(pbi.get("status")).casefold() in {"active", "awaiting_operator"}:
+            if (
+                _text(pbi.get("status")).casefold() in {"active", "awaiting_operator"}
+                and not include_in_progress
+            ):
                 continue
             planning_status = _text(pbi.get("planning_status"), "backlog").casefold()
             if planning_status not in {"todo", "backlog"} and not (
                 include_in_progress and planning_status == "in progress"
             ):
                 continue
-            candidates.append(
-                {
-                    "repository": repository_name,
-                    "pbi_number": pbi.get("number"),
-                    "title": _text(pbi.get("title"), "Untitled PBI"),
-                    "planning_status": planning_status,
-                    "stage": _text(pbi.get("stage"), "backlog"),
-                    "subtasks": pbi.get("subtasks", []),
-                }
-            )
+            candidate = {
+                "repository": repository_name,
+                "pbi_number": pbi.get("number"),
+                "title": _text(pbi.get("title"), "Untitled PBI"),
+                "planning_status": planning_status,
+                "stage": _text(pbi.get("stage"), "backlog"),
+                "subtasks": pbi.get("subtasks", []),
+            }
+            metadata = _mapping(pbi.get("metadata"))
+            for target, values in {
+                "parent_number": (
+                    pbi.get("parent_issue_number"),
+                    pbi.get("parent_number"),
+                    metadata.get("parent_issue_number"),
+                ),
+                "project_priority": (
+                    pbi.get("project_priority"),
+                    metadata.get("project_priority"),
+                ),
+                "project_order": (
+                    pbi.get("project_order"),
+                    metadata.get("project_order"),
+                ),
+            }.items():
+                value = next((item for item in values if type(item) is int), None)
+                if value is not None:
+                    candidate[target] = value
+            candidates.append(candidate)
     return candidates
 
 
@@ -383,13 +421,22 @@ def select_work_item(repositories: Iterable[object]) -> dict[str, object] | None
     return candidates[0] if candidates else None
 
 
-def _candidate_sort_key(item: Mapping[str, object]) -> tuple[int, int]:
+def _candidate_sort_key(item: Mapping[str, object]) -> tuple[int, ...]:
     raw_number = item.get("pbi_number")
     number = raw_number if type(raw_number) is int else 2_147_483_647
-    priority = {"todo": 0, "in progress": 1, "backlog": 2}.get(
+    status_priority = {"in progress": 0, "todo": 1, "backlog": 2}.get(
         _text(item.get("planning_status")).casefold(), 3
     )
-    return priority, number
+    project_priority = item.get("project_priority")
+    project_order = item.get("project_order")
+    parent_number = item.get("parent_number")
+    return (
+        status_priority,
+        project_priority if type(project_priority) is int else 2_147_483_647,
+        project_order if type(project_order) is int else 2_147_483_647,
+        parent_number if type(parent_number) is int else number,
+        number,
+    )
 
 
 def _start_index(context: Mapping[str, object]) -> int:
@@ -640,6 +687,14 @@ class CodexSkillExecutor:
         )
         self.on_output = on_output
         self.on_process = on_process
+        self._process_lock = Lock()
+        self._process: subprocess.Popen[bytes] | None = None
+
+    def cancel(self) -> None:
+        with self._process_lock:
+            process = self._process
+        if process is not None and process.poll() is None:
+            CodexProcessMixin._terminate_process(process)  # pyright: ignore[reportPrivateUsage]
 
     def execute(
         self,
@@ -757,6 +812,8 @@ class CodexSkillExecutor:
                     )
                 raise
             assert process is not None
+            with self._process_lock:
+                self._process = process
             if self.on_process is not None:
                 self.on_process(
                     {
@@ -789,6 +846,9 @@ class CodexSkillExecutor:
                 process_state = "error"
                 raise
             finally:
+                with self._process_lock:
+                    if self._process is process:
+                        self._process = None
                 if self.on_process is not None:
                     self.on_process(
                         {
@@ -858,7 +918,7 @@ class AutonomousLifecycleService:
             raise ValueError("Autonomous worker capacity must be a positive integer")
         self.orchestrator = orchestrator
         self._runs: dict[str, dict[str, object]] = {}
-        self._active_projects: set[str] = set()
+        self._active_repositories: set[str] = set()
         self._max_concurrency = max_concurrency
         configured_repository = os.environ.get(
             "BEEHAIIVE_AGENT_REPOSITORY_NAME", ""
@@ -869,6 +929,9 @@ class AutonomousLifecycleService:
         self._advisor = advisor
         self._workflow_service = workflow_service
         self._workspaces: dict[str, WorkspaceLease] = {}
+        self._workspace_heartbeats: dict[
+            str, tuple[Event, Thread, list[Exception]]
+        ] = {}
 
     def start(
         self,
@@ -877,10 +940,6 @@ class AutonomousLifecycleService:
         pbi_number: int | None = None,
     ) -> dict[str, object]:
         with self._lock:
-            if project_id in self._active_projects:
-                raise ValueError("An autonomous lifecycle is already running")
-            if len(self._active_projects) >= self._max_concurrency:
-                raise ValueError("Autonomous worker capacity is full")
             selected_repository = repository or self._configured_repository
             if (
                 repository is not None
@@ -909,6 +968,11 @@ class AutonomousLifecycleService:
             selected_number = selected.get("pbi_number")
             if type(selected_number) is not int or selected_number <= 0:
                 raise ValueError("Selected PBI number is invalid")
+            active_repository = str(selected["repository"])
+            if active_repository in self._active_repositories:
+                raise ValueError("An autonomous lifecycle is already running")
+            if len(self._active_repositories) >= self._max_concurrency:
+                raise ValueError("Autonomous worker capacity is full")
             run_id = str(uuid4())
             context = {"project_id": project_id, **selected, "run_id": run_id}
             if (
@@ -934,7 +998,7 @@ class AutonomousLifecycleService:
                 selected_number,
                 run_id,
             )
-            self._active_projects.add(project_id)
+            self._active_repositories.add(active_repository)
             self._runs[run_id] = {
                 "run_id": run_id,
                 "project_id": project_id,
@@ -967,14 +1031,14 @@ class AutonomousLifecycleService:
         if len(idea) > 8_000:
             raise ValueError("An idea must be at most 8000 characters")
         with self._lock:
-            if project_id in self._active_projects:
-                raise ValueError("An autonomous lifecycle is already running")
-            if len(self._active_projects) >= self._max_concurrency:
-                raise ValueError("Autonomous worker capacity is full")
             if self._executor is None and not self._configured_repository:
                 raise ValueError("Idea capture requires a configured target repository")
             run_id = str(uuid4())
             repository = self._configured_repository or "configured repository"
+            if repository in self._active_repositories:
+                raise ValueError("An autonomous lifecycle is already running")
+            if len(self._active_repositories) >= self._max_concurrency:
+                raise ValueError("Autonomous worker capacity is full")
             context = {
                 "project_id": project_id,
                 "repository": repository,
@@ -983,7 +1047,7 @@ class AutonomousLifecycleService:
                 "idea": idea.strip(),
                 "run_id": run_id,
             }
-            self._active_projects.add(project_id)
+            self._active_repositories.add(repository)
             self._runs[run_id] = {
                 "run_id": run_id,
                 "project_id": project_id,
@@ -1031,11 +1095,11 @@ class AutonomousLifecycleService:
 
     def has_capacity(self) -> bool:
         with self._lock:
-            return len(self._active_projects) < self._max_concurrency
+            return len(self._active_repositories) < self._max_concurrency
 
     def active_count(self) -> int:
         with self._lock:
-            return len(self._active_projects)
+            return len(self._active_repositories)
 
     def set_max_concurrency(self, maximum: int) -> None:
         if type(maximum) is not int or maximum <= 0:
@@ -1048,6 +1112,28 @@ class AutonomousLifecycleService:
         for project_id in project_ids:
             for action in self.orchestrator.store.actions_for_project(project_id):
                 if (
+                    action.get("kind") == "skill:review-pr-branch"
+                    and action.get("status") == "pending"
+                ):
+                    request = _mapping(action.get("request"))
+                    if request.get("reviewAttempted") is True:
+                        detail = (
+                            "Review outcome was interrupted after the review attempt; "
+                            "resume from the recorded review handover."
+                        )
+                        self.orchestrator.store.finish_action(
+                            str(action["id"]),
+                            "failed",
+                            {
+                                "status": "uncertain",
+                                "reviewAttempted": True,
+                                "review_attempted": True,
+                            },
+                            detail,
+                        )
+                        recovered += 1
+                    continue
+                if (
                     action.get("kind") not in {"autonomous_start", "capture_idea"}
                     or action.get("status") != "pending"
                 ):
@@ -1059,10 +1145,13 @@ class AutonomousLifecycleService:
                     else "Idea capture did not survive the server restart; "
                     "no live worker process is attached."
                 )
+                result: dict[str, object] = {"status": "blocked", "error": detail}
+                if action.get("kind") == "autonomous_start":
+                    result["resume_after_restart"] = True
                 self.orchestrator.store.finish_action(
                     str(action["id"]),
                     "failed",
-                    {"status": "blocked", "error": detail},
+                    result,
                     detail,
                 )
                 recovered += 1
@@ -1084,21 +1173,7 @@ class AutonomousLifecycleService:
             else ()
         )
         resumable = resumable or set()
-        candidates = _pbi_candidates(
-            repositories,
-            include_in_progress=pbi_number is not None or bool(resumable),
-        )
-        if pbi_number is None:
-            candidates = [
-                item
-                for item in candidates
-                if item["planning_status"] != "in progress"
-                or (
-                    isinstance(item.get("repository"), str)
-                    and type(item.get("pbi_number")) is int
-                    and (item["repository"], item["pbi_number"]) in resumable
-                )
-            ]
+        candidates = _pbi_candidates(repositories, include_in_progress=True)
         if repository is not None:
             candidates = [
                 item for item in candidates if item["repository"] == repository
@@ -1125,18 +1200,22 @@ class AutonomousLifecycleService:
     ) -> set[tuple[str, int]]:
         resumable: set[tuple[str, int]] = set()
         for action in actions:
-            if (
-                action.get("kind") != "autonomous_start"
-                or action.get("status") != "failed"
-            ):
+            if action.get("kind") != "autonomous_start" or action.get("status") not in {
+                "failed",
+                "uncertain",
+            }:
                 continue
             repository = action.get("repository")
             pbi_number = action.get("pbi_number")
             if (
                 isinstance(repository, str)
                 and type(pbi_number) is int
-                and AutonomousLifecycleService._resume_context(
-                    actions, repository, pbi_number
+                and (
+                    AutonomousLifecycleService._resume_context(
+                        actions, repository, pbi_number
+                    )
+                    or _mapping(action.get("result")).get("resume_after_restart")
+                    is True
                 )
             ):
                 resumable.add((repository, pbi_number))
@@ -1164,6 +1243,71 @@ class AutonomousLifecycleService:
         )
         if requeue_index is not None:
             scoped_actions = scoped_actions[: requeue_index + 1]
+        for action in scoped_actions:
+            if action.get("kind") != "skill:review-pr-branch" or action.get(
+                "status"
+            ) not in {"pending", "failed"}:
+                continue
+            request = _mapping(action.get("request"))
+            if not (
+                request.get("reviewAttempted") is True
+                or request.get("review_attempted") is True
+            ):
+                continue
+            resume: dict[str, object] = {
+                "resume_step": "fix-pr-review",
+                "reviewAttempted": True,
+                "review_attempted": True,
+                "resume_existing_workspace": True,
+            }
+            checkpoint: Mapping[str, object] = next(
+                (
+                    _mapping(candidate.get("result"))
+                    for candidate in scoped_actions
+                    if candidate.get("kind") == "autonomous_start"
+                    and candidate.get("status") == "uncertain"
+                ),
+                cast(Mapping[str, object], {}),
+            )
+            branch = request.get("branch") or request.get("workspace_branch")
+            if isinstance(branch, str) and branch:
+                resume["branch"] = branch
+                resume["workspace_branch"] = branch
+            for key in (
+                "workspace_path",
+                "workspace_lease_id",
+                "workspace_lease_token",
+            ):
+                value = checkpoint.get(key)
+                if isinstance(value, str) and value:
+                    resume[key] = value
+            return resume
+        for action in scoped_actions:
+            if (
+                action.get("kind") != "autonomous_start"
+                or action.get("status") != "uncertain"
+            ):
+                continue
+            checkpoint = _mapping(action.get("result"))
+            branch = checkpoint.get("workspace_branch")
+            if not isinstance(branch, str) or not branch:
+                continue
+            resume: dict[str, object] = {
+                "resume_step": _text(
+                    checkpoint.get("resume_step"), "refine-backlog-item"
+                ),
+                "resume_existing_workspace": True,
+                "workspace_branch": branch,
+                "branch": branch,
+            }
+            workspace_path = checkpoint.get("workspace_path")
+            if isinstance(workspace_path, str) and workspace_path:
+                resume["workspace_path"] = workspace_path
+            for key in ("workspace_lease_id", "workspace_lease_token"):
+                value = checkpoint.get(key)
+                if isinstance(value, str) and value:
+                    resume[key] = value
+            return resume
         known_handover: dict[str, object] = {}
         for action in scoped_actions:
             for source in (
@@ -1250,6 +1394,14 @@ class AutonomousLifecycleService:
         return {}
 
     @staticmethod
+    def resume_context_for_recovery(
+        actions: Sequence[Mapping[str, object]], repository: str, pbi_number: int
+    ) -> dict[str, object]:
+        return AutonomousLifecycleService._resume_context(
+            actions, repository, pbi_number
+        )
+
+    @staticmethod
     def _requeued_items(
         actions: Sequence[Mapping[str, object]],
     ) -> set[tuple[str, int]]:
@@ -1297,6 +1449,8 @@ class AutonomousLifecycleService:
         context: Mapping[str, object],
         action_id: str,
     ) -> None:
+        pending_step_actions: dict[str, str] = {}
+
         def record_step(step: str) -> None:
             with self._lock:
                 current = self._runs.get(run_id)
@@ -1306,6 +1460,27 @@ class AutonomousLifecycleService:
                     current["last_output_at"] = None
                     current["last_output"] = None
                     current["process"] = {"state": "starting"}
+            if step == "review-pr-branch":
+                pbi_number = context.get("pbi_number")
+                if type(pbi_number) is not int or pbi_number <= 0:
+                    raise ValueError("Autonomous review has an invalid PBI number")
+                review_action = self.orchestrator.store.begin_action(
+                    str(context["project_id"]),
+                    "skill:review-pr-branch",
+                    {
+                        "reviewAttempted": True,
+                        "review_attempted": True,
+                        "repository": context.get("repository"),
+                        "pbi_number": pbi_number,
+                        "run_id": run_id,
+                        "branch": context.get("branch")
+                        or context.get("workspace_branch"),
+                    },
+                    str(context["repository"]),
+                    pbi_number,
+                    run_id,
+                )
+                pending_step_actions[step] = str(review_action["id"])
 
         def record_process(process: Mapping[str, object]) -> None:
             with self._lock:
@@ -1340,16 +1515,19 @@ class AutonomousLifecycleService:
             if type(pbi_number) is not int or pbi_number <= 0:
                 raise ValueError("Autonomous handoff has an invalid PBI number")
             safe_handoff = _persisted_action_value(handoff.as_dict())
-            step_action = self.orchestrator.store.begin_action(
-                str(context["project_id"]),
-                f"skill:{handoff.step}",
-                safe_handoff,
-                str(context["repository"]),
-                pbi_number,
-                run_id,
-            )
+            step_action_id = pending_step_actions.pop(handoff.step, None)
+            if step_action_id is None:
+                step_action = self.orchestrator.store.begin_action(
+                    str(context["project_id"]),
+                    f"skill:{handoff.step}",
+                    safe_handoff,
+                    str(context["repository"]),
+                    pbi_number,
+                    run_id,
+                )
+                step_action_id = str(step_action["id"])
             self.orchestrator.store.finish_action(
-                str(step_action["id"]),
+                step_action_id,
                 "succeeded" if handoff.status == "succeeded" else "failed",
                 safe_handoff,
                 None
@@ -1372,7 +1550,9 @@ class AutonomousLifecycleService:
         workspace_context = dict(context)
         workspace_created = False
         try:
-            workspace_context = self._prepare_workspace(run_id, workspace_context)
+            workspace_context = self._prepare_workspace(
+                run_id, workspace_context, action_id
+            )
             workspace_created = "workspace_path" in workspace_context
             executor = self._executor_for(
                 workspace_context, record_output, record_process
@@ -1380,10 +1560,33 @@ class AutonomousLifecycleService:
             advisor = self._advisor_for(
                 workspace_context, record_output, record_process
             )
+            cancel_executor = getattr(executor, "cancel", None)
+            cancel_advisor = getattr(advisor, "cancel", None)
+
+            def cancel_processes() -> None:
+                for cancel in (cancel_executor, cancel_advisor):
+                    if callable(cancel):
+                        cancel()
+
+            workspace_lease = self._workspaces.get(run_id)
+            if workspace_lease is not None:
+                self._start_workspace_heartbeat(
+                    run_id, workspace_lease, cancel_processes
+                )
+            if advisor is not None:
+                advisor = _LeaseGuardedSkillExecutor(
+                    advisor, lambda: self._workspace_heartbeat_failed(run_id)
+                )
             runner = AutonomousLifecycleRunner(
                 executor, advisor, record, on_step=record_step
             )
             result = runner.run(workspace_context)
+            heartbeat_errors = self._stop_workspace_heartbeat(run_id)
+            if heartbeat_errors:
+                raise RuntimeError(
+                    f"Autonomous workspace lease heartbeat failed: "
+                    f"{format_worker_exception(heartbeat_errors[0])}"
+                )
             if workspace_created:
                 self._release_workspace(run_id)
                 workspace_created = False
@@ -1432,10 +1635,11 @@ class AutonomousLifecycleService:
                         }
                     )
         finally:
+            self._stop_workspace_heartbeat(run_id)
             if workspace_created:
                 self._release_workspace(run_id)
             with self._lock:
-                self._active_projects.discard(str(context["project_id"]))
+                self._active_repositories.discard(str(context["repository"]))
 
     def _run_idea(
         self,
@@ -1572,7 +1776,7 @@ class AutonomousLifecycleService:
             if idea_workspace is not None:
                 shutil.rmtree(idea_workspace, ignore_errors=True)
             with self._lock:
-                self._active_projects.discard(str(context["project_id"]))
+                self._active_repositories.discard(str(context["repository"]))
 
     def _idea_executor(
         self,
@@ -1652,11 +1856,22 @@ class AutonomousLifecycleService:
         return workspace
 
     def _prepare_workspace(
-        self, run_id: str, context: dict[str, object]
+        self, run_id: str, context: dict[str, object], action_id: str
     ) -> dict[str, object]:
         mode = os.environ.get("BEEHAIIVE_AUTONOMOUS_MODE", "codex").strip().lower()
         if self._executor is not None or mode != "codex":
             return context
+        requested_repository = context.get("repository")
+        if self._configured_repository is None:
+            raise RuntimeError(
+                "Autonomous Codex execution requires "
+                "BEEHAIIVE_AGENT_REPOSITORY_NAME; no checkout was touched"
+            )
+        if requested_repository != self._configured_repository:
+            raise RuntimeError(
+                "Autonomous Codex execution requested a repository outside the "
+                "configured checkout; no checkout was touched"
+            )
         service = self._workflow_service
         if service is None:
             raise RuntimeError(
@@ -1670,6 +1885,20 @@ class AutonomousLifecycleService:
             raise RuntimeError(
                 "Autonomous Codex execution requires a server-managed repository "
                 "worktree service; no checkout was touched"
+            )
+        remote_urls_value = getattr(worktrees, "origin_push_urls", ())
+        remote_urls = cast(tuple[str, ...], remote_urls_value)
+        if len(remote_urls) != 1:
+            raise RuntimeError(
+                "Autonomous Codex execution requires one configured origin remote; "
+                "no checkout was touched"
+            )
+        if (repository_identity(remote_urls[0]) or "").casefold() != str(
+            requested_repository
+        ).casefold():
+            raise RuntimeError(
+                "Autonomous Codex execution remote does not match the requested "
+                "repository; no checkout was touched"
             )
         workspace_root = (
             repository.parent / f".{repository.name}.beehaiive" / "autonomous-worktrees"
@@ -1690,7 +1919,12 @@ class AutonomousLifecycleService:
                 base_ref = "HEAD"
         except Exception:
             base_ref = "HEAD"
-        workspace_path = workspace_root / workspace_id
+        checkpoint_path = context.get("workspace_path")
+        workspace_path = (
+            Path(checkpoint_path).resolve()
+            if isinstance(checkpoint_path, str) and checkpoint_path
+            else workspace_root / workspace_id
+        )
         if context.get("resume_existing_workspace"):
             existing_loader = getattr(
                 getattr(worktrees, "store", None), "get_lease_for_branch", None
@@ -1698,11 +1932,22 @@ class AutonomousLifecycleService:
             existing = existing_loader(branch) if callable(existing_loader) else None
             if existing is not None:
                 status = getattr(getattr(existing, "status", None), "value", "")
-                if status != "retained":
+                if status == "active":
+                    lease_token = context.get("workspace_lease_token")
+                    if not isinstance(lease_token, str) or lease_token != getattr(
+                        existing, "lease_token", None
+                    ):
+                        raise RuntimeError(
+                            "Autonomous resume cannot reclaim an active workspace "
+                            "without its durable lease token"
+                        )
+                    lease = cast(WorkspaceLease, existing)
+                elif status == "retained":
+                    lease = cast(WorkspaceLease, existing)
+                else:
                     raise RuntimeError(
-                        "Autonomous resume found an active branch workspace"
+                        "Autonomous resume found an unavailable branch workspace"
                     )
-                lease = cast(WorkspaceLease, existing)
             else:
                 acquire_existing = getattr(worktrees, "acquire_existing", None)
                 if not callable(acquire_existing):
@@ -1722,11 +1967,83 @@ class AutonomousLifecycleService:
             )
         with self._lock:
             self._workspaces[run_id] = lease
+        self.orchestrator.store.finish_action(
+            action_id,
+            "uncertain",
+            {
+                "workspace_branch": lease.branch,
+                "workspace_path": str(lease.worktree_path),
+                "workspace_lease_id": lease.lease_id,
+                "workspace_lease_token": lease.lease_token,
+                "resume_step": AUTONOMOUS_STEPS[_start_index(context)].name,
+                "resume_existing_workspace": True,
+            },
+        )
         return {
             **context,
             "workspace_path": lease.worktree_path,
             "workspace_branch": lease.branch,
         }
+
+    def _start_workspace_heartbeat(
+        self,
+        run_id: str,
+        lease: WorkspaceLease,
+        cancel: Callable[[], None] | None = None,
+    ) -> None:
+        service = self._workflow_service
+        store = getattr(service, "store", None)
+        renew = getattr(store, "renew_lease", None)
+        heartbeat_seconds = getattr(store, "lease_heartbeat_seconds", None)
+        if (
+            service is None
+            or not callable(renew)
+            or not isinstance(heartbeat_seconds, (int, float))
+            or not lease.lease_token
+            or getattr(getattr(lease, "status", None), "value", "") != "active"
+        ):
+            return
+        stop = Event()
+        errors: list[Exception] = []
+
+        def heartbeat() -> None:
+            while not stop.wait(float(heartbeat_seconds)):
+                try:
+                    renew(lease.lease_id, lease.lease_token)
+                except Exception as error:
+                    errors.append(error)
+                    if cancel is not None:
+                        try:
+                            cancel()
+                        except Exception as cancel_error:
+                            errors.append(cancel_error)
+                    return
+
+        thread = Thread(
+            target=heartbeat,
+            name=f"beehaiive-autonomous-lease-{run_id[:8]}",
+            daemon=True,
+        )
+        with self._lock:
+            self._workspace_heartbeats[run_id] = (stop, thread, errors)
+        thread.start()
+
+    def _stop_workspace_heartbeat(self, run_id: str) -> list[Exception]:
+        with self._lock:
+            heartbeat = self._workspace_heartbeats.pop(run_id, None)
+        if heartbeat is None:
+            return []
+        stop, thread, errors = heartbeat
+        stop.set()
+        thread.join(timeout=5)
+        if thread.is_alive():
+            errors.append(RuntimeError("Autonomous workspace heartbeat did not stop"))
+        return list(errors)
+
+    def _workspace_heartbeat_failed(self, run_id: str) -> bool:
+        with self._lock:
+            heartbeat = self._workspace_heartbeats.get(run_id)
+        return heartbeat is not None and bool(heartbeat[2])
 
     def _release_workspace(self, run_id: str) -> None:
         with self._lock:

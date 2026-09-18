@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 from beehaiive.github.dashboard_helpers import (
     _dashboard_metadata as _dashboard_metadata,
@@ -110,7 +110,26 @@ class DiscoveryMixin:
         project_statuses, project_status_conflicts = _project_status_index(
             project_items
         )
+        parent_numbers: dict[tuple[str, int], int] = {}
         for item in project_items:
+            content_value = item.get("content")
+            if not isinstance(content_value, Mapping):
+                continue
+            content = cast(Mapping[str, Any], content_value)
+            repository_value = content.get("repository")
+            if not isinstance(repository_value, Mapping):
+                continue
+            repository = cast(Mapping[str, Any], repository_value)
+            repository_name = repository.get("nameWithOwner")
+            number = content.get("number")
+            if not isinstance(repository_name, str) or not isinstance(number, int):
+                continue
+            for child in _nodes(content.get("subIssues", {})):
+                child_number = child.get("number")
+                if isinstance(child_number, int):
+                    parent_numbers[(repository_name.casefold(), child_number)] = number
+
+        for project_order, item in enumerate(project_items):
             content_value = item.get("content")
             if content_value is None:
                 continue
@@ -141,6 +160,11 @@ class DiscoveryMixin:
                 project_status_conflicts,
             )
             stage = _stage_from_status(status)
+            metadata = _dashboard_metadata(completed_content)
+            metadata["project_order"] = project_order
+            parent_number = parent_numbers.get((repository_name.casefold(), number))
+            if parent_number is not None:
+                metadata["parent_issue_number"] = parent_number
             repositories.setdefault(repository_name, []).append(
                 PbiSnapshot(
                     repository_name,
@@ -149,7 +173,7 @@ class DiscoveryMixin:
                     stage,
                     status,
                     stage is not None,
-                    _dashboard_metadata(completed_content),
+                    metadata,
                 )
             )
 

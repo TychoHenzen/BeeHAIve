@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import time
 from pathlib import Path
 from threading import Event
@@ -20,8 +21,13 @@ from beehaiive.autonomous import (
 from beehaiive.models import PbiSnapshot, ProjectSnapshot, RepositorySnapshot, Stage
 from beehaiive.orchestrator import Orchestrator
 from beehaiive.storage import OrchestratorStore
+from beehaiive.workflow import LeaseStatus, WorkspaceLease
 from tests.conftest import FakeProvider
-from tests.support.agent.helpers import make_git_repository, workflow_service_for
+from tests.support.agent.helpers import (
+    configure_test_remote,
+    make_git_repository,
+    workflow_service_for,
+)
 from tests.support.dashboard.helpers import dashboard_snapshot
 
 
@@ -48,6 +54,78 @@ def test_select_work_item_prefers_todo_over_backlog_and_skips_active() -> None:
         "stage": "backlog",
         "subtasks": [],
     }
+
+
+def test_select_work_item_keeps_parent_priority_and_children_together() -> None:
+    selected = select_work_item(
+        [
+            {
+                "name": "owner/api",
+                "active": True,
+                "pbis": [
+                    {
+                        "number": 20,
+                        "planning_status": "Todo",
+                        "metadata": {"project_priority": 2},
+                    },
+                    {
+                        "number": 10,
+                        "planning_status": "Todo",
+                        "metadata": {"project_priority": 1},
+                    },
+                    {
+                        "number": 11,
+                        "planning_status": "Todo",
+                        "metadata": {
+                            "project_priority": 1,
+                            "parent_issue_number": 10,
+                        },
+                    },
+                ],
+            }
+        ]
+    )
+
+    assert selected is not None
+    assert selected["pbi_number"] == 10
+
+
+def test_autonomous_selection_prefers_an_orphaned_in_progress_parent() -> None:
+    store = OrchestratorStore()
+    service = Orchestrator(store, FakeProvider(dashboard_snapshot()))
+    automation = AutonomousLifecycleService(service, PlaceholderSkillExecutor())
+
+    try:
+        selected = automation._select(
+            {
+                "repositories": [
+                    {
+                        "name": "owner/api",
+                        "active": True,
+                        "pbis": [
+                            {
+                                "number": 9,
+                                "planning_status": "In Progress",
+                                "status": "active",
+                                "stage": "review",
+                            },
+                            {
+                                "number": 10,
+                                "planning_status": "Todo",
+                                "stage": "backlog",
+                            },
+                        ],
+                    }
+                ]
+            },
+            "owner/api",
+            None,
+            set(),
+        )
+        assert selected is not None
+        assert selected["pbi_number"] == 9
+    finally:
+        store.close()
 
 
 def test_autonomous_explicit_resume_accepts_an_in_progress_pbi() -> None:
@@ -773,6 +851,88 @@ def test_autonomous_service_marks_orphaned_pending_runs_after_restart() -> None:
         store.close()
 
 
+def test_restart_recovery_makes_an_orphaned_run_resumable() -> None:
+    store = OrchestratorStore()
+    service = Orchestrator(store, FakeProvider(dashboard_snapshot()))
+    service.synchronize("project-1")
+    store.begin_action(
+        "project-1",
+        "autonomous_start",
+        {"repository": "owner/api", "pbi_number": 1},
+        "owner/api",
+        1,
+        "orphaned-run",
+    )
+    automation = AutonomousLifecycleService(service, PlaceholderSkillExecutor())
+
+    try:
+        assert automation.recover_pending(("project-1",)) == 1
+        actions = store.actions_for_project("project-1")
+        assert AutonomousLifecycleService._resumable_items(actions) == {
+            ("owner/api", 1)
+        }
+        recovered = next(
+            action for action in actions if action["kind"] == "autonomous_start"
+        )
+        assert recovered["result"]["resume_after_restart"] is True
+        started = automation.start("project-1", repository="owner/api", pbi_number=1)
+        deadline = time.monotonic() + 3
+        current = automation.status(str(started["run_id"]))
+        while current["status"] == "running" and time.monotonic() < deadline:
+            time.sleep(0.01)
+            current = automation.status(str(started["run_id"]))
+        assert current["status"] == "completed"
+    finally:
+        store.close()
+
+
+def test_restart_recovery_preserves_a_workspace_checkpoint() -> None:
+    actions = [
+        {
+            "kind": "autonomous_start",
+            "status": "uncertain",
+            "repository": "owner/api",
+            "pbi_number": 1,
+            "result": {
+                "workspace_branch": "codex/beehaiive-autonomous-run",
+                "workspace_path": "C:/worktrees/run",
+                "resume_step": "next-ticket",
+            },
+        }
+    ]
+
+    resume = AutonomousLifecycleService._resume_context(actions, "owner/api", 1)
+
+    assert resume == {
+        "resume_step": "next-ticket",
+        "resume_existing_workspace": True,
+        "workspace_branch": "codex/beehaiive-autonomous-run",
+        "branch": "codex/beehaiive-autonomous-run",
+        "workspace_path": "C:/worktrees/run",
+    }
+
+
+def test_restart_recovery_does_not_repeat_an_attempted_review() -> None:
+    actions = [
+        {
+            "kind": "skill:review-pr-branch",
+            "status": "failed",
+            "repository": "owner/api",
+            "pbi_number": 1,
+            "request": {
+                "reviewAttempted": True,
+                "branch": "codex/automation-proof",
+            },
+        }
+    ]
+
+    resume = AutonomousLifecycleService._resume_context(actions, "owner/api", 1)
+
+    assert resume["resume_step"] == "fix-pr-review"
+    assert resume["reviewAttempted"] is True
+    assert resume["branch"] == "codex/automation-proof"
+
+
 def test_autonomous_service_marks_orphaned_idea_capture_after_restart() -> None:
     store = OrchestratorStore()
     service = Orchestrator(store, FakeProvider(dashboard_snapshot()))
@@ -801,6 +961,7 @@ def test_codex_autonomous_run_uses_a_server_worktree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repository = make_git_repository(tmp_path / "repository")
+    configure_test_remote(repository, tmp_path)
     workflow_service, workflow_store = workflow_service_for(tmp_path, repository)
     store = OrchestratorStore()
     orchestrator = Orchestrator(store, FakeProvider(dashboard_snapshot()))
@@ -822,6 +983,7 @@ def test_codex_autonomous_run_uses_a_server_worktree(
             }
 
     monkeypatch.setenv("BEEHAIIVE_AUTONOMOUS_MODE", "codex")
+    monkeypatch.setenv("BEEHAIIVE_AGENT_REPOSITORY_NAME", "owner/api")
     monkeypatch.setattr(autonomous, "CodexSkillExecutor", RecordingExecutor)
     service = AutonomousLifecycleService(
         orchestrator,
@@ -848,6 +1010,123 @@ def test_codex_autonomous_run_uses_a_server_worktree(
         store.close()
 
 
+def test_codex_autonomous_run_rejects_a_mismatched_origin_before_leasing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = make_git_repository(tmp_path / "repository")
+    other_remote = tmp_path / "owner" / "other.git"
+    other_remote.parent.mkdir()
+    subprocess.run(
+        ("git", "init", "--bare", str(other_remote)),
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ("git", "remote", "add", "origin", str(other_remote)),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+    )
+    workflow_service, workflow_store = workflow_service_for(tmp_path, repository)
+    store = OrchestratorStore()
+    orchestrator = Orchestrator(store, FakeProvider(dashboard_snapshot()))
+    orchestrator.synchronize("project-1")
+    monkeypatch.setenv("BEEHAIIVE_AUTONOMOUS_MODE", "codex")
+    monkeypatch.setenv("BEEHAIIVE_AGENT_REPOSITORY_NAME", "owner/api")
+    automation = AutonomousLifecycleService(
+        orchestrator, workflow_service=workflow_service
+    )
+
+    try:
+        started = automation.start("project-1", "owner/api", 1)
+        deadline = time.monotonic() + 3
+        current = automation.status(str(started["run_id"]))
+        while current["status"] == "running" and time.monotonic() < deadline:
+            time.sleep(0.01)
+            current = automation.status(str(started["run_id"]))
+        assert current["status"] == "failed"
+        assert "remote does not match" in str(current["error"])
+        assert not (
+            repository.parent / ".repository.beehaiive" / "autonomous-worktrees"
+        ).exists()
+    finally:
+        workflow_store.close()
+        store.close()
+
+
+def test_autonomous_workspace_heartbeat_renews_until_stop() -> None:
+    class HeartbeatStore:
+        lease_heartbeat_seconds = 0.01
+
+        def __init__(self) -> None:
+            self.renewals = 0
+
+        def renew_lease(self, _lease_id: str, _lease_token: str) -> None:
+            self.renewals += 1
+
+    class Workflow:
+        def __init__(self) -> None:
+            self.store = HeartbeatStore()
+
+    store = OrchestratorStore()
+    orchestrator = Orchestrator(store, FakeProvider(dashboard_snapshot()))
+    automation = AutonomousLifecycleService(
+        orchestrator, PlaceholderSkillExecutor(), workflow_service=Workflow()
+    )
+    lease = WorkspaceLease(
+        "lease-1",
+        "dashboard-run:run-1",
+        "codex/heartbeat",
+        "C:/worktree",
+        LeaseStatus.ACTIVE,
+        "now",
+        "now",
+        "token-1",
+    )
+
+    try:
+        automation._start_workspace_heartbeat("run-1", lease)
+        time.sleep(0.05)
+        errors = automation._stop_workspace_heartbeat("run-1")
+        assert not errors
+        assert automation._workflow_service.store.renewals >= 2
+    finally:
+        store.close()
+
+
+def test_autonomous_workspace_heartbeat_cancels_on_renewal_failure() -> None:
+    class FailingStore:
+        lease_heartbeat_seconds = 0.01
+
+        def renew_lease(self, _lease_id: str, _lease_token: str) -> None:
+            raise RuntimeError("lease lost")
+
+    class Workflow:
+        store = FailingStore()
+
+    cancelled = Event()
+    store = OrchestratorStore()
+    orchestrator = Orchestrator(store, FakeProvider(dashboard_snapshot()))
+    automation = AutonomousLifecycleService(orchestrator, workflow_service=Workflow())
+    lease = WorkspaceLease(
+        "lease-1",
+        "dashboard-run:run-1",
+        "codex/heartbeat",
+        "C:/worktree",
+        LeaseStatus.ACTIVE,
+        "now",
+        "now",
+        "token-1",
+    )
+
+    try:
+        automation._start_workspace_heartbeat("run-1", lease, cancelled.set)
+        assert cancelled.wait(1)
+        assert automation._stop_workspace_heartbeat("run-1")
+    finally:
+        store.close()
+
+
 def test_autonomous_service_runs_one_pbi_at_a_time() -> None:
     class BlockingExecutor:
         started = Event()
@@ -869,7 +1148,7 @@ def test_autonomous_service_runs_one_pbi_at_a_time() -> None:
         assert executor.started.wait(1)
         assert automation.active_count() == 1
         with pytest.raises(ValueError, match="already running"):
-            automation.start("project-1")
+            automation.start("project-1", repository="owner/api", pbi_number=4)
         executor.release.set()
         deadline = time.monotonic() + 3
         current = automation.status(str(started["run_id"]))
@@ -877,6 +1156,57 @@ def test_autonomous_service_runs_one_pbi_at_a_time() -> None:
             time.sleep(0.01)
             current = automation.status(str(started["run_id"]))
         assert current["status"] == "completed"
+        assert automation.active_count() == 0
+    finally:
+        executor.release.set()
+        store.close()
+
+
+def test_autonomous_service_runs_independent_repositories_concurrently() -> None:
+    class BlockingExecutor:
+        started = Event()
+        release = Event()
+
+        def execute(self, step, context, handover):
+            self.started.set()
+            self.release.wait(3)
+            return PlaceholderSkillExecutor().execute(step, context, handover)
+
+    snapshot = ProjectSnapshot(
+        "project-1",
+        "Planning",
+        (
+            RepositorySnapshot(
+                "owner/api",
+                (PbiSnapshot("owner/api", 1, "API one"),),
+            ),
+            RepositorySnapshot(
+                "owner/web",
+                (PbiSnapshot("owner/web", 2, "Web one"),),
+            ),
+        ),
+    )
+    store = OrchestratorStore()
+    service = Orchestrator(store, FakeProvider(snapshot))
+    service.synchronize("project-1")
+    executor = BlockingExecutor()
+    automation = AutonomousLifecycleService(
+        service, executor, executor, max_concurrency=2
+    )
+
+    try:
+        first = automation.start("project-1", repository="owner/api", pbi_number=1)
+        assert executor.started.wait(1)
+        second = automation.start("project-1", repository="owner/web", pbi_number=2)
+        assert automation.active_count() == 2
+        executor.release.set()
+        for started in (first, second):
+            deadline = time.monotonic() + 3
+            current = automation.status(str(started["run_id"]))
+            while current["status"] == "running" and time.monotonic() < deadline:
+                time.sleep(0.01)
+                current = automation.status(str(started["run_id"]))
+            assert current["status"] == "completed"
         assert automation.active_count() == 0
     finally:
         executor.release.set()
