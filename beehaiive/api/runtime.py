@@ -246,9 +246,10 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
             cast(SelectedRepairAgent, effective_executor),
         )
 
-    configured_projects = set(_configured_project_ids(allowed_project_ids))
+    project_boundary = frozenset(_configured_project_ids(allowed_project_ids))
+    configured_projects = set(project_boundary)
     persisted_projects = persisted_settings.get("projects")
-    if allowed_project_ids is None and isinstance(persisted_projects, list):
+    if isinstance(persisted_projects, list):
         persisted_projects = cast(list[object], persisted_projects)
         valid_projects = {
             value.strip()
@@ -258,7 +259,7 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
             and value.rsplit(":", 1)[1].isdigit()
             and value.strip()
         }
-        if valid_projects:
+        if valid_projects and valid_projects.issubset(project_boundary):
             configured_projects = valid_projects
     recover_pending = getattr(autonomous_service, "recover_pending", None)
     if callable(recover_pending):
@@ -309,6 +310,7 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
         "review_repair_service": review_repair_service,
         "review_operations_enabled": review_operations_enabled,
         "configured_projects": configured_projects,
+        "project_boundary": project_boundary,
         "runtime_settings": persisted_settings,
         "scheduler_config": scheduler_config,
         "scheduler": scheduler,

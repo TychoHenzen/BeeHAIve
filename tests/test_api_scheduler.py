@@ -201,3 +201,69 @@ def test_disabled_scheduler_can_apply_capacity_configuration(
         "poll_interval_seconds": 30.0,
     }
     store.close()
+
+
+def test_scheduler_settings_restore_after_restart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setenv("BEEHAIIVE_SCHEDULER_ENABLED", "false")
+
+    class WorkerProbe:
+        workflow_service = object()
+        executor = SimpleNamespace(task="scheduled task")
+
+        def __init__(self) -> None:
+            self.maximum = 0
+
+        @property
+        def active_worker_count(self) -> int:
+            return 0
+
+        def set_max_concurrent_workers(self, maximum: int) -> None:
+            self.maximum = maximum
+
+        def recover(self, project_ids=None) -> None:
+            del project_ids
+
+        def shutdown(self) -> None:
+            return None
+
+    database = tmp_path / "state.db"
+    first_store = OrchestratorStore(database)
+    try:
+        first_app = create_app(
+            orchestrator=Orchestrator(first_store, ApiProvider()),
+            api_key="test-key",
+            allowed_project_ids={"owner:7"},
+            agent_worker=WorkerProbe(),
+        )
+        with TestClient(first_app) as client:
+            response = client.post(
+                "/projects/owner:7/scheduler",
+                headers={"X-API-Key": "test-key"},
+                json={
+                    "approved": True,
+                    "enabled": False,
+                    "poll_interval_seconds": 30,
+                    "max_concurrency": 4,
+                },
+            )
+            assert response.status_code == 200
+    finally:
+        first_store.close()
+
+    second_store = OrchestratorStore(database)
+    try:
+        second_app = create_app(
+            orchestrator=Orchestrator(second_store, ApiProvider()),
+            api_key="test-key",
+            allowed_project_ids={"owner:7"},
+            agent_worker=WorkerProbe(),
+        )
+        with TestClient(second_app) as client:
+            scheduler = client.get("/projects/owner:7/dashboard").json()["scheduler"]
+            assert scheduler["enabled"] is False
+            assert scheduler["poll_interval_seconds"] == 30.0
+            assert scheduler["max_concurrency"] == 4
+    finally:
+        second_store.close()

@@ -1,6 +1,7 @@
 import hashlib
 import json
 from collections.abc import Callable
+from contextlib import suppress
 from typing import Any, Literal, cast
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
@@ -223,6 +224,7 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
             "scheduler_configure",
             request.model_dump(exclude_none=True),
         )
+        old_scheduler_config = scheduler.config
         try:
             scheduler.configure(
                 SchedulerConfig(
@@ -247,6 +249,8 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
             )
             return {"scheduler": status or {}, "action": completed}
         except Exception as exc:
+            with suppress(Exception):
+                scheduler.configure(old_scheduler_config)
             error = redact_worker_text(
                 str(exc), dashboard_secret_values, max_length=MAX_AGENT_OUTPUT_LENGTH
             )

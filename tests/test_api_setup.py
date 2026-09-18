@@ -18,7 +18,7 @@ def test_dashboard_settings_persist_and_restore_from_state_store(tmp_path) -> No
             store=store,
             orchestrator=Orchestrator(store, ApiProvider()),
             api_key="test-key",
-            allowed_project_ids={"owner:1"},
+            allowed_project_ids={"owner:1", "owner:7"},
         )
         with TestClient(app) as client:
             response = client.put(
@@ -42,6 +42,7 @@ def test_dashboard_settings_persist_and_restore_from_state_store(tmp_path) -> No
             store=restored_store,
             orchestrator=Orchestrator(restored_store, ApiProvider()),
             api_key="test-key",
+            allowed_project_ids={"owner:1", "owner:7"},
         )
         with TestClient(restored) as client:
             settings = client.get("/dashboard/settings")
@@ -52,6 +53,38 @@ def test_dashboard_settings_persist_and_restore_from_state_store(tmp_path) -> No
             assert client.get("/dashboard/config").json() == {"projects": ["owner:7"]}
     finally:
         restored_store.close()
+
+
+def test_dashboard_settings_fail_closed_for_boundary_and_mixed_input(tmp_path) -> None:
+    store = OrchestratorStore(tmp_path / "state.db")
+    app = create_app(
+        store=store,
+        orchestrator=Orchestrator(store, ApiProvider()),
+        api_key="test-key",
+        allowed_project_ids={"owner:1"},
+    )
+    try:
+        with TestClient(app) as client:
+            outside = client.put(
+                "/dashboard/settings",
+                headers={"X-API-Key": "test-key"},
+                json={"approved": True, "projects": ["owner:2"]},
+            )
+            assert outside.status_code == 403
+            assert client.get("/dashboard/config").json() == {"projects": ["owner:1"]}
+            mixed = client.put(
+                "/dashboard/settings",
+                headers={"X-API-Key": "test-key"},
+                json={
+                    "approved": True,
+                    "projects": ["owner:1"],
+                    "workflow_id": "Not Valid",
+                },
+            )
+            assert mixed.status_code == 422
+            assert client.get("/dashboard/config").json() == {"projects": ["owner:1"]}
+    finally:
+        store.close()
 
 
 def test_project_scope_configuration_uses_environment(

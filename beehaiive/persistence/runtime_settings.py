@@ -28,6 +28,11 @@ class RuntimeSettingsMixin:
             for key, value in updates.items():
                 if not key.strip():
                     raise ValueError("Runtime setting keys must be non-empty")
+                if value is None:
+                    connection.execute(
+                        "DELETE FROM runtime_settings WHERE key = ?", (key,)
+                    )
+                    continue
                 encoded = json.dumps(value, sort_keys=True)
                 connection.execute(
                     """

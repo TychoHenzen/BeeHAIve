@@ -21,6 +21,7 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
     require_routing_run_access = context["require_routing_run_access"]
     routing_service = context["routing_service"]
     configured_projects = context["configured_projects"]
+    project_boundary = context["project_boundary"]
     scheduler = context["scheduler"]
     runtime_settings = context["runtime_settings"]
     docs_directory = Path(__file__).resolve().parents[3] / "docs"
@@ -111,25 +112,28 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
                 detail="Operator approval is required for dashboard settings",
             )
         updates: dict[str, object] = {}
+        next_projects = set(configured_projects)
         if request.projects is not None:
-            projects = {
+            next_projects = {
                 project.strip() for project in request.projects if project.strip()
             }
-            if not projects or any(
+            if not next_projects or any(
                 project.count(":") != 1
                 or not project.rsplit(":", 1)[1].isdigit()
                 or not re.fullmatch(r"[A-Za-z0-9_.-]+", project.split(":", 1)[0])
-                for project in projects
+                for project in next_projects
             ):
                 raise HTTPException(
                     status_code=422,
                     detail="Projects must use owner:number format",
                 )
-            if scheduler is not None:
-                scheduler.configure_projects(projects)
-            configured_projects.clear()
-            configured_projects.update(projects)
-            updates["projects"] = sorted(projects)
+            if not next_projects.issubset(project_boundary):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Project is outside the configured allowlist",
+                )
+            updates["projects"] = sorted(next_projects)
+        workflow_id = None
         if "workflow_id" in request.model_fields_set:
             workflow_id = request.workflow_id.strip() if request.workflow_id else ""
             if workflow_id and not re.fullmatch(
@@ -142,8 +146,27 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
                     ),
                 )
             updates["workflow_id"] = workflow_id
-        if updates:
-            runtime_settings.update(orchestrator.store.update_runtime_settings(updates))
+        if not updates:
+            return dashboard_settings()
+        scheduler_reconfigured = False
+        old_projects = set(configured_projects)
+        try:
+            if scheduler is not None and request.projects is not None:
+                scheduler.configure_projects(next_projects)
+                scheduler_reconfigured = True
+            persisted = orchestrator.store.update_runtime_settings(updates)
+        except Exception as exc:
+            if scheduler_reconfigured and scheduler is not None:
+                scheduler.configure_projects(old_projects)
+            raise HTTPException(
+                status_code=409,
+                detail="Dashboard settings could not be applied",
+            ) from exc
+        if request.projects is not None:
+            configured_projects.clear()
+            configured_projects.update(next_projects)
+        runtime_settings.clear()
+        runtime_settings.update(persisted)
         return dashboard_settings()
 
     @app.get("/dashboard.js", response_class=FileResponse)
