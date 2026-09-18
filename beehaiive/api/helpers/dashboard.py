@@ -628,7 +628,12 @@ def _start_dashboard_worker(
             max_length=MAX_AGENT_OUTPUT_LENGTH,
         )
         try:
-            orchestrator.stop(run.run_id, failure)
+            if orchestrator.store.admission_enabled:
+                orchestrator.store.fail_agent_run(
+                    run.run_id, failure, run.lease_token or ""
+                )
+            else:
+                orchestrator.stop(run.run_id, failure)
         except StoreError as stop_error:
             raise StoreError(
                 f"Agent worker failed to start and cleanup failed: {stop_error}"
@@ -716,7 +721,12 @@ def _execute_start(
             max_length=MAX_AGENT_OUTPUT_LENGTH,
         )
         try:
-            orchestrator.stop(run.run_id, failure)
+            if orchestrator.store.admission_enabled:
+                orchestrator.store.fail_agent_run(
+                    run.run_id, failure, run.lease_token or ""
+                )
+            else:
+                orchestrator.stop(run.run_id, failure)
         except StoreError as stop_error:
             raise StoreError(
                 f"Agent worker failed to start and cleanup failed: {stop_error}"

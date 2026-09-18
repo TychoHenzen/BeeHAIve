@@ -5,6 +5,7 @@ from uuid import uuid4
 
 from beehaiive.models import RunState, Stage
 
+from .admission import AdmissionError
 from .errors import StoreError
 from .helpers.lease_helpers import _lease_is_active as _lease_is_active
 from .helpers.lease_helpers import _now as _now
@@ -69,7 +70,8 @@ class ProjectClaimMixin:
                 SELECT p.*, r.run_id, r.status, r.attempt,
                        r.owner_id, r.lease_token, r.lease_expires_at,
                        r.last_error AS run_error, r.last_result AS run_result,
-                       r.task_contract_json, r.task_result_json, r.task_answer
+                       r.task_contract_json, r.task_result_json, r.task_answer,
+                       r.admission_generation
                 FROM pbis AS p
                 JOIN repositories AS repository
                   ON repository.project_id = p.project_id
@@ -122,6 +124,8 @@ class ProjectClaimMixin:
                         )
                     return self._run_for_id(connection, active_run.run_id)
                 if _lease_is_active(active_run.lease_expires_at):
+                    if self._admission_capacity is not None:
+                        raise AdmissionError("repository_owned")
                     return None
                 run_id = active_run.run_id
                 new_lease_token = str(uuid4())
@@ -141,6 +145,7 @@ class ProjectClaimMixin:
                         run_id,
                     ),
                 )
+                self._admit(connection, self._run_for_id(connection, run_id))
                 self._record_event(
                     connection,
                     project_id,
@@ -254,6 +259,7 @@ class ProjectClaimMixin:
                 )
                 event_type = "claimed"
 
+            self._admit(connection, self._run_for_id(connection, run_id))
             current_stage = Stage(candidate["stage"])
             if current_stage is Stage.BACKLOG:
                 connection.execute(

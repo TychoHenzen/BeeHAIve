@@ -105,7 +105,7 @@ class RowMappingMixin:
                    r.run_id, r.status, r.attempt, r.owner_id, r.lease_token,
                    r.lease_expires_at, r.last_error AS run_error,
                    r.last_result AS run_result, r.task_contract_json,
-                   r.task_result_json, r.task_answer
+                   r.task_result_json, r.task_answer, r.admission_generation
             FROM runs AS r
             JOIN pbis AS p
               ON p.project_id = r.project_id
@@ -140,6 +140,7 @@ class RowMappingMixin:
             task_contract=_json_mapping_or_none(row["task_contract_json"]),
             task_result=_json_mapping_or_none(row["task_result_json"]),
             task_answer=row["task_answer"],
+            admission_generation=row["admission_generation"],
         )
 
     def _events_for_project(

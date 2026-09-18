@@ -178,6 +178,8 @@ class RunFailureMixin:
             row = self._run_for_id(connection, run_id)
             if row is None:
                 raise StoreError(f"Unknown run: {run_id}")
+            if self._admission_capacity is not None:
+                self._require_lease(row, expected_lease_token)
             if row.status in {RunStatus.COMPLETED, RunStatus.FAILED}:
                 return row
             task_paused, answered_question = _task_claimability_for_run(

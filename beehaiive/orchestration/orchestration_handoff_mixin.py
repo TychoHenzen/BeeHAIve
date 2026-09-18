@@ -128,6 +128,7 @@ class OrchestrationHandoffMixin:
         if intent.run.status is RunStatus.COMPLETED:
             return intent.run
         self._ensure_handoff_routing_allowed(run_id)
+        self.store.validate_lease(run_id, lease_token)
         result = self.provider.create_handoff(
             HandoffRequest(
                 project_id=intent.run.project_id,

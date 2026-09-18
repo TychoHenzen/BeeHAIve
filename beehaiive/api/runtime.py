@@ -82,7 +82,13 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
         if store is None:
             database = os.environ.get("BEEHAIIVE_STATE_DB", ".beehaiive/state.db")
             store = OrchestratorStore(
-                database if database == ":memory:" else Path(database)
+                database if database == ":memory:" else Path(database),
+                admission_capacity=(
+                    int(os.environ.get("BEEHAIIVE_ADMISSION_CAPACITY", "1"))
+                    if os.environ.get("BEEHAIIVE_ADMISSION_ENABLED", "").lower()
+                    in {"1", "true"}
+                    else None
+                ),
             )
         if model_executor is None:
             model_executor = CodexExecModelExecutor.from_environment()

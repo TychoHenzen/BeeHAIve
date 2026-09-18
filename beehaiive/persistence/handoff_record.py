@@ -253,7 +253,7 @@ class HandoffRecordMixin:
     def pending_handoff(
         self: Any, run_id: str, lease_token: str
     ) -> HandoffIntent | None:
-        with self._lock:
+        with self._transaction():
             run = self._run_for_id(self._connection, run_id)
             if run is None:
                 raise StoreError(f"Unknown run: {run_id}")
