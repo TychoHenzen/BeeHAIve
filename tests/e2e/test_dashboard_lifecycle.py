@@ -744,6 +744,12 @@ def test_real_mode_wires_autonomous_lifecycle_endpoint(dashboard_page) -> None:
             }
         ],
         "actions": [],
+        "workflow_ids": ["automation-swarm"],
+        "graph": {
+            "workflow_id": "automation-swarm",
+            "definitions": [],
+            "active": None,
+        },
     }
     observed: list[dict[str, object]] = []
 
@@ -822,6 +828,7 @@ def test_real_mode_wires_autonomous_lifecycle_endpoint(dashboard_page) -> None:
     assert observed[0]["body"] == {
         "repository": "owner/app",
         "pbi_number": 1,
+        "workflow_id": "automation-swarm",
         "approved": True,
     }
     headers = observed[0]["headers"]

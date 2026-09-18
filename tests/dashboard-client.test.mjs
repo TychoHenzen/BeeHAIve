@@ -104,6 +104,23 @@ test("actions preserve the selected workflow graph", async () => {
   );
 });
 
+test("autonomous runs send the selected workflow to the server", async () => {
+  let requestBody;
+  const { client } = harness(async (_url, options) => {
+    requestBody = JSON.parse(options.body);
+    return response({ status: "blocked", run_id: "run-1" });
+  }, { workflowId: () => "automation-swarm" });
+
+  await client.runAutonomous({ repository: "owner/app", pbi_number: 1 });
+
+  assert.deepEqual(requestBody, {
+    repository: "owner/app",
+    pbi_number: 1,
+    workflow_id: "automation-swarm",
+    approved: true,
+  });
+});
+
 test("changing workflows during an action drops stale state", async () => {
   let selectedWorkflow = "old-flow";
   let actionResolve;

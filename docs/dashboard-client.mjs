@@ -173,7 +173,11 @@ export function createDashboardClient({
             "Content-Type": "application/json",
             "X-BeeHAIve-Dashboard": "1",
           },
-          body: JSON.stringify({ ...payload, approved: true }),
+          body: JSON.stringify({
+            ...payload,
+            ...(actionWorkflow ? { workflow_id: actionWorkflow } : {}),
+            approved: true,
+          }),
         },
       );
       const result = await readJson(response);

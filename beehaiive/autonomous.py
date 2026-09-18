@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event, Lock, RLock, Thread
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 from uuid import uuid4
 
 from beehaiive.agent_parts.codex_process_mixin import CodexProcessMixin
@@ -22,6 +22,14 @@ from beehaiive.agent_parts.worker_text import (
     worker_secret_values,
 )
 from beehaiive.dashboard.values import safe_dashboard_value
+from beehaiive.graph import (
+    GraphDefinition,
+    GraphEdge,
+    GraphNode,
+    GraphNodeKind,
+    GraphReference,
+)
+from beehaiive.graph_safety import GraphSafetyService, GraphSafetyStore
 from beehaiive.workflow import WorkspaceLease
 from beehaiive.workflows.helpers import repository_identity
 
@@ -53,6 +61,7 @@ class _WorkflowWorkspaceService(Protocol):
 __all__ = [
     "ADVISOR_STEP",
     "AUTONOMOUS_STEPS",
+    "DEFAULT_AUTOMATION_WORKFLOW_ID",
     "IDEA_CAPTURE_STEP",
     "AutonomousLifecycleRunner",
     "AutonomousLifecycleService",
@@ -64,6 +73,7 @@ __all__ = [
     "SkillHandoff",
     "SkillStep",
     "select_work_item",
+    "bootstrap_automation_workflow",
 ]
 
 
@@ -184,6 +194,132 @@ AUTONOMOUS_STEPS: tuple[SkillStep, ...] = (
         "Complete the accepted pull request and reconcile the linked PBI.",
     ),
 )
+
+DEFAULT_AUTOMATION_WORKFLOW_ID = "automation-swarm"
+
+
+def bootstrap_automation_workflow(store: GraphSafetyStore) -> GraphDefinition:
+    definition = store.graph_definition_for(DEFAULT_AUTOMATION_WORKFLOW_ID, 1)
+    if definition is None:
+        definition = GraphDefinition(
+            DEFAULT_AUTOMATION_WORKFLOW_ID,
+            1,
+            tuple(
+                GraphNode(
+                    step.name,
+                    GraphNodeKind.SKILL,
+                    GraphReference(f"skill/{step.name}"),
+                    {"purpose": step.purpose},
+                )
+                for step in AUTONOMOUS_STEPS
+            ),
+            tuple(
+                GraphEdge(source.name, target.name, "pass")
+                for source, target in zip(
+                    AUTONOMOUS_STEPS, AUTONOMOUS_STEPS[1:], strict=False
+                )
+            ),
+            metadata={"source": "Automation.md", "runtime": "autonomous-lifecycle"},
+        )
+    service = GraphSafetyService(store)
+    evaluation = service.evaluate(definition, _automation_workflow_fixtures(definition))
+    if not evaluation.activatable:
+        raise ValueError("The canonical automation workflow failed safety evaluation")
+    if (
+        store.graph_safety_review_for(definition.workflow_id, definition.revision)
+        is None
+    ):
+        service.review(evaluation, "operator")
+    if store.active_graph_version(definition.workflow_id) is None:
+        service.activate(evaluation, "operator")
+    return definition
+
+
+def _automation_workflow_fixtures(
+    definition: GraphDefinition,
+) -> dict[str, dict[str, dict[str, object]]]:
+    result: dict[str, object] = {
+        "outcome": "pass",
+        "evidence": {},
+        "artifact_refs": [],
+        "question": None,
+        "required_action": None,
+        "validation_reason": None,
+        "answer": None,
+    }
+    return {"happy": {node.node_id: dict(result) for node in definition.nodes}}
+
+
+def _active_workflow_definition(
+    store: GraphSafetyStore, workflow_id: str
+) -> GraphDefinition:
+    active = store.active_graph_version(workflow_id)
+    revision = active.get("revision") if active is not None else None
+    if type(revision) is not int:
+        raise ValueError("Selected workflow has no active revision")
+    definition = store.graph_definition_for(workflow_id, revision)
+    if definition is None:
+        raise ValueError("Selected workflow definition was not found")
+    return definition
+
+
+def _workflow_step_names(definition: GraphDefinition) -> tuple[str, ...]:
+    nodes = {node.node_id: node for node in definition.nodes}
+    targets = {edge.target for edge in definition.edges}
+    entries = tuple(node_id for node_id in nodes if node_id not in targets)
+    if len(entries) != 1:
+        raise ValueError("Selected workflow must have one entry node")
+    outgoing: dict[str, tuple[GraphEdge, ...]] = {
+        node_id: tuple(edge for edge in definition.edges if edge.source == node_id)
+        for node_id in nodes
+    }
+    ordered: list[str] = []
+    visited_nodes: set[str] = set()
+    current = entries[0]
+    while True:
+        if current in visited_nodes:
+            raise ValueError("Selected workflow contains a cycle")
+        visited_nodes.add(current)
+        node = nodes[current]
+        if (
+            node.kind is not GraphNodeKind.SKILL
+            or not node.reference.reference_id.startswith("skill/")
+        ):
+            raise ValueError("Selected workflow contains an unsupported node")
+        ordered.append(node.reference.reference_id.removeprefix("skill/"))
+        edges = outgoing[current]
+        if not edges:
+            break
+        if len(edges) != 1 or edges[0].condition != "pass":
+            raise ValueError("Selected workflow must be a linear pass sequence")
+        current = edges[0].target
+    if len(ordered) != len(nodes) or set(ordered) != {
+        step.name for step in AUTONOMOUS_STEPS
+    }:
+        raise ValueError(
+            "Selected workflow must contain the complete autonomous sequence"
+        )
+    return tuple(ordered)
+
+
+def _workflow_steps(context: Mapping[str, object]) -> tuple[SkillStep, ...]:
+    raw_names = context.get("workflow_step_names")
+    if raw_names is None:
+        return AUTONOMOUS_STEPS
+    if not isinstance(raw_names, Sequence) or isinstance(
+        raw_names, (str, bytes, bytearray)
+    ):
+        raise ValueError("Workflow step names are invalid")
+    raw_values = cast(Sequence[object], raw_names)
+    names = tuple(item for item in raw_values if isinstance(item, str))
+    if len(names) != len(raw_values):
+        raise ValueError("Workflow step names are invalid")
+    steps = {step.name: step for step in AUTONOMOUS_STEPS}
+    try:
+        return tuple(steps[name] for name in names)
+    except KeyError as error:
+        raise ValueError("Workflow references an unknown autonomous skill") from error
+
 
 ADVISOR_STEP = SkillStep(
     "codex-advisor",
@@ -451,10 +587,12 @@ def _candidate_sort_key(item: Mapping[str, object]) -> tuple[int, ...]:
     )
 
 
-def _start_index(context: Mapping[str, object]) -> int:
+def _start_index(
+    context: Mapping[str, object], steps: Sequence[SkillStep] = AUTONOMOUS_STEPS
+) -> int:
     requested_step = _text(context.get("resume_step")).casefold()
     if requested_step:
-        for index, step in enumerate(AUTONOMOUS_STEPS):
+        for index, step in enumerate(steps):
             if step.name == requested_step:
                 return index
     planning_status = _text(context.get("planning_status")).casefold()
@@ -462,12 +600,12 @@ def _start_index(context: Mapping[str, object]) -> int:
         return 0
     stage = _text(context.get("stage")).casefold()
     if stage in {"pull_request", "review"}:
-        return 3
+        return min(3, len(steps) - 1)
     if stage == "merge":
-        return 5
+        return min(5, len(steps) - 1)
     if stage == "implement" and context.get("branch"):
-        return 2
-    return 1
+        return min(2, len(steps) - 1)
+    return min(1, len(steps) - 1)
 
 
 def _handover(value: object) -> dict[str, object]:
@@ -584,7 +722,8 @@ class AutonomousLifecycleRunner:
         }
         handoffs: list[SkillHandoff] = []
         advisor_handoff: SkillHandoff | None = None
-        steps = AUTONOMOUS_STEPS[_start_index(context) :]
+        workflow_steps = _workflow_steps(context)
+        steps = workflow_steps[_start_index(context, workflow_steps) :]
         for step in steps:
             if self.on_step is not None:
                 self.on_step(step.name)
@@ -950,7 +1089,13 @@ class AutonomousLifecycleService:
         project_id: str,
         repository: str | None = None,
         pbi_number: int | None = None,
+        workflow_id: str | None = None,
     ) -> dict[str, object]:
+        selected_workflow_id = (
+            workflow_id.strip()
+            if workflow_id is not None and workflow_id.strip()
+            else None
+        )
         with self._lock:
             selected_repository = repository or self._configured_repository
             if (
@@ -977,6 +1122,19 @@ class AutonomousLifecycleService:
             )
             if selected is None:
                 raise ValueError("No eligible lifecycle PBI is available")
+            workflow_step_names: tuple[str, ...] | None = None
+            graph_store = cast(Any, self.orchestrator.store)
+            if selected_workflow_id is None:
+                default_active = graph_store.active_graph_version(
+                    DEFAULT_AUTOMATION_WORKFLOW_ID
+                )
+                if default_active is not None:
+                    selected_workflow_id = DEFAULT_AUTOMATION_WORKFLOW_ID
+            if selected_workflow_id is not None:
+                workflow_definition = _active_workflow_definition(
+                    cast(GraphSafetyStore, graph_store), selected_workflow_id
+                )
+                workflow_step_names = _workflow_step_names(workflow_definition)
             selected_number = selected.get("pbi_number")
             if type(selected_number) is not int or selected_number <= 0:
                 raise ValueError("Selected PBI number is invalid")
@@ -986,7 +1144,20 @@ class AutonomousLifecycleService:
             if len(self._active_repositories) >= self._max_concurrency:
                 raise ValueError("Autonomous worker capacity is full")
             run_id = str(uuid4())
-            context = {"project_id": project_id, **selected, "run_id": run_id}
+            context = {
+                "project_id": project_id,
+                **selected,
+                "run_id": run_id,
+                **(
+                    {
+                        "workflow_id": selected_workflow_id,
+                        "workflow_step_names": workflow_step_names,
+                    }
+                    if workflow_step_names is not None
+                    and selected_workflow_id is not None
+                    else {}
+                ),
+            }
             if (
                 pbi_number is not None
                 or (
@@ -1002,10 +1173,16 @@ class AutonomousLifecycleService:
                         selected_number,
                     )
                 )
+            action_request: dict[str, object] = {
+                "repository": selected["repository"],
+                "pbi_number": selected_number,
+            }
+            if selected_workflow_id is not None:
+                action_request["workflow_id"] = selected_workflow_id
             action = self.orchestrator.store.begin_action(
                 project_id,
                 "autonomous_start",
-                {"repository": selected["repository"], "pbi_number": selected_number},
+                action_request,
                 str(selected["repository"]),
                 selected_number,
                 run_id,
@@ -1016,6 +1193,7 @@ class AutonomousLifecycleService:
                 "project_id": project_id,
                 "repository": selected["repository"],
                 "pbi_number": selected_number,
+                "workflow_id": selected_workflow_id,
                 "status": "running",
                 "current_step": None,
                 "started_at": _now_iso(),

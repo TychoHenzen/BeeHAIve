@@ -14,7 +14,10 @@ from beehaiive.api.helpers.configuration import (
 from beehaiive.api.helpers.configuration import (
     _routing_config_from_environment as _routing_config_from_environment,
 )
-from beehaiive.autonomous import AutonomousLifecycleService
+from beehaiive.autonomous import (
+    AutonomousLifecycleService,
+    bootstrap_automation_workflow,
+)
 from beehaiive.conflict_repair import ConflictRepairAgent, ConflictRepairService
 from beehaiive.graph_safety import GraphSafetyService
 from beehaiive.meta_review import MetaReviewService
@@ -106,6 +109,8 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("The graph safety service and API must share one state store")
     if graph_safety_service is None:
         graph_safety_service = GraphSafetyService(orchestrator.store)
+    if owns_orchestrator:
+        bootstrap_automation_workflow(orchestrator.store)
     persisted_settings = orchestrator.store.get_runtime_settings()
     environment_scheduler_config = SchedulerConfig.from_environment()
     persisted_scheduler = persisted_settings.get("scheduler")

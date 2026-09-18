@@ -22,7 +22,12 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
                 detail="Operator approval is required for autonomous runs",
             )
         try:
-            return service.start(project_id, request.repository, request.pbi_number)
+            return service.start(
+                project_id,
+                request.repository,
+                request.pbi_number,
+                request.workflow_id,
+            )
         except ValueError as exc:
             raise HTTPException(
                 status_code=409, detail="Autonomous lifecycle could not start"
