@@ -16,6 +16,7 @@ from .graph_safety import GraphSafetyMixin
 from .graph_transitions import GraphTransitionMixin
 from .handoff_mutation import HandoffMutationMixin
 from .handoff_record import HandoffRecordMixin
+from .idea_capture import IdeaCaptureMixin
 from .lease_store import LeaseStoreMixin
 from .meta_review import MetaReviewMixin
 from .migrations import StorageMigrationMixin
@@ -58,6 +59,7 @@ class OrchestratorStore(
     RunCompletionMixin,
     RoutingFailureMixin,
     ActionsMixin,
+    IdeaCaptureMixin,
     PbiCreationMixin,
     HandoffMutationMixin,
     AgentSessionsMixin,

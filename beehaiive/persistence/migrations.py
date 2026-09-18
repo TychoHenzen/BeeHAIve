@@ -5,6 +5,17 @@ from typing import Any
 
 class StorageMigrationMixin:
     def _migrate_schema(self: Any) -> None:
+        idea_capture_columns = {
+            str(row["name"])
+            for row in self._connection.execute(
+                "PRAGMA table_info(idea_captures)"
+            ).fetchall()
+        }
+        if "side_effect_started" not in idea_capture_columns:
+            self._connection.execute(
+                "ALTER TABLE idea_captures ADD COLUMN side_effect_started "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
         session_columns = {
             str(row["name"])
             for row in self._connection.execute("PRAGMA table_info(agent_sessions)")

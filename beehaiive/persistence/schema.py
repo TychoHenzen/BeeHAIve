@@ -326,6 +326,23 @@ class StorageSchemaMixin:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS idea_captures (
+                    project_id TEXT NOT NULL,
+                    key_hash TEXT NOT NULL,
+                    action_id TEXT NOT NULL UNIQUE,
+                    lease_owner TEXT,
+                    lease_expires_at TEXT,
+                    side_effect_started INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (project_id, key_hash),
+                    FOREIGN KEY (action_id)
+                        REFERENCES actions(action_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idea_captures_by_action
+                    ON idea_captures(action_id);
+
                 CREATE TABLE IF NOT EXISTS pbi_creations (
                     project_id TEXT NOT NULL,
                     key_hash TEXT NOT NULL,
