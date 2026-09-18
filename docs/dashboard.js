@@ -185,6 +185,7 @@ async function loadIdeaProjects() {
       if (settingsResponse.ok && typeof settings.workflow_id === "string" && settings.workflow_id) {
         initialWorkflow = settings.workflow_id;
         settingsWorkflowInput.value = settings.workflow_id;
+        if (settingsProjectInput.value.trim()) void client.refresh();
       }
     }
   } catch (error) {
