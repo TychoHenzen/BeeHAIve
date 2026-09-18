@@ -48,6 +48,51 @@ def test_poll_rotates_active_repositories_and_respects_process_capacity() -> Non
     assert scheduler.status_for("project-1")["last_started_run_ids"] == []
 
 
+def test_poll_fills_autonomous_capacity_across_projects() -> None:
+    states = {
+        "project-1": {"repositories": [{"name": "owner/a", "active": True}]},
+        "project-2": {"repositories": [{"name": "owner/b", "active": True}]},
+    }
+    scheduler, _orchestrator, worker = _scheduler(
+        states, projects={"project-1", "project-2"}, maximum=2
+    )
+    started_projects: list[tuple[str, str]] = []
+
+    def start(project_id: str, repository: str) -> dict[str, object]:
+        started_projects.append((project_id, repository))
+        return {"run_id": f"autonomous-{project_id}"}
+
+    scheduler.autonomous_start = start
+    scheduler.autonomous_has_capacity = lambda: len(started_projects) < 2
+
+    assert scheduler.poll_once() == ("autonomous-project-1", "autonomous-project-2")
+    assert started_projects == [("project-1", "owner/a"), ("project-2", "owner/b")]
+    assert worker.active == 0
+
+
+def test_poll_combines_worker_and_autonomous_capacity() -> None:
+    states = {
+        "project-1": {"repositories": [{"name": "owner/a", "active": True}]},
+        "project-2": {"repositories": [{"name": "owner/b", "active": True}]},
+    }
+    scheduler, _orchestrator, worker = _scheduler(
+        states, projects={"project-1", "project-2"}, maximum=2
+    )
+    worker.active = 1
+    started_projects: list[tuple[str, str]] = []
+
+    def start(project_id: str, repository: str) -> dict[str, object]:
+        started_projects.append((project_id, repository))
+        return {"run_id": f"autonomous-{project_id}"}
+
+    scheduler.autonomous_start = start
+    scheduler.autonomous_has_capacity = lambda: True
+    scheduler.autonomous_active_count = lambda: len(started_projects)
+
+    assert scheduler.poll_once() == ("autonomous-project-1",)
+    assert started_projects == [("project-1", "owner/a")]
+
+
 def test_poll_records_sync_claim_and_worker_start_errors_without_secrets() -> None:
     states = {"project": {"repositories": [{"name": "owner/a", "active": True}]}}
     scheduler, orchestrator, worker = _scheduler(states)
