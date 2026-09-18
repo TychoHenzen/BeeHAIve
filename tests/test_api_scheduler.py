@@ -195,4 +195,9 @@ def test_disabled_scheduler_can_apply_capacity_configuration(
     assert response.json()["scheduler"]["enabled"] is False
     assert response.json()["scheduler"]["max_concurrency"] == 4
     assert worker.maximum == 4
+    assert store.get_runtime_settings()["scheduler"] == {
+        "enabled": False,
+        "max_concurrency": 4,
+        "poll_interval_seconds": 30.0,
+    }
     store.close()
