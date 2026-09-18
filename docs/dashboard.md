@@ -28,6 +28,8 @@ operator-entered JSON. The guided demo uses placeholder
 systems so the complete
 Plan, Refine, Implement, Pull request, Review, and Ship journey can be
 exercised without GitHub or Codex changes.
+Production startup seeds the active `automation-swarm` workflow from the same
+six autonomous lifecycle skills; older stored definitions remain selectable.
 
 The live Queue view groups work into Refinement, Implementation, Publish,
 Review, Repair, Completion, Blocked, and Completed queues. Queue assignment is

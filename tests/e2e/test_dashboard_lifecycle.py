@@ -5,14 +5,23 @@ import os
 import re
 import shutil
 import threading
+import time
 from collections.abc import Iterator
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
+import uvicorn
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, expect, sync_playwright
+
+from beehaiive.api.app import create_app
+from beehaiive.autonomous import AutonomousLifecycleService, PlaceholderSkillExecutor
+from beehaiive.orchestrator import Orchestrator
+from beehaiive.storage import OrchestratorStore
+from tests.conftest import FakeProvider
+from tests.support.dashboard.helpers import dashboard_snapshot
 
 ROOT = Path(__file__).resolve().parents[2]
 DOCS = ROOT / "docs"
@@ -71,6 +80,62 @@ def dashboard_page() -> Iterator[tuple[Page, str]]:
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
+
+
+@pytest.fixture
+def live_dashboard_page(tmp_path) -> Iterator[tuple[Page, str]]:
+    executable = browser_executable()
+    with sync_playwright() as playwright:
+        try:
+            launch_options = {"headless": True}
+            if executable is not None:
+                launch_options["executable_path"] = executable
+            browser = playwright.chromium.launch(**launch_options)
+        except PlaywrightError:
+            pytest.skip(
+                "Set BEEHAIIVE_PLAYWRIGHT_BROWSER or run playwright install chromium"
+            )
+        store = OrchestratorStore(tmp_path / "state.sqlite3")
+        orchestrator = Orchestrator(
+            store, FakeProvider(dashboard_snapshot(project_id="project-1"))
+        )
+        app = create_app(
+            orchestrator=orchestrator,
+            api_key="test-key",
+            allowed_project_ids={"project-1"},
+            autonomous_service=AutonomousLifecycleService(
+                orchestrator, PlaceholderSkillExecutor()
+            ),
+        )
+        server = uvicorn.Server(
+            uvicorn.Config(
+                app,
+                host="127.0.0.1",
+                port=0,
+                log_level="critical",
+            )
+        )
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 10
+        while not server.started and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not server.started:
+            server.should_exit = True
+            thread.join(timeout=2)
+            browser.close()
+            store.close()
+            pytest.fail("live dashboard server did not start")
+        port = server.servers[0].sockets[0].getsockname()[1]
+        page = browser.new_page(viewport={"width": 1280, "height": 900})
+        try:
+            yield page, f"http://127.0.0.1:{port}"
+        finally:
+            page.close()
+            browser.close()
+            server.should_exit = True
+            thread.join(timeout=5)
+            store.close()
 
 
 def work_item(page: Page, title: str):
@@ -717,6 +782,31 @@ def test_workflow_query_selects_live_graph(dashboard_page) -> None:
 
 
 @pytest.mark.e2e
+def test_fresh_runtime_bootstraps_and_runs_the_live_workflow(
+    live_dashboard_page,
+) -> None:
+    page, base_url = live_dashboard_page
+    page.goto(f"{base_url}/dashboard?project=project-1#workflow-graphs")
+
+    expect(page.locator("#workflow-select")).to_have_value("automation-swarm")
+    expect(page.locator("#graph-output")).to_contain_text("Revision 1")
+    expect(page.locator("#graph-output")).to_contain_text("refine-backlog-item")
+
+    page.get_by_role("button", name="Mission control", exact=True).click()
+    item = work_item(page, "API one")
+    with page.expect_response(
+        lambda response: (
+            response.url.endswith("/autonomous-runs")
+            and response.request.method == "POST"
+        )
+    ) as run_response:
+        item.get_by_test_id("run-lifecycle").click()
+    payload = run_response.value.json()
+    assert payload["workflow_id"] == "automation-swarm"
+    expect(item).to_contain_text("Waiting", timeout=10_000)
+
+
+@pytest.mark.e2e
 def test_real_mode_wires_autonomous_lifecycle_endpoint(dashboard_page) -> None:
     page, base_url = dashboard_page
     state = {
@@ -744,6 +834,12 @@ def test_real_mode_wires_autonomous_lifecycle_endpoint(dashboard_page) -> None:
             }
         ],
         "actions": [],
+        "workflow_ids": ["automation-swarm"],
+        "graph": {
+            "workflow_id": "automation-swarm",
+            "definitions": [],
+            "active": None,
+        },
     }
     observed: list[dict[str, object]] = []
 
@@ -822,6 +918,7 @@ def test_real_mode_wires_autonomous_lifecycle_endpoint(dashboard_page) -> None:
     assert observed[0]["body"] == {
         "repository": "owner/app",
         "pbi_number": 1,
+        "workflow_id": "automation-swarm",
         "approved": True,
     }
     headers = observed[0]["headers"]

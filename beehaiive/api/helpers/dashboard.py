@@ -41,7 +41,11 @@ from beehaiive.api.models import DashboardStopRequest as DashboardStopRequest
 from beehaiive.api.models import (
     DashboardSynchronizeRequest as DashboardSynchronizeRequest,
 )
-from beehaiive.autonomous import ADVISOR_STEP, AUTONOMOUS_STEPS
+from beehaiive.autonomous import (
+    ADVISOR_STEP,
+    AUTONOMOUS_STEPS,
+    DEFAULT_AUTOMATION_WORKFLOW_ID,
+)
 from beehaiive.dashboard import build_dashboard_state
 from beehaiive.dashboard.values import mapping, safe_dashboard_value
 from beehaiive.dashboard.views import queue_for_skill
@@ -136,10 +140,16 @@ def _dashboard_state(
             "last_error": None,
             "last_started_run_ids": [],
         }
-    dashboard["graph"] = _dashboard_graph_state(
-        orchestrator, workflow_id, graph_safety_service
+    workflow_ids = list(orchestrator.store.graph_workflow_ids())
+    selected_workflow_id = workflow_id or (
+        DEFAULT_AUTOMATION_WORKFLOW_ID
+        if DEFAULT_AUTOMATION_WORKFLOW_ID in workflow_ids
+        else None
     )
-    dashboard["workflow_ids"] = list(orchestrator.store.graph_workflow_ids())
+    dashboard["graph"] = _dashboard_graph_state(
+        orchestrator, selected_workflow_id, graph_safety_service
+    )
+    dashboard["workflow_ids"] = workflow_ids
     dashboard["workflow_skill_ids"] = _workflow_skill_ids()
     status_for_work_item = getattr(autonomous_service, "status_for_work_item", None)
     if callable(status_for_work_item):

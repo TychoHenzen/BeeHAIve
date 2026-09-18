@@ -9,3 +9,4 @@ class AutonomousRunRequest(BaseModel):
     approved: bool = Field(default=False, strict=True)
     repository: str | None = None
     pbi_number: int | None = Field(default=None, strict=True, gt=0)
+    workflow_id: str | None = Field(default=None, max_length=128)
