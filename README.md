@@ -62,6 +62,11 @@ BEEHAIIVE_AGENT_REPOSITORY_NAME=<owner>/<repository>
 # BEEHAIIVE_SCHEDULER_ENABLED=false
 # BEEHAIIVE_SCHEDULER_POLL_INTERVAL_SECONDS=600
 # BEEHAIIVE_SCHEDULER_MAX_CONCURRENCY=1
+# BEEHAIIVE_WORKER_HOST_ID=stable-host-id
+# BEEHAIIVE_WORKER_SLOTS=1
+# BEEHAIIVE_WORKER_CAPABILITIES=codex,python
+# BEEHAIIVE_WORKER_HEARTBEAT_SECONDS=30
+# BEEHAIIVE_WORKER_STALE_SECONDS=90
 ```
 
 The project ID is exactly `<owner>:<number>`. The tracked launcher reads the
@@ -89,6 +94,11 @@ capacity to a running server when the workflow-backed worker is configured.
 Validated project, workflow, and scheduler settings persist in the server
 state store and are restored after restart. Credentials and checkout paths
 remain environment-owned.
+When `BEEHAIIVE_WORKER_HOST_ID` is configured, the server registers that stable
+host identity in the shared state store and refreshes its bounded heartbeat.
+`BEEHAIIVE_WORKER_SLOTS` defaults to the scheduler worker capacity; stale hosts
+advertise zero available slots. Host facts and derived liveness are included in
+the read-only dashboard state.
 
 Start the service from the repository root so the launcher loads `.env`:
 

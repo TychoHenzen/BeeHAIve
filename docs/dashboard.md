@@ -85,9 +85,11 @@ repository-inventory worker. A completed result is shown in the work-item row
 and run inspector. Every action is recorded as `pending`, `succeeded`, or `failed`; a
 response always includes the latest available run state. Graph traces use the
 existing 100-event and 4,000-character limits, a 64,000-byte aggregate cap,
-status filters, expandable details, and redacted text. Review,
-refinement, and host APIs remain authenticated owning-service boundaries until
-their own dashboard slices add controls.
+status filters, expandable details, and redacted text. Review and refinement
+APIs remain authenticated owning-service boundaries. When a stable worker host
+is configured, the read-only dashboard state also exposes its bounded host
+facts, capabilities, advertised slots, heartbeat, and derived `active`,
+`stale`, or `unknown` liveness.
 
 The dashboard worker runs `codex exec` with a writable sandbox rooted at one
 unique Git worktree. It disables network access and child agents, filters the

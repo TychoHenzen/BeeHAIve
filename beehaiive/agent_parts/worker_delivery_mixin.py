@@ -156,6 +156,9 @@ class WorkerDeliveryMixin:
         return redact_worker_text(f"{result}\n{summary}")
 
     def shutdown(self: Any) -> None:
+        stop_host_heartbeat = getattr(self, "_stop_host_heartbeat", None)
+        if callable(stop_host_heartbeat):
+            stop_host_heartbeat()
         with self._lock:
             items = list(self._threads.items())
         cancellation_error: Exception | None = None

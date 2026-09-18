@@ -176,6 +176,7 @@ class ProjectReadMixin:
                 "name": project["name"],
                 "updated_at": project["updated_at"],
                 "event_limit": event_limit,
+                "worker_hosts": list(self.worker_host_records()),
                 "repositories": repositories,
             }
 

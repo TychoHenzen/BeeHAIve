@@ -155,6 +155,21 @@ def test_live_dashboard_route_reports_repositories_and_writers() -> None:
     assert api_pbi["activity"][0]["action"] == "Started review"
 
 
+def test_dashboard_api_exposes_worker_hosts_without_credentials() -> None:
+    service = Orchestrator(OrchestratorStore(), FakeProvider(dashboard_snapshot()))
+    service.store.register_worker_host("host-a", 2, ["codex"])
+    client = TestClient(
+        main_module.create_app(orchestrator=service, allowed_project_ids={"project-1"})
+    )
+
+    response = client.get("/projects/project-1/dashboard")
+
+    assert response.status_code == 200
+    assert response.json()["worker_hosts"][0]["host_id"] == "host-a"
+    assert response.json()["worker_hosts"][0]["available_worker_slots"] == 2
+    service.store.close()
+
+
 def test_live_autonomous_skill_moves_the_dashboard_queue() -> None:
     class LiveAutonomous:
         def status_for_work_item(self, project_id, repository, pbi_number):

@@ -25,6 +25,10 @@ from beehaiive.review_github import GitHubReviewProvider, github_review_readers
 from beehaiive.review_repair import ReviewRepairService, SelectedRepairAgent
 from beehaiive.routing import ModelRouter, RoutingStore
 from beehaiive.scheduler import AgentScheduler, SchedulerConfig
+from beehaiive.storage import (
+    DEFAULT_WORKER_HOST_HEARTBEAT_SECONDS,
+    DEFAULT_WORKER_HOST_STALE_SECONDS,
+)
 
 
 def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
@@ -136,6 +140,19 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
         set_capacity = getattr(autonomous_service, "set_max_concurrency", None)
         if callable(set_capacity):
             set_capacity(scheduler_config.max_concurrency)
+    worker_host_heartbeat_seconds = _worker_host_seconds(
+        "BEEHAIIVE_WORKER_HEARTBEAT_SECONDS",
+        DEFAULT_WORKER_HOST_HEARTBEAT_SECONDS,
+    )
+    worker_host_stale_seconds = _worker_host_seconds(
+        "BEEHAIIVE_WORKER_STALE_SECONDS",
+        DEFAULT_WORKER_HOST_STALE_SECONDS,
+    )
+    configure_worker_hosts = getattr(
+        orchestrator.store, "configure_worker_host_liveness", None
+    )
+    if callable(configure_worker_hosts):
+        configure_worker_hosts(worker_host_heartbeat_seconds, worker_host_stale_seconds)
     pbi_creation_service = PbiCreationService(
         orchestrator.store,
         cast(PbiCreationProvider, orchestrator.provider),
@@ -191,6 +208,11 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
                 orchestrator,
                 cast(CancellableModelExecutor, effective_executor),
                 workflow_service,
+                host_id=os.environ.get("BEEHAIIVE_WORKER_HOST_ID"),
+                worker_slots=_worker_host_slots(scheduler_config.max_concurrency),
+                capabilities=_worker_host_capabilities(),
+                heartbeat_seconds=worker_host_heartbeat_seconds,
+                stale_seconds=worker_host_stale_seconds,
             )
     if (
         review_service is not None
@@ -319,3 +341,34 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
         "autonomous_service": autonomous_service,
         "require_review_adapters": require_review_adapters,
     }
+
+
+def _worker_host_slots(default: int) -> int:
+    raw = os.environ.get("BEEHAIIVE_WORKER_SLOTS", "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError("BEEHAIIVE_WORKER_SLOTS must be an integer") from exc
+
+
+def _worker_host_capabilities() -> tuple[str, ...]:
+    return tuple(
+        value.strip()
+        for value in os.environ.get("BEEHAIIVE_WORKER_CAPABILITIES", "").split(",")
+        if value.strip()
+    )
+
+
+def _worker_host_seconds(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+    return value

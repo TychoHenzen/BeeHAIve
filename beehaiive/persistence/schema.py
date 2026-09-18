@@ -305,6 +305,18 @@ class StorageSchemaMixin:
                         REFERENCES agent_sessions(run_id) ON DELETE CASCADE
                 );
 
+                CREATE TABLE IF NOT EXISTS worker_hosts (
+                    host_id TEXT PRIMARY KEY,
+                    worker_slots INTEGER NOT NULL CHECK (worker_slots > 0),
+                    capabilities_json TEXT NOT NULL,
+                    registered_at TEXT NOT NULL,
+                    heartbeat_at TEXT NOT NULL,
+                    status_reason TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE INDEX IF NOT EXISTS worker_hosts_by_heartbeat
+                    ON worker_hosts(heartbeat_at);
+
                 CREATE TABLE IF NOT EXISTS handoffs (
                     run_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL,
