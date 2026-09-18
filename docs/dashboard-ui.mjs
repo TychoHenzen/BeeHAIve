@@ -265,6 +265,7 @@ export function createDashboardUi({
   detailsOutput,
   runAction,
   runAutonomous,
+  onProjectSelect = () => {},
   onQueueArchive = () => {},
   initialFilter = "all",
   demo = false,
@@ -276,6 +277,7 @@ export function createDashboardUi({
   let selectedDetailTab = "lifecycle";
   let currentPage = "mission";
   const graphDrafts = new Map();
+  let availableProjects = [];
 
   function element(tag, value, className) {
     const node = document.createElement(tag);
@@ -311,6 +313,8 @@ export function createDashboardUi({
     projectSwitcher.replaceChildren();
     const projectNames = list(state.projects).length
       ? list(state.projects)
+      : availableProjects.length
+        ? availableProjects
       : [state.name || state.project_id];
     if (currentProjectFilter !== "all" && !projectNames.includes(currentProjectFilter)) {
       currentProjectFilter = "all";
@@ -328,6 +332,14 @@ export function createDashboardUi({
       project.type = "button";
       project.setAttribute("aria-pressed", String(currentProjectFilter === name));
       project.addEventListener("click", () => {
+        const hasLoadedProject = allItems(currentState).some(
+          (item) => item.project === name,
+        );
+        if (name !== currentState?.project_id && !hasLoadedProject) {
+          currentProjectFilter = "all";
+          onProjectSelect(name);
+          return;
+        }
         currentProjectFilter = name;
         render(currentState);
       });
@@ -1471,5 +1483,12 @@ export function createDashboardUi({
     });
   }
 
-  return { render, closeInspector, setPage };
+  function setProjects(projects) {
+    availableProjects = [...new Set(
+      list(projects).filter((value) => typeof value === "string" && value.trim()),
+    )];
+    if (currentState) render({ ...currentState, projects: availableProjects });
+  }
+
+  return { render, closeInspector, setPage, setProjects };
 }

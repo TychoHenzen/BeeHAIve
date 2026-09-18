@@ -55,7 +55,7 @@ class AgentScheduler:
         project_ids: set[str] | frozenset[str],
         config: SchedulerConfig,
         *,
-        autonomous_start: Callable[[str], Mapping[str, object]] | None = None,
+        autonomous_start: Callable[[str, str], Mapping[str, object]] | None = None,
         autonomous_has_capacity: Callable[[], bool] | None = None,
         autonomous_set_capacity: Callable[[int], None] | None = None,
         autonomous_active_count: Callable[[], int] | None = None,
@@ -190,20 +190,25 @@ class AgentScheduler:
             for offset in range(len(candidates)):
                 if not self.worker.has_capacity():
                     break
+                if (
+                    self.autonomous_start is not None
+                    and self.autonomous_active_count is not None
+                    and self.worker.active_worker_count + self.autonomous_active_count()
+                    >= self.config.max_concurrency
+                ):
+                    break
                 project_id, repository = candidates[
                     (start_cursor + offset) % len(candidates)
                 ]
                 attempted = True
                 try:
                     if self.autonomous_start is not None:
-                        if started:
-                            break
                         if (
                             self.autonomous_has_capacity is not None
                             and not self.autonomous_has_capacity()
                         ):
                             break
-                        autonomous = self.autonomous_start(project_id)
+                        autonomous = self.autonomous_start(project_id, repository)
                         run_id = autonomous.get("run_id")
                         if not isinstance(run_id, str) or not run_id:
                             raise RuntimeError("Autonomous run did not return an id")

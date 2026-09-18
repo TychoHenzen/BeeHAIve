@@ -41,6 +41,8 @@ sends one authenticated capture action to the add-backlog-idea skill context.
 The action log shows pending, succeeded, or failed state and the created issue
 returns to the selected Project's Backlog. The read-only dashboard config
 endpoint at /dashboard/config supplies the Project IDs for that selector.
+The top Project switcher uses the same allowlist; selecting another Project
+refreshes its queue and keeps actions scoped to that Project.
 
 On Windows, copy `.env.example` to `.env`, fill in the required values, and run
 the tracked `start_dashboard.bat` launcher. The launcher reads `.env` before

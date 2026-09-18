@@ -33,6 +33,16 @@ def _dashboard_metadata(issue: Mapping[str, Any]) -> dict[str, object]:
     if isinstance(project_status, str):
         metadata["project_status"] = project_status
     labels = _label_names(issue.get("labels", {}))
+    priority = next(
+        (
+            int(match.group(1))
+            for label in labels
+            if (match := re.match(r"Prio\s+(\d+)\b", label, re.IGNORECASE))
+        ),
+        None,
+    )
+    if priority is not None:
+        metadata["project_priority"] = priority
 
     subtasks: list[dict[str, object]] = []
     for raw_subtask in _nodes(issue.get("subIssues", {})):
