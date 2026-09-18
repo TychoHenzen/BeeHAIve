@@ -428,8 +428,11 @@ def _skill_status(value: object) -> str:
             "complete",
             "completed",
             "done",
+            "fixed",
+            "merged",
             "passed",
             "published",
+            "reviewed",
             "success",
             "succeeded",
         }
@@ -538,7 +541,7 @@ class AutonomousLifecycleRunner:
             result = _mapping(raw_result)
             status = _skill_status(result.get("status"))
             summary = _text(result.get("summary"), f"{step.name} completed")
-            handover = {**handover, **_handover(result.get("handover"))}
+            handover = {**handover, **_review_handover(result)}
             handoff = SkillHandoff(
                 step.name,
                 status,
@@ -697,9 +700,16 @@ class CodexSkillExecutor:
             "credentials, or a destructive policy choice that cannot be made safely. "
             "If a material blocker remains, return blocked JSON with its exact "
             "reason.\n"
-            f"{workspace_instruction}"
-            f"PBI context: {json.dumps(dict(context), sort_keys=True)}\n"
-            f"Handover: {json.dumps(dict(handover), sort_keys=True)}"
+            + (
+                "All findings in the prior review handover are selected for this "
+                "unattended run. Fix each once and do not ask the operator to "
+                "select findings.\n"
+                if step.name == "fix-pr-review"
+                else ""
+            )
+            + f"{workspace_instruction}"
+            + f"PBI context: {json.dumps(dict(context), sort_keys=True)}\n"
+            + f"Handover: {json.dumps(dict(handover), sort_keys=True)}"
         )
         if step.name == "next-ticket":
             prompt += (
