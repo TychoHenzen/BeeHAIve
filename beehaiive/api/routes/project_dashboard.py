@@ -225,6 +225,8 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
             request.model_dump(exclude_none=True),
         )
         old_scheduler_config = scheduler.config
+        old_runtime_settings = orchestrator.store.get_runtime_settings()
+        persisted_scheduler = False
         try:
             scheduler.configure(
                 SchedulerConfig(
@@ -244,6 +246,7 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
                     }
                 }
             )
+            persisted_scheduler = True
             completed = orchestrator.store.finish_action(
                 str(action["id"]), "succeeded", result
             )
@@ -251,6 +254,13 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
         except Exception as exc:
             with suppress(Exception):
                 scheduler.configure(old_scheduler_config)
+            if persisted_scheduler:
+                with suppress(Exception):
+                    orchestrator.store.update_runtime_settings(
+                        {
+                            "scheduler": old_runtime_settings.get("scheduler"),
+                        }
+                    )
             error = redact_worker_text(
                 str(exc), dashboard_secret_values, max_length=MAX_AGENT_OUTPUT_LENGTH
             )

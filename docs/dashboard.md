@@ -68,10 +68,11 @@ actions. The API accepts explicit
 `synchronize`, `claim`, `retry`, and `deliver` action names through the same
 authenticated boundary. Workflow graphs have their own structured page with
 definition, transition, safety, review, activation, and rollback readback.
-Settings also exposes the scheduler switch, poll interval, and autonomous
-worker capacity. Applying those values updates the running server when a
-workflow-backed agent worker exists. Put the same values in `.env` to retain
-them after a restart.
+Settings also exposes validated project and workflow selection plus the
+scheduler switch, poll interval, and autonomous worker capacity. Applying
+those values updates the running server when a workflow-backed agent worker
+exists and persists them in the server state store. Credentials and checkout
+paths remain environment-owned.
 Production lifecycle buttons call the server autonomous-run endpoint. The
 guided demo is the only browser-local placeholder and is labeled in its
 buttons and status message. Recent activity includes the action reason,
