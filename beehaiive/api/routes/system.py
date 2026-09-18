@@ -1,3 +1,5 @@
+import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -5,6 +7,9 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 
 from beehaiive.api.helpers.http import _handle_store_error as _handle_store_error
+from beehaiive.api.models import (
+    DashboardSettingsRequest as DashboardSettingsRequest,
+)
 from beehaiive.api.models import RoutingAttemptRequest as RoutingAttemptRequest
 from beehaiive.routing import RoutingError
 
@@ -12,9 +17,13 @@ from beehaiive.routing import RoutingError
 def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
     orchestrator = context["orchestrator"]
     require_mutation_access = context["require_mutation_access"]
+    require_dashboard_settings_mutation = context["require_dashboard_settings_mutation"]
     require_routing_run_access = context["require_routing_run_access"]
     routing_service = context["routing_service"]
     configured_projects = context["configured_projects"]
+    project_boundary = context["project_boundary"]
+    scheduler = context["scheduler"]
+    runtime_settings = context["runtime_settings"]
     docs_directory = Path(__file__).resolve().parents[3] / "docs"
     dashboard_view_modules = {
         "actions",
@@ -72,6 +81,93 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
     @app.get("/dashboard/config")
     def dashboard_config() -> dict[str, object]:
         return {"projects": sorted(configured_projects)}
+
+    @app.get("/dashboard/settings")
+    def dashboard_settings() -> dict[str, object]:
+        persisted = orchestrator.store.get_runtime_settings()
+        return {
+            "projects": sorted(configured_projects),
+            "workflow_id": persisted.get("workflow_id"),
+            "repository": os.environ.get("BEEHAIIVE_AGENT_REPOSITORY_NAME"),
+            "scheduler": (
+                {
+                    "enabled": scheduler.config.enabled,
+                    "poll_interval_seconds": scheduler.config.poll_interval_seconds,
+                    "max_concurrency": scheduler.config.max_concurrency,
+                }
+                if scheduler is not None
+                else persisted.get("scheduler")
+            ),
+            "restart_persistence": "server_state",
+        }
+
+    @app.put("/dashboard/settings")
+    def update_dashboard_settings(
+        request: DashboardSettingsRequest,
+        _auth: None = Depends(require_dashboard_settings_mutation),
+    ) -> dict[str, object]:
+        if not request.approved:
+            raise HTTPException(
+                status_code=400,
+                detail="Operator approval is required for dashboard settings",
+            )
+        updates: dict[str, object] = {}
+        next_projects = set(configured_projects)
+        if request.projects is not None:
+            next_projects = {
+                project.strip() for project in request.projects if project.strip()
+            }
+            if not next_projects or any(
+                project.count(":") != 1
+                or not project.rsplit(":", 1)[1].isdigit()
+                or not re.fullmatch(r"[A-Za-z0-9_.-]+", project.split(":", 1)[0])
+                for project in next_projects
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Projects must use owner:number format",
+                )
+            if not next_projects.issubset(project_boundary):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Project is outside the configured allowlist",
+                )
+            updates["projects"] = sorted(next_projects)
+        workflow_id = None
+        if "workflow_id" in request.model_fields_set:
+            workflow_id = request.workflow_id.strip() if request.workflow_id else ""
+            if workflow_id and not re.fullmatch(
+                r"[a-z0-9][a-z0-9-]{0,127}", workflow_id
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Workflow IDs must use lowercase letters, digits, and hyphens"
+                    ),
+                )
+            updates["workflow_id"] = workflow_id
+        if not updates:
+            return dashboard_settings()
+        scheduler_reconfigured = False
+        old_projects = set(configured_projects)
+        try:
+            if scheduler is not None and request.projects is not None:
+                scheduler.configure_projects(next_projects)
+                scheduler_reconfigured = True
+            persisted = orchestrator.store.update_runtime_settings(updates)
+        except Exception as exc:
+            if scheduler_reconfigured and scheduler is not None:
+                scheduler.configure_projects(old_projects)
+            raise HTTPException(
+                status_code=409,
+                detail="Dashboard settings could not be applied",
+            ) from exc
+        if request.projects is not None:
+            configured_projects.clear()
+            configured_projects.update(next_projects)
+        runtime_settings.clear()
+        runtime_settings.update(persisted)
+        return dashboard_settings()
 
     @app.get("/dashboard.js", response_class=FileResponse)
     def dashboard_script() -> FileResponse:  # pyright: ignore[reportUnusedFunction]

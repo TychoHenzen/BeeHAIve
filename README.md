@@ -86,7 +86,9 @@ The continuous scheduler is off by default. Enable it with
 `BEEHAIIVE_SCHEDULER_ENABLED=true`; it polls only `BEEHAIIVE_ALLOWED_PROJECTS`
 and starts the autonomous lifecycle. Settings can apply polling and worker
 capacity to a running server when the workflow-backed worker is configured.
-Put the same values in `.env` to retain them after a restart.
+Validated project, workflow, and scheduler settings persist in the server
+state store and are restored after restart. Credentials and checkout paths
+remain environment-owned.
 
 Start the service from the repository root so the launcher loads `.env`:
 

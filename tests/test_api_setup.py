@@ -3,10 +3,88 @@ import importlib
 import pytest
 from fastapi.testclient import TestClient
 
+from beehaiive.orchestrator import Orchestrator
 from beehaiive.provider import EnvironmentGitHubProvider
 from beehaiive.storage import OrchestratorStore
 from main import _configured_project_ids, _routing_config_from_environment, create_app
 from tests.support.api_provider import ApiProvider
+
+
+def test_dashboard_settings_persist_and_restore_from_state_store(tmp_path) -> None:
+    database = tmp_path / "state.db"
+    store = OrchestratorStore(database)
+    try:
+        app = create_app(
+            store=store,
+            orchestrator=Orchestrator(store, ApiProvider()),
+            api_key="test-key",
+            allowed_project_ids={"owner:1", "owner:7"},
+        )
+        with TestClient(app) as client:
+            response = client.put(
+                "/dashboard/settings",
+                headers={"X-API-Key": "test-key"},
+                json={
+                    "approved": True,
+                    "projects": ["owner:7"],
+                    "workflow_id": "delivery-flow",
+                },
+            )
+            assert response.status_code == 200
+            assert response.json()["projects"] == ["owner:7"]
+            assert response.json()["workflow_id"] == "delivery-flow"
+    finally:
+        store.close()
+
+    restored_store = OrchestratorStore(database)
+    try:
+        restored = create_app(
+            store=restored_store,
+            orchestrator=Orchestrator(restored_store, ApiProvider()),
+            api_key="test-key",
+            allowed_project_ids={"owner:1", "owner:7"},
+        )
+        with TestClient(restored) as client:
+            settings = client.get("/dashboard/settings")
+            assert settings.status_code == 200
+            assert settings.json()["projects"] == ["owner:7"]
+            assert settings.json()["workflow_id"] == "delivery-flow"
+            assert settings.json()["restart_persistence"] == "server_state"
+            assert client.get("/dashboard/config").json() == {"projects": ["owner:7"]}
+    finally:
+        restored_store.close()
+
+
+def test_dashboard_settings_fail_closed_for_boundary_and_mixed_input(tmp_path) -> None:
+    store = OrchestratorStore(tmp_path / "state.db")
+    app = create_app(
+        store=store,
+        orchestrator=Orchestrator(store, ApiProvider()),
+        api_key="test-key",
+        allowed_project_ids={"owner:1"},
+    )
+    try:
+        with TestClient(app) as client:
+            outside = client.put(
+                "/dashboard/settings",
+                headers={"X-API-Key": "test-key"},
+                json={"approved": True, "projects": ["owner:2"]},
+            )
+            assert outside.status_code == 403
+            assert client.get("/dashboard/config").json() == {"projects": ["owner:1"]}
+            mixed = client.put(
+                "/dashboard/settings",
+                headers={"X-API-Key": "test-key"},
+                json={
+                    "approved": True,
+                    "projects": ["owner:1"],
+                    "workflow_id": "Not Valid",
+                },
+            )
+            assert mixed.status_code == 422
+            assert client.get("/dashboard/config").json() == {"projects": ["owner:1"]}
+    finally:
+        store.close()
 
 
 def test_project_scope_configuration_uses_environment(

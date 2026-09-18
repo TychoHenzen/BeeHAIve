@@ -144,6 +144,12 @@ class AgentScheduler:
         elif not config.enabled and was_running:
             self.shutdown()
 
+    def configure_projects(self, project_ids: set[str] | frozenset[str]) -> None:
+        if not project_ids:
+            raise ValueError("The scheduler requires at least one allowlisted project")
+        with self._state_lock:
+            self.project_ids = tuple(sorted(project_ids))
+
     def poll_once(self) -> tuple[str, ...]:
         errors: list[str] = []
         started_by_project: dict[str, list[str]] = {}

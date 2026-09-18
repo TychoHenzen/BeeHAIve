@@ -179,6 +179,15 @@ async function loadIdeaProjects() {
     if (!response.ok) throw new Error(payload.detail || "Request failed (" + response.status + ")");
     configuredProjects = setIdeaProjects(payload.projects);
     ui.setProjects(configuredProjects);
+    if (!params.get("workflow_id")) {
+      const settingsResponse = await fetch("/dashboard/settings", { cache: "no-store" });
+      const settings = await settingsResponse.json();
+      if (settingsResponse.ok && typeof settings.workflow_id === "string" && settings.workflow_id) {
+        initialWorkflow = settings.workflow_id;
+        settingsWorkflowInput.value = settings.workflow_id;
+        if (settingsProjectInput.value.trim()) void client.refresh();
+      }
+    }
   } catch (error) {
     setIdeaProjects(settingsProjectInput.value.trim() ? [settingsProjectInput.value.trim()] : []);
     setIdeaFeedback("Project list unavailable: " + error.message, "failure");
@@ -318,7 +327,28 @@ if (demo) {
   });
 }
 
-function openProject(navigateToMission = true) {
+async function persistSettings(project, workflow) {
+  const projects = [...new Set([...configuredProjects, project])];
+  const response = await fetch("/dashboard/settings", {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      "X-BeeHAIve-Dashboard": "1",
+    },
+    body: JSON.stringify({
+      approved: true,
+      projects,
+      workflow_id: workflow || null,
+    }),
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
+  configuredProjects = setIdeaProjects(payload.projects);
+  ui.setProjects(configuredProjects);
+  return payload;
+}
+
+async function openProject(navigateToMission = true, persist = true) {
   const project = settingsProjectInput.value.trim();
   const workflow = settingsWorkflowInput.value.trim() || initialWorkflow;
   if (!project) {
@@ -336,6 +366,14 @@ function openProject(navigateToMission = true) {
     window.location.href = next;
     return;
   }
+  if (persist && !demo) {
+    try {
+      await persistSettings(project, workflow);
+    } catch (error) {
+      setSettingsFeedback(`Settings could not be saved: ${error.message}`, "failure");
+      return;
+    }
+  }
   updateUrl(project, workflow, demo);
   setSettingsFeedback("Saved for this dashboard URL.", "success");
   if (navigateToMission) setPage("mission");
@@ -344,7 +382,7 @@ function openProject(navigateToMission = true) {
 
 settingsForm.addEventListener("submit", (event) => {
   event.preventDefault();
-  openProject();
+  void openProject(true, true);
 });
 refreshButton.addEventListener("click", () => void client.refresh());
 for (const input of [settingsSchedulerEnabled, settingsMaxWorkers, settingsPollInterval]) {
@@ -461,7 +499,7 @@ document.addEventListener("keydown", (event) => {
 });
 
 setPage(window.location.hash || "mission", false);
-if (demo || settingsProjectInput.value.trim()) openProject(false);
+if (demo || settingsProjectInput.value.trim()) void openProject(false, false);
 else showWelcome();
 void loadIdeaProjects();
 if (!demo) window.setInterval(() => void client.refresh(), 15000);

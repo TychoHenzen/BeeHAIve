@@ -59,8 +59,8 @@ Open `http://127.0.0.1:8000/dashboard?project=OWNER:NUMBER`. The project ID
 must be present in `BEEHAIIVE_ALLOWED_PROJECTS`, or in the owner and number
 environment variables used by the service.
 
-Read-only state needs no API key. Dashboard actions use the configured
-server-side `BEEHAIIVE_API_KEY`; the browser never asks for or stores it.
+Read-only state needs no API key. Dashboard actions and Settings writes use the
+configured server-side `BEEHAIIVE_API_KEY`; the browser never asks for or stores it.
 Direct API clients still send it as `X-API-Key`. The dashboard exposes a
 focused work queue with sync, start or claim writer, stop, advance, approval,
 clarification, operator-question answers, retry, and commit-and-push delivery
@@ -68,10 +68,11 @@ actions. The API accepts explicit
 `synchronize`, `claim`, `retry`, and `deliver` action names through the same
 authenticated boundary. Workflow graphs have their own structured page with
 definition, transition, safety, review, activation, and rollback readback.
-Settings also exposes the scheduler switch, poll interval, and autonomous
-worker capacity. Applying those values updates the running server when a
-workflow-backed agent worker exists. Put the same values in `.env` to retain
-them after a restart.
+Settings also exposes validated project and workflow selection plus the
+scheduler switch, poll interval, and autonomous worker capacity. Applying
+those values updates the running server when a workflow-backed agent worker
+exists and persists them in the server state store. Credentials and checkout
+paths remain environment-owned.
 Production lifecycle buttons call the server autonomous-run endpoint. The
 guided demo is the only browser-local placeholder and is labeled in its
 buttons and status message. Recent activity includes the action reason,

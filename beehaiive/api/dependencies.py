@@ -160,6 +160,25 @@ def build_route_dependencies(
         ):
             raise HTTPException(status_code=403, detail="Repository is not authorized")
 
+    def require_dashboard_settings_mutation(
+        request: Request,
+        supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    ) -> None:
+        if supplied_api_key is None:
+            dashboard_marker = request.headers.get("X-BeeHAIve-Dashboard")
+            origin = request.headers.get("Origin")
+            expected_origin = str(request.base_url).rstrip("/")
+            fetch_site = request.headers.get("Sec-Fetch-Site")
+            if (
+                dashboard_marker != "1"
+                or (origin is None or origin.rstrip("/") != expected_origin)
+                or fetch_site not in {None, "same-origin", "same-site", "none"}
+            ):
+                require_api_key(None)
+            require_api_key(configured_api_key)
+            return
+        require_api_key(supplied_api_key)
+
     def require_workflow_access(
         supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
     ) -> None:
@@ -234,6 +253,7 @@ def build_route_dependencies(
         "require_api_key": require_api_key,
         "require_handoff_lease_token": require_handoff_lease_token,
         "require_mutation_access": require_mutation_access,
+        "require_dashboard_settings_mutation": require_dashboard_settings_mutation,
         "require_project_access": require_project_access,
         "require_refinement_operator": require_refinement_operator,
         "require_review_access": require_review_access,

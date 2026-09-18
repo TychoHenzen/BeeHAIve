@@ -10,7 +10,6 @@ import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 from beehaiive.provider import PROVIDER_REQUEST_TIMEOUT
 
@@ -1083,35 +1082,42 @@ def run_browser_smoke(
     set_input(devtools, "#settings-project-id", invalid_project)
     if not click_button(devtools, "Save and open mission control"):
         raise SmokeFailure("The dashboard did not render the Settings save action")
-    rejected_status = wait_for_status(
+    rejected_status = wait_until(
         devtools,
-        "Project is not authorized",
+        "(document.querySelector('#settings-feedback')?.textContent || '')"
+        ".includes('outside the configured allowlist')",
         "unallowlisted project rejection",
         timeout=refresh_timeout,
-    )
-    invalid_project_paths = (
-        f"/projects/{invalid_project}/dashboard",
-        f"/projects/{quote(invalid_project, safe='')}/dashboard",
     )
     rejection_response = next(
         (
             item
             for item in browser_fetches(devtools)
-            if item.get("method") == "GET"
+            if item.get("method") == "PUT"
             and item.get("status") == 403
-            and any(path in str(item.get("url", "")) for path in invalid_project_paths)
+            and "/dashboard/settings" in str(item.get("url", ""))
         ),
         None,
     )
     if rejection_response is None:
-        raise SmokeFailure(
-            "The unallowlisted dashboard request did not return HTTP 403"
-        )
+        raise SmokeFailure("The unallowlisted settings write did not return HTTP 403")
+    invalid_dashboard_get = next(
+        (
+            item
+            for item in browser_fetches(devtools)
+            if item.get("method") == "GET"
+            and "/projects/" in str(item.get("url", ""))
+            and "not-allowed%3A0" in str(item.get("url", ""))
+        ),
+        None,
+    )
+    if invalid_dashboard_get is not None:
+        raise SmokeFailure("The rejected settings write opened an invalid dashboard")
     if provider.discoveries != discoveries_before_rejection:
         raise SmokeFailure("The unallowlisted request reached the provider")
     report["unallowlisted_project"] = {
         "project_id": redact_project_id(invalid_project),
-        "ui": rejected_status,
+        "ui": {"message": str(rejected_status)},
         "provider_access": "blocked before provider discovery",
     }
 

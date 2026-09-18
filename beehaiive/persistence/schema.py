@@ -15,6 +15,12 @@ class StorageSchemaMixin:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS runtime_settings (
+                    key TEXT PRIMARY KEY,
+                    value_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS repositories (
                     project_id TEXT NOT NULL,
                     name TEXT NOT NULL,
