@@ -109,7 +109,7 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("The graph safety service and API must share one state store")
     if graph_safety_service is None:
         graph_safety_service = GraphSafetyService(orchestrator.store)
-    if owns_orchestrator:
+    if owns_orchestrator or not orchestrator.store.graph_workflow_ids():
         bootstrap_automation_workflow(orchestrator.store)
     persisted_settings = orchestrator.store.get_runtime_settings()
     environment_scheduler_config = SchedulerConfig.from_environment()

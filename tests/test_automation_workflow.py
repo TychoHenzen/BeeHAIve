@@ -13,6 +13,14 @@ from beehaiive.autonomous import (
     PlaceholderSkillExecutor,
     bootstrap_automation_workflow,
 )
+from beehaiive.graph import (
+    GraphDefinition,
+    GraphEdge,
+    GraphNode,
+    GraphNodeKind,
+    GraphReference,
+)
+from beehaiive.graph_safety import GraphSafetyService
 from beehaiive.orchestrator import Orchestrator
 from beehaiive.storage import OrchestratorStore
 from tests.conftest import FakeProvider
@@ -67,6 +75,19 @@ def test_application_startup_reuses_one_workflow_revision_after_reopen(
         assert active["revision"] == 1
     finally:
         second.close()
+
+
+def test_external_orchestrator_startup_bootstraps_the_workflow() -> None:
+    store = OrchestratorStore()
+    orchestrator = Orchestrator(store, FakeProvider(dashboard_snapshot()))
+
+    create_app(orchestrator=orchestrator)
+
+    try:
+        assert DEFAULT_AUTOMATION_WORKFLOW_ID in store.graph_workflow_ids()
+        assert store.active_graph_version(DEFAULT_AUTOMATION_WORKFLOW_ID) is not None
+    finally:
+        store.close()
 
 
 def test_dashboard_defaults_to_the_active_automation_workflow() -> None:
@@ -136,5 +157,98 @@ def test_autonomous_run_rejects_an_unavailable_workflow_before_claiming() -> Non
             item["kind"] == "autonomous_start"
             for item in store.actions_for_project("project-1")
         )
+    finally:
+        store.close()
+
+
+def test_permuted_active_workflow_drives_run_and_resume_order() -> None:
+    store = OrchestratorStore()
+    orchestrator = Orchestrator(store, FakeProvider(dashboard_snapshot()))
+    orchestrator.synchronize("project-1")
+    ordered_steps = (
+        AUTONOMOUS_STEPS[2],
+        AUTONOMOUS_STEPS[0],
+        AUTONOMOUS_STEPS[3],
+        AUTONOMOUS_STEPS[1],
+        AUTONOMOUS_STEPS[5],
+        AUTONOMOUS_STEPS[4],
+    )
+    definition = GraphDefinition(
+        "permuted-flow",
+        1,
+        tuple(
+            GraphNode(
+                step.name,
+                GraphNodeKind.SKILL,
+                GraphReference(f"skill/{step.name}"),
+            )
+            for step in ordered_steps
+        ),
+        tuple(
+            GraphEdge(source.name, target.name, "pass")
+            for source, target in zip(ordered_steps, ordered_steps[1:], strict=False)
+        ),
+    )
+    fixtures = {
+        "happy": {
+            node.node_id: {
+                "outcome": "pass",
+                "evidence": {},
+                "artifact_refs": [],
+                "question": None,
+                "required_action": None,
+                "validation_reason": None,
+                "answer": None,
+            }
+            for node in definition.nodes
+        }
+    }
+    safety = GraphSafetyService(store)
+    evaluation = safety.evaluate(definition, fixtures)
+    safety.review(evaluation, "operator")
+    safety.activate(evaluation, "operator")
+    service = AutonomousLifecycleService(orchestrator, PlaceholderSkillExecutor())
+
+    try:
+        started = service.start(
+            "project-1",
+            repository="owner/api",
+            pbi_number=1,
+            workflow_id="permuted-flow",
+        )
+        deadline = time.monotonic() + 3
+        current = service.status(str(started["run_id"]))
+        while current["status"] == "running" and time.monotonic() < deadline:
+            time.sleep(0.01)
+            current = service.status(str(started["run_id"]))
+        assert current["status"] == "completed"
+        assert [item["step"] for item in current["handoffs"]] == [
+            step.name for step in ordered_steps
+        ]
+
+        actions = [
+            {
+                "kind": "autonomous_start",
+                "status": "succeeded",
+                "repository": "owner/api",
+                "pbi_number": 1,
+                "request": {"workflow_id": "permuted-flow"},
+            },
+            {
+                "kind": "skill:submit-draft-pr",
+                "status": "succeeded",
+                "repository": "owner/api",
+                "pbi_number": 1,
+                "result": {"handover": {"branch": "codex/permuted"}},
+            },
+        ]
+        resume = AutonomousLifecycleService._resume_context(
+            actions,
+            "owner/api",
+            1,
+            tuple(step.name for step in ordered_steps),
+        )
+        assert resume["workflow_id"] == "permuted-flow"
+        assert resume["resume_step"] == "refine-backlog-item"
     finally:
         store.close()

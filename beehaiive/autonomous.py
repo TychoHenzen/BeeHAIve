@@ -590,6 +590,12 @@ def _candidate_sort_key(item: Mapping[str, object]) -> tuple[int, ...]:
 def _start_index(
     context: Mapping[str, object], steps: Sequence[SkillStep] = AUTONOMOUS_STEPS
 ) -> int:
+    def index_for(name: str, fallback: int) -> int:
+        return next(
+            (index for index, step in enumerate(steps) if step.name == name),
+            min(fallback, len(steps) - 1),
+        )
+
     requested_step = _text(context.get("resume_step")).casefold()
     if requested_step:
         for index, step in enumerate(steps):
@@ -600,12 +606,12 @@ def _start_index(
         return 0
     stage = _text(context.get("stage")).casefold()
     if stage in {"pull_request", "review"}:
-        return min(3, len(steps) - 1)
+        return index_for("review-pr-branch", 3)
     if stage == "merge":
-        return min(5, len(steps) - 1)
+        return index_for("complete-pr", 5)
     if stage == "implement" and context.get("branch"):
-        return min(2, len(steps) - 1)
-    return min(1, len(steps) - 1)
+        return index_for("submit-draft-pr", 2)
+    return index_for("next-ticket", 1)
 
 
 def _handover(value: object) -> dict[str, object]:
@@ -1122,6 +1128,23 @@ class AutonomousLifecycleService:
             )
             if selected is None:
                 raise ValueError("No eligible lifecycle PBI is available")
+            selected_number = selected.get("pbi_number")
+            if type(selected_number) is not int or selected_number <= 0:
+                raise ValueError("Selected PBI number is invalid")
+            resume_requested = (
+                pbi_number is not None
+                or (str(selected["repository"]), selected_number) in resumable
+            )
+            resume_context = (
+                self._resume_context(
+                    actions, str(selected["repository"]), selected_number
+                )
+                if resume_requested
+                else {}
+            )
+            resumed_workflow_id = resume_context.get("workflow_id")
+            if selected_workflow_id is None and isinstance(resumed_workflow_id, str):
+                selected_workflow_id = resumed_workflow_id
             workflow_step_names: tuple[str, ...] | None = None
             graph_store = cast(Any, self.orchestrator.store)
             if selected_workflow_id is None:
@@ -1135,9 +1158,6 @@ class AutonomousLifecycleService:
                     cast(GraphSafetyStore, graph_store), selected_workflow_id
                 )
                 workflow_step_names = _workflow_step_names(workflow_definition)
-            selected_number = selected.get("pbi_number")
-            if type(selected_number) is not int or selected_number <= 0:
-                raise ValueError("Selected PBI number is invalid")
             active_repository = str(selected["repository"])
             if active_repository in self._active_repositories:
                 raise ValueError("An autonomous lifecycle is already running")
@@ -1158,19 +1178,13 @@ class AutonomousLifecycleService:
                     else {}
                 ),
             }
-            if (
-                pbi_number is not None
-                or (
-                    str(selected["repository"]),
-                    selected_number,
-                )
-                in resumable
-            ):
+            if resume_requested:
                 context.update(
                     self._resume_context(
                         actions,
                         str(selected["repository"]),
                         selected_number,
+                        workflow_step_names,
                     )
                 )
             action_request: dict[str, object] = {
@@ -1423,15 +1437,32 @@ class AutonomousLifecycleService:
 
     @staticmethod
     def _resume_context(
-        actions: Sequence[Mapping[str, object]], repository: str, pbi_number: int
+        actions: Sequence[Mapping[str, object]],
+        repository: str,
+        pbi_number: int,
+        step_names: Sequence[str] | None = None,
     ) -> dict[str, object]:
-        step_names = [step.name for step in AUTONOMOUS_STEPS]
+        step_names = tuple(step_names or (step.name for step in AUTONOMOUS_STEPS))
         scoped_actions = [
             action
             for action in actions
             if action.get("repository") == repository
             and action.get("pbi_number") == pbi_number
         ]
+        workflow_id = next(
+            (
+                _mapping(action.get("request")).get("workflow_id")
+                for action in scoped_actions
+                if action.get("kind") == "autonomous_start"
+                and isinstance(_mapping(action.get("request")).get("workflow_id"), str)
+            ),
+            None,
+        )
+        workflow_context = (
+            {"workflow_id": workflow_id}
+            if isinstance(workflow_id, str) and workflow_id
+            else {}
+        )
         requeue_index = next(
             (
                 index
@@ -1459,6 +1490,7 @@ class AutonomousLifecycleService:
                 "reviewAttempted": True,
                 "review_attempted": True,
                 "resume_existing_workspace": True,
+                **workflow_context,
             }
             checkpoint: Mapping[str, object] = next(
                 (
@@ -1499,6 +1531,7 @@ class AutonomousLifecycleService:
                 "resume_existing_workspace": True,
                 "workspace_branch": branch,
                 "branch": branch,
+                **workflow_context,
             }
             workspace_path = checkpoint.get("workspace_path")
             if isinstance(workspace_path, str) and workspace_path:
@@ -1578,6 +1611,7 @@ class AutonomousLifecycleService:
             resume: dict[str, object] = {
                 "resume_step": step_names[next_index],
                 "resume_existing_workspace": True,
+                **workflow_context,
             }
             for key in ("branch", "pr", "pull_request", "head", "head_commit"):
                 value = handover.get(key)
@@ -2227,6 +2261,7 @@ class AutonomousLifecycleService:
             )
         with self._lock:
             self._workspaces[run_id] = lease
+        workflow_steps = _workflow_steps(context)
         self.orchestrator.store.finish_action(
             action_id,
             "uncertain",
@@ -2235,7 +2270,9 @@ class AutonomousLifecycleService:
                 "workspace_path": str(lease.worktree_path),
                 "workspace_lease_id": lease.lease_id,
                 "workspace_lease_token": lease.lease_token,
-                "resume_step": AUTONOMOUS_STEPS[_start_index(context)].name,
+                "resume_step": workflow_steps[
+                    _start_index(context, workflow_steps)
+                ].name,
                 "resume_existing_workspace": True,
             },
         )
