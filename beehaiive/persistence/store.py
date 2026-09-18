@@ -35,6 +35,7 @@ from .row_mapping import RowMappingMixin
 from .run_completion import RunCompletionMixin
 from .run_failure import RunFailureMixin
 from .run_transition import RunTransitionMixin
+from .runtime_settings import RuntimeSettingsMixin
 from .schema import StorageSchemaMixin
 from .task_contract import TaskContractMixin
 
@@ -48,6 +49,7 @@ class OrchestratorStore(
     ProjectSyncMixin,
     ProjectClaimMixin,
     RunTransitionMixin,
+    RuntimeSettingsMixin,
     HandoffRecordMixin,
     LeaseStoreMixin,
     ExecutionLeaseMixin,

@@ -96,7 +96,36 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("The graph safety service and API must share one state store")
     if graph_safety_service is None:
         graph_safety_service = GraphSafetyService(orchestrator.store)
-    scheduler_config = SchedulerConfig.from_environment()
+    persisted_settings = orchestrator.store.get_runtime_settings()
+    environment_scheduler_config = SchedulerConfig.from_environment()
+    persisted_scheduler = persisted_settings.get("scheduler")
+    if isinstance(persisted_scheduler, dict):
+        persisted_scheduler = cast(dict[str, object], persisted_scheduler)
+        enabled = persisted_scheduler.get("enabled")
+        poll_interval = persisted_scheduler.get("poll_interval_seconds")
+        max_concurrency = persisted_scheduler.get("max_concurrency")
+        try:
+            scheduler_config = SchedulerConfig(
+                enabled=(
+                    enabled
+                    if type(enabled) is bool
+                    else environment_scheduler_config.enabled
+                ),
+                poll_interval_seconds=(
+                    float(poll_interval)
+                    if isinstance(poll_interval, (int, float))
+                    else environment_scheduler_config.poll_interval_seconds
+                ),
+                max_concurrency=(
+                    max_concurrency
+                    if type(max_concurrency) is int
+                    else environment_scheduler_config.max_concurrency
+                ),
+            )
+        except (TypeError, ValueError):
+            scheduler_config = environment_scheduler_config
+    else:
+        scheduler_config = environment_scheduler_config
     if autonomous_service is None:
         autonomous_service = AutonomousLifecycleService(
             orchestrator,
@@ -217,7 +246,20 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
             cast(SelectedRepairAgent, effective_executor),
         )
 
-    configured_projects = _configured_project_ids(allowed_project_ids)
+    configured_projects = set(_configured_project_ids(allowed_project_ids))
+    persisted_projects = persisted_settings.get("projects")
+    if allowed_project_ids is None and isinstance(persisted_projects, list):
+        persisted_projects = cast(list[object], persisted_projects)
+        valid_projects = {
+            value.strip()
+            for value in persisted_projects
+            if isinstance(value, str)
+            and value.count(":") == 1
+            and value.rsplit(":", 1)[1].isdigit()
+            and value.strip()
+        }
+        if valid_projects:
+            configured_projects = valid_projects
     recover_pending = getattr(autonomous_service, "recover_pending", None)
     if callable(recover_pending):
         recover_pending(configured_projects)
@@ -267,6 +309,7 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
         "review_repair_service": review_repair_service,
         "review_operations_enabled": review_operations_enabled,
         "configured_projects": configured_projects,
+        "runtime_settings": persisted_settings,
         "scheduler_config": scheduler_config,
         "scheduler": scheduler,
         "workflow_service": workflow_service,
