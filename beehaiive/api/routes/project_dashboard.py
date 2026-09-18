@@ -233,6 +233,15 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
             )
             status = cast(dict[str, object], scheduler.status_for(project_id) or {})
             result: dict[str, object] = {"scheduler": status}
+            orchestrator.store.update_runtime_settings(
+                {
+                    "scheduler": {
+                        "enabled": request.enabled,
+                        "poll_interval_seconds": request.poll_interval_seconds,
+                        "max_concurrency": request.max_concurrency,
+                    }
+                }
+            )
             completed = orchestrator.store.finish_action(
                 str(action["id"]), "succeeded", result
             )

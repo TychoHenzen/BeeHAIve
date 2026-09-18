@@ -32,6 +32,9 @@ from .dashboard_requeue_request import (
     DashboardRequeueRequest as DashboardRequeueRequest,
 )
 from .dashboard_retry_request import DashboardRetryRequest as DashboardRetryRequest
+from .dashboard_settings_request import (
+    DashboardSettingsRequest as DashboardSettingsRequest,
+)
 from .dashboard_start_request import DashboardStartRequest as DashboardStartRequest
 from .dashboard_stop_request import DashboardStopRequest as DashboardStopRequest
 from .dashboard_synchronize_request import (
@@ -131,6 +134,7 @@ __all__ = [
     "DashboardRetryRequest",
     "DashboardRequeueRequest",
     "DashboardStartRequest",
+    "DashboardSettingsRequest",
     "DashboardStopRequest",
     "DashboardSynchronizeRequest",
     "FailureRequest",

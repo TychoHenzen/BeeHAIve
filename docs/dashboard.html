@@ -414,7 +414,7 @@
                 <h3>Workspace</h3>
                 <div class="field"><label for="settings-project-id">Project ID</label><input id="settings-project-id" autocomplete="off" placeholder="owner:123"></div>
                 <div class="field"><label for="settings-workflow-id">Workflow</label><select id="settings-workflow-id"><option value="">No workflow selected</option></select></div>
-                <p class="settings-note">These values select the live read model. They are not repeated on every action.</p>
+                <p class="settings-note">Validated project and workflow settings persist in the server state store. Secrets never enter browser or runtime settings.</p>
                 <div class="settings-actions"><button id="settings-save" class="primary" type="submit">Save and open mission control</button></div>
                 <p id="settings-feedback" class="settings-status" role="status" aria-live="polite"></p>
               </section>
@@ -430,7 +430,7 @@
                 <div class="field"><label for="settings-scheduler-enabled">Polling</label><select id="settings-scheduler-enabled"><option value="false">Off</option><option value="true">On</option></select></div>
                 <div class="field"><label for="settings-max-workers">Worker capacity</label><input id="settings-max-workers" type="number" min="1" max="64" step="1" inputmode="numeric" value="1"></div>
                 <div class="field"><label for="settings-poll-interval">Poll interval (seconds)</label><input id="settings-poll-interval" type="number" min="1" step="1" inputmode="decimal" value="600"></div>
-                <p class="settings-note">Each worker runs one PBI lifecycle at a time. Apply changes to this server process. Set the same values in `.env` to keep them after restart.</p>
+                <p class="settings-note">Each worker runs one PBI lifecycle at a time. Validated scheduler settings persist in the server state store.</p>
                 <div class="settings-actions"><button id="scheduler-save" class="primary" type="button" data-testid="scheduler-configure">Apply scheduler settings</button></div>
                 <p id="scheduler-feedback" class="settings-status" role="status" aria-live="polite"></p>
               </section>
