@@ -110,3 +110,34 @@ def test_worker_manager_enforces_shared_concurrency_limit(
         workflow_store.close()
         store.close()
         routing_store.close()
+
+
+def test_worker_manager_registers_and_heartbeats_configured_host(
+    tmp_path: Path,
+) -> None:
+    repository = make_git_repository(tmp_path / "repository")
+    executor = ImmediateExecutor(
+        ModelExecution(AttemptOutcome.SUCCESS, result="unused"), repository
+    )
+    service, store, routing_store, _run = service_with_run(executor)
+    workflow_service, workflow_store = workflow_service_for(tmp_path, repository)
+    manager = AgentWorkerManager(
+        service,
+        executor,
+        workflow_service,
+        host_id="configured-host",
+        worker_slots=2,
+        capabilities=("codex", "python"),
+        heartbeat_seconds=0.01,
+        stale_seconds=0.03,
+    )
+    try:
+        assert store.worker_host_for_id("configured-host")["liveness"] == "active"
+        time.sleep(0.03)
+        assert store.worker_host_for_id("configured-host")["liveness"] == "active"
+        assert store.worker_host_for_id("configured-host")["worker_slots"] == 2
+    finally:
+        manager.shutdown()
+        workflow_store.close()
+        store.close()
+        routing_store.close()

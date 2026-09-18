@@ -38,6 +38,7 @@ from .run_transition import RunTransitionMixin
 from .runtime_settings import RuntimeSettingsMixin
 from .schema import StorageSchemaMixin
 from .task_contract import TaskContractMixin
+from .worker_hosts import WorkerHostsMixin
 
 
 class OrchestratorStore(
@@ -73,6 +74,7 @@ class OrchestratorStore(
     MetaReviewMixin,
     ProjectReadMixin,
     RowMappingMixin,
+    WorkerHostsMixin,
 ):
     def __init__(
         self, database: str | Path = ":memory:", lease_seconds: int = 300

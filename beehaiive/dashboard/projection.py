@@ -85,6 +85,7 @@ def build_dashboard_state(
         "name": state.get("name"),
         "updated_at": state.get("updated_at"),
         "event_limit": state.get("event_limit"),
+        "worker_hosts": [dict(host) for host in mappings(state.get("worker_hosts"))],
         "counts": {
             "projects": 1,
             "repositories": len(repositories),

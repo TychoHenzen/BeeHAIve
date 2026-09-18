@@ -4,12 +4,16 @@ import os
 from collections.abc import Callable, Collection
 from contextlib import suppress
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from beehaiive.models import RunState, RunStatus
-from beehaiive.storage import StoreError
+from beehaiive.storage import (
+    DEFAULT_WORKER_HOST_HEARTBEAT_SECONDS,
+    DEFAULT_WORKER_HOST_STALE_SECONDS,
+    StoreError,
+)
 from beehaiive.workflow import WorkflowError, WorkflowService, WorkspaceLease
 
 from .errors import WorkerCapacityError as WorkerCapacityError
@@ -27,6 +31,12 @@ class WorkerCapacityMixin:
         orchestrator: Orchestrator,
         executor: CancellableModelExecutor,
         workflow_service: WorkflowService | None = None,
+        *,
+        host_id: str | None = None,
+        worker_slots: int | None = None,
+        capabilities: Collection[str] = (),
+        heartbeat_seconds: float = DEFAULT_WORKER_HOST_HEARTBEAT_SECONDS,
+        stale_seconds: float = DEFAULT_WORKER_HOST_STALE_SECONDS,
     ) -> None:
         self.orchestrator = orchestrator
         self.executor = executor
@@ -40,9 +50,57 @@ class WorkerCapacityMixin:
         self._worker_delivery_runs: set[str] = set()
         self._delivery_lock = Lock()
         self._worker_id = f"{os.getpid()}:{uuid4().hex}"
+        self._host_id = (
+            host_id or os.environ.get("BEEHAIIVE_WORKER_HOST_ID", "")
+        ).strip()
+        if worker_slots is None:
+            raw_slots = os.environ.get("BEEHAIIVE_WORKER_SLOTS", "1").strip()
+            try:
+                worker_slots = int(raw_slots)
+            except ValueError as exc:
+                raise StoreError("BEEHAIIVE_WORKER_SLOTS must be an integer") from exc
+        self._host_worker_slots = worker_slots
+        self._host_capabilities = tuple(capabilities)
+        self._host_heartbeat_seconds = heartbeat_seconds
+        self._host_stale_seconds = stale_seconds
+        self._host_heartbeat_stop = Event()
+        self._host_heartbeat_thread: Thread | None = None
+        if self._host_id:
+            if heartbeat_seconds <= 0 or stale_seconds <= heartbeat_seconds:
+                raise StoreError(
+                    "Worker stale threshold must exceed heartbeat interval"
+                )
+            self.orchestrator.store.register_worker_host(
+                self._host_id,
+                self._host_worker_slots,
+                self._host_capabilities,
+                "registered",
+            )
+            self._host_heartbeat_thread = Thread(
+                target=self._heartbeat_host,
+                name=f"beehaiive-host-{self._host_id[:24]}",
+                daemon=True,
+            )
+            self._host_heartbeat_thread.start()
         register = getattr(orchestrator, "register_worker_canceller", None)
         if callable(register):
             register(self.cancel)
+
+    def _heartbeat_host(self: Any) -> None:
+        while not self._host_heartbeat_stop.wait(self._host_heartbeat_seconds):
+            try:
+                self.orchestrator.store.heartbeat_worker_host(
+                    self._host_id, "heartbeat"
+                )
+            except Exception:
+                return
+
+    def _stop_host_heartbeat(self: Any) -> None:
+        self._host_heartbeat_stop.set()
+        thread = self._host_heartbeat_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(self._host_heartbeat_seconds, 1.0))
+        self._host_heartbeat_thread = None
 
     @property
     def active_worker_count(self: Any) -> int:
