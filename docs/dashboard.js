@@ -53,6 +53,7 @@ let initialWorkflow = params.get("workflow_id") || (demo ? "demo-flow" : "");
 settingsWorkflowInput.value = initialWorkflow;
 let archivedMode = params.get("archived") === "true";
 let schedulerSettingsDirty = false;
+let configuredProjects = [];
 
 function setConnectionState(state, label) {
   if (!connectionState) return;
@@ -154,7 +155,7 @@ function setIdeaProjects(projects) {
     option.disabled = true;
     option.selected = true;
     ideaProjectInput.append(option);
-    return;
+    return values;
   }
   values.forEach((project) => {
     const option = document.createElement("option");
@@ -164,6 +165,7 @@ function setIdeaProjects(projects) {
     ideaProjectInput.append(option);
   });
   if (!values.includes(current)) ideaProjectInput.value = values[0];
+  return values;
 }
 
 async function loadIdeaProjects() {
@@ -175,7 +177,8 @@ async function loadIdeaProjects() {
     const response = await fetch("/dashboard/config", { cache: "no-store" });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.detail || "Request failed (" + response.status + ")");
-    setIdeaProjects(payload.projects);
+    configuredProjects = setIdeaProjects(payload.projects);
+    ui.setProjects(configuredProjects);
   } catch (error) {
     setIdeaProjects(settingsProjectInput.value.trim() ? [settingsProjectInput.value.trim()] : []);
     setIdeaFeedback("Project list unavailable: " + error.message, "failure");
@@ -224,6 +227,11 @@ const ui = createDashboardUi({
   detailsPane: document.querySelector("#details-pane"),
   detailsOutput: document.querySelector("#details-output"),
   runAutonomous: (payload) => client.runAutonomous(payload),
+  onProjectSelect: (project) => {
+    settingsProjectInput.value = project;
+    updateUrl(project, settingsWorkflowInput.value.trim(), demo);
+    void client.refresh();
+  },
   onQueueArchive: (archived) => {
     archivedMode = archived;
     const project = settingsProjectInput.value.trim();
@@ -255,7 +263,13 @@ function setPage(page, updateHash = true) {
 function handleState(state) {
   showApp();
   const project = state.project_id || settingsProjectInput.value.trim();
-  setIdeaProjects([...(state.available_projects || []), project]);
+  const projects = [...new Set([
+    ...configuredProjects,
+    ...(state.available_projects || []),
+    ...(state.projects || []),
+    ...(configuredProjects.length ? [] : [project]),
+  ].filter((value) => typeof value === "string" && value.trim()))];
+  configuredProjects = setIdeaProjects(projects);
   projectContext.textContent = state.name ? `${state.name} · ${project}` : project || "No project selected";
   const scheduler = state.scheduler;
   if (scheduler && !schedulerSettingsDirty) {
@@ -263,7 +277,7 @@ function handleState(state) {
     settingsMaxWorkers.value = String(scheduler.max_concurrency || 1);
     settingsPollInterval.value = String(scheduler.poll_interval_seconds || 600);
   }
-  ui.render(state);
+  ui.render({ ...state, projects });
   if (initialWorkflow && settingsWorkflowInput.value === initialWorkflow) initialWorkflow = "";
 }
 

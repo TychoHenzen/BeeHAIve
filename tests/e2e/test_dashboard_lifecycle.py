@@ -830,6 +830,60 @@ def test_real_mode_wires_autonomous_lifecycle_endpoint(dashboard_page) -> None:
 
 
 @pytest.mark.e2e
+def test_real_mode_switches_between_allowlisted_projects(dashboard_page) -> None:
+    page, base_url = dashboard_page
+    states = {
+        "owner:1": {
+            "project_id": "owner:1",
+            "name": "First project",
+            "updated_at": "now",
+            "repositories": [],
+            "actions": [],
+        },
+        "owner:2": {
+            "project_id": "owner:2",
+            "name": "Second project",
+            "updated_at": "now",
+            "repositories": [],
+            "actions": [],
+        },
+    }
+    dashboard_requests: list[str] = []
+
+    page.route(
+        "**/dashboard/config",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"projects": ["owner:1", "owner:2"]}),
+        ),
+    )
+
+    def api(route) -> None:
+        project = next(
+            project_id
+            for project_id in states
+            if f"/projects/{project_id.replace(':', '%3A')}/" in route.request.url
+            or f"/projects/{project_id}/" in route.request.url
+        )
+        dashboard_requests.append(project)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(states[project]),
+        )
+
+    page.route("**/projects/**", api)
+    page.goto(f"{base_url}/dashboard?project=owner:1")
+    expect(page.get_by_role("button", name="owner:1", exact=True)).to_be_visible()
+    expect(page.get_by_role("button", name="owner:2", exact=True)).to_be_visible()
+
+    page.get_by_role("button", name="owner:2", exact=True).click()
+    expect(page.locator("#project-context")).to_contain_text("owner:2")
+    assert "owner:2" in dashboard_requests
+
+
+@pytest.mark.e2e
 def test_guided_demo_can_stop_and_retry_work(dashboard_page) -> None:
     page, base_url = dashboard_page
     page.goto(f"{base_url}/dashboard?demo=true")
