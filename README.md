@@ -124,19 +124,25 @@ lifecycle. Demo actions stay in the browser and make no external changes.
 
 ## Autonomous lifecycle
 
-Select **Run lifecycle on server** on a claimable PBI. BeeHAIve starts one
-server-side background run and hands the PBI through `refine-backlog-item`, `next-ticket`, published
-`submit-draft-pr`, `review-pr-branch`, `fix-pr-review`, and `complete-pr`.
-Each skill runs in its own Codex context and receives the previous handover.
-Set `BEEHAIIVE_AUTONOMOUS_MODE=placeholder` for the deterministic browser
-proof. The default `codex` mode invokes the named local skill files. The
-guided demo is the only browser-local placeholder path and is labeled as such.
+Select **Run lifecycle on server** for a claimable PBI. BeeHAIve starts one
+server-side background run. In production `codex` mode, that run invokes the
+real lifecycle runner through the ordered stages `refine-backlog-item`,
+`next-ticket`, published `submit-draft-pr`, `review-pr-branch`,
+`fix-pr-review`, and `complete-pr`. Each stage runs in its own Codex context
+and receives the previous stage's JSON handover.
 
-The scheduler applies the configured worker capacity to autonomous runs and
-does not start a second lifecycle for the same project. Handover evidence is
-retained in the action log and appears in the run inspector. The advisor runs
-once for a blocker, and the run pauses for operator-directed resolution rather
-than guessing how to apply advice.
+The runner confines execution to the server-assigned unique leased worktree
+and branch. The run inspector and action log retain the stage handoffs,
+outcomes, commit, push, and blocker evidence for the run. The scheduler
+applies the configured worker capacity and does not start a second lifecycle
+for the same project.
+
+Set `BEEHAIIVE_AUTONOMOUS_MODE=placeholder` for deterministic browser proof.
+The default `codex` mode invokes the named local skill files. The guided demo
+is the browser-local placeholder path: it does not invoke the production
+runner or make external changes. This documentation covers the configured
+single-run lifecycle only; autonomous swarms and multi-device coordination
+are not supported claims.
 
 The Queue view separates Refinement, Implementation, Publish, Review, Repair,
 Completion, Blocked, and Completed work. The server assigns each PBI one queue
