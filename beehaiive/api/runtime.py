@@ -8,6 +8,7 @@ from beehaiive.agent import (
     CancellableModelExecutor,
     CodexExecModelExecutor,
 )
+from beehaiive.agent_stations import AgentStationService
 from beehaiive.api.helpers.configuration import (
     _configured_project_ids as _configured_project_ids,
 )
@@ -62,6 +63,7 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
     unit_world: UnitWorld | None = options.get("unit_world")
     building_signal_service = options.get("building_signal_service")
     building_signal_world = options.get("building_signal_world")
+    agent_station_service = options.get("agent_station_service")
     owns_orchestrator = orchestrator is None
     if orchestrator is not None and orchestrator.model_router is not None:
         if model_router is not None and model_router is not orchestrator.model_router:
@@ -142,6 +144,10 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "The building signal service and API must share one state store"
         )
+    if agent_station_service is None:
+        agent_station_service = AgentStationService(orchestrator.store)
+    elif agent_station_service.store is not orchestrator.store:
+        raise ValueError("The agent station service and API must share one state store")
     if owns_orchestrator or not orchestrator.store.graph_workflow_ids():
         bootstrap_automation_workflow(orchestrator.store)
     persisted_settings = orchestrator.store.get_runtime_settings()
@@ -385,6 +391,7 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
         "graph_safety_service": graph_safety_service,
         "behavior_service": behavior_service,
         "building_signal_service": building_signal_service,
+        "agent_station_service": agent_station_service,
         "autonomous_service": autonomous_service,
         "require_review_adapters": require_review_adapters,
     }
