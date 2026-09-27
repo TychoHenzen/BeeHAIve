@@ -892,6 +892,46 @@ def test_fresh_runtime_bootstraps_and_runs_the_live_workflow(
 
 
 @pytest.mark.e2e
+def test_live_dashboard_exposes_work_done_by_the_server_executor(
+    live_dashboard_page,
+) -> None:
+    page, base_url = live_dashboard_page
+    page.goto(f"{base_url}/dashboard?project=project-1")
+    item = work_item(page, "API one")
+    item.get_by_test_id("run-lifecycle").click()
+    page.get_by_role("button", name="Evidence log", exact=True).click()
+    expect(page.locator("#activity-output")).to_contain_text(
+        "Recorded work product", timeout=10_000
+    )
+
+
+@pytest.mark.e2e
+def test_live_dashboard_settings_use_same_origin_and_persist(
+    live_dashboard_page,
+) -> None:
+    page, base_url = live_dashboard_page
+    page.goto(f"{base_url}/dashboard?project=project-1#settings")
+    expect(page.locator("#settings-project-id")).to_have_value("project-1")
+    page.locator("#settings-workflow-id").select_option("automation-swarm")
+    with page.expect_response(
+        lambda response: response.url.endswith("/dashboard/settings")
+        and response.request.method == "PUT"
+    ) as settings_response:
+        page.get_by_role(
+            "button", name="Save and open mission control", exact=True
+        ).click()
+    response = settings_response.value
+    assert response.status == 200
+    assert "x-api-key" not in response.request.headers
+    expect(page.locator("#settings-feedback")).to_contain_text(
+        "Saved for this dashboard URL."
+    )
+    page.reload()
+    expect(page.locator("#settings-project-id")).to_have_value("project-1")
+    expect(page.locator("#settings-workflow-id")).to_have_value("automation-swarm")
+
+
+@pytest.mark.e2e
 def test_real_mode_wires_autonomous_lifecycle_endpoint(dashboard_page) -> None:
     page, base_url = dashboard_page
     state = {

@@ -107,6 +107,38 @@ def test_dashboard_requeue_makes_a_blocked_autonomous_pbi_claimable() -> None:
     service.store.close()
 
 
+def test_dashboard_requeue_makes_a_failed_manual_run_claimable() -> None:
+    service = Orchestrator(OrchestratorStore(), FakeProvider(dashboard_snapshot()))
+    service.synchronize("project-1")
+    run = service.claim("project-1", "owner/api", "worker")
+    assert run is not None
+    service.stop(run.run_id, "Stopped by operator")
+    client = TestClient(
+        main_module.create_app(
+            orchestrator=service,
+            api_key="test-key",
+            allowed_project_ids={"project-1"},
+        )
+    )
+
+    response = client.post(
+        "/projects/project-1/actions",
+        headers={"X-API-Key": "test-key"},
+        json={
+            "action": "requeue",
+            "approved": True,
+            "repository": "owner/api",
+            "pbi_number": 1,
+            "run_id": run.run_id,
+        },
+    )
+
+    assert response.status_code == 200
+    pbi = response.json()["state"]["repositories"][0]["pbis"][0]
+    assert pbi["claimable"] is True
+    service.store.close()
+
+
 def test_dashboard_requeue_survives_provider_refresh_and_action_history_limit() -> None:
     provider = FakeProvider(dashboard_snapshot())
     service = Orchestrator(OrchestratorStore(), provider)
