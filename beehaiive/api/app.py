@@ -14,6 +14,9 @@ from beehaiive.api.routes.autonomous import (
     register_routes as register_autonomous_routes,
 )
 from beehaiive.api.routes.behaviors import register_routes as register_behavior_routes
+from beehaiive.api.routes.building_signals import (
+    register_routes as register_building_signal_routes,
+)
 from beehaiive.api.routes.graph_safety import (
     register_routes as register_graph_safety_routes,
 )
@@ -33,6 +36,8 @@ from beehaiive.api.routes.workflow import register_routes as register_workflow_r
 from beehaiive.api.runtime import build_api_runtime
 from beehaiive.autonomous import AutonomousLifecycleService
 from beehaiive.behavior_service import BehaviorService, UnitWorld
+from beehaiive.building_signal import BuildingSignalWorld
+from beehaiive.building_signal_service import BuildingSignalService
 from beehaiive.conflict_repair import ConflictRepairService
 from beehaiive.graph_safety import GraphSafetyService
 from beehaiive.meta_review import MetaReviewService
@@ -74,6 +79,8 @@ def create_app(
     autonomous_service: AutonomousLifecycleService | None = None,
     behavior_service: BehaviorService | None = None,
     unit_world: UnitWorld | None = None,
+    building_signal_service: BuildingSignalService | None = None,
+    building_signal_world: BuildingSignalWorld | None = None,
 ) -> FastAPI:
     runtime_options: dict[str, Any] = {
         "agent_worker": agent_worker,
@@ -97,6 +104,8 @@ def create_app(
         "autonomous_service": autonomous_service,
         "behavior_service": behavior_service,
         "unit_world": unit_world,
+        "building_signal_service": building_signal_service,
+        "building_signal_world": building_signal_world,
     }
     runtime = build_api_runtime(runtime_options)
     app = FastAPI(title="BeeHAIve")
@@ -108,6 +117,7 @@ def create_app(
     route_context = runtime | dependencies
     register_autonomous_routes(app, route_context)
     register_behavior_routes(app, route_context)
+    register_building_signal_routes(app, route_context)
     register_reviews_routes(app, route_context)
     register_workflow_routes(app, route_context)
     register_graph_safety_routes(app, route_context)

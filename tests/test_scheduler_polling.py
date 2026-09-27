@@ -146,3 +146,15 @@ def test_poll_handles_empty_projects_and_unclaimable_repositories() -> None:
     assert status is not None
     assert status["last_error"] is None
     assert status["last_started_run_ids"] == []
+
+
+def test_poll_evaluates_building_signals_on_the_existing_cadence() -> None:
+    states = {"project": {"repositories": []}}
+    scheduler, _orchestrator, _worker = _scheduler(states)
+    evaluations: list[tuple[str, ...]] = []
+    scheduler.building_signal_poll = lambda projects: evaluations.append(
+        tuple(projects)
+    )
+
+    assert scheduler.poll_once() == ()
+    assert evaluations == [("project",)]

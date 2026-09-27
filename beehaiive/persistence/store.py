@@ -10,6 +10,7 @@ from .actions import ActionsMixin
 from .admission import AdmissionMixin
 from .agent_sessions import AgentSessionsMixin
 from .budget_evidence import BudgetEvidenceMixin
+from .building_signals import BuildingSignalMixin
 from .canonical_lifecycle import CanonicalLifecycleMixin
 from .execution_lease import ExecutionLeaseMixin
 from .graph_definitions import GraphDefinitionMixin
@@ -73,6 +74,7 @@ class OrchestratorStore(
     GraphSafetyMixin,
     GraphTransitionMixin,
     BudgetEvidenceMixin,
+    BuildingSignalMixin,
     CanonicalLifecycleMixin,
     MetaReviewMixin,
     ProjectReadMixin,

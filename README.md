@@ -123,6 +123,8 @@ Use `/dashboard?demo=true` on that same origin for the guided placeholder
 lifecycle. Demo actions stay in the browser and make no external changes.
 Use `/dashboard?project=<owner>:<number>` on the same origin to open mission
 control for the configured Project.
+Use `/building-signal-design?project=<owner>:<number>` to define, review,
+confirm, assign, and read back one bounded inventory signal rule.
 
 ## Autonomous lifecycle
 
