@@ -17,7 +17,7 @@ from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, expect, sync_playwright
 
 from beehaiive.api.app import create_app
-from beehaiive.autonomous import AutonomousLifecycleService, PlaceholderSkillExecutor
+from beehaiive.autonomous import AutonomousLifecycleService, SkillStep
 from beehaiive.orchestrator import Orchestrator
 from beehaiive.storage import OrchestratorStore
 from tests.conftest import FakeProvider
@@ -53,6 +53,31 @@ def browser_executable() -> str | None:
         "/usr/bin/chromium",
     ]
     return next((path for path in candidates if path and Path(path).is_file()), None)
+
+
+class RecordingLifecycleExecutor:
+    def __init__(self, work_directory: Path) -> None:
+        self.work_directory = work_directory
+
+    def execute(
+        self,
+        step: SkillStep,
+        _context: dict[str, object],
+        handover: dict[str, object],
+    ) -> dict[str, object]:
+        self.work_directory.mkdir(parents=True, exist_ok=True)
+        (self.work_directory / f"{step.name}.done").write_text(
+            "dashboard lifecycle work", encoding="utf-8"
+        )
+        return {
+            "status": "succeeded",
+            "summary": f"Recorded work product for {step.name}.",
+            "handover": {
+                **handover,
+                "completed_skill": step.name,
+                "next_skill": "complete",
+            },
+        }
 
 
 @pytest.fixture
@@ -104,8 +129,9 @@ def live_dashboard_page(tmp_path) -> Iterator[tuple[Page, str]]:
             api_key="test-key",
             allowed_project_ids={"project-1"},
             autonomous_service=AutonomousLifecycleService(
-                orchestrator, PlaceholderSkillExecutor()
+                orchestrator, RecordingLifecycleExecutor(tmp_path / "work-products")
             ),
+            workflow_actor="operator",
         )
         server = uvicorn.Server(
             uvicorn.Config(
@@ -679,10 +705,68 @@ def test_agents_exposes_retry_for_blocked_autonomous_work(dashboard_page) -> Non
     item = work_item(page, "Blocked autonomous work")
     expect(item.get_by_test_id("requeue-work")).to_have_attribute(
         "title",
-        "Put this blocked PBI back into the claimable queue without starting work.",
+        "Resolve the blocked run and put this PBI back into the retryable queue.",
     )
     item.get_by_test_id("requeue-work").click()
     expect(item.get_by_test_id("start-work")).to_be_visible()
+
+
+@pytest.mark.e2e
+def test_failed_manual_work_exposes_resolve_and_retry_controls(dashboard_page) -> None:
+    page, base_url = dashboard_page
+    state = {
+        "project_id": "owner:1",
+        "name": "Server project",
+        "updated_at": "now",
+        "counts": {},
+        "repositories": [
+            {
+                "name": "owner/app",
+                "active": True,
+                "writer": {"status": "idle"},
+                "pbis": [
+                    {
+                        "number": 1,
+                        "title": "Failed manual work",
+                        "status": "failed",
+                        "run_id": "run-1",
+                        "claimable": False,
+                        "active": True,
+                    }
+                ],
+            }
+        ],
+        "actions": [],
+    }
+
+    def api(route) -> None:
+        if route.request.method == "POST":
+            pbi = state["repositories"][0]["pbis"][0]
+            pbi["claimable"] = True
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps(
+                    {
+                        "action": {"kind": "requeue", "status": "succeeded"},
+                        "result": {"pbi": {"claimable": True}},
+                        "state": state,
+                    }
+                ),
+            )
+            return
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(state),
+        )
+
+    page.route("**/projects/**", api)
+    page.goto(f"{base_url}/dashboard?project=owner:1")
+    item = work_item(page, "Failed manual work")
+    expect(item.get_by_test_id("resolve-block")).to_be_visible()
+    item.get_by_test_id("resolve-block").click()
+    expect(item.get_by_test_id("retry-work")).to_be_visible()
 
 
 @pytest.mark.e2e

@@ -137,6 +137,7 @@ function stageLabel(pbi) {
 }
 
 function isCompleted(pbi) {
+  if (pbi.status === "idle" && pbi.claimable === true && !pbi.run_id) return false;
   return pbi.status === "completed"
     || pbi.archived === true
     || TERMINAL_PLANNING_STATUSES.has(String(pbi.planning_status || "").toLowerCase());
@@ -217,13 +218,21 @@ function actionSpec(item, demo) {
   const identity = { repository, pbi_number: pbi.number, run_id: pbi.run_id };
   if (pbi.autonomous_status === "blocked") {
     return {
-      label: "Make claimable",
+      label: "Resolve block",
       testid: "requeue-work",
-      description: "Put this blocked PBI back into the claimable queue without starting work.",
+      description: "Resolve the blocked run and put this PBI back into the retryable queue.",
       payload: { action: "requeue", repository, pbi_number: pbi.number, run_id: pbi.run_id },
     };
   }
   if (pbi.autonomous_status === "running") return null;
+  if (pbi.status === "failed" && pbi.run_id && !pbi.claimable && pbi.active !== false) {
+    return {
+      label: "Resolve block",
+      testid: "resolve-block",
+      description: "Resolve the failed run and make this PBI retryable.",
+      payload: { action: "requeue", repository, pbi_number: pbi.number, run_id: pbi.run_id },
+    };
+  }
   if (map(pbi.delivery).retry_available && pbi.run_id && pbi.active !== false) {
     return {
       label: "Retry delivery",

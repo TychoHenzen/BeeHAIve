@@ -88,11 +88,9 @@ if not defined GITHUB_PROJECT_OWNER_TYPE set "GITHUB_PROJECT_OWNER_TYPE=user"
 if not defined BEEHAIIVE_ALLOWED_PROJECTS set "BEEHAIIVE_ALLOWED_PROJECTS=%GITHUB_PROJECT_OWNER%:%GITHUB_PROJECT_NUMBER%"
 if not defined BEEHAIIVE_REVIEW_MODE set "BEEHAIIVE_REVIEW_MODE=demo"
 if not defined BEEHAIIVE_AGENT_REPOSITORY set "BEEHAIIVE_AGENT_REPOSITORY=%CD%"
+set "PYTHONPATH=%CD%"
 
-echo BeeHAIve dashboard: http://127.0.0.1:8000/dashboard?project=%GITHUB_PROJECT_OWNER%:%GITHUB_PROJECT_NUMBER%
-echo Documentation: http://127.0.0.1:8000/docs
-echo Stop the server with Ctrl+C.
-uv run uvicorn main:app --reload
+uv run python -m beehaiive.dashboard_launcher
 set "EXIT_CODE=%ERRORLEVEL%"
 if not "%EXIT_CODE%"=="0" pause
 exit /b %EXIT_CODE%

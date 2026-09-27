@@ -107,19 +107,19 @@ Start the service from the repository root so the launcher loads `.env`:
 ```
 
 The launcher checks `uv`, the configured Codex executable, GitHub configuration,
-and the API key. It starts `uv run uvicorn main:app --reload` and keeps the
-server output visible. Direct Uvicorn startup is supported only when the same
-variables are already present in the process environment.
+and the API key. It starts Uvicorn on port 8000, refuses to start a second server
+on an occupied port, and closes its server process tree when the launcher exits.
+Direct Uvicorn startup is supported only when the same variables are already
+present in the process environment.
 
-Open `http://127.0.0.1:8000/dashboard?project=<owner>:<number>` and
-`http://127.0.0.1:8000/docs`. Viewing and operating the dashboard uses the
+Open the URLs printed by the launcher. Viewing and operating the dashboard uses the
 server-side `BEEHAIIVE_API_KEY`; the browser does not request, store, or display
 that value. Direct API clients still send it as `X-API-Key`.
 Use Settings to choose the project and a stored workflow. Use the Queue
 filters to switch between active and archived work. Mission control keeps
 recent delivery evidence visible while terminal work stays out of the active
 queue.
-Use `http://127.0.0.1:8000/dashboard?demo=true` for the guided placeholder
+Use `/dashboard?demo=true` on that same origin for the guided placeholder
 lifecycle. Demo actions stay in the browser and make no external changes.
 
 ## Autonomous lifecycle
