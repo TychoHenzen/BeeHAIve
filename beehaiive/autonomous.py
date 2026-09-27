@@ -463,6 +463,8 @@ def _workflow_edge_matches(
         return True
     if condition in {"pass", "success", "succeeded"}:
         return status == "succeeded"
+    if condition == "question":
+        return status == "question"
     if condition in {"fail", "failed", "error"}:
         return status not in {
             "succeeded",

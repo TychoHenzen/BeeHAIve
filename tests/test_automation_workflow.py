@@ -201,6 +201,39 @@ def test_human_outcome_does_not_take_failure_fallback() -> None:
     assert [handoff.step for handoff in result.handoffs] == ["work"]
 
 
+def test_question_outcome_takes_declared_question_transition() -> None:
+    definition = GraphDefinition(
+        "question-fallback",
+        1,
+        (
+            GraphNode("work", GraphNodeKind.SKILL, GraphReference("skill/work")),
+            GraphNode("repair", GraphNodeKind.SKILL, GraphReference("skill/repair")),
+        ),
+        (GraphEdge("work", "repair", "question"),),
+    )
+
+    class QuestionExecutor:
+        def execute(self, step, _context, _handover):
+            if step.name == "work":
+                return {"status": "question", "summary": "operator input required"}
+            return {"status": "succeeded", "summary": "question resolved"}
+
+    result = AutonomousLifecycleRunner(QuestionExecutor()).run(
+        {
+            "repository": "owner/api",
+            "pbi_number": 1,
+            "workflow_definition": definition.as_dict(),
+        }
+    )
+
+    assert result.status == "completed"
+    assert [handoff.step for handoff in result.handoffs] == ["work", "repair"]
+    assert [handoff.status for handoff in result.handoffs] == [
+        "question",
+        "succeeded",
+    ]
+
+
 def test_application_startup_reuses_one_workflow_revision_after_reopen(
     tmp_path,
 ) -> None:
