@@ -1,5 +1,9 @@
 from .advance_request import AdvanceRequest as AdvanceRequest
 from .autonomous_run_request import AutonomousRunRequest as AutonomousRunRequest
+from .behavior_design import BehaviorAssignmentRequest as BehaviorAssignmentRequest
+from .behavior_design import BehaviorBindingsRequest as BehaviorBindingsRequest
+from .behavior_design import BehaviorGenerateRequest as BehaviorGenerateRequest
+from .behavior_design import BehaviorSaveRequest as BehaviorSaveRequest
 from .conflict_repair_request import ConflictRepairRequest as ConflictRepairRequest
 from .dashboard_action_base import DashboardActionBase as DashboardActionBase
 from .dashboard_action_request import DASHBOARD_ACTIONS as DASHBOARD_ACTIONS
@@ -118,6 +122,10 @@ from .workflow_workspace_request import (
 
 __all__ = [
     "AutonomousRunRequest",
+    "BehaviorAssignmentRequest",
+    "BehaviorBindingsRequest",
+    "BehaviorGenerateRequest",
+    "BehaviorSaveRequest",
     "AdvanceRequest",
     "ConflictRepairRequest",
     "DashboardActionBase",

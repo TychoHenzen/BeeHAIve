@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>BeeHAIve behavior designer</title>
+    <style>
+      :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #101220; color: #e9e9ed; }
+      body { max-width: 1180px; margin: 0 auto; padding: 28px; background: #101220; }
+      button, input, textarea { font: inherit; color: inherit; background: #202230; border: 1px solid #3b3e50; border-radius: 7px; }
+      button { padding: 9px 13px; cursor: pointer; }
+      button:hover:not(:disabled), button:focus-visible { border-color: #9184d9; }
+      textarea, input { width: 100%; padding: 10px; box-sizing: border-box; }
+      textarea { min-height: 120px; resize: vertical; }
+      .layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, .8fr); gap: 20px; }
+      .card { padding: 18px; border: 1px solid #2b2e3e; border-radius: 10px; background: #171925; }
+      .field { display: grid; gap: 7px; margin: 14px 0; }
+      .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+      pre { max-height: 520px; overflow: auto; padding: 12px; border-radius: 7px; background: #0c0d18; color: #d2d4df; font: .78rem/1.5 ui-monospace, monospace; white-space: pre-wrap; }
+      .muted { color: #9b9fae; }
+      .status { min-height: 24px; color: #e4bf68; }
+      .status[data-kind="success"] { color: #72d1a5; }
+      .status[data-kind="error"] { color: #ef8a83; }
+      @media (max-width: 800px) { body { padding: 16px; } .layout { grid-template-columns: 1fr; } }
+    </style>
+  </head>
+  <body>
+    <header>
+      <p class="muted"><a href="/dashboard">Mission control</a> / Define</p>
+      <h1>Behavior designer</h1>
+      <p class="muted">Generate a bounded graph locally, inspect it, bind real target references, then explicitly confirm before assignment or execution.</p>
+    </header>
+    <div class="layout">
+      <section class="card">
+        <div class="field">
+          <label for="project">Project</label>
+          <input id="project" autocomplete="off" placeholder="owner:123">
+        </div>
+        <div class="field">
+          <label for="prompt">Behavior prompt</label>
+          <textarea id="prompt" maxlength="4000" placeholder="Grab the item from storage, wait, inspect the signal, then bring it to factory-a."></textarea>
+        </div>
+        <div class="actions">
+          <button id="generate" class="primary">Generate draft</button>
+          <button id="save" disabled>Save draft</button>
+          <button id="bind" disabled>Save bindings</button>
+          <button id="confirm" disabled>Confirm</button>
+          <button id="assign" disabled>Assign</button>
+          <button id="run" disabled>Run bounded example</button>
+          <button id="reload">Reload readback</button>
+        </div>
+        <p id="status" class="status" role="status"></p>
+        <div class="field">
+          <label for="bindings">Bindings JSON</label>
+          <textarea id="bindings" spellcheck="false" placeholder='{"storage":{"kind":"storage","id":"storage-a"},"item":{"kind":"item","id":"item-1"},"signal":{"kind":"signal","id":"signal-a"},"color":{"kind":"color","id":"color-a"},"factory":{"kind":"factory","id":"factory-a"}}'></textarea>
+        </div>
+        <div class="field">
+          <label for="unit">Automated unit id</label>
+          <input id="unit" autocomplete="off" placeholder="unit-1">
+        </div>
+      </section>
+      <section class="card">
+        <h2>Graph and readback</h2>
+        <p class="muted">The server renders the validated definition here. Unknown actions, targets, limits, and malformed model output never reach Save.</p>
+        <pre id="output">No draft generated.</pre>
+      </section>
+    </div>
+    <script>
+      const state = { draft: null, behaviorId: null };
+      const $ = (id) => document.getElementById(id);
+      const project = $("project");
+      project.value = new URLSearchParams(location.search).get("project") || "";
+      const status = (message, kind = "") => { $("status").textContent = message; $("status").dataset.kind = kind; };
+      const show = (value) => { $("output").textContent = JSON.stringify(value, null, 2); };
+      const headers = () => ({ "Content-Type": "application/json", "X-BeeHAIve-Dashboard": "1" });
+      const endpoint = (suffix = "") => `/projects/${encodeURIComponent(project.value.trim())}/behaviors${suffix}`;
+      const refreshButtons = () => {
+        const draft = state.draft;
+        $("save").disabled = !draft || !!state.behaviorId;
+        $("bind").disabled = !state.behaviorId;
+        $("confirm").disabled = !state.behaviorId || !["draft"].includes(draft?.status);
+        $("assign").disabled = !state.behaviorId || draft?.status !== "confirmed";
+        $("run").disabled = !state.behaviorId || !["assigned", "running"].includes(draft?.status);
+      };
+      const readJson = async (response) => { const body = await response.json(); if (!response.ok) throw new Error(body.detail || "Request failed"); return body; };
+      const reloadReadback = async () => {
+        const behavior = new URLSearchParams(location.search).get("behavior");
+        const suffix = behavior ? `/${encodeURIComponent(behavior)}` : "";
+        const readback = await readJson(await fetch(endpoint(suffix), { headers: headers() }));
+        if (behavior) {
+          state.behaviorId = readback.behavior_id;
+          state.draft = readback;
+        }
+        show(readback);
+        status("Persisted behavior state reloaded.", "success");
+        refreshButtons();
+      };
+      $("reload").onclick = async () => {
+        try { await reloadReadback(); }
+        catch (error) { status(error.message, "error"); }
+      };
+      $("generate").onclick = async () => {
+        try { status("Generating locally..."); state.draft = await readJson(await fetch(endpoint("/generate"), { method: "POST", headers: headers(), body: JSON.stringify({ prompt: $("prompt").value }) })); show(state.draft); status("Draft generated; inspect it before saving.", "success"); refreshButtons(); }
+        catch (error) { status(error.message, "error"); }
+      };
+      $("save").onclick = async () => {
+        try { const definition = state.draft.definition; const bindings = JSON.parse($("bindings").value || "{}"); state.draft = await readJson(await fetch(endpoint(), { method: "POST", headers: headers(), body: JSON.stringify({ definition, bindings }) })); state.behaviorId = state.draft.behavior_id; show(state.draft); status("Draft saved; bindings and confirmation are still required.", "success"); refreshButtons(); }
+        catch (error) { status(error.message, "error"); }
+      };
+      $("bind").onclick = async () => {
+        try { const bindings = JSON.parse($("bindings").value || "{}"); state.draft = await readJson(await fetch(endpoint(`/${state.behaviorId}/bindings`), { method: "PUT", headers: headers(), body: JSON.stringify({ bindings }) })); show(state.draft); status("Bindings saved.", "success"); refreshButtons(); }
+        catch (error) { status(error.message, "error"); }
+      };
+      $("confirm").onclick = async () => {
+        try { state.draft = await readJson(await fetch(endpoint(`/${state.behaviorId}/confirm`), { method: "POST", headers: headers() })); show(state.draft); status("Confirmed. Assignment is now available.", "success"); refreshButtons(); }
+        catch (error) { status(error.message, "error"); }
+      };
+      $("assign").onclick = async () => {
+        try { state.draft = await readJson(await fetch(endpoint(`/${state.behaviorId}/assign`), { method: "POST", headers: headers(), body: JSON.stringify({ unit_id: $("unit").value }) })); show(state.draft); status("Assigned. Execution remains an explicit action.", "success"); refreshButtons(); }
+        catch (error) { status(error.message, "error"); }
+      };
+      $("run").onclick = async () => {
+        try { state.draft = await readJson(await fetch(endpoint(`/${state.behaviorId}/run`), { method: "POST", headers: headers() })); show(state.draft); status(`Execution ${state.draft.status}.`, state.draft.status === "completed" ? "success" : "error"); refreshButtons(); }
+        catch (error) { status(error.message, "error"); }
+      };
+      refreshButtons();
+      if (new URLSearchParams(location.search).get("behavior")) {
+        reloadReadback().catch((error) => status(error.message, "error"));
+      }
+    </script>
+  </body>
+</html>

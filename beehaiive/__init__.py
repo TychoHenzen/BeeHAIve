@@ -12,6 +12,23 @@ from .autonomous import (
     SkillStep,
     select_work_item,
 )
+from .behavior import (
+    ALLOWED_ACTIONS,
+    ALLOWED_PARAMETER_KINDS,
+    BehaviorRecord,
+    BehaviorValidationError,
+    normalize_bindings,
+    normalize_definition,
+)
+from .behavior_model import (
+    BehaviorModelError,
+    OllamaBehaviorModelClient,
+)
+from .behavior_service import (
+    BehaviorService,
+    BehaviorServiceError,
+    RecordingUnitWorld,
+)
 from .conflict_repair import ConflictRepairAgent, ConflictRepairService
 from .contracts import (
     ArtifactRequirement,
@@ -127,8 +144,15 @@ from .workflow import (
 
 __all__ = [
     "ADVISOR_STEP",
+    "ALLOWED_ACTIONS",
+    "ALLOWED_PARAMETER_KINDS",
     "AUTONOMOUS_STEPS",
     "AllowListReviewAuthorizer",
+    "BehaviorModelError",
+    "BehaviorRecord",
+    "BehaviorService",
+    "BehaviorServiceError",
+    "BehaviorValidationError",
     "AutonomousLifecycleRunner",
     "AutonomousLifecycleService",
     "AutonomousRunResult",
@@ -190,6 +214,7 @@ __all__ = [
     "ModelTier",
     "Orchestrator",
     "OrchestratorStore",
+    "OllamaBehaviorModelClient",
     "PullRequestReviewProvider",
     "PullRequestTarget",
     "ProjectProvider",
@@ -201,6 +226,7 @@ __all__ = [
     "ReaderResult",
     "ReaderExecution",
     "ReaderStatus",
+    "RecordingUnitWorld",
     "ReviewAction",
     "ReviewAdapterError",
     "ReviewConcern",
@@ -235,4 +261,6 @@ __all__ = [
     "graph_structural_changes",
     "simulate_graph",
     "validate_graph",
+    "normalize_bindings",
+    "normalize_definition",
 ]

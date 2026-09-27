@@ -1,0 +1,98 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from fastapi.testclient import TestClient
+
+from beehaiive.behavior_service import BehaviorService, RecordingUnitWorld
+from beehaiive.orchestrator import Orchestrator
+from beehaiive.storage import OrchestratorStore
+from main import create_app
+from tests.support.api_provider import ApiProvider
+from tests.test_behavior import bindings, definition
+
+
+class FakeBehaviorModel:
+    def generate(self, _prompt: str) -> object:
+        return definition()
+
+
+def test_behavior_design_api_is_explicit_and_project_scoped(tmp_path: Path) -> None:
+    store = OrchestratorStore(tmp_path / "api.sqlite3")
+    service = BehaviorService(
+        store,
+        model_client=FakeBehaviorModel(),
+        unit_world=RecordingUnitWorld(),
+    )
+    client = TestClient(
+        create_app(
+            orchestrator=Orchestrator(store, ApiProvider()),
+            behavior_service=service,
+            api_key="test-key",
+            allowed_project_ids={"owner:7"},
+            workflow_actor="operator",
+        )
+    )
+    unauthenticated = client.post(
+        "/projects/owner:7/behaviors/generate", json={"prompt": "move the item"}
+    )
+    assert unauthenticated.status_code == 401
+
+    headers = {"X-API-Key": "test-key"}
+    generated = client.post(
+        "/projects/owner:7/behaviors/generate",
+        json={"prompt": "move the item"},
+        headers=headers,
+    )
+    assert generated.status_code == 200
+    blank_prompt = client.post(
+        "/projects/owner:7/behaviors/generate",
+        json={"prompt": "   "},
+        headers=headers,
+    )
+    assert blank_prompt.status_code == 422
+    saved = client.post(
+        "/projects/owner:7/behaviors",
+        json={"definition": generated.json()["definition"]},
+        headers=headers,
+    )
+    assert saved.status_code == 200
+    behavior_id = saved.json()["behavior_id"]
+    not_confirmed = client.post(
+        f"/projects/owner:7/behaviors/{behavior_id}/assign",
+        json={"unit_id": "unit-1"},
+        headers=headers,
+    )
+    assert not_confirmed.status_code == 409
+    bound = client.put(
+        f"/projects/owner:7/behaviors/{behavior_id}/bindings",
+        json={"bindings": bindings()},
+        headers=headers,
+    )
+    assert bound.status_code == 200
+    confirmed = client.post(
+        f"/projects/owner:7/behaviors/{behavior_id}/confirm", headers=headers
+    )
+    assert confirmed.status_code == 200
+    assigned = client.post(
+        f"/projects/owner:7/behaviors/{behavior_id}/assign",
+        json={"unit_id": "unit-1"},
+        headers=headers,
+    )
+    assert assigned.status_code == 200
+    executed = client.post(
+        f"/projects/owner:7/behaviors/{behavior_id}/run", headers=headers
+    )
+    assert executed.status_code == 200
+    assert executed.json()["status"] == "completed"
+    design_page = client.get("/behavior-design")
+    assert design_page.status_code == 200
+    assert "Reload readback" in design_page.text
+    assert (
+        client.get(
+            f"/projects/owner:7/behaviors/{behavior_id}", headers=headers
+        ).json()["execution"]["status"]
+        == "completed"
+    )
+    assert client.get("/projects/other:7/behaviors", headers=headers).status_code == 403
+    store.close()
