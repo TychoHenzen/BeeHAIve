@@ -39,6 +39,7 @@ from .run_failure import RunFailureMixin
 from .run_transition import RunTransitionMixin
 from .runtime_settings import RuntimeSettingsMixin
 from .schema import StorageSchemaMixin
+from .station_issues import StationIssueMixin
 from .task_contract import TaskContractMixin
 from .unit_behaviors import UnitBehaviorMixin
 from .worker_hosts import WorkerHostsMixin
@@ -48,6 +49,7 @@ class OrchestratorStore(
     AdmissionMixin,
     StorageSchemaMixin,
     StorageMigrationMixin,
+    StationIssueMixin,
     PbiRefinementStartMixin,
     PbiRefinementAnswerMixin,
     PbiRefinementReopenMixin,

@@ -445,6 +445,42 @@ class StorageSchemaMixin:
                 CREATE INDEX IF NOT EXISTS actions_by_project
                     ON actions(project_id, created_at DESC);
 
+                CREATE TABLE IF NOT EXISTS station_issues (
+                    issue_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    repository_name TEXT,
+                    pbi_number INTEGER,
+                    run_id TEXT,
+                    station_id TEXT NOT NULL,
+                    explanation TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN (
+                        'open', 'dismissed', 'addressed', 'resolved'
+                    )),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (project_id)
+                        REFERENCES projects(project_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS station_issues_by_project
+                    ON station_issues(project_id, updated_at DESC);
+
+                CREATE TABLE IF NOT EXISTS station_issue_attempts (
+                    attempt_id TEXT PRIMARY KEY,
+                    issue_id TEXT NOT NULL,
+                    action TEXT NOT NULL CHECK (action IN (
+                        'dismiss', 'address', 'resolve'
+                    )),
+                    actor TEXT NOT NULL,
+                    note TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (issue_id)
+                        REFERENCES station_issues(issue_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS station_issue_attempts_by_issue
+                    ON station_issue_attempts(issue_id, created_at DESC);
+
                 CREATE TABLE IF NOT EXISTS meta_review_runs (
                     review_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL,

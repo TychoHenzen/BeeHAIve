@@ -33,6 +33,8 @@ def _dashboard_metadata(issue: Mapping[str, Any]) -> dict[str, object]:
     if isinstance(project_status, str):
         metadata["project_status"] = project_status
     labels = _label_names(issue.get("labels", {}))
+    if labels:
+        metadata["labels"] = labels
     priority = next(
         (
             int(match.group(1))

@@ -5,10 +5,14 @@ from fastapi import FastAPI
 
 from beehaiive import Orchestrator, OrchestratorStore
 from beehaiive.agent import AgentWorkerManager
+from beehaiive.agent_stations import AgentStationService
 from beehaiive.api.dependencies import build_route_dependencies
 from beehaiive.api.lifecycle import (
     register_background_handlers,
     register_error_handlers,
+)
+from beehaiive.api.routes.agent_stations import (
+    register_routes as register_agent_station_routes,
 )
 from beehaiive.api.routes.autonomous import (
     register_routes as register_autonomous_routes,
@@ -81,6 +85,7 @@ def create_app(
     unit_world: UnitWorld | None = None,
     building_signal_service: BuildingSignalService | None = None,
     building_signal_world: BuildingSignalWorld | None = None,
+    agent_station_service: AgentStationService | None = None,
 ) -> FastAPI:
     runtime_options: dict[str, Any] = {
         "agent_worker": agent_worker,
@@ -106,6 +111,7 @@ def create_app(
         "unit_world": unit_world,
         "building_signal_service": building_signal_service,
         "building_signal_world": building_signal_world,
+        "agent_station_service": agent_station_service,
     }
     runtime = build_api_runtime(runtime_options)
     app = FastAPI(title="BeeHAIve")
@@ -118,6 +124,7 @@ def create_app(
     register_autonomous_routes(app, route_context)
     register_behavior_routes(app, route_context)
     register_building_signal_routes(app, route_context)
+    register_agent_station_routes(app, route_context)
     register_reviews_routes(app, route_context)
     register_workflow_routes(app, route_context)
     register_graph_safety_routes(app, route_context)
