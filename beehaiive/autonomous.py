@@ -1720,17 +1720,6 @@ class AutonomousLifecycleService:
             if isinstance(workflow_id, str) and workflow_id
             else {}
         )
-        requeue_index = next(
-            (
-                index
-                for index, action in enumerate(scoped_actions)
-                if action.get("kind") == "requeue"
-                and action.get("status") == "succeeded"
-            ),
-            None,
-        )
-        if requeue_index is not None:
-            scoped_actions = scoped_actions[: requeue_index + 1]
         for action in scoped_actions:
             if action.get("kind") != "skill:review-pr-branch" or action.get(
                 "status"

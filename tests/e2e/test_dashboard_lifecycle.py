@@ -659,6 +659,7 @@ def test_agents_exposes_retry_for_blocked_autonomous_work(dashboard_page) -> Non
                         "number": 1,
                         "title": "Blocked autonomous work",
                         "status": "failed",
+                        "planning_status": "Done",
                         "autonomous_status": "blocked",
                         "last_error": "Launch failed with context",
                     }
