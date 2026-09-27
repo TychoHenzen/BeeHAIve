@@ -4,6 +4,13 @@ from .behavior_design import BehaviorAssignmentRequest as BehaviorAssignmentRequ
 from .behavior_design import BehaviorBindingsRequest as BehaviorBindingsRequest
 from .behavior_design import BehaviorGenerateRequest as BehaviorGenerateRequest
 from .behavior_design import BehaviorSaveRequest as BehaviorSaveRequest
+from .building_signal import (
+    BuildingSignalAssignmentRequest as BuildingSignalAssignmentRequest,
+)
+from .building_signal import (
+    BuildingSignalGenerateRequest as BuildingSignalGenerateRequest,
+)
+from .building_signal import BuildingSignalRuleRequest as BuildingSignalRuleRequest
 from .conflict_repair_request import ConflictRepairRequest as ConflictRepairRequest
 from .dashboard_action_base import DashboardActionBase as DashboardActionBase
 from .dashboard_action_request import DASHBOARD_ACTIONS as DASHBOARD_ACTIONS
@@ -126,6 +133,9 @@ __all__ = [
     "BehaviorBindingsRequest",
     "BehaviorGenerateRequest",
     "BehaviorSaveRequest",
+    "BuildingSignalAssignmentRequest",
+    "BuildingSignalGenerateRequest",
+    "BuildingSignalRuleRequest",
     "AdvanceRequest",
     "ConflictRepairRequest",
     "DashboardActionBase",

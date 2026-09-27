@@ -1,3 +1,4 @@
+from .building_signals import BuildingSignalMixin as BuildingSignalMixin
 from .constants import _REFINEMENT_SECRET_ASSIGNMENT as _REFINEMENT_SECRET_ASSIGNMENT
 from .constants import _REFINEMENT_URL as _REFINEMENT_URL
 from .constants import _SENSITIVE_URL_PARTS as _SENSITIVE_URL_PARTS
@@ -83,6 +84,7 @@ __all__ = [
     "DEFAULT_EVENT_LIMIT",
     "DEFAULT_WORKER_HOST_HEARTBEAT_SECONDS",
     "DEFAULT_WORKER_HOST_STALE_SECONDS",
+    "BuildingSignalMixin",
     "MAX_ACTION_LIMIT",
     "MAX_AGENT_DIAGNOSTIC_LENGTH",
     "MAX_AGENT_RESULT_LENGTH",

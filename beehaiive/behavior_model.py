@@ -28,6 +28,11 @@ class BehaviorModelClient(Protocol):
         """Return one structured behavior object for a prompt."""
 
 
+class StructuredBehaviorModelClient(Protocol):
+    def generate_structured(self, prompt: str, schema: Mapping[str, object]) -> object:
+        """Return one object constrained by the supplied JSON schema."""
+
+
 class OllamaBehaviorModelClient:
     def __init__(
         self,
@@ -57,6 +62,15 @@ class OllamaBehaviorModelClient:
         self._timeout_seconds = timeout_seconds
 
     def generate(self, prompt: str) -> object:
+        try:
+            response = self.generate_structured(prompt, BEHAVIOR_DEFINITION_SCHEMA)
+            return normalize_definition(response)
+        except BehaviorValidationError as exc:
+            raise BehaviorModelError(
+                "invalid_response", "The behavior model returned malformed JSON"
+            ) from exc
+
+    def generate_structured(self, prompt: str, schema: Mapping[str, object]) -> object:
         if not prompt.strip():
             raise BehaviorModelError("invalid_prompt", "A behavior prompt is required")
         if len(prompt) > MAX_BEHAVIOR_PROMPT_LENGTH:
@@ -78,7 +92,7 @@ class OllamaBehaviorModelClient:
                         },
                         {"role": "user", "content": prompt.strip()},
                     ],
-                    "format": BEHAVIOR_DEFINITION_SCHEMA,
+                    "format": dict(schema),
                     "stream": False,
                 }
             ).encode("utf-8"),
@@ -115,19 +129,20 @@ class OllamaBehaviorModelClient:
                 message_mapping.get("content") if message_mapping is not None else None
             )
             if isinstance(content, str):
-                definition = json.loads(content)
+                return json.loads(content)
             elif isinstance(content, Mapping):
-                definition = dict(cast(Mapping[str, object], content))
+                return dict(cast(Mapping[str, object], content))
             else:
                 raise ValueError("message content is not JSON")
-            try:
-                return normalize_definition(definition)
-            except BehaviorValidationError as exc:
-                raise ValueError("message content is not a valid behavior") from exc
         except (UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise BehaviorModelError(
                 "invalid_response", "The behavior model returned malformed JSON"
             ) from exc
 
 
-__all__ = ["BehaviorModelClient", "BehaviorModelError", "OllamaBehaviorModelClient"]
+__all__ = [
+    "BehaviorModelClient",
+    "BehaviorModelError",
+    "OllamaBehaviorModelClient",
+    "StructuredBehaviorModelClient",
+]

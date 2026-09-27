@@ -198,6 +198,38 @@ class StorageMigrationMixin:
         )
         self._connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS building_signal_rules (
+                rule_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN (
+                    'draft', 'confirmed', 'assigned'
+                )),
+                rule_json TEXT NOT NULL,
+                assignment_json TEXT,
+                signal_state_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS building_signal_rules_by_project
+                ON building_signal_rules(project_id, created_at, rule_id)
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS building_signal_assigned_building
+                ON building_signal_rules(
+                    project_id,
+                    json_extract(assignment_json, '$.building_id')
+                )
+                WHERE status = 'assigned' AND assignment_json IS NOT NULL
+            """
+        )
+        self._connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS graph_safety_evidence (
                 evidence_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 workflow_id TEXT NOT NULL,

@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>BeeHAIve building signal designer</title>
+    <style>
+      :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #101220; color: #e9e9ed; }
+      body { max-width: 1180px; margin: 0 auto; padding: 28px; background: #101220; }
+      button, input, textarea { font: inherit; color: inherit; background: #202230; border: 1px solid #3b3e50; border-radius: 7px; }
+      button { padding: 9px 13px; cursor: pointer; }
+      button:hover:not(:disabled), button:focus-visible { border-color: #9184d9; }
+      textarea, input { width: 100%; padding: 10px; box-sizing: border-box; }
+      textarea { min-height: 100px; resize: vertical; }
+      .layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, .8fr); gap: 20px; }
+      .card { padding: 18px; border: 1px solid #2b2e3e; border-radius: 10px; background: #171925; }
+      .field { display: grid; gap: 7px; margin: 14px 0; }
+      .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+      pre { max-height: 520px; overflow: auto; padding: 12px; border-radius: 7px; background: #0c0d18; color: #d2d4df; font: .78rem/1.5 ui-monospace, monospace; white-space: pre-wrap; }
+      .muted { color: #9b9fae; }
+      .status { min-height: 24px; color: #e4bf68; }
+      .status[data-kind="success"] { color: #72d1a5; }
+      .status[data-kind="error"] { color: #ef8a83; }
+      @media (max-width: 800px) { body { padding: 16px; } .layout { grid-template-columns: 1fr; } }
+    </style>
+  </head>
+  <body>
+    <header>
+      <p class="muted"><a href="/dashboard">Mission control</a> / Define</p>
+      <h1>Building signal designer</h1>
+      <p class="muted">Describe one bounded inventory rule, inspect the structured draft, then confirm and assign it to a building.</p>
+    </header>
+    <div class="layout">
+      <section class="card">
+        <div class="field">
+          <label for="project">Project</label>
+          <input id="project" autocomplete="off" placeholder="owner:123">
+        </div>
+        <div class="field">
+          <label for="prompt">Building signal prompt</label>
+          <textarea id="prompt" maxlength="4000" placeholder="If stored iron plate is at most 5, emit green."></textarea>
+        </div>
+        <div class="actions">
+          <button id="generate">Generate draft</button>
+          <button id="save" disabled>Save draft</button>
+          <button id="update" disabled>Update draft</button>
+          <button id="confirm" disabled>Confirm</button>
+          <button id="assign" disabled>Assign</button>
+          <button id="evaluate" disabled>Evaluate now</button>
+          <button id="reload">Reload readback</button>
+        </div>
+        <div class="field">
+          <label for="rule">Corrected rule JSON</label>
+          <textarea id="rule" spellcheck="false" placeholder='{"schema_version":1,"comparison":"lte","quantity":5,"item":"iron-plate","signal":"green"}'></textarea>
+        </div>
+        <div class="field">
+          <label for="building">Building id</label>
+          <input id="building" autocomplete="off" placeholder="smelter">
+        </div>
+        <p id="status" class="status" role="status"></p>
+      </section>
+      <section class="card">
+        <h2>Rule and current state</h2>
+        <p class="muted">Unknown targets, malformed output, invalid inventory, and model failures stay out of the active signal state.</p>
+        <pre id="output">No rule loaded.</pre>
+      </section>
+    </div>
+    <script>
+      const state = { draft: null, ruleId: null };
+      const $ = (id) => document.getElementById(id);
+      $("project").value = new URLSearchParams(location.search).get("project") || "";
+      const status = (message, kind = "") => { $("status").textContent = message; $("status").dataset.kind = kind; };
+      const show = (value) => { $("output").textContent = JSON.stringify(value, null, 2); if (value.rule) $("rule").value = JSON.stringify(value.rule, null, 2); };
+      const headers = () => ({ "Content-Type": "application/json", "X-BeeHAIve-Dashboard": "1" });
+      const endpoint = (suffix = "") => "/projects/" + encodeURIComponent($("project").value.trim()) + "/building-signals" + suffix;
+      const readJson = async (response) => { const body = await response.json(); if (!response.ok) throw new Error(body.detail || "Request failed"); return body; };
+       const refreshButtons = () => {
+         const draft = state.draft;
+         $("save").disabled = !draft || !!state.ruleId;
+         $("update").disabled = !state.ruleId || draft?.status !== "draft";
+         $("confirm").disabled = !state.ruleId || draft?.status !== "draft";
+        $("assign").disabled = !state.ruleId || draft?.status !== "confirmed";
+        $("evaluate").disabled = !state.ruleId || draft?.status !== "assigned";
+       };
+       const rememberRule = (ruleId) => {
+         state.ruleId = ruleId;
+         const url = new URL(location.href);
+         url.searchParams.set("rule", ruleId);
+         history.replaceState(null, "", url);
+       };
+       const readRule = () => JSON.parse($("rule").value || JSON.stringify(state.draft.rule));
+      const reloadReadback = async () => {
+        const rule = new URLSearchParams(location.search).get("rule");
+        const suffix = rule ? "/" + encodeURIComponent(rule) : "";
+        const readback = await readJson(await fetch(endpoint(suffix), { headers: headers() }));
+        if (rule) { state.ruleId = readback.rule_id; state.draft = readback; }
+        show(readback); status("Persisted building signal state reloaded.", "success"); refreshButtons();
+      };
+      $("reload").onclick = async () => { try { await reloadReadback(); } catch (error) { status(error.message, "error"); } };
+      $("generate").onclick = async () => {
+        try { const draft = await readJson(await fetch(endpoint("/generate"), { method: "POST", headers: headers(), body: JSON.stringify({ prompt: $("prompt").value }) })); state.draft = draft; show(draft); status("Draft generated; inspect or correct it before saving.", "success"); refreshButtons(); }
+        catch (error) { status(error.message, "error"); }
+      };
+       $("save").onclick = async () => {
+         try { const saved = await readJson(await fetch(endpoint(), { method: "POST", headers: headers(), body: JSON.stringify({ rule: readRule() }) })); state.draft = saved; rememberRule(saved.rule_id); show(saved); status("Draft saved; confirmation and assignment are still required.", "success"); refreshButtons(); }
+         catch (error) { status(error.message, "error"); }
+       };
+       $("update").onclick = async () => {
+         try { state.draft = await readJson(await fetch(endpoint("/" + state.ruleId), { method: "PUT", headers: headers(), body: JSON.stringify({ rule: readRule() }) })); show(state.draft); status("Draft updated; confirmation and assignment are still required.", "success"); refreshButtons(); }
+         catch (error) { status(error.message, "error"); }
+       };
+      $("confirm").onclick = async () => { try { state.draft = await readJson(await fetch(endpoint("/" + state.ruleId + "/confirm"), { method: "POST", headers: headers() })); show(state.draft); status("Confirmed. Assign it to a building next.", "success"); refreshButtons(); } catch (error) { status(error.message, "error"); } };
+      $("assign").onclick = async () => { try { state.draft = await readJson(await fetch(endpoint("/" + state.ruleId + "/assign"), { method: "POST", headers: headers(), body: JSON.stringify({ building_id: $("building").value }) })); show(state.draft); status("Assigned. Evaluation uses the existing scheduler cadence.", "success"); refreshButtons(); } catch (error) { status(error.message, "error"); } };
+      $("evaluate").onclick = async () => { try { state.draft = await readJson(await fetch(endpoint("/" + state.ruleId + "/evaluate"), { method: "POST", headers: headers() })); show(state.draft); status("Current signal state reloaded.", "success"); refreshButtons(); } catch (error) { status(error.message, "error"); } };
+      refreshButtons();
+      if (new URLSearchParams(location.search).get("rule")) reloadReadback().catch((error) => status(error.message, "error"));
+    </script>
+  </body>
+</html>
