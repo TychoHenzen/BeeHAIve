@@ -644,11 +644,7 @@ def pbi_view(
         None,
     )
     requeue_action = next(
-        (
-            action
-            for action in matching_actions
-            if action.get("kind") == "requeue"
-        ),
+        (action for action in matching_actions if action.get("kind") == "requeue"),
         None,
     )
     provider_completed = _provider_completion_confirmed(

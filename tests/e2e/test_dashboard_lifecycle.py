@@ -914,8 +914,10 @@ def test_live_dashboard_settings_use_same_origin_and_persist(
     expect(page.locator("#settings-project-id")).to_have_value("project-1")
     page.locator("#settings-workflow-id").select_option("automation-swarm")
     with page.expect_response(
-        lambda response: response.url.endswith("/dashboard/settings")
-        and response.request.method == "PUT"
+        lambda response: (
+            response.url.endswith("/dashboard/settings")
+            and response.request.method == "PUT"
+        )
     ) as settings_response:
         page.get_by_role(
             "button", name="Save and open mission control", exact=True

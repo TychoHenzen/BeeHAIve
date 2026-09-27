@@ -121,6 +121,8 @@ recent delivery evidence visible while terminal work stays out of the active
 queue.
 Use `/dashboard?demo=true` on that same origin for the guided placeholder
 lifecycle. Demo actions stay in the browser and make no external changes.
+Use `/dashboard?project=<owner>:<number>` on the same origin to open mission
+control for the configured Project.
 
 ## Autonomous lifecycle
 

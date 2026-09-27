@@ -122,9 +122,7 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
                 and (
                     project.count(":") != 1
                     or not project.rsplit(":", 1)[1].isdigit()
-                    or not re.fullmatch(
-                        r"[A-Za-z0-9_.-]+", project.split(":", 1)[0]
-                    )
+                    or not re.fullmatch(r"[A-Za-z0-9_.-]+", project.split(":", 1)[0])
                 )
                 for project in next_projects
             ):

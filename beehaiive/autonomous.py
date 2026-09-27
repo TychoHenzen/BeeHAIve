@@ -365,8 +365,7 @@ def _workflow_step_names(definition: GraphDefinition) -> tuple[str, ...]:
     if len(ordered) == len(nodes):
         return tuple(ordered)
     return tuple(
-        node.reference.reference_id.removeprefix("skill/")
-        for node in definition.nodes
+        node.reference.reference_id.removeprefix("skill/") for node in definition.nodes
     )
 
 
@@ -401,9 +400,7 @@ def _workflow_definition(
     raw_definition = context.get("workflow_definition")
     if not isinstance(raw_definition, Mapping):
         return None
-    definition = GraphDefinition.from_dict(
-        cast(Mapping[str, object], raw_definition)
-    )
+    definition = GraphDefinition.from_dict(cast(Mapping[str, object], raw_definition))
     _validate_workflow_definition(definition)
     steps: dict[str, SkillStep] = {}
     registered_steps = {step.name: step for step in AUTONOMOUS_STEPS}
@@ -483,9 +480,9 @@ def _workflow_edge_matches(
         if isinstance(evidence, Mapping)
         else cast(Mapping[str, object], {})
     )
-    return (
-        evidence_mapping.get(edge.condition) is True
-    ) or result.get(edge.condition) is True
+    return (evidence_mapping.get(edge.condition) is True) or result.get(
+        edge.condition
+    ) is True
 
 
 ADVISOR_STEP = SkillStep(

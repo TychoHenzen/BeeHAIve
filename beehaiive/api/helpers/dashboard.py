@@ -98,9 +98,7 @@ def _workflow_skill_ids() -> list[str]:
     )
     if plugin_cache.is_dir():
         roots.extend(
-            version / "skills"
-            for version in plugin_cache.iterdir()
-            if version.is_dir()
+            version / "skills" for version in plugin_cache.iterdir() if version.is_dir()
         )
     known = {
         f"skill/{Path(step.skill_path).parent.name}"
