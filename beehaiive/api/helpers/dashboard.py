@@ -88,6 +88,20 @@ def _workflow_skill_ids() -> list[str]:
     configured = os.environ.get("BEEHAIIVE_DOD_GUARD_SKILLS", "").strip()
     if configured:
         roots.append(Path(configured))
+    plugin_cache = (
+        Path.home()
+        / ".codex"
+        / "plugins"
+        / "cache"
+        / "dod-guard-monorepo"
+        / "dod-guard"
+    )
+    if plugin_cache.is_dir():
+        roots.extend(
+            version / "skills"
+            for version in plugin_cache.iterdir()
+            if version.is_dir()
+        )
     known = {
         f"skill/{Path(step.skill_path).parent.name}"
         for step in (*AUTONOMOUS_STEPS, ADVISOR_STEP)

@@ -133,7 +133,7 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
     scheduler_config = context["scheduler_config"]
     workflow_service = context["workflow_service"]
     graph_safety_service = context["graph_safety_service"]
-    require_workflow_operator = context["require_workflow_operator"]
+    require_dashboard_workflow_operator = context["require_dashboard_workflow_operator"]
 
     @app.get("/projects/{project_id}")
     def project_state(  # pyright: ignore[reportUnusedFunction]
@@ -326,7 +326,9 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
                 detail="Operator approval is required for dashboard actions",
             )
         if request.action in {"graph_review", "graph_activate", "graph_rollback"}:
-            require_workflow_operator(http_request.headers.get("X-API-Key"))
+            require_dashboard_workflow_operator(
+                http_request, http_request.headers.get("X-API-Key")
+            )
         body_workflow_id = getattr(request, "workflow_id", None)
         if (
             workflow_id is not None

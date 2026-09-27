@@ -87,6 +87,51 @@ def test_dashboard_settings_fail_closed_for_boundary_and_mixed_input(tmp_path) -
         store.close()
 
 
+def test_dashboard_can_review_graph_without_browser_api_key(tmp_path) -> None:
+    store = OrchestratorStore(tmp_path / "state.db")
+    app = create_app(
+        store=store,
+        orchestrator=Orchestrator(store, ApiProvider()),
+        api_key="test-key",
+        allowed_project_ids={"owner:1"},
+        workflow_actor="operator",
+    )
+    definition = store.graph_definition_for("automation-swarm", 1)
+    assert definition is not None
+    fixture = {
+        node.node_id: {
+            "outcome": "pass",
+            "evidence": {},
+            "artifact_refs": [],
+            "question": None,
+            "required_action": None,
+            "validation_reason": None,
+            "answer": None,
+        }
+        for node in definition.nodes
+    }
+    try:
+        with TestClient(app, base_url="http://testserver") as client:
+            response = client.post(
+                "/projects/owner:1/actions",
+                headers={
+                    "X-BeeHAIve-Dashboard": "1",
+                    "Origin": "http://testserver",
+                    "Sec-Fetch-Site": "same-origin",
+                },
+                json={
+                    "action": "graph_review",
+                    "workflow_id": "automation-swarm",
+                    "candidate": definition.as_dict(),
+                    "fixtures": {"happy": fixture},
+                    "approved": True,
+                },
+            )
+        assert response.status_code == 200
+    finally:
+        store.close()
+
+
 def test_project_scope_configuration_uses_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
