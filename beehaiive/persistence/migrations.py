@@ -174,6 +174,30 @@ class StorageMigrationMixin:
         )
         self._connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS unit_behaviors (
+                behavior_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN (
+                    'draft', 'confirmed', 'assigned', 'running',
+                    'completed', 'failed'
+                )),
+                definition_json TEXT NOT NULL,
+                bindings_json TEXT NOT NULL,
+                assignment_json TEXT,
+                execution_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS unit_behaviors_by_project
+                ON unit_behaviors(project_id, created_at, behavior_id)
+            """
+        )
+        self._connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS graph_safety_evidence (
                 evidence_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 workflow_id TEXT NOT NULL,

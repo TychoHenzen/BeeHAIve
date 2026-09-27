@@ -18,6 +18,8 @@ from beehaiive.autonomous import (
     AutonomousLifecycleService,
     bootstrap_automation_workflow,
 )
+from beehaiive.behavior_model import OllamaBehaviorModelClient
+from beehaiive.behavior_service import BehaviorService, TargetUnitWorld, UnitWorld
 from beehaiive.conflict_repair import ConflictRepairAgent, ConflictRepairService
 from beehaiive.graph_safety import GraphSafetyService
 from beehaiive.meta_review import MetaReviewService
@@ -54,6 +56,8 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
     workflow_service = options["workflow_service"]
     graph_safety_service = options["graph_safety_service"]
     autonomous_service = options.get("autonomous_service")
+    behavior_service = options.get("behavior_service")
+    unit_world: UnitWorld | None = options.get("unit_world")
     owns_orchestrator = orchestrator is None
     if orchestrator is not None and orchestrator.model_router is not None:
         if model_router is not None and model_router is not orchestrator.model_router:
@@ -99,6 +103,9 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
             store, EnvironmentGitHubProvider(), routing_service, model_executor
         )
     else:
+        if store is not None and store is not orchestrator.store:
+            raise ValueError("The orchestrator and API must share one state store")
+        store = orchestrator.store
         orchestrator.model_router = routing_service
     if orchestrator.model_executor is None:
         orchestrator.model_executor = model_executor
@@ -109,6 +116,17 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("The graph safety service and API must share one state store")
     if graph_safety_service is None:
         graph_safety_service = GraphSafetyService(orchestrator.store)
+    if (
+        behavior_service is not None
+        and behavior_service.store is not orchestrator.store
+    ):
+        raise ValueError("The behavior service and API must share one state store")
+    if behavior_service is None:
+        behavior_service = BehaviorService(
+            orchestrator.store,
+            model_client=OllamaBehaviorModelClient(),
+            unit_world=unit_world or TargetUnitWorld(),
+        )
     if owns_orchestrator or not orchestrator.store.graph_workflow_ids():
         bootstrap_automation_workflow(orchestrator.store)
     persisted_settings = orchestrator.store.get_runtime_settings()
@@ -349,6 +367,7 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
         "scheduler": scheduler,
         "workflow_service": workflow_service,
         "graph_safety_service": graph_safety_service,
+        "behavior_service": behavior_service,
         "autonomous_service": autonomous_service,
         "require_review_adapters": require_review_adapters,
     }

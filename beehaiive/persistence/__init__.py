@@ -76,6 +76,7 @@ from .helpers.value_helpers import _json_list as _json_list
 from .helpers.value_helpers import _json_mapping as _json_mapping
 from .helpers.value_helpers import _json_mapping_or_none as _json_mapping_or_none
 from .store import OrchestratorStore as OrchestratorStore
+from .unit_behaviors import UnitBehaviorMixin as UnitBehaviorMixin
 
 __all__ = [
     "DEFAULT_ACTION_LIMIT",
@@ -109,6 +110,7 @@ __all__ = [
     "MAX_PBI_REFINEMENT_TEXT_LENGTH",
     "META_REVIEW_LEASE_SECONDS",
     "OrchestratorStore",
+    "UnitBehaviorMixin",
     "PBI_CREATION_LEASE_SECONDS",
     "StoreError",
     "_REFINEMENT_SECRET_ASSIGNMENT",

@@ -39,6 +39,7 @@ from .run_transition import RunTransitionMixin
 from .runtime_settings import RuntimeSettingsMixin
 from .schema import StorageSchemaMixin
 from .task_contract import TaskContractMixin
+from .unit_behaviors import UnitBehaviorMixin
 from .worker_hosts import WorkerHostsMixin
 
 
@@ -76,6 +77,7 @@ class OrchestratorStore(
     MetaReviewMixin,
     ProjectReadMixin,
     RowMappingMixin,
+    UnitBehaviorMixin,
     WorkerHostsMixin,
 ):
     def __init__(
