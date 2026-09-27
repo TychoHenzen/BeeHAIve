@@ -5,8 +5,10 @@ import os
 import socket
 import subprocess
 import sys
+from collections.abc import Callable
 from ctypes import wintypes
 from pathlib import Path
+from typing import Protocol, cast
 
 
 class _BasicLimitInformation(ctypes.Structure):
@@ -45,8 +47,34 @@ class _ExtendedLimitInformation(ctypes.Structure):
     ]
 
 
+class _WindowsFunction(Protocol):
+    argtypes: tuple[object, ...]
+    restype: object
+
+    def __call__(self, *args: object) -> object: ...
+
+
+class _Kernel32(Protocol):
+    CreateJobObjectW: _WindowsFunction
+    SetInformationJobObject: _WindowsFunction
+    OpenProcess: _WindowsFunction
+    AssignProcessToJobObject: _WindowsFunction
+    CloseHandle: _WindowsFunction
+
+
+class _WinDllLoader(Protocol):
+    def __call__(self, name: str, *, use_last_error: bool = False) -> _Kernel32: ...
+
+
+def _windows_error() -> OSError:
+    get_last_error = cast(Callable[[], int], ctypes.__dict__["get_last_error"])
+    win_error = cast(Callable[[int], OSError], ctypes.__dict__["WinError"])
+    return win_error(get_last_error())
+
+
 def run_in_job(command: list[str]) -> int:
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    load_library = cast(_WinDllLoader, ctypes.__dict__["WinDLL"])
+    kernel32 = load_library("kernel32", use_last_error=True)
     create_job = kernel32.CreateJobObjectW
     create_job.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
     create_job.restype = wintypes.HANDLE
@@ -70,23 +98,23 @@ def run_in_job(command: list[str]) -> int:
 
     job = create_job(None, None)
     if not job:
-        raise ctypes.WinError(ctypes.get_last_error())
+        raise _windows_error()
     child: subprocess.Popen[bytes] | None = None
     try:
         limits = _ExtendedLimitInformation()
         limits.BasicLimitInformation.LimitFlags = 0x2000
         if not set_limits(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise _windows_error()
 
         child = subprocess.Popen(command)
         process = open_process(0x0101, False, child.pid)
         if not process:
             child.terminate()
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise _windows_error()
         try:
             if not assign(job, process):
                 child.terminate()
-                raise ctypes.WinError(ctypes.get_last_error())
+                raise _windows_error()
         finally:
             close_handle(process)
         try:
