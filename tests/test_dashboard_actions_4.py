@@ -7,6 +7,7 @@ from beehaiive.agent import redact_worker_text
 from beehaiive.dashboard.values import safe_dashboard_value
 from beehaiive.models import PbiSnapshot, ProjectSnapshot, RepositorySnapshot
 from beehaiive.orchestrator import Orchestrator
+from beehaiive.persistence.constants import DEFAULT_ACTION_LIMIT
 from beehaiive.storage import OrchestratorStore
 from beehaiive.workflow import LeaseStatus
 from tests.conftest import FakeProvider
@@ -103,6 +104,103 @@ def test_dashboard_requeue_makes_a_blocked_autonomous_pbi_claimable() -> None:
     assert pbi["claimable"] is True
     assert pbi["status"] == "idle"
     assert pbi["autonomous_status"] is None
+    service.store.close()
+
+
+def test_dashboard_requeue_makes_a_failed_manual_run_claimable() -> None:
+    service = Orchestrator(OrchestratorStore(), FakeProvider(dashboard_snapshot()))
+    service.synchronize("project-1")
+    run = service.claim("project-1", "owner/api", "worker")
+    assert run is not None
+    service.stop(run.run_id, "Stopped by operator")
+    client = TestClient(
+        main_module.create_app(
+            orchestrator=service,
+            api_key="test-key",
+            allowed_project_ids={"project-1"},
+        )
+    )
+
+    response = client.post(
+        "/projects/project-1/actions",
+        headers={"X-API-Key": "test-key"},
+        json={
+            "action": "requeue",
+            "approved": True,
+            "repository": "owner/api",
+            "pbi_number": 1,
+            "run_id": run.run_id,
+        },
+    )
+
+    assert response.status_code == 200
+    pbi = response.json()["state"]["repositories"][0]["pbis"][0]
+    assert pbi["claimable"] is True
+    service.store.close()
+
+
+def test_dashboard_requeue_survives_provider_refresh_and_action_history_limit() -> None:
+    provider = FakeProvider(dashboard_snapshot())
+    service = Orchestrator(OrchestratorStore(), provider)
+    service.synchronize("project-1")
+    run = service.claim("project-1", "owner/api", "worker")
+    assert run is not None
+    service.stop(run.run_id, "Stopped by operator")
+    provider.snapshot = ProjectSnapshot(
+        "project-1",
+        "Planning",
+        (
+            RepositorySnapshot(
+                "owner/api",
+                (
+                    PbiSnapshot(
+                        "owner/api",
+                        1,
+                        "API one",
+                        stage=None,
+                        planning_status="Done",
+                        claimable=False,
+                        metadata={"issue_state": "CLOSED"},
+                    ),
+                ),
+            ),
+        ),
+    )
+    client = TestClient(
+        main_module.create_app(
+            orchestrator=service,
+            api_key="test-key",
+            allowed_project_ids={"project-1"},
+        )
+    )
+
+    response = client.post(
+        "/projects/project-1/actions",
+        headers={"X-API-Key": "test-key"},
+        json={
+            "action": "requeue",
+            "approved": True,
+            "repository": "owner/api",
+            "pbi_number": 1,
+            "run_id": run.run_id,
+        },
+    )
+    assert response.json()["action"]["status"] == "succeeded"
+
+    for action_number in range(DEFAULT_ACTION_LIMIT):
+        action = service.store.begin_action(
+            "project-1", "synchronize", {"number": action_number}
+        )
+        service.store.finish_action(str(action["id"]), "succeeded")
+
+    refreshed = client.get("/projects/project-1/dashboard")
+    pbi = refreshed.json()["repositories"][0]["pbis"][0]
+    assert pbi["status"] == "idle"
+    assert pbi["claimable"] is True
+    assert pbi["run_id"] is None
+    assert pbi["workflow_queue"]["id"] == "refinement"
+    persisted = service.store.project_state("project-1")["repositories"][0]["pbis"][0]
+    assert persisted["claimable"] is True
     service.store.close()
 
 

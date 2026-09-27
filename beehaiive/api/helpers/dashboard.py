@@ -88,6 +88,18 @@ def _workflow_skill_ids() -> list[str]:
     configured = os.environ.get("BEEHAIIVE_DOD_GUARD_SKILLS", "").strip()
     if configured:
         roots.append(Path(configured))
+    plugin_cache = (
+        Path.home()
+        / ".codex"
+        / "plugins"
+        / "cache"
+        / "dod-guard-monorepo"
+        / "dod-guard"
+    )
+    if plugin_cache.is_dir():
+        roots.extend(
+            version / "skills" for version in plugin_cache.iterdir() if version.is_dir()
+        )
     known = {
         f"skill/{Path(step.skill_path).parent.name}"
         for step in (*AUTONOMOUS_STEPS, ADVISOR_STEP)
@@ -787,8 +799,18 @@ def _execute_requeue(
         and action.get("status") == "failed"
         for action in actions
     )
+    run = orchestrator.store.get_run(request.run_id)
+    run_status = None if run is None else getattr(run.status, "value", run.status)
+    failed_run = (
+        run is not None
+        and run_status == RunStatus.FAILED.value
+        and run.project_id == project_id
+        and run.repository == request.repository
+        and run.pbi_number == request.pbi_number
+    )
+    blocked = blocked or failed_run
     if not blocked:
-        raise StoreError("Only a blocked autonomous run can be made claimable")
+        raise StoreError("Only a failed run can be made claimable")
     return {
         "pbi": orchestrator.store.set_pbi_claimable(
             project_id, request.repository, request.pbi_number

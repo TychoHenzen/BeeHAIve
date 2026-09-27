@@ -60,6 +60,13 @@ uv run uvicorn main:app --reload
 Open `http://127.0.0.1:8000/dashboard?project=OWNER:NUMBER`. The project ID
 must be present in `BEEHAIIVE_ALLOWED_PROJECTS`, or in the owner and number
 environment variables used by the service.
+`start_dashboard.bat` refuses to start when port 8000 is already occupied rather
+than leaving another reload worker behind.
+
+Use the URL served by FastAPI rather than opening `docs/dashboard.html` or a
+standalone design export directly. The static files do not provide
+`/dashboard/settings`; a `Not Found` save response means the browser is pointed
+at the wrong or stale server origin.
 
 Read-only state needs no API key. Dashboard actions and Settings writes use the
 configured server-side `BEEHAIIVE_API_KEY`; the browser never asks for or stores it.

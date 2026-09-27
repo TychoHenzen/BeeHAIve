@@ -29,7 +29,11 @@ from beehaiive.graph import (
     GraphNodeKind,
     GraphReference,
 )
-from beehaiive.graph_safety import GraphSafetyService, GraphSafetyStore
+from beehaiive.graph_safety import (
+    GraphSafetyService,
+    GraphSafetyStore,
+    validate_graph,
+)
 from beehaiive.workflow import WorkspaceLease
 from beehaiive.workflows.helpers import repository_identity
 
@@ -81,20 +85,45 @@ def _skill_root() -> Path:
     configured = os.environ.get("BEEHAIIVE_DOD_GUARD_SKILLS", "").strip()
     if configured:
         return Path(configured)
-    return (
+    versions = _skill_cache_roots()
+    return next(
+        (root for root in versions if root.is_dir()),
+        Path.home() / ".agents" / "skills",
+    )
+
+
+def _skill_cache_roots() -> tuple[Path, ...]:
+    cache = (
         Path.home()
         / ".codex"
         / "plugins"
         / "cache"
         / "dod-guard-monorepo"
         / "dod-guard"
-        / "5.4.5"
-        / "skills"
     )
+    if not cache.is_dir():
+        return ()
+    versions = sorted(
+        (candidate for candidate in cache.iterdir() if candidate.is_dir()),
+        key=lambda path: tuple(
+            (0, int(part)) if part.isdigit() else (1, part)
+            for part in path.name.split(".")
+        ),
+        reverse=True,
+    )
+    return tuple(candidate / "skills" for candidate in versions)
 
 
 def _skill_path(name: str) -> str:
-    return str(_skill_root() / name / "SKILL.md")
+    roots = [_skill_root(), Path.home() / ".agents" / "skills"]
+    configured = os.environ.get("BEEHAIIVE_DOD_GUARD_SKILLS", "").strip()
+    if not configured:
+        roots.extend(_skill_cache_roots())
+    for root in dict.fromkeys(roots):
+        candidate = root / name / "SKILL.md"
+        if candidate.is_file():
+            return str(candidate)
+    return str(roots[0] / name / "SKILL.md")
 
 
 def _output_tail(value: object) -> str:
@@ -160,6 +189,8 @@ class SkillStep:
     skill_path: str
     purpose: str
     model: str | None = None
+    kind: str = "skill"
+    reference_id: str | None = None
 
 
 AUTONOMOUS_STEPS: tuple[SkillStep, ...] = (
@@ -263,7 +294,46 @@ def _active_workflow_definition(
     return definition
 
 
+def _validate_workflow_definition(definition: GraphDefinition) -> None:
+    try:
+        safety = validate_graph(definition)
+    except Exception as error:
+        raise ValueError("Selected workflow failed graph safety validation") from error
+    if not safety.passed:
+        raise ValueError("Selected workflow failed graph safety validation")
+    for node in definition.nodes:
+        if (
+            node.kind is not GraphNodeKind.SKILL
+            or not node.reference.reference_id.startswith("skill/")
+        ):
+            raise ValueError("Selected workflow contains an unsupported node")
+    outgoing: dict[str, tuple[GraphEdge, ...]] = {
+        node.node_id: tuple(
+            edge for edge in definition.edges if edge.source == node.node_id
+        )
+        for node in definition.nodes
+    }
+    outcome_aliases = {
+        "pass": "succeeded",
+        "success": "succeeded",
+        "succeeded": "succeeded",
+        "fail": "failed",
+        "failed": "failed",
+        "error": "failed",
+    }
+    for edges in outgoing.values():
+        conditions = [
+            outcome_aliases.get(edge.condition.casefold(), edge.condition.casefold())
+            for edge in edges
+        ]
+        if "always" in conditions and len(edges) > 1:
+            raise ValueError("Selected workflow contains ambiguous transitions")
+        if len(conditions) != len(set(conditions)):
+            raise ValueError("Selected workflow contains ambiguous transitions")
+
+
 def _workflow_step_names(definition: GraphDefinition) -> tuple[str, ...]:
+    _validate_workflow_definition(definition)
     nodes = {node.node_id: node for node in definition.nodes}
     targets = {edge.target for edge in definition.edges}
     entries = tuple(node_id for node_id in nodes if node_id not in targets)
@@ -281,25 +351,22 @@ def _workflow_step_names(definition: GraphDefinition) -> tuple[str, ...]:
             raise ValueError("Selected workflow contains a cycle")
         visited_nodes.add(current)
         node = nodes[current]
-        if (
-            node.kind is not GraphNodeKind.SKILL
-            or not node.reference.reference_id.startswith("skill/")
-        ):
-            raise ValueError("Selected workflow contains an unsupported node")
-        ordered.append(node.reference.reference_id.removeprefix("skill/"))
+        ordered.append(
+            node.reference.reference_id.removeprefix("skill/")
+            if node.kind is GraphNodeKind.SKILL
+            else node.node_id
+        )
         edges = outgoing[current]
         if not edges:
             break
         if len(edges) != 1 or edges[0].condition != "pass":
-            raise ValueError("Selected workflow must be a linear pass sequence")
+            break
         current = edges[0].target
-    if len(ordered) != len(nodes) or set(ordered) != {
-        step.name for step in AUTONOMOUS_STEPS
-    }:
-        raise ValueError(
-            "Selected workflow must contain the complete autonomous sequence"
-        )
-    return tuple(ordered)
+    if len(ordered) == len(nodes):
+        return tuple(ordered)
+    return tuple(
+        node.reference.reference_id.removeprefix("skill/") for node in definition.nodes
+    )
 
 
 def _workflow_steps(context: Mapping[str, object]) -> tuple[SkillStep, ...]:
@@ -315,10 +382,109 @@ def _workflow_steps(context: Mapping[str, object]) -> tuple[SkillStep, ...]:
     if len(names) != len(raw_values):
         raise ValueError("Workflow step names are invalid")
     steps = {step.name: step for step in AUTONOMOUS_STEPS}
-    try:
-        return tuple(steps[name] for name in names)
-    except KeyError as error:
-        raise ValueError("Workflow references an unknown autonomous skill") from error
+    return tuple(
+        steps.get(
+            name,
+            SkillStep(name, _skill_path(name), f"Run the {name} workflow step."),
+        )
+        for name in names
+    )
+
+
+def _workflow_definition(
+    context: Mapping[str, object],
+) -> (
+    tuple[GraphDefinition, dict[str, SkillStep], dict[str, tuple[GraphEdge, ...]]]
+    | None
+):
+    raw_definition = context.get("workflow_definition")
+    if not isinstance(raw_definition, Mapping):
+        return None
+    definition = GraphDefinition.from_dict(cast(Mapping[str, object], raw_definition))
+    _validate_workflow_definition(definition)
+    steps: dict[str, SkillStep] = {}
+    registered_steps = {step.name: step for step in AUTONOMOUS_STEPS}
+    for node in definition.nodes:
+        reference_id = node.reference.reference_id
+        if node.kind is GraphNodeKind.SKILL:
+            if not reference_id.startswith("skill/"):
+                raise ValueError("Workflow skill references must start with skill/")
+            name = reference_id.removeprefix("skill/")
+            purpose = _text(
+                node.metadata.get("purpose"), f"Run the {name} workflow step."
+            )
+            registered = registered_steps.get(name)
+            steps[node.node_id] = (
+                registered
+                if registered is not None
+                else SkillStep(
+                    name,
+                    _skill_path(name),
+                    purpose,
+                    kind=node.kind.value,
+                    reference_id=reference_id,
+                )
+            )
+            continue
+        purpose = _text(
+            node.metadata.get("prompt"),
+            f"Execute the {node.kind.value} step {node.node_id} ({reference_id}).",
+        )
+        steps[node.node_id] = SkillStep(
+            node.node_id,
+            "",
+            purpose,
+            kind=node.kind.value,
+            reference_id=reference_id,
+        )
+    edges = {
+        node.node_id: tuple(
+            edge for edge in definition.edges if edge.source == node.node_id
+        )
+        for node in definition.nodes
+    }
+    return definition, steps, edges
+
+
+def _workflow_entries(definition: GraphDefinition) -> tuple[str, ...]:
+    targets = {edge.target for edge in definition.edges}
+    return tuple(
+        node.node_id for node in definition.nodes if node.node_id not in targets
+    )
+
+
+def _workflow_edge_matches(
+    edge: GraphEdge,
+    status: str,
+    result: Mapping[str, object],
+) -> bool:
+    condition = edge.condition.casefold()
+    if condition == "always":
+        return True
+    if condition in {"pass", "success", "succeeded"}:
+        return status == "succeeded"
+    if condition == "question":
+        return status == "question"
+    if condition in {"fail", "failed", "error"}:
+        return status not in {
+            "succeeded",
+            "blocked",
+            "human_handoff",
+            "paused",
+            "question",
+            "awaiting_operator",
+        }
+    if condition == "blocked":
+        return status == "blocked"
+    evidence = _mapping(result.get("handover")).get("evidence")
+    evidence_mapping = (
+        cast(Mapping[str, object], evidence)
+        if isinstance(evidence, Mapping)
+        else cast(Mapping[str, object], {})
+    )
+    return (evidence_mapping.get(edge.condition) is True) or result.get(
+        edge.condition
+    ) is True
 
 
 ADVISOR_STEP = SkillStep(
@@ -630,9 +796,15 @@ def _skill_status(value: object) -> str:
         in {
             "complete",
             "completed",
+            "created",
             "done",
             "fixed",
             "merged",
+            "no-findings",
+            "no_findings",
+            "no-op",
+            "noop",
+            "pass",
             "passed",
             "published",
             "reviewed",
@@ -728,9 +900,54 @@ class AutonomousLifecycleRunner:
         }
         handoffs: list[SkillHandoff] = []
         advisor_handoff: SkillHandoff | None = None
-        workflow_steps = _workflow_steps(context)
-        steps = workflow_steps[_start_index(context, workflow_steps) :]
-        for step in steps:
+        graph = _workflow_definition(context)
+        if graph is None:
+            workflow_steps = _workflow_steps(context)
+            steps: tuple[SkillStep, ...] | None = workflow_steps[
+                _start_index(context, workflow_steps) :
+            ]
+            current_node: str | None = None
+            graph_steps: dict[str, SkillStep] = {}
+            graph_edges: dict[str, tuple[GraphEdge, ...]] = {}
+            max_steps = len(steps)
+        else:
+            definition, graph_steps, graph_edges = graph
+            entries = _workflow_entries(definition)
+            if len(entries) != 1:
+                raise ValueError("Selected workflow must have one entry node")
+            requested_step = _text(context.get("resume_step"))
+            if requested_step:
+                current_node = next(
+                    (
+                        node_id
+                        for node_id, step in graph_steps.items()
+                        if node_id == requested_step or step.name == requested_step
+                    ),
+                    None,
+                )
+                if current_node is None:
+                    raise ValueError("Workflow resume step is not declared")
+            else:
+                current_node = entries[0]
+            steps = None
+            max_steps = max(1, definition.limits.max_loops)
+        step_index = 0
+        while True:
+            if step_index >= max_steps:
+                return AutonomousRunResult(
+                    run_id,
+                    "blocked",
+                    repository,
+                    pbi_number,
+                    tuple(handoffs),
+                    error="Workflow loop limit reached",
+                    advisor=advisor_handoff,
+                )
+            if current_node is not None:
+                step = graph_steps[current_node]
+            else:
+                assert steps is not None
+                step = steps[step_index]
             if self.on_step is not None:
                 self.on_step(step.name)
             step_context = _context_for_step(context, handover)
@@ -756,6 +973,23 @@ class AutonomousLifecycleRunner:
             handoffs.append(handoff)
             if self.on_handoff is not None:
                 self.on_handoff(handoff)
+            matches = (
+                tuple(
+                    edge
+                    for edge in graph_edges.get(current_node or "", ())
+                    if _workflow_edge_matches(edge, status, result)
+                )
+                if current_node is not None
+                else ()
+            )
+            if len(matches) > 1:
+                raise ValueError(
+                    f"Workflow has multiple matching transitions for {step.name}"
+                )
+            if current_node is not None and matches:
+                current_node = matches[0].target
+                step_index += 1
+                continue
             if status != "succeeded":
                 if self.advisor is not None:
                     advisor_context = {
@@ -799,6 +1033,12 @@ class AutonomousLifecycleRunner:
                     error=summary[:4_000],
                     advisor=advisor_handoff,
                 )
+            if current_node is None:
+                step_index += 1
+                assert steps is not None
+                if step_index < len(steps):
+                    continue
+            break
         return AutonomousRunResult(
             run_id, "completed", repository, pbi_number, tuple(handoffs)
         )
@@ -812,8 +1052,13 @@ class PlaceholderSkillExecutor:
         handover: Mapping[str, object],
     ) -> Mapping[str, object]:
         try:
-            remaining = AUTONOMOUS_STEPS[AUTONOMOUS_STEPS.index(step) + 1 :]
-        except ValueError:
+            step_index = next(
+                index
+                for index, candidate in enumerate(AUTONOMOUS_STEPS)
+                if candidate.name == step.name
+            )
+            remaining = AUTONOMOUS_STEPS[step_index + 1 :]
+        except StopIteration:
             remaining = ()
         next_step = remaining[0].name if remaining else "complete"
         return {
@@ -859,7 +1104,7 @@ class CodexSkillExecutor:
         context: Mapping[str, object],
         handover: Mapping[str, object],
     ) -> Mapping[str, object]:
-        if not Path(step.skill_path).is_file():
+        if step.kind == "skill" and not Path(step.skill_path).is_file():
             raise FileNotFoundError(f"Skill file not found: {step.skill_path}")
         workspace_instruction = ""
         if context.get("workspace_path") and context.get("workspace_branch"):
@@ -889,9 +1134,17 @@ class CodexSkillExecutor:
                 "selected fixes."
             )
         )
+        instruction = (
+            f"Read and follow this skill file exactly: {step.skill_path}"
+            if step.kind == "skill"
+            else (
+                "Execute this dashboard workflow "
+                f"{step.kind} instruction: {step.purpose}"
+            )
+        )
         prompt = (
-            "You are one autonomous BeeHAIve lifecycle context. Read and follow "
-            f"this skill file exactly: {step.skill_path}\n"
+            "You are one autonomous BeeHAIve lifecycle context. "
+            f"{instruction}\n"
             f"Stage purpose: {step.purpose}\n"
             "Use the supplied context and handover. "
             f"{scope} "
@@ -930,6 +1183,16 @@ class CodexSkillExecutor:
                 "one. Do not invoke collab, spawn a nested reviewer, or wait for "
                 "that review here. Complete implementation, verification, commit, "
                 "and push, then return the handover."
+            )
+        if step.name == "complete-pr":
+            prompt += (
+                "\nThe supplied PBI number is authoritative for reconciliation. If the "
+                "pull request is already merged but GitHub does not expose a closing "
+                "issue reference, reconcile that supplied PBI directly, read back its "
+                "closed state and Project status, and continue; do not report a "
+                "missing closing reference as a blocker when the repository, PR, and "
+                "PBI context "
+                "match."
             )
         command = [
             self.executable,
@@ -1170,6 +1433,7 @@ class AutonomousLifecycleService:
                 "run_id": run_id,
                 "workflow_id": selected_workflow_id,
                 "workflow_step_names": workflow_step_names,
+                "workflow_definition": workflow_definition.as_dict(),
             }
             if resume_requested:
                 context.update(
@@ -1455,17 +1719,6 @@ class AutonomousLifecycleService:
             if isinstance(workflow_id, str) and workflow_id
             else {}
         )
-        requeue_index = next(
-            (
-                index
-                for index, action in enumerate(scoped_actions)
-                if action.get("kind") == "requeue"
-                and action.get("status") == "succeeded"
-            ),
-            None,
-        )
-        if requeue_index is not None:
-            scoped_actions = scoped_actions[: requeue_index + 1]
         for action in scoped_actions:
             if action.get("kind") != "skill:review-pr-branch" or action.get(
                 "status"

@@ -196,6 +196,9 @@ def build_route_dependencies(
         supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
     ) -> str:
         require_api_key(supplied_api_key)
+        return workflow_operator()
+
+    def workflow_operator() -> str:
         if configured_workflow_actor is None:
             raise HTTPException(
                 status_code=503,
@@ -214,6 +217,13 @@ def build_route_dependencies(
                 detail="Workflow operator approval is required",
             )
         return actor.value
+
+    def require_dashboard_workflow_operator(
+        request: Request,
+        supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    ) -> str:
+        require_mutation_access(request, supplied_api_key)
+        return workflow_operator()
 
     def require_refinement_operator(
         request: Request,
@@ -261,5 +271,6 @@ def build_route_dependencies(
         "require_routing_run_access": require_routing_run_access,
         "require_workflow_access": require_workflow_access,
         "require_workflow_operator": require_workflow_operator,
+        "require_dashboard_workflow_operator": require_dashboard_workflow_operator,
         "require_workflow_service": require_workflow_service,
     }

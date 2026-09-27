@@ -644,11 +644,7 @@ def pbi_view(
         None,
     )
     requeue_action = next(
-        (
-            action
-            for action in matching_actions
-            if action.get("kind") == "requeue" and action.get("status") == "succeeded"
-        ),
+        (action for action in matching_actions if action.get("kind") == "requeue"),
         None,
     )
     provider_completed = _provider_completion_confirmed(
@@ -706,10 +702,16 @@ def pbi_view(
         ),
         None,
     )
-    requeue_is_latest = requeue_index is not None and (
-        autonomous_index is None or requeue_index < autonomous_index
+    requeue_is_latest = (
+        requeue_index is not None
+        and requeue_action is not None
+        and requeue_action.get("status") == "succeeded"
+        and (autonomous_index is None or requeue_index < autonomous_index)
     )
-    if requeue_is_latest and not provider_completed:
+    requeue_effective = (
+        requeue_is_latest or (status == "failed" and claimable and last_error is None)
+    ) and (status == "failed" or not provider_completed)
+    if requeue_effective:
         status = "idle"
         run_id = None
         active = bool(raw_pbi.get("active"))
@@ -725,8 +727,9 @@ def pbi_view(
         handoff_result = action.get("result")
         if isinstance(handoff_result, Mapping):
             autonomous_handoffs.append(dict(cast(Mapping[str, object], handoff_result)))
+    effective_planning_status = None if requeue_effective else planning_status
     display_stage_value = display_stage(
-        raw_stage, status, planning_status, pull_requests
+        raw_stage, status, effective_planning_status, pull_requests
     )
     queue_actions = matching_actions
     if status in {"active", "awaiting_operator"} and isinstance(run_id, str):
@@ -747,7 +750,7 @@ def pbi_view(
             queue_actions = queue_actions[: queue_requeue_index + 1]
     workflow_queue = queue_for_pbi(
         status,
-        planning_status,
+        effective_planning_status,
         raw_stage,
         archived,
         raw_pbi.get("branch"),

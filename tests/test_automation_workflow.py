@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 
 import pytest
 
@@ -9,8 +10,10 @@ from beehaiive.api.helpers.dashboard import _dashboard_state
 from beehaiive.autonomous import (
     AUTONOMOUS_STEPS,
     DEFAULT_AUTOMATION_WORKFLOW_ID,
+    AutonomousLifecycleRunner,
     AutonomousLifecycleService,
     PlaceholderSkillExecutor,
+    SkillStep,
     bootstrap_automation_workflow,
 )
 from beehaiive.graph import (
@@ -55,6 +58,180 @@ def test_bootstrap_persists_and_activates_one_idempotent_workflow(tmp_path) -> N
         assert active["revision"] == 1
     finally:
         store.close()
+
+
+def test_custom_graph_executes_declared_failure_fallback(tmp_path) -> None:
+    class RecordingExecutor:
+        def execute(
+            self,
+            step: SkillStep,
+            _context: Mapping[str, object],
+            _handover: Mapping[str, object],
+        ) -> Mapping[str, object]:
+            (tmp_path / f"{step.name}.done").write_text("worked", encoding="utf-8")
+            if step.name == "work":
+                return {"status": "failed", "summary": "transient check failure"}
+            return {"status": "succeeded", "summary": "fallback repaired the check"}
+
+    store = OrchestratorStore()
+    orchestrator = Orchestrator(store, FakeProvider(dashboard_snapshot()))
+    orchestrator.synchronize("project-1")
+    definition = GraphDefinition(
+        "custom-fallback",
+        1,
+        (
+            GraphNode("work", GraphNodeKind.SKILL, GraphReference("skill/work")),
+            GraphNode("repair", GraphNodeKind.SKILL, GraphReference("skill/repair")),
+        ),
+        (GraphEdge("work", "repair", "fail"),),
+    )
+    base = {
+        "evidence": {},
+        "artifact_refs": [],
+        "question": None,
+        "required_action": None,
+        "validation_reason": None,
+        "answer": None,
+    }
+    safety = GraphSafetyService(store)
+    evaluation = safety.evaluate(
+        definition,
+        {
+            "failure": {
+                "work": {**base, "outcome": "fail"},
+                "repair": {**base, "outcome": "pass"},
+            }
+        },
+    )
+    safety.review(evaluation, "operator")
+    safety.activate(evaluation, "operator")
+    service = AutonomousLifecycleService(orchestrator, RecordingExecutor())
+
+    try:
+        started = service.start(
+            "project-1",
+            repository="owner/api",
+            pbi_number=1,
+            workflow_id="custom-fallback",
+        )
+        deadline = time.monotonic() + 3
+        current = service.status(str(started["run_id"]))
+        while current["status"] == "running" and time.monotonic() < deadline:
+            time.sleep(0.01)
+            current = service.status(str(started["run_id"]))
+
+        assert current["status"] == "completed"
+        assert [item["step"] for item in current["handoffs"]] == ["work", "repair"]
+        assert [item["status"] for item in current["handoffs"]] == [
+            "failed",
+            "succeeded",
+        ]
+        assert (tmp_path / "work.done").is_file()
+        assert (tmp_path / "repair.done").is_file()
+    finally:
+        store.close()
+
+
+def test_unsupported_graph_is_rejected_before_worker_claim() -> None:
+    store = OrchestratorStore()
+    orchestrator = Orchestrator(store, FakeProvider(dashboard_snapshot()))
+    orchestrator.synchronize("project-1")
+    definition = GraphDefinition(
+        "unsupported-node",
+        1,
+        (GraphNode("prompt", GraphNodeKind.PROMPT, GraphReference("prompt/ask")),),
+    )
+    base = {
+        "outcome": "pass",
+        "evidence": {},
+        "artifact_refs": [],
+        "question": None,
+        "required_action": None,
+        "validation_reason": None,
+        "answer": None,
+    }
+    safety = GraphSafetyService(store)
+    evaluation = safety.evaluate(definition, {"happy": {"prompt": base}})
+    safety.review(evaluation, "operator")
+    safety.activate(evaluation, "operator")
+    service = AutonomousLifecycleService(orchestrator, PlaceholderSkillExecutor())
+
+    try:
+        with pytest.raises(ValueError, match="unsupported node"):
+            service.start(
+                "project-1",
+                repository="owner/api",
+                pbi_number=1,
+                workflow_id="unsupported-node",
+            )
+        assert service.active_count() == 0
+        assert not any(
+            action.get("kind") == "autonomous_start"
+            for action in store.actions_for_project("project-1")
+        )
+    finally:
+        store.close()
+
+
+def test_human_outcome_does_not_take_failure_fallback() -> None:
+    definition = GraphDefinition(
+        "human-stop",
+        1,
+        (
+            GraphNode("work", GraphNodeKind.SKILL, GraphReference("skill/work")),
+            GraphNode("repair", GraphNodeKind.SKILL, GraphReference("skill/repair")),
+        ),
+        (GraphEdge("work", "repair", "fail"),),
+    )
+
+    class HumanExecutor:
+        def execute(self, step, _context, _handover):
+            assert step.name == "work"
+            return {"status": "question", "summary": "operator input required"}
+
+    result = AutonomousLifecycleRunner(HumanExecutor()).run(
+        {
+            "repository": "owner/api",
+            "pbi_number": 1,
+            "workflow_definition": definition.as_dict(),
+        }
+    )
+
+    assert result.status == "blocked"
+    assert [handoff.step for handoff in result.handoffs] == ["work"]
+
+
+def test_question_outcome_takes_declared_question_transition() -> None:
+    definition = GraphDefinition(
+        "question-fallback",
+        1,
+        (
+            GraphNode("work", GraphNodeKind.SKILL, GraphReference("skill/work")),
+            GraphNode("repair", GraphNodeKind.SKILL, GraphReference("skill/repair")),
+        ),
+        (GraphEdge("work", "repair", "question"),),
+    )
+
+    class QuestionExecutor:
+        def execute(self, step, _context, _handover):
+            if step.name == "work":
+                return {"status": "question", "summary": "operator input required"}
+            return {"status": "succeeded", "summary": "question resolved"}
+
+    result = AutonomousLifecycleRunner(QuestionExecutor()).run(
+        {
+            "repository": "owner/api",
+            "pbi_number": 1,
+            "workflow_definition": definition.as_dict(),
+        }
+    )
+
+    assert result.status == "completed"
+    assert [handoff.step for handoff in result.handoffs] == ["work", "repair"]
+    assert [handoff.status for handoff in result.handoffs] == [
+        "question",
+        "succeeded",
+    ]
 
 
 def test_application_startup_reuses_one_workflow_revision_after_reopen(

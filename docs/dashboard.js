@@ -113,9 +113,14 @@ function workflowDraft(workflowId) {
     schema_version: 1,
     nodes: [
       { node_id: "start", kind: "prompt", reference: { reference_id: "prompt/start" } },
-      { node_id: "work", kind: "skill", reference: { reference_id: "skill/work" } },
+      {
+        node_id: "work",
+        kind: "skill",
+        reference: { reference_id: "skill/refine-backlog-item" },
+      },
     ],
     edges: [{ source: "start", target: "work", condition: "pass" }],
+    limits: { max_retries: 3, max_loops: 8, timeout_seconds: 900, max_maintenance_passes: 1 },
     fixtures: { happy: { start: result, work: result } },
   };
 }

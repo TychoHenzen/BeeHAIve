@@ -246,6 +246,43 @@ def test_autonomous_resume_retries_a_draft_publication() -> None:
     }
 
 
+def test_autonomous_requeue_preserves_a_completed_review_checkpoint() -> None:
+    actions = [
+        {
+            "kind": "autonomous_start",
+            "status": "failed",
+            "repository": "owner/api",
+            "pbi_number": 1,
+            "request": {"workflow_id": "automation-swarm"},
+        },
+        {
+            "kind": "skill:fix-pr-review",
+            "status": "succeeded",
+            "repository": "owner/api",
+            "pbi_number": 1,
+            "result": {
+                "status": "pass",
+                "handover": {
+                    "branch": "codex/recovery",
+                    "review_complete": True,
+                    "reviewAttempted": True,
+                },
+            },
+        },
+        {
+            "kind": "requeue",
+            "status": "succeeded",
+            "repository": "owner/api",
+            "pbi_number": 1,
+        },
+    ]
+
+    resume = AutonomousLifecycleService._resume_context(actions, "owner/api", 1)
+
+    assert resume["resume_step"] == "complete-pr"
+    assert resume["resume_existing_workspace"] is True
+
+
 def test_autonomous_start_resumes_the_next_lifecycle_skill() -> None:
     snapshot = ProjectSnapshot(
         "project-1",
@@ -531,6 +568,9 @@ def test_runner_normalizes_completed_skill_status() -> None:
 
 
 def test_runner_normalizes_published_skill_status() -> None:
+    assert autonomous._skill_status("created") == "succeeded"
+    assert autonomous._skill_status("pass") == "succeeded"
+    assert autonomous._skill_status("no-op") == "succeeded"
     assert autonomous._skill_status("published") == "succeeded"
     assert autonomous._skill_status("reviewed") == "succeeded"
     assert autonomous._skill_status("fixed") == "succeeded"

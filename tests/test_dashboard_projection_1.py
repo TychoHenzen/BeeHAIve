@@ -479,6 +479,92 @@ def test_provider_completion_clears_old_autonomous_failure() -> None:
     assert pbi["last_error"] is None
 
 
+def test_requeue_reopens_a_failed_run_even_when_provider_status_is_done() -> None:
+    view = build_dashboard_state(
+        {
+            "project_id": "project-1",
+            "name": "Planning",
+            "repositories": [
+                {
+                    "name": "owner/api",
+                    "pbis": [
+                        {
+                            "number": 1,
+                            "title": "Stopped work",
+                            "stage": "implement",
+                            "status": "failed",
+                            "run_id": "run-1",
+                            "planning_status": "Done",
+                            "archived": False,
+                            "claimable": False,
+                        }
+                    ],
+                }
+            ],
+        },
+        [
+            {
+                "kind": "requeue",
+                "status": "succeeded",
+                "repository": "owner/api",
+                "pbi_number": 1,
+                "run_id": "run-1",
+            }
+        ],
+    )
+
+    pbi = view["repositories"][0]["pbis"][0]
+    assert pbi["status"] == "idle"
+    assert pbi["claimable"] is True
+    assert pbi["run_id"] is None
+
+
+def test_failed_requeue_does_not_replay_an_older_success() -> None:
+    view = build_dashboard_state(
+        {
+            "project_id": "project-1",
+            "name": "Planning",
+            "repositories": [
+                {
+                    "name": "owner/api",
+                    "pbis": [
+                        {
+                            "number": 1,
+                            "title": "Stopped work",
+                            "stage": "refine",
+                            "status": "failed",
+                            "run_id": "run-1",
+                            "planning_status": "Done",
+                            "claimable": False,
+                        }
+                    ],
+                }
+            ],
+        },
+        [
+            {
+                "kind": "requeue",
+                "status": "failed",
+                "repository": "owner/api",
+                "pbi_number": 1,
+                "run_id": "run-1",
+            },
+            {
+                "kind": "requeue",
+                "status": "succeeded",
+                "repository": "owner/api",
+                "pbi_number": 1,
+                "run_id": "run-1",
+            },
+        ],
+    )
+
+    pbi = view["repositories"][0]["pbis"][0]
+    assert pbi["status"] == "failed"
+    assert pbi["claimable"] is False
+    assert pbi["run_id"] == "run-1"
+
+
 def test_dashboard_projection_exposes_optional_run_details() -> None:
     view = build_dashboard_state(
         {

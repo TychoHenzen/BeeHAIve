@@ -118,9 +118,12 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
                 project.strip() for project in request.projects if project.strip()
             }
             if not next_projects or any(
-                project.count(":") != 1
-                or not project.rsplit(":", 1)[1].isdigit()
-                or not re.fullmatch(r"[A-Za-z0-9_.-]+", project.split(":", 1)[0])
+                project not in project_boundary
+                and (
+                    project.count(":") != 1
+                    or not project.rsplit(":", 1)[1].isdigit()
+                    or not re.fullmatch(r"[A-Za-z0-9_.-]+", project.split(":", 1)[0])
+                )
                 for project in next_projects
             ):
                 raise HTTPException(

@@ -61,7 +61,7 @@ class ProjectSyncMixin:
                     )
                     existing = connection.execute(
                         """
-                        SELECT p.stage, p.run_id, p.claimable,
+                        SELECT p.stage, p.run_id, p.claimable, p.last_error,
                                r.status AS run_status, r.task_contract_json,
                                r.task_result_json, r.task_answer,
                                r.task_answer_resumed
@@ -114,6 +114,12 @@ class ProjectSyncMixin:
                         if incoming_stage is not None
                         else current_stage
                     )
+                    operator_requeued = (
+                        bool(existing["claimable"])
+                        and existing["run_status"] == RunStatus.FAILED.value
+                        and existing["last_error"] is None
+                        and merged_stage is not Stage.PULL_REQUEST
+                    )
                     connection.execute(
                         """
                         UPDATE pbis
@@ -140,15 +146,19 @@ class ProjectSyncMixin:
                             json.dumps(dict(pbi.metadata), sort_keys=True),
                             pbi.planning_status,
                             int(
-                                incoming_stage is not None
-                                and merged_stage is not Stage.PULL_REQUEST
-                                and existing["run_status"] != RunStatus.COMPLETED.value
-                                and (
-                                    existing["run_status"]
-                                    != RunStatus.AWAITING_OPERATOR.value
-                                    or bool(existing["task_answer_resumed"])
+                                operator_requeued
+                                or (
+                                    incoming_stage is not None
+                                    and merged_stage is not Stage.PULL_REQUEST
+                                    and existing["run_status"]
+                                    != RunStatus.COMPLETED.value
+                                    and (
+                                        existing["run_status"]
+                                        != RunStatus.AWAITING_OPERATOR.value
+                                        or bool(existing["task_answer_resumed"])
+                                    )
+                                    and not task_pause
                                 )
-                                and not task_pause
                             ),
                             current_stage.value,
                             merged_stage.value,

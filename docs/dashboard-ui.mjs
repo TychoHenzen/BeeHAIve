@@ -137,6 +137,7 @@ function stageLabel(pbi) {
 }
 
 function isCompleted(pbi) {
+  if (pbi.status === "idle" && pbi.claimable === true && !pbi.run_id) return false;
   return pbi.status === "completed"
     || pbi.archived === true
     || TERMINAL_PLANNING_STATUSES.has(String(pbi.planning_status || "").toLowerCase());
@@ -217,13 +218,21 @@ function actionSpec(item, demo) {
   const identity = { repository, pbi_number: pbi.number, run_id: pbi.run_id };
   if (pbi.autonomous_status === "blocked") {
     return {
-      label: "Make claimable",
+      label: "Resolve block",
       testid: "requeue-work",
-      description: "Put this blocked PBI back into the claimable queue without starting work.",
+      description: "Resolve the blocked run and put this PBI back into the retryable queue.",
       payload: { action: "requeue", repository, pbi_number: pbi.number, run_id: pbi.run_id },
     };
   }
   if (pbi.autonomous_status === "running") return null;
+  if (pbi.status === "failed" && pbi.run_id && !pbi.claimable && pbi.active !== false) {
+    return {
+      label: "Resolve block",
+      testid: "resolve-block",
+      description: "Resolve the failed run and make this PBI retryable.",
+      payload: { action: "requeue", repository, pbi_number: pbi.number, run_id: pbi.run_id },
+    };
+  }
   if (map(pbi.delivery).retry_available && pbi.run_id && pbi.active !== false) {
     return {
       label: "Retry delivery",
@@ -936,9 +945,14 @@ export function createDashboardUi({
         schema_version: 1,
         nodes: [
           { node_id: "start", kind: "prompt", reference: { reference_id: "prompt/start" } },
-          { node_id: "work", kind: "skill", reference: { reference_id: "skill/work" } },
+          {
+            node_id: "work",
+            kind: "skill",
+            reference: { reference_id: workflowSkills()[0]?.[0] || "skill/refine-backlog-item" },
+          },
         ],
         edges: [{ source: "start", target: "work", condition: "pass" }],
+        limits: { max_retries: 3, max_loops: 8, timeout_seconds: 900, max_maintenance_passes: 1 },
       };
     draft.workflow_id = workflowId;
     draft.revision = latestRevision + 1;
@@ -974,6 +988,14 @@ export function createDashboardUi({
     textarea.addEventListener("input", () => onInput(textarea.value));
     field.append(label, textarea);
     return { field, textarea };
+  }
+
+  function editorNumber(labelText, value, id, onInput, min = "0") {
+    const control = editorField(labelText, value, id, onInput);
+    control.input.type = "number";
+    control.input.min = min;
+    control.input.step = "1";
+    return control;
   }
 
   function editorSelect(labelText, value, id, options, onChange) {
@@ -1104,6 +1126,31 @@ export function createDashboardUi({
     heading.append(element("h3", `Edit next revision ${draft.revision}`));
     heading.append(element("p", "Build the run path from prompts, Codex skills, and safe tools. Save the draft to evaluate it."));
     editor.append(heading, graphVisual(draft));
+
+    draft.limits = draft.limits && typeof draft.limits === "object" ? draft.limits : {};
+    const limitHeading = element("div", undefined, "editor-heading");
+    limitHeading.append(element("h4", "Execution bounds"));
+    const limitRow = element("div", undefined, "workflow-editor-row");
+    const limits = [
+      ["Max retries", "max_retries", 3, "0"],
+      ["Max loops", "max_loops", 8, "1"],
+      ["Timeout (seconds)", "timeout_seconds", 900, "1"],
+      ["Maintenance passes", "max_maintenance_passes", 1, "0"],
+    ];
+    limits.forEach(([label, key, fallback, minimum], index) => {
+      const control = editorNumber(
+        label,
+        draft.limits[key] ?? fallback,
+        `graph-limit-${key}-${index}`,
+        (value) => {
+          draft.limits[key] = Number(value);
+          draft.dirty = true;
+        },
+        minimum,
+      );
+      limitRow.append(control.field);
+    });
+    editor.append(limitHeading, limitRow);
 
     const nodeHeading = element("div", undefined, "editor-heading");
     nodeHeading.append(element("h4", "Nodes"));

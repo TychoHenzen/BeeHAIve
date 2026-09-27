@@ -53,7 +53,7 @@ def test_batch_launcher_is_rooted_and_actionable() -> None:
     assert "BEEHAIIVE_API_KEY" in launcher
     assert "BEEHAIIVE_REVIEW_ACTOR" in launcher
     assert "BEEHAIIVE_AGENT_REPOSITORY_NAME" in launcher
-    assert "uv run uvicorn main:app --reload" in launcher
+    assert "uv run python -m beehaiive.dashboard_launcher" in launcher
 
 
 @pytest.mark.skipif(os.name != "nt", reason="The launcher is Windows-specific")
