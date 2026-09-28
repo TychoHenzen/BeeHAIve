@@ -92,7 +92,7 @@ Do not repeat identical issue, Project, PBI, pull-request, or queue reads inside
 
 Pass the snapshot into each skill handoff. A skill may read a field it was not given, or an invalidated field, but it must not rerun discovery solely because the lifecycle phase changed.
 
-Use subagents only for bounded work that benefits from an independent context or real parallelism. Do not delegate workflow rereads, compaction recovery, or unchanged-state checks; reuse the handoff snapshot instead.
+Use subagents only for bounded work that benefits from an independent context or real parallelism. Routine implementation, review, and recovery work must stay in bounded collaboration subagents attached to this goal; do not launch a separate full Codex thread for routine work. Use a full thread only when explicit host or project isolation is required, and record that reason in the handoff. Do not delegate workflow rereads, compaction recovery, or unchanged-state checks; reuse the handoff snapshot instead.
 
 Before broad delegation, run a short external-prerequisite preflight for the selected delivery unit: source/provenance rights, publish or cache policy, credentials, remote permissions, and provider capabilities required by the next mutation. Resolve facts already established by repository or provider state without asking the user. If a prerequisite is genuinely missing, do not fan out dependent subagents; preserve the checkpoint, record the exact missing prerequisite, and isolate only that parent while the queue continues.
 
@@ -409,6 +409,8 @@ If the review errors:
 
 \- Use available findings, targeted checks, and advisor guidance to repair the cause before recovery or retry. Do not rerun the reviewer blindly or treat a failed execution as a completed `BLOCK` or `REQUEST_CHANGES` result; continue only when each failure has a repaired cause.
 
+Before `/complete-pr`, compare the durable completed-review report with the provider's visible review state. If the completed recommendation is not published remotely, transport the saved recommendation and evidence once, then read back exactly one review at the recorded reviewed head. A GitHub `COMMENT` is publication transport, not a second review; never rerun a completed review solely because its publication was missing.
+
 
 
 \*\*REVIEWS CAN TAKE A VERY LONG TIME\*\*
@@ -498,6 +500,8 @@ For every failed, timed-out, or ambiguous action:
 Retry the same exact transient failure at most once for ordinary actions. Never loop blindly.
 
 Incomplete review executions are exempt from that cap: after each repaired cause, retry until a completed reviewer recommendation exists; never repeat an unchanged failure blindly.
+
+When a pending review or gate sees the branch head or base ref move, assign one ref-reconciliation owner. Invalidate evidence tied to the old refs, suppress duplicate attestations while refs are moving, perform one branch update and remote readback, then recompute and attest the exact target once. Continue unrelated queue work while reconciliation is blocked; do not stack parallel ref updates or repeat attestations against moving refs.
 
 
 
@@ -596,6 +600,8 @@ You may cut speculative polish, unrelated cleanup, and unnecessary abstractions.
 After a successful merge:
 
 \- Mark mandatory children and the parent complete, then read their statuses back.
+
+\- Before reporting throughput or selecting the next item, fully paginate the authoritative Project items and count parent PBIs and child PBIs separately. Never infer either count by incrementing a prior snapshot or by subtracting one total from another.
 
 \- Perform only post-merge release steps required by the repository or the user's request. Let the completion workflow own branch cleanup; do not sweep unrelated branches.
 
