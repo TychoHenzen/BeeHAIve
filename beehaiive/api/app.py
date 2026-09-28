@@ -128,7 +128,7 @@ def create_app(
     register_reviews_routes(app, route_context)
     register_workflow_routes(app, route_context)
     register_graph_safety_routes(app, route_context)
-    register_system_routes(app, route_context.as_legacy_mapping())
+    register_system_routes(app, route_context)
     register_pbi_refinement_routes(app, route_context)
     register_pbi_creation_routes(app, route_context)
     register_project_dashboard_routes(app, route_context)

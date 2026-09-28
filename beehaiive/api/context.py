@@ -208,52 +208,6 @@ class ApiRouteContext:
             require_workflow_service=dependencies.require_workflow_service,
         )
 
-    def as_legacy_mapping(self) -> dict[str, object]:
-        return {
-            "orchestrator": self.orchestrator,
-            "routing_service": self.routing_service,
-            "pbi_creation_service": self.pbi_creation_service,
-            "pbi_relations_service": self.pbi_relations_service,
-            "conflict_repair_service": self.conflict_repair_service,
-            "meta_review_service": self.meta_review_service,
-            "agent_worker": self.agent_worker,
-            "review_service": self.review_service,
-            "review_repair_service": self.review_repair_service,
-            "configured_projects": self.configured_projects,
-            "project_boundary": self.project_boundary,
-            "runtime_settings": self.runtime_settings,
-            "scheduler_config": self.scheduler_config,
-            "scheduler": self.scheduler,
-            "workflow_service": self.workflow_service,
-            "graph_safety_service": self.graph_safety_service,
-            "behavior_service": self.behavior_service,
-            "building_signal_service": self.building_signal_service,
-            "agent_station_service": self.agent_station_service,
-            "autonomous_service": self.autonomous_service,
-            "refinement_path": self.refinement_path,
-            "refinement_secret_values": self.refinement_secret_values,
-            "dashboard_secret_values": self.dashboard_secret_values,
-            "routing_snapshot": self.routing_snapshot,
-            "require_api_key": self.require_api_key,
-            "require_handoff_lease_token": self.require_handoff_lease_token,
-            "require_mutation_access": self.require_mutation_access,
-            "require_dashboard_settings_mutation": (
-                self.require_dashboard_settings_mutation
-            ),
-            "require_project_access": self.require_project_access,
-            "require_refinement_operator": self.require_refinement_operator,
-            "require_review_access": self.require_review_access,
-            "require_review_repair_service": self.require_review_repair_service,
-            "require_routing_run_access": self.require_routing_run_access,
-            "require_workflow_access": self.require_workflow_access,
-            "require_workflow_operator": self.require_workflow_operator,
-            "require_dashboard_workflow_operator": (
-                self.require_dashboard_workflow_operator
-            ),
-            "require_workflow_service": self.require_workflow_service,
-        }
-
-
 __all__ = [
     "ApiDependencies",
     "ApiRouteContext",
