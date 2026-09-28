@@ -17,13 +17,24 @@ from .behavior import (
     validate_prompt,
     validate_unit_id,
 )
-from .behavior_model import BehaviorModelClient
+from .behavior_model import BehaviorModelClient, BehaviorModelError
+from .service_failures import (
+    FailureCategory,
+    TargetProviderError,
+    WorldActionError,
+)
 
 
 class BehaviorServiceError(RuntimeError):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        category: FailureCategory = FailureCategory.VALIDATION,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.category = category
 
 
 class UnitWorld(Protocol):
@@ -249,9 +260,16 @@ class BehaviorService:
             raise BehaviorServiceError("invalid_prompt", str(exc)) from exc
         if self.model_client is None:
             raise BehaviorServiceError(
-                "model_unavailable", "A local behavior model is not configured"
+                "model_unavailable",
+                "A local behavior model is not configured",
+                FailureCategory.MODEL,
             )
-        raw_definition = self.model_client.generate(prompt_text)
+        try:
+            raw_definition = self.model_client.generate(prompt_text)
+        except BehaviorModelError as exc:
+            raise BehaviorServiceError(
+                exc.code, str(exc), FailureCategory.MODEL
+            ) from exc
         try:
             definition = normalize_definition(raw_definition)
         except BehaviorValidationError as exc:
@@ -280,7 +298,9 @@ class BehaviorService:
                 normalized_bindings,
             )
         except StoreError as exc:
-            raise BehaviorServiceError("persistence", str(exc)) from exc
+            raise BehaviorServiceError(
+                "persistence", str(exc), FailureCategory.PERSISTENCE
+            ) from exc
 
     def get(self, project_id: str, behavior_id: str) -> BehaviorRecord:
         record = self.store.unit_behavior_for(_project_id(project_id), behavior_id)
@@ -292,7 +312,9 @@ class BehaviorService:
         try:
             return self.store.unit_behaviors_for(_project_id(project_id))
         except StoreError as exc:
-            raise BehaviorServiceError("persistence", str(exc)) from exc
+            raise BehaviorServiceError(
+                "persistence", str(exc), FailureCategory.PERSISTENCE
+            ) from exc
 
     def bind(
         self, project_id: str, behavior_id: str, bindings: object
@@ -449,8 +471,10 @@ class BehaviorService:
                         idempotency_key=idempotency_key,
                     )
                     bounded_observation = _bounded_observation(observation)
-                except Exception as exc:
-                    return self._fail(record, execution, str(exc))
+                except (WorldActionError, RuntimeError, ValueError) as exc:
+                    return self._fail(
+                        record, execution, str(exc), FailureCategory.WORLD
+                    )
                 history = list(cast(list[object], execution.get("history", [])))
                 history.append(
                     {
@@ -484,7 +508,9 @@ class BehaviorService:
                         expected_status="running",
                     )
                 except StoreError as exc:
-                    raise BehaviorServiceError("persistence", str(exc)) from exc
+                    raise BehaviorServiceError(
+                        "persistence", str(exc), FailureCategory.PERSISTENCE
+                    ) from exc
             execution = {
                 **execution,
                 "state": transition["to"],
@@ -516,15 +542,22 @@ class BehaviorService:
                 expected_status="running",
             )
         except StoreError as exc:
-            raise BehaviorServiceError("persistence", str(exc)) from exc
+            raise BehaviorServiceError(
+                "persistence", str(exc), FailureCategory.PERSISTENCE
+            ) from exc
 
     def _fail(
-        self, record: BehaviorRecord, execution: dict[str, object], message: str
+        self,
+        record: BehaviorRecord,
+        execution: dict[str, object],
+        message: str,
+        category: FailureCategory = FailureCategory.VALIDATION,
     ) -> BehaviorRecord:
         failed_execution = {
             **execution,
             "status": "failed",
             "error": _redact_text(message)[:512],
+            "failure_class": category.value,
         }
         try:
             return self.store.update_unit_behavior(
@@ -535,14 +568,18 @@ class BehaviorService:
                 expected_status="running",
             )
         except StoreError as exc:
-            raise BehaviorServiceError("persistence", str(exc)) from exc
+            raise BehaviorServiceError(
+                "persistence", str(exc), FailureCategory.PERSISTENCE
+            ) from exc
 
     def _allowed_targets(self, project_id: str) -> Mapping[str, Collection[str]]:
         try:
             return self.unit_world.allowed_targets(_project_id(project_id))
-        except Exception as exc:
+        except (TargetProviderError, RuntimeError, ValueError) as exc:
             raise BehaviorServiceError(
-                "invalid_bindings", "Target allowlists are unavailable"
+                "target_provider",
+                "Target allowlists are unavailable",
+                FailureCategory.TARGET_PROVIDER,
             ) from exc
 
 

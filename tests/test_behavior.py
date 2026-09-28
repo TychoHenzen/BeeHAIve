@@ -300,6 +300,25 @@ def test_unit_failure_error_is_redacted(tmp_path: Path) -> None:
     assigned = service.assign("owner:7", confirmed.behavior_id, "unit-1")
     failed = service.run("owner:7", assigned.behavior_id)
     assert failed.status == "failed"
+    assert failed.execution["failure_class"] == "world"
     assert failed.execution["error"] == "[redacted]"
     assert "unit-secret" not in str(failed.execution["error"])
+    store.close()
+
+
+def test_unexpected_behavior_defect_propagates_without_domain_failure(
+    tmp_path: Path,
+) -> None:
+    class DefectiveWorld(RecordingUnitWorld):
+        def execute(self, *args: object, **kwargs: object) -> dict[str, object]:
+            raise AssertionError("programming defect")
+
+    store = OrchestratorStore(tmp_path / "unexpected.sqlite3")
+    service = BehaviorService(store, unit_world=DefectiveWorld())
+    draft = service.create("owner:7", definition(), bindings())
+    confirmed = service.confirm("owner:7", draft.behavior_id)
+    assigned = service.assign("owner:7", confirmed.behavior_id, "unit-1")
+    with pytest.raises(AssertionError, match="programming defect"):
+        service.run("owner:7", assigned.behavior_id)
+    assert service.get("owner:7", assigned.behavior_id).status == "running"
     store.close()

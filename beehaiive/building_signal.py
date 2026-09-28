@@ -14,9 +14,10 @@ class BuildingSignalValidationError(ValueError):
 
 
 class BuildingSignalServiceError(RuntimeError):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, category: str = "validation") -> None:
         super().__init__(message)
         self.code = code
+        self.category = category
 
 
 BuildingSignalStatus = Literal["draft", "confirmed", "assigned"]

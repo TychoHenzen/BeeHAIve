@@ -27,6 +27,7 @@ from .building_signal import (
     validate_prompt,
     validate_targets,
 )
+from .service_failures import FailureCategory, TargetProviderError, WorldActionError
 
 
 class BuildingSignalService:
@@ -62,7 +63,9 @@ class BuildingSignalService:
                 secrets.token_hex(12), normalized_project, normalized_rule
             )
         except StoreError as exc:
-            raise BuildingSignalServiceError("persistence", str(exc)) from exc
+            raise BuildingSignalServiceError(
+                "persistence", str(exc), FailureCategory.PERSISTENCE.value
+            ) from exc
 
     def update(
         self, project_id: str, rule_id: str, rule: object
@@ -86,7 +89,9 @@ class BuildingSignalService:
                 expected_status="draft",
             )
         except StoreError as exc:
-            raise BuildingSignalServiceError("persistence", str(exc)) from exc
+            raise BuildingSignalServiceError(
+                "persistence", str(exc), FailureCategory.PERSISTENCE.value
+            ) from exc
 
     def confirm(self, project_id: str, rule_id: str) -> BuildingSignalRecord:
         normalized_project = _project_id(project_id)
@@ -103,7 +108,9 @@ class BuildingSignalService:
                 expected_status="draft",
             )
         except StoreError as exc:
-            raise BuildingSignalServiceError("persistence", str(exc)) from exc
+            raise BuildingSignalServiceError(
+                "persistence", str(exc), FailureCategory.PERSISTENCE.value
+            ) from exc
 
     def assign(
         self, project_id: str, rule_id: str, building_id: object
@@ -137,7 +144,9 @@ class BuildingSignalService:
         except BuildingSignalAssignmentConflict as exc:
             raise BuildingSignalServiceError("conflict", str(exc)) from exc
         except StoreError as exc:
-            raise BuildingSignalServiceError("persistence", str(exc)) from exc
+            raise BuildingSignalServiceError(
+                "persistence", str(exc), FailureCategory.PERSISTENCE.value
+            ) from exc
 
     def get(self, project_id: str, rule_id: str) -> BuildingSignalRecord | None:
         normalized_project = _project_id(project_id)
@@ -147,14 +156,18 @@ class BuildingSignalService:
                 normalized_project, normalized_rule_id
             )
         except StoreError as exc:
-            raise BuildingSignalServiceError("persistence", str(exc)) from exc
+            raise BuildingSignalServiceError(
+                "persistence", str(exc), FailureCategory.PERSISTENCE.value
+            ) from exc
 
     def list(self, project_id: str) -> tuple[BuildingSignalRecord, ...]:
         normalized_project = _project_id(project_id)
         try:
             return self.store.building_signal_rules_for(normalized_project)
         except StoreError as exc:
-            raise BuildingSignalServiceError("persistence", str(exc)) from exc
+            raise BuildingSignalServiceError(
+                "persistence", str(exc), FailureCategory.PERSISTENCE.value
+            ) from exc
 
     def evaluate(self, project_id: str, rule_id: str) -> BuildingSignalRecord:
         normalized_project = _project_id(project_id)
@@ -199,11 +212,19 @@ class BuildingSignalService:
                 "last_evaluated_at": now(),
                 "last_error": None,
             }
-        except Exception as exc:
+        except (
+            BuildingSignalServiceError,
+            BuildingSignalValidationError,
+            TargetProviderError,
+            WorldActionError,
+            RuntimeError,
+            ValueError,
+        ) as exc:
             state = {
                 **record.signal_state,
                 "last_evaluated_at": now(),
-                "last_error": redact_text(f"{type(exc).__name__}: {exc}"),
+                "last_error": redact_text(f"{type(exc).__name__}: {exc}")[:512],
+                "failure_class": _evaluation_failure_category(exc),
             }
         try:
             return self.store.update_building_signal_rule(
@@ -213,7 +234,9 @@ class BuildingSignalService:
                 expected_status="assigned",
             )
         except StoreError as exc:
-            raise BuildingSignalServiceError("persistence", str(exc)) from exc
+            raise BuildingSignalServiceError(
+                "persistence", str(exc), FailureCategory.PERSISTENCE.value
+            ) from exc
 
     def poll(self, project_ids: Collection[str]) -> tuple[str, ...]:
         evaluated: list[str] = []
@@ -232,7 +255,9 @@ class BuildingSignalService:
     def _generate_rule(self, prompt: str) -> object:
         if self.model_client is None:
             raise BuildingSignalServiceError(
-                "model_unavailable", "A local behavior model is not configured"
+                "model_unavailable",
+                "A local behavior model is not configured",
+                FailureCategory.MODEL.value,
             )
         try:
             return self.model_client.generate_structured(
@@ -246,11 +271,9 @@ class BuildingSignalService:
                 "invalid_prompt": "A non-empty building signal prompt is required",
             }
             raise BuildingSignalServiceError(
-                exc.code, messages.get(exc.code, "The behavior model request failed")
-            ) from exc
-        except Exception as exc:
-            raise BuildingSignalServiceError(
-                "model_unavailable", "The local behavior model is unavailable"
+                exc.code,
+                messages.get(exc.code, "The behavior model request failed"),
+                FailureCategory.MODEL.value,
             ) from exc
 
     def _normalize_and_bind(
@@ -271,9 +294,11 @@ class BuildingSignalService:
     def _allowed_targets(self, project_id: str) -> Mapping[str, Collection[str]]:
         try:
             targets = cast(object, self.world.allowed_targets(project_id))
-        except Exception as exc:
+        except (TargetProviderError, RuntimeError, ValueError) as exc:
             raise BuildingSignalServiceError(
-                "invalid_target", "Building signal targets are unavailable"
+                "target_provider",
+                "Building signal targets are unavailable",
+                FailureCategory.TARGET_PROVIDER.value,
             ) from exc
         if not isinstance(targets, Mapping):
             raise BuildingSignalServiceError(
@@ -350,6 +375,16 @@ def _rule_id(value: object) -> str:
     if not isinstance(value, str) or not value.strip() or len(value) > 128:
         raise BuildingSignalServiceError("invalid_rule", "A valid rule id is required")
     return value.strip()
+
+
+def _evaluation_failure_category(error: BaseException) -> str:
+    if isinstance(error, BuildingSignalServiceError):
+        return error.category
+    if isinstance(error, BuildingSignalValidationError):
+        return FailureCategory.VALIDATION.value
+    if isinstance(error, (TargetProviderError,)):
+        return FailureCategory.TARGET_PROVIDER.value
+    return FailureCategory.WORLD.value
 
 
 __all__ = ["BuildingSignalService"]

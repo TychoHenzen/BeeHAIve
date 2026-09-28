@@ -146,8 +146,30 @@ def test_building_signal_fails_closed_and_redacts_world_errors(
     )
     failed = service.evaluate("owner:7", assigned.rule_id)
     assert failed.signal_state["active"] is False
+    assert failed.signal_state["failure_class"] == "world"
     assert "[redacted]" in str(failed.signal_state["last_error"])
     assert "unit-secret" not in str(failed.signal_state)
+    store.close()
+
+
+def test_unexpected_building_signal_defect_propagates_without_state_write(
+    tmp_path: Path,
+) -> None:
+    class DefectiveWorld(TargetBuildingSignalWorld):
+        def inventory_count(self, *_args: str) -> int:
+            raise AssertionError("programming defect")
+
+    store, service = make_service(tmp_path, world=DefectiveWorld(targets()))
+    assigned = service.assign(
+        "owner:7",
+        service.confirm("owner:7", service.create("owner:7", rule()).rule_id).rule_id,
+        "smelter",
+    )
+    with pytest.raises(AssertionError, match="programming defect"):
+        service.evaluate("owner:7", assigned.rule_id)
+    restored = service.get("owner:7", assigned.rule_id)
+    assert restored is not None
+    assert restored.signal_state["last_error"] is None
     store.close()
 
 
