@@ -7,12 +7,13 @@ import pytest
 
 from beehaiive.building_signal import (
     BUILDING_SIGNAL_RULE_SCHEMA,
+    BuildingSignalServiceError,
     TargetBuildingSignalWorld,
     normalize_rule,
 )
 from beehaiive.building_signal_service import BuildingSignalService
 from beehaiive.persistence import OrchestratorStore, StoreError
-from beehaiive.service_failures import WorldActionError
+from beehaiive.service_failures import FailureCategory, WorldActionError
 
 
 def rule() -> dict[str, object]:
@@ -130,6 +131,7 @@ def test_building_signal_restarts_with_assignment_and_state(tmp_path: Path) -> N
         "secret-token: unit-secret",
         '{"secret":"unit-secret"}',
         "Authorization: Bearer unit-secret",
+        "secret-token=unit-secret " + "x" * 2048,
     ),
 )
 def test_building_signal_fails_closed_and_redacts_world_errors(
@@ -149,7 +151,34 @@ def test_building_signal_fails_closed_and_redacts_world_errors(
     assert failed.signal_state["active"] is False
     assert failed.signal_state["failure_class"] == "world"
     assert "[redacted]" in str(failed.signal_state["last_error"])
+    assert len(str(failed.signal_state["last_error"])) <= 512
     assert "unit-secret" not in str(failed.signal_state)
+    store.close()
+
+
+def test_building_signal_persistence_failure_does_not_write_domain_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, service = make_service(tmp_path)
+    draft = service.create("owner:7", rule())
+    confirmed = service.confirm("owner:7", draft.rule_id)
+    assigned = service.assign("owner:7", confirmed.rule_id, "smelter")
+    original_update = store.update_building_signal_rule
+
+    def fail_state(project_id: str, rule_id: str, **kwargs: Any) -> Any:
+        if kwargs.get("signal_state") is not None:
+            raise StoreError("signal state persistence unavailable")
+        return original_update(project_id, rule_id, **kwargs)
+
+    monkeypatch.setattr(store, "update_building_signal_rule", fail_state)
+    with pytest.raises(BuildingSignalServiceError) as raised:
+        service.evaluate("owner:7", assigned.rule_id)
+    assert raised.value.code == "persistence"
+    assert raised.value.category == FailureCategory.PERSISTENCE.value
+    persisted = service.get("owner:7", assigned.rule_id)
+    assert persisted is not None
+    assert persisted.signal_state["last_error"] is None
+    assert "failure_class" not in persisted.signal_state
     store.close()
 
 

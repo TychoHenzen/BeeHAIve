@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from beehaiive.behavior import BehaviorValidationError, normalize_definition
 from beehaiive.behavior_service import (
     BehaviorService,
+    BehaviorServiceError,
     RecordingUnitWorld,
     TargetUnitWorld,
 )
-from beehaiive.service_failures import WorldActionError
-from beehaiive.storage import OrchestratorStore
+from beehaiive.service_failures import FailureCategory, WorldActionError
+from beehaiive.storage import OrchestratorStore, StoreError
 
 
 def definition() -> dict[str, object]:
@@ -292,7 +294,7 @@ def test_in_flight_action_is_idempotent_across_store_restart(tmp_path: Path) -> 
 def test_unit_failure_error_is_redacted(tmp_path: Path) -> None:
     class SecretFailureWorld(RecordingUnitWorld):
         def execute(self, *args: object, **kwargs: object) -> dict[str, object]:
-            raise WorldActionError("secret-token=unit-secret")
+            raise WorldActionError("secret-token=unit-secret " + "x" * 2048)
 
     store = OrchestratorStore(tmp_path / "redaction.sqlite3")
     service = BehaviorService(store, unit_world=SecretFailureWorld())
@@ -302,8 +304,35 @@ def test_unit_failure_error_is_redacted(tmp_path: Path) -> None:
     failed = service.run("owner:7", assigned.behavior_id)
     assert failed.status == "failed"
     assert failed.execution["failure_class"] == "world"
-    assert failed.execution["error"] == "[redacted]"
+    assert str(failed.execution["error"]).startswith("[redacted]")
+    assert len(str(failed.execution["error"])) <= 512
     assert "unit-secret" not in str(failed.execution["error"])
+    store.close()
+
+
+def test_behavior_persistence_failure_is_not_recorded_as_domain_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = OrchestratorStore(tmp_path / "persistence.sqlite3")
+    service = BehaviorService(store, unit_world=RecordingUnitWorld())
+    draft = service.create("owner:7", definition(), bindings())
+    confirmed = service.confirm("owner:7", draft.behavior_id)
+    assigned = service.assign("owner:7", confirmed.behavior_id, "unit-1")
+    original_update = store.update_unit_behavior
+
+    def fail_checkpoint(project_id: str, behavior_id: str, **kwargs: Any) -> Any:
+        if "in_flight" in (kwargs.get("execution") or {}):
+            raise StoreError("checkpoint unavailable")
+        return original_update(project_id, behavior_id, **kwargs)
+
+    monkeypatch.setattr(store, "update_unit_behavior", fail_checkpoint)
+    with pytest.raises(BehaviorServiceError) as raised:
+        service.run("owner:7", assigned.behavior_id)
+    assert raised.value.code == "persistence"
+    assert raised.value.category is FailureCategory.PERSISTENCE
+    persisted = service.get("owner:7", assigned.behavior_id)
+    assert persisted.status == "running"
+    assert "failure_class" not in persisted.execution
     store.close()
 
 
