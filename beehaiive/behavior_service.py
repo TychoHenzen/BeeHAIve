@@ -5,7 +5,7 @@ import secrets
 from collections.abc import Collection, Mapping
 from typing import Protocol, cast
 
-from beehaiive.persistence import OrchestratorStore, StoreError
+from beehaiive.persistence import OrchestratorStore, StateConflictError, StoreError
 
 from .behavior import (
     MAX_BEHAVIOR_WAIT_SECONDS,
@@ -345,7 +345,7 @@ class BehaviorService:
                 expected_status="draft",
             )
         except StoreError as exc:
-            raise BehaviorServiceError("state_conflict", str(exc)) from exc
+            raise _behavior_update_error(exc) from exc
 
     def confirm(self, project_id: str, behavior_id: str) -> BehaviorRecord:
         record = self.get(project_id, behavior_id)
@@ -367,7 +367,7 @@ class BehaviorService:
                 expected_status="draft",
             )
         except StoreError as exc:
-            raise BehaviorServiceError("state_conflict", str(exc)) from exc
+            raise _behavior_update_error(exc) from exc
 
     def assign(
         self, project_id: str, behavior_id: str, unit_id: object
@@ -387,7 +387,7 @@ class BehaviorService:
                 expected_status="confirmed",
             )
         except StoreError as exc:
-            raise BehaviorServiceError("state_conflict", str(exc)) from exc
+            raise _behavior_update_error(exc) from exc
 
     def run(self, project_id: str, behavior_id: str) -> BehaviorRecord:
         record = self.get(project_id, behavior_id)
@@ -536,7 +536,7 @@ class BehaviorService:
                 expected_status="assigned",
             )
         except StoreError as exc:
-            raise BehaviorServiceError("state_conflict", str(exc)) from exc
+            raise _behavior_update_error(exc) from exc
 
     def _save_execution(
         self, record: BehaviorRecord, execution: dict[str, object]
@@ -705,9 +705,11 @@ def _resolved_action(
 def _bounded_observation(value: object) -> dict[str, object]:
     if not isinstance(value, Mapping):
         raise WorldActionError("Unit returned an invalid observation")
-    observation = cast(Mapping[str, object], value)
+    observation = cast(Mapping[object, object], value)
     bounded: dict[str, object] = {}
     for key, item in observation.items():
+        if not isinstance(key, str):
+            raise WorldActionError("Unit returned an invalid observation key")
         if len(key) > 64:
             continue
         if item is None or isinstance(item, (bool, int, float)):
@@ -715,6 +717,12 @@ def _bounded_observation(value: object) -> dict[str, object]:
         elif isinstance(item, str):
             bounded[key] = _redact_text(item)
     return bounded
+
+
+def _behavior_update_error(error: StoreError) -> BehaviorServiceError:
+    if isinstance(error, StateConflictError):
+        return BehaviorServiceError("state_conflict", str(error))
+    return BehaviorServiceError("persistence", str(error), FailureCategory.PERSISTENCE)
 
 
 def _next_transition(

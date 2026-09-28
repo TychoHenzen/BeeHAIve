@@ -12,6 +12,7 @@ from beehaiive.behavior_service import (
     RecordingUnitWorld,
     TargetUnitWorld,
 )
+from beehaiive.persistence.errors import StateConflictError
 from beehaiive.service_failures import FailureCategory, WorldActionError
 from beehaiive.storage import OrchestratorStore, StoreError
 
@@ -307,6 +308,67 @@ def test_unit_failure_error_is_redacted(tmp_path: Path) -> None:
     assert str(failed.execution["error"]).startswith("[redacted]")
     assert len(str(failed.execution["error"])) <= 512
     assert "unit-secret" not in str(failed.execution["error"])
+    store.close()
+
+
+def test_behavior_state_race_keeps_state_conflict_classification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = OrchestratorStore(tmp_path / "state-race.sqlite3")
+    service = BehaviorService(store, unit_world=RecordingUnitWorld())
+    draft = service.create("owner:7", definition(), bindings())
+
+    def fail_transition(*args: object, **kwargs: object) -> Any:
+        del args, kwargs
+        raise StateConflictError("Behavior state changed before it could be updated")
+
+    monkeypatch.setattr(store, "update_unit_behavior", fail_transition)
+    with pytest.raises(BehaviorServiceError) as raised:
+        service.confirm("owner:7", draft.behavior_id)
+    assert raised.value.code == "state_conflict"
+    assert raised.value.category is FailureCategory.VALIDATION
+    store.close()
+
+
+def test_behavior_transition_persistence_failure_is_not_state_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = OrchestratorStore(tmp_path / "transition-persistence.sqlite3")
+    service = BehaviorService(store, unit_world=RecordingUnitWorld())
+    draft = service.create("owner:7", definition(), bindings())
+
+    def fail_transition(*args: object, **kwargs: object) -> Any:
+        del args, kwargs
+        raise StoreError("database unavailable")
+
+    monkeypatch.setattr(store, "update_unit_behavior", fail_transition)
+    with pytest.raises(BehaviorServiceError) as raised:
+        service.confirm("owner:7", draft.behavior_id)
+    assert raised.value.code == "persistence"
+    assert raised.value.category is FailureCategory.PERSISTENCE
+    store.close()
+
+
+def test_malformed_observation_key_is_persisted_as_world_failure(
+    tmp_path: Path,
+) -> None:
+    class MalformedObservationWorld(RecordingUnitWorld):
+        def execute(self, *args: object, **kwargs: object) -> dict[object, object]:
+            del args, kwargs
+            return {1: "malformed"}
+
+    store = OrchestratorStore(tmp_path / "malformed-observation.sqlite3")
+    service = BehaviorService(store, unit_world=MalformedObservationWorld())
+    draft = service.create("owner:7", definition(), bindings())
+    confirmed = service.confirm("owner:7", draft.behavior_id)
+    assigned = service.assign("owner:7", confirmed.behavior_id, "unit-1")
+
+    failed = service.run("owner:7", assigned.behavior_id)
+
+    assert failed.status == "failed"
+    assert failed.execution["failure_class"] == "world"
+    assert failed.execution["error"] == "Unit returned an invalid observation key"
+    assert service.get("owner:7", assigned.behavior_id).status == "failed"
     store.close()
 
 
