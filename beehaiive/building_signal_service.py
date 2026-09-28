@@ -198,7 +198,7 @@ class BuildingSignalService:
                 or inventory_count < 0
                 or inventory_count > MAX_BUILDING_SIGNAL_QUANTITY
             ):
-                raise ValueError("Building inventory count is invalid")
+                raise WorldActionError("Building inventory count is invalid")
             condition_result = compare_inventory(comparison, inventory_count, quantity)
             self.world.set_signal(
                 normalized_project, building_id, signal_id, condition_result

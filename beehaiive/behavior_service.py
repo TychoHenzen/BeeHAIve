@@ -704,9 +704,7 @@ def _resolved_action(
 
 def _bounded_observation(value: object) -> dict[str, object]:
     if not isinstance(value, Mapping):
-        raise BehaviorServiceError(
-            "unit_failure", "Unit returned an invalid observation"
-        )
+        raise WorldActionError("Unit returned an invalid observation")
     observation = cast(Mapping[str, object], value)
     bounded: dict[str, object] = {}
     for key, item in observation.items():
