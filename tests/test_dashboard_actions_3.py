@@ -19,7 +19,7 @@ from tests.support.dashboard.failing_dashboard_provider import (
 from tests.support.dashboard.helpers import dashboard_snapshot
 
 
-def test_dashboard_action_failure_can_return_no_existing_state() -> None:
+def test_dashboard_action_rejects_removed_start_action() -> None:
     service = Orchestrator(
         OrchestratorStore(), FailingDashboardProvider(dashboard_snapshot())
     )
@@ -37,9 +37,7 @@ def test_dashboard_action_failure_can_return_no_existing_state() -> None:
         json={"action": "start", "approved": True},
     )
 
-    assert response.status_code == 200
-    assert response.json()["action"]["status"] == "failed"
-    assert response.json()["state"] is None
+    assert response.status_code == 422
     assert main_module._dashboard_pbi(service, "project-1", "owner/api", 1) is None
 
     invalid_target = client.post(

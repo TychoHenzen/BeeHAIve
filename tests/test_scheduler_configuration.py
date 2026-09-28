@@ -5,7 +5,6 @@ from threading import Event
 import pytest
 
 from beehaiive.scheduler import (
-    DEFAULT_DEMO_TASK,
     SCHEDULER_ENABLED_ENV,
     SCHEDULER_MAX_CONCURRENCY_ENV,
     SCHEDULER_POLL_INTERVAL_ENV,
@@ -65,11 +64,14 @@ def test_scheduler_validates_worker_project_and_enabled_state() -> None:
         )
 
     worker.workflow_service = object()
-    worker.executor.task = " "
     scheduler = AgentScheduler(
-        FakeOrchestrator(states), worker, {"project"}, SchedulerConfig(True)
+        FakeOrchestrator(states),
+        worker,
+        {"project"},
+        SchedulerConfig(True),
+        autonomous_start=lambda _project, _repository: {"run_id": "run-1"},
     )
-    assert scheduler._task == DEFAULT_DEMO_TASK
+    assert not hasattr(scheduler, "_task")
 
 
 def test_scheduler_status_reports_a_running_background_thread() -> None:

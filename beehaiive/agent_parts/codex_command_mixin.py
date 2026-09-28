@@ -7,7 +7,7 @@ from typing import Any, cast
 from beehaiive.contracts import TaskContract
 from beehaiive.routing import ModelSpec, RoutingDecision
 
-from .constants import _ROUTING_MODEL_ALIASES, DEMO_TASK_NAME
+from .constants import _ROUTING_MODEL_ALIASES
 
 
 class CodexCommandMixin:
@@ -16,19 +16,8 @@ class CodexCommandMixin:
         spec: ModelSpec,
         decision: RoutingDecision,
         contract: TaskContract | None = None,
-        repository: Path | None = None,
         workspace_write: bool = False,
     ) -> str:
-        branch = (
-            self._discover_repository_branch()
-            if repository is None
-            else self._discover_repository_branch(repository)
-        )
-        tracked_file_count = len(
-            self._repository_files()
-            if repository is None
-            else self._repository_files(repository)
-        )
         with self._lock:
             task = self._session_tasks.get(decision.problem_id, self.task)
         scope = (
@@ -40,12 +29,9 @@ class CodexCommandMixin:
             "completed."
         )
         prompt = (
-            "BeeHAIve dashboard demo.\n"
-            f"Task name: {DEMO_TASK_NAME}\n"
-            f"Task: {task}\n"
-            f"Repository identity: {self.repository_name or self.repository.name}\n"
-            f"Verified current branch: {branch}\n"
-            f"Verified tracked file count: {tracked_file_count}\n"
+            "BeeHAIve Codex worker.\n"
+            + (f"Task: {task}\n" if isinstance(task, str) and task else "")
+            + f"Repository identity: {self.repository_name or self.repository.name}\n"
             f"Routing tier: {spec.tier.value}. Routing reason: {decision.reason}.\n"
             f"{scope}"
         )

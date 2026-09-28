@@ -19,10 +19,15 @@ def create_scheduler(
 ) -> tuple[AgentScheduler, FakeOrchestrator, FakeWorker]:
     actual_worker = worker or FakeWorker()
     orchestrator = FakeOrchestrator(states)
+
+    def autonomous_start(project_id: str, repository: str) -> dict[str, object]:
+        return {"run_id": f"autonomous-{project_id}-{repository}"}
+
     scheduler = AgentScheduler(
         orchestrator,
         actual_worker,
         projects or set(states),
         SchedulerConfig(enabled=True, max_concurrency=maximum),
+        autonomous_start=autonomous_start,
     )
     return scheduler, orchestrator, actual_worker

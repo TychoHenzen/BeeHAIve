@@ -53,9 +53,7 @@ def test_repair_api_authorizes_before_recovering_transition(
         harness.close()
 
 
-def test_review_repair_api_enforces_operator_scope_and_demo_read_only(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_review_repair_api_enforces_operator_scope(tmp_path: Path) -> None:
     agent = CommitAgent()
     harness = repair_harness(tmp_path, agent)
     try:
@@ -83,29 +81,5 @@ def test_review_repair_api_enforces_operator_scope_and_demo_read_only(
             writer_state.close()
             writer_routing.close()
 
-        monkeypatch.setenv("BEEHAIIVE_REVIEW_MODE", "demo")
-        demo_state = OrchestratorStore(":memory:")
-        demo_routing = RoutingStore(":memory:")
-        try:
-            with TestClient(
-                create_app(
-                    store=demo_state,
-                    routing_store=demo_routing,
-                    review_service=harness.reviews,
-                    review_repair_service=harness.service,
-                    api_key="test-key",
-                    review_actor="operator",
-                )
-            ) as demo_client:
-                disabled = demo_client.post(
-                    f"/reviews/cycles/{harness.cycle_id}/repair",
-                    json={"finding_ids": [harness.selected_id]},
-                    headers={"X-API-Key": "test-key"},
-                )
-                assert disabled.status_code == 503
-                assert agent.calls == 0
-        finally:
-            demo_state.close()
-            demo_routing.close()
     finally:
         harness.close()

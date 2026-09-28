@@ -29,8 +29,6 @@ from beehaiive import routing as _routing
 from beehaiive import scheduler as _scheduler
 from beehaiive import storage as _storage
 from beehaiive import workflow as _workflow
-from beehaiive.agent import DEFAULT_DEMO_TASK as DEFAULT_DEMO_TASK
-from beehaiive.agent import DEMO_TASK_NAME as DEMO_TASK_NAME
 from beehaiive.api import models as _api_models
 from beehaiive.api.app import create_app as create_app
 from beehaiive.api.helpers import configuration as _configuration

@@ -6,17 +6,6 @@ from beehaiive.session_evidence import (
     SESSION_PROGRESS_EVENTS as _SESSION_PROGRESS_EVENTS,
 )
 
-DEMO_TASK_NAME = "bounded repository inventory"
-
-DEFAULT_DEMO_TASK = (
-    "Inspect only the current checkout and report the repository name, current "
-    "branch, and count of tracked files. The runner supplies verified Git "
-    "metadata because the isolated checkout omits .git. Confirm the copied "
-    "files are present, then report that metadata. Do not edit files, create "
-    "files, access the network, read credentials, or start other agents. Return "
-    "a concise plain-text result."
-)
-
 MAX_AGENT_OUTPUT_LENGTH = 4_000
 
 MAX_AGENT_OUTPUT_BYTES = 64_000
@@ -82,8 +71,6 @@ _BEARER_TOKEN = re.compile(r"\bBearer\s+\S+", re.IGNORECASE)
 _URL_CREDENTIALS = re.compile(r"(https?://)[^/\s:@]+:[^@\s]+@", re.IGNORECASE)
 
 __all__ = [
-    "DEFAULT_DEMO_TASK",
-    "DEMO_TASK_NAME",
     "MAX_AGENT_OUTPUT_BYTES",
     "MAX_AGENT_OUTPUT_LENGTH",
     "MAX_AGENT_TIMEOUT_SECONDS",

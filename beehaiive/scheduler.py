@@ -1,4 +1,3 @@
-from .agent import DEFAULT_DEMO_TASK as DEFAULT_DEMO_TASK
 from .scheduler_types import AccountUsageSnapshot as AccountUsageSnapshot
 from .scheduler_types import AgentScheduler as AgentScheduler
 from .scheduler_types import AllowanceBucket as AllowanceBucket
@@ -29,7 +28,6 @@ __all__ = [
     "BudgetPolicy",
     "BudgetReason",
     "evaluate_budget",
-    "DEFAULT_DEMO_TASK",
 ]
 
 from .scheduler_types import (

@@ -8,7 +8,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_readme_documents_the_clean_device_demo_path() -> None:
+def test_readme_documents_the_live_dashboard_path() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
     required_sections = (
@@ -25,14 +25,10 @@ def test_readme_documents_the_clean_device_demo_path() -> None:
         "GitHub CLI",
         "Node.js",
         "Chromium",
-        "Start work",
-        "Result",
-        "Failure",
+        "Run full lifecycle",
+        "autonomous lifecycle",
+        "HTTP status",
         "Stop the run before removing local `.beehaiive` state.",
-        "dashboard-configured.png",
-        "active-demo.png",
-        "completed-demo.png",
-        "stopped-demo.png",
     )
     assert all(section in readme for section in required_sections)
     assert 'GITHUB_TOKEN = "ghp_' not in readme

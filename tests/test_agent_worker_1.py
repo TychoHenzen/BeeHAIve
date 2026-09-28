@@ -159,7 +159,7 @@ def test_worker_manager_rejects_duplicates_and_shutdowns(
         session = store.get_agent_session(run.run_id)
         assert session is not None
         assert session["session_id"] == run.run_id
-        assert session["task"] == executor.task
+        assert session["task"] == run.title
         executor._session_event_handlers[run.run_id](
             "message", "item.completed", "assistant", "token=private"
         )

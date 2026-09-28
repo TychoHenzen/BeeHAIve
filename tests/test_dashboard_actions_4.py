@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 from fastapi.testclient import TestClient
 
 import main as main_module
@@ -9,7 +7,6 @@ from beehaiive.models import PbiSnapshot, ProjectSnapshot, RepositorySnapshot
 from beehaiive.orchestrator import Orchestrator
 from beehaiive.persistence.constants import DEFAULT_ACTION_LIMIT
 from beehaiive.storage import OrchestratorStore
-from beehaiive.workflow import LeaseStatus
 from tests.conftest import FakeProvider
 from tests.support.dashboard.helpers import dashboard_snapshot
 
@@ -49,16 +46,6 @@ def test_dashboard_exposes_one_supported_action_inventory() -> None:
     )
     assert synchronized.status_code == 200
     assert synchronized.json()["action"]["status"] == "succeeded"
-    sync_compat = client.post(
-        "/projects/project-1/actions",
-        headers={"X-API-Key": "test-key"},
-        json={"action": "start", "approved": True},
-    )
-    assert sync_compat.status_code == 200
-    assert sync_compat.json()["result"] == {
-        "project_id": "project-1",
-        "status": "synchronized",
-    }
     service.store.close()
 
 
@@ -104,38 +91,6 @@ def test_dashboard_requeue_makes_a_blocked_autonomous_pbi_claimable() -> None:
     assert pbi["claimable"] is True
     assert pbi["status"] == "idle"
     assert pbi["autonomous_status"] is None
-    service.store.close()
-
-
-def test_dashboard_requeue_makes_a_failed_manual_run_claimable() -> None:
-    service = Orchestrator(OrchestratorStore(), FakeProvider(dashboard_snapshot()))
-    service.synchronize("project-1")
-    run = service.claim("project-1", "owner/api", "worker")
-    assert run is not None
-    service.stop(run.run_id, "Stopped by operator")
-    client = TestClient(
-        main_module.create_app(
-            orchestrator=service,
-            api_key="test-key",
-            allowed_project_ids={"project-1"},
-        )
-    )
-
-    response = client.post(
-        "/projects/project-1/actions",
-        headers={"X-API-Key": "test-key"},
-        json={
-            "action": "requeue",
-            "approved": True,
-            "repository": "owner/api",
-            "pbi_number": 1,
-            "run_id": run.run_id,
-        },
-    )
-
-    assert response.status_code == 200
-    pbi = response.json()["state"]["repositories"][0]["pbis"][0]
-    assert pbi["claimable"] is True
     service.store.close()
 
 
@@ -201,163 +156,6 @@ def test_dashboard_requeue_survives_provider_refresh_and_action_history_limit() 
     assert pbi["workflow_queue"]["id"] == "refinement"
     persisted = service.store.project_state("project-1")["repositories"][0]["pbis"][0]
     assert persisted["claimable"] is True
-    service.store.close()
-
-
-def test_dashboard_advance_and_retry_use_the_existing_run_lease() -> None:
-    service = Orchestrator(OrchestratorStore(), FakeProvider(dashboard_snapshot()))
-    service.synchronize("project-1")
-
-    class RecordingWorker:
-        executor = SimpleNamespace(task="retry task")
-
-        def claim(
-            self,
-            project_id,
-            repository,
-            owner_id,
-            task,
-            expected_run_id=None,
-        ):
-            return service.claim(
-                project_id,
-                repository,
-                owner_id,
-                expected_run_id=expected_run_id,
-                agent_session=("worker", task),
-            )
-
-        def retry(self, project_id, repository, owner_id, task, run_id):
-            return service.retry(
-                project_id,
-                repository,
-                owner_id,
-                run_id,
-                agent_session=("worker", task),
-            )
-
-        def start(self, run) -> None:
-            del run
-
-        def cancel(self, run_id: str) -> None:
-            del run_id
-
-    client = TestClient(
-        main_module.create_app(
-            orchestrator=service,
-            api_key="test-key",
-            allowed_project_ids={"project-1"},
-            agent_worker=RecordingWorker(),
-        )
-    )
-    auth = {"X-API-Key": "test-key"}
-    claimed = client.post(
-        "/projects/project-1/actions",
-        headers=auth,
-        json={
-            "action": "claim",
-            "approved": True,
-            "repository": "owner/api",
-            "worker_id": "api_key=secret-token",
-        },
-    )
-    assert claimed.status_code == 200
-    assert "secret-token" not in repr(claimed.json())
-    run = service.store.get_run(claimed.json()["result"]["run"]["run_id"])
-    assert run is not None
-
-    advanced = client.post(
-        "/projects/project-1/actions",
-        headers=auth,
-        json={
-            "action": "advance",
-            "approved": True,
-            "repository": "owner/api",
-            "pbi_number": 1,
-            "run_id": run.run_id,
-            "target": "implement",
-        },
-    )
-    assert advanced.status_code == 200
-    assert advanced.json()["result"]["run"]["stage"] == "implement"
-
-    approved = client.post(
-        "/projects/project-1/actions",
-        headers=auth,
-        json={
-            "action": "approve",
-            "approved": True,
-            "repository": "owner/api",
-            "pbi_number": 1,
-            "run_id": run.run_id,
-        },
-    )
-    clarified = client.post(
-        "/projects/project-1/actions",
-        headers=auth,
-        json={
-            "action": "clarify",
-            "approved": True,
-            "repository": "owner/api",
-            "pbi_number": 1,
-            "run_id": run.run_id,
-            "clarification": "Keep the current branch.",
-        },
-    )
-    assert approved.status_code == 200
-    assert clarified.status_code == 200
-    event_types = {
-        event["type"]
-        for event in clarified.json()["state"]["repositories"][0]["pbis"][0]["events"]
-    }
-    assert {"operator_approve", "operator_clarify"} <= event_types
-
-    service.stop(run.run_id, "test retry")
-    retried = client.post(
-        "/projects/project-1/actions",
-        headers=auth,
-        json={
-            "action": "retry",
-            "approved": True,
-            "repository": "owner/api",
-            "pbi_number": 1,
-            "run_id": run.run_id,
-        },
-    )
-    assert retried.status_code == 200
-    retried_payload = retried.json()
-    assert retried_payload["action"]["status"] == "succeeded", retried_payload[
-        "action"
-    ]["error"]
-    assert retried_payload["result"]["run"]["run_id"] == run.run_id, retried_payload
-    assert retried_payload["result"]["run"]["status"] == "active"
-    service.store.close()
-
-
-def test_dashboard_retry_does_not_reclaim_an_expired_active_run() -> None:
-    service = Orchestrator(OrchestratorStore(), FakeProvider(dashboard_snapshot()))
-    service.synchronize("project-1")
-    run = service.claim("project-1", "owner/api", "worker")
-    assert run is not None
-    service.store._connection.execute(
-        "UPDATE runs SET lease_expires_at = ? WHERE run_id = ?",
-        ("2000-01-01T00:00:00+00:00", run.run_id),
-    )
-
-    assert (
-        service.retry(
-            "project-1",
-            "owner/api",
-            "worker",
-            run.run_id,
-            agent_session=("worker", "retry"),
-        )
-        is None
-    )
-    current = service.store.get_run(run.run_id)
-    assert current is not None
-    assert current.status.value == "active"
-    assert current.lease_expires_at == "2000-01-01T00:00:00+00:00"
     service.store.close()
 
 
@@ -504,47 +302,6 @@ def test_dashboard_rejects_unknown_and_unscoped_actions() -> None:
         ).status_code
         == 422
     )
-    service.store.close()
-
-
-def test_dashboard_records_unexpected_worker_failures() -> None:
-    service = Orchestrator(OrchestratorStore(), FakeProvider(dashboard_snapshot()))
-    service.synchronize("project-1")
-
-    class ExplodingWorker:
-        def claim(self, project_id, repository, owner_id, task):
-            del task
-            return service.claim(project_id, repository, owner_id)
-
-        def start(self, run):
-            del run
-            raise RuntimeError("secret-token " + "x" * 10_000)
-
-    client = TestClient(
-        main_module.create_app(
-            orchestrator=service,
-            api_key="secret-token",
-            allowed_project_ids={"project-1"},
-            agent_worker=ExplodingWorker(),
-        )
-    )
-    response = client.post(
-        "/projects/project-1/actions",
-        headers={"X-API-Key": "secret-token"},
-        json={
-            "action": "start",
-            "approved": True,
-            "repository": "owner/api",
-        },
-    )
-    assert response.status_code == 200
-    assert response.json()["action"]["status"] == "failed"
-    error = response.json()["action"]["error"]
-    assert "secret-token" not in error
-    assert len(error) <= 4_000
-    pbi = response.json()["state"]["repositories"][0]["pbis"][0]
-    assert "secret-token" not in pbi["last_error"]
-    assert len(pbi["last_error"]) <= 4_000
     service.store.close()
 
 
@@ -897,81 +654,3 @@ def test_dashboard_redaction_covers_prefixed_and_array_credentials() -> None:
     )
     assert "TOP" not in repr(projected)
     assert "TAIL" not in repr(projected)
-
-
-def test_dashboard_retry_rejects_answered_questions_and_retained_worktrees() -> None:
-    service = Orchestrator(OrchestratorStore(), FakeProvider(dashboard_snapshot()))
-    service.synchronize("project-1")
-    run = service.claim("project-1", "owner/api", "worker")
-    assert run is not None
-    service.store.await_operator(
-        run.run_id,
-        run.lease_token or "",
-        kind="question",
-        question="Which branch?",
-        evidence={},
-    )
-    service.store._connection.execute(
-        "UPDATE operator_questions SET status = 'answered', answer = 'main' "
-        "WHERE run_id = ?",
-        (run.run_id,),
-    )
-    service.store._connection.execute(
-        "UPDATE runs SET task_answer_resumed = 1 WHERE run_id = ?",
-        (run.run_id,),
-    )
-    service.store._connection.execute(
-        "UPDATE pbis SET claimable = 1 WHERE project_id = ? AND repository_name = ? "
-        "AND number = ?",
-        ("project-1", "owner/api", 1),
-    )
-    resumed = service.retry(
-        "project-1",
-        "owner/api",
-        "worker",
-        run.run_id,
-        agent_session=("worker", "retry"),
-    )
-    assert resumed is None
-
-    service.store._connection.execute(
-        "UPDATE runs SET status = 'failed', lease_token = NULL, "
-        "lease_expires_at = NULL WHERE run_id = ?",
-        (run.run_id,),
-    )
-    service.store._connection.execute(
-        "UPDATE operator_questions SET status = 'closed' WHERE run_id = ?",
-        (run.run_id,),
-    )
-    service.store._connection.execute(
-        "UPDATE pbis SET claimable = 1 WHERE project_id = ? AND repository_name = ? "
-        "AND number = ?",
-        ("project-1", "owner/api", 1),
-    )
-
-    class RetainedWorkflow:
-        def workspace_for_run(self, _run_id: str):
-            return SimpleNamespace(status=LeaseStatus.RETAINED)
-
-    client = TestClient(
-        main_module.create_app(
-            orchestrator=service,
-            api_key="test-key",
-            allowed_project_ids={"project-1"},
-            workflow_service=RetainedWorkflow(),
-        )
-    )
-    response = client.post(
-        "/projects/project-1/actions",
-        headers={"X-API-Key": "test-key"},
-        json={
-            "action": "retry",
-            "approved": True,
-            "repository": "owner/api",
-            "pbi_number": 1,
-            "run_id": run.run_id,
-        },
-    )
-    assert response.status_code == 409
-    assert "retained worktree" in response.json()["detail"]
-    service.store.close()

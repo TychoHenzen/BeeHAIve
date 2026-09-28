@@ -186,14 +186,8 @@ test("active and failed PBIs expose run controls through the dashboard action bo
     dashboardOutput,
     (node) => node.tag === "button" && node.textContent === "Advance to implementation",
   );
-  const retry = findNode(
-    dashboardOutput,
-    (node) => node.tag === "button" && node.textContent === "Retry writer",
-  );
   assert.ok(advance);
-  assert.ok(retry);
   advance.click();
-  retry.click();
   assert.deepEqual(actionPayloads, [
     {
       action: "advance",
@@ -201,12 +195,6 @@ test("active and failed PBIs expose run controls through the dashboard action bo
       pbi_number: 1,
       run_id: "run-1",
       target: "implement",
-    },
-    {
-      action: "retry",
-      repository: "owner/api",
-      pbi_number: 2,
-      run_id: "run-2",
     },
   ]);
   assert.match(actionsOutput.textContent, /Result:.*implement/);

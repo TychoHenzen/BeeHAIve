@@ -1,6 +1,5 @@
-import { createDashboardClient } from "/dashboard-client.mjs?v=12";
-import { createDemoClient } from "/dashboard-demo.mjs?v=12";
-import { createDashboardUi } from "/dashboard-ui.mjs?v=12";
+import { createDashboardClient } from "/dashboard-client.mjs?v=13";
+import { createDashboardUi } from "/dashboard-ui.mjs?v=13";
 
 const settingsProjectInput = document.querySelector("#settings-project-id");
 const settingsWorkflowInput = document.querySelector("#settings-workflow-id");
@@ -27,11 +26,8 @@ const pageTitle = document.querySelector("#page-title");
 const welcome = document.querySelector("#welcome");
 const mission = document.querySelector("#mission");
 const refreshButton = document.querySelector("#refresh");
-const demoLink = document.querySelector("#demo-link");
-const welcomeDemo = document.querySelector("#welcome-demo");
 const welcomeSettings = document.querySelector("#welcome-settings");
 const params = new URLSearchParams(window.location.search);
-const demo = params.get("demo") === "true";
 const pageTitles = {
   mission: "Mission control",
   queue: "Queue",
@@ -48,8 +44,8 @@ function normalizePage(value) {
   return Object.hasOwn(pageTitles, page) ? page : "mission";
 }
 
-settingsProjectInput.value = demo ? "demo:1" : params.get("project") || "";
-let initialWorkflow = params.get("workflow_id") || (demo ? "demo-flow" : "");
+settingsProjectInput.value = params.get("project") || "";
+let initialWorkflow = params.get("workflow_id") || "";
 settingsWorkflowInput.value = initialWorkflow;
 let archivedMode = params.get("archived") === "true";
 let schedulerSettingsDirty = false;
@@ -174,10 +170,6 @@ function setIdeaProjects(projects) {
 }
 
 async function loadIdeaProjects() {
-  if (demo) {
-    setIdeaProjects(["demo:1"]);
-    return;
-  }
   try {
     const response = await fetch("/dashboard/config", { cache: "no-store" });
     const payload = await response.json();
@@ -209,10 +201,9 @@ function showWelcome() {
   mission.hidden = true;
 }
 
-function updateUrl(project, workflow = settingsWorkflowInput.value.trim(), keepDemo = false) {
+function updateUrl(project, workflow = settingsWorkflowInput.value.trim()) {
   const next = new URL(window.location.href);
-  if (keepDemo) next.searchParams.set("demo", "true");
-  else next.searchParams.delete("demo");
+  next.search = "";
   next.searchParams.set("project", project);
   if (workflow) next.searchParams.set("workflow_id", workflow);
   else next.searchParams.delete("workflow_id");
@@ -243,17 +234,16 @@ const ui = createDashboardUi({
   runAutonomous: (payload) => client.runAutonomous(payload),
   onProjectSelect: (project) => {
     settingsProjectInput.value = project;
-    updateUrl(project, settingsWorkflowInput.value.trim(), demo);
+    updateUrl(project, settingsWorkflowInput.value.trim());
     void client.refresh();
   },
   onQueueArchive: (archived) => {
     archivedMode = archived;
     const project = settingsProjectInput.value.trim();
-    if (project) updateUrl(project, settingsWorkflowInput.value.trim(), demo);
+    if (project) updateUrl(project, settingsWorkflowInput.value.trim());
     void client.refresh();
   },
   initialFilter: archivedMode ? "archived" : "all",
-  demo,
   runAction: (payload) => client.runAction(payload),
 });
 
@@ -309,28 +299,15 @@ function toggleBusy(disabled) {
   ideaSubmit.disabled = disabled;
 }
 
-if (demo) {
-  client = createDemoClient({
-    archived: () => archivedMode,
-    workflowId: () => settingsWorkflowInput.value.trim() || initialWorkflow,
-    onState: handleState,
-    onStatus: setStatus,
-      onBusy: toggleBusy,
-  });
-  demoLink.textContent = "Exit demo";
-  demoLink.href = "/dashboard";
-  setStatus("Demo mode uses placeholder systems. No external changes are made.");
-} else {
-  client = createDashboardClient({
-    fetcher: window.fetch.bind(window),
-    projectId: () => settingsProjectInput.value,
-    workflowId: () => settingsWorkflowInput.value || initialWorkflow,
-    archived: () => archivedMode,
-    onState: handleState,
-    onStatus: setStatus,
-    onBusy: toggleBusy,
-  });
-}
+client = createDashboardClient({
+  fetcher: window.fetch.bind(window),
+  projectId: () => settingsProjectInput.value,
+  workflowId: () => settingsWorkflowInput.value || initialWorkflow,
+  archived: () => archivedMode,
+  onState: handleState,
+  onStatus: setStatus,
+  onBusy: toggleBusy,
+});
 
 async function persistSettings(project, workflow) {
   const projects = [...new Set([...configuredProjects, project])];
@@ -362,16 +339,7 @@ async function openProject(navigateToMission = true, persist = true) {
     setPage("settings");
     return;
   }
-  if (demo && project !== "demo:1") {
-    const next = new URL(window.location.href);
-    next.searchParams.delete("demo");
-    next.searchParams.set("project", project);
-    if (workflow) next.searchParams.set("workflow_id", workflow);
-    next.hash = "#mission";
-    window.location.href = next;
-    return;
-  }
-  if (persist && !demo) {
+  if (persist) {
     try {
       await persistSettings(project, workflow);
     } catch (error) {
@@ -379,7 +347,7 @@ async function openProject(navigateToMission = true, persist = true) {
       return;
     }
   }
-  updateUrl(project, workflow, demo);
+  updateUrl(project, workflow);
   setSettingsFeedback("Saved for this dashboard URL.", "success");
   if (navigateToMission) setPage("mission");
   void client.refresh();
@@ -431,7 +399,7 @@ ideaForm.addEventListener("submit", (event) => {
     return;
   }
   settingsProjectInput.value = project;
-  updateUrl(project, settingsWorkflowInput.value.trim(), demo);
+  updateUrl(project, settingsWorkflowInput.value.trim());
   setIdeaFeedback("Sending idea to add-backlog-idea...", "pending");
   void client.runAction({ action: "capture_idea", idea }).then((result) => {
     if (!result) {
@@ -466,7 +434,7 @@ workflowCreateForm.addEventListener("submit", (event) => {
   }
   const draft = workflowDraft(workflowId);
   settingsWorkflowInput.value = workflowId;
-  updateUrl(project, workflowId, demo);
+  updateUrl(project, workflowId);
   void client.runAction({
     action: "graph_evaluate",
     workflow_id: workflowId,
@@ -488,11 +456,8 @@ workflowSelector.addEventListener("change", () => {
     setPage("settings");
     return;
   }
-  updateUrl(project, settingsWorkflowInput.value, demo);
+  updateUrl(project, settingsWorkflowInput.value);
   void client.refresh();
-});
-welcomeDemo.addEventListener("click", () => {
-  window.location.href = "/dashboard?demo=true#mission";
 });
 welcomeSettings.addEventListener("click", () => setPage("settings"));
 document.querySelectorAll("[data-page]").forEach((node) => {
@@ -504,7 +469,7 @@ document.addEventListener("keydown", (event) => {
 });
 
 setPage(window.location.hash || "mission", false);
-if (demo || settingsProjectInput.value.trim()) void openProject(false, false);
+if (settingsProjectInput.value.trim()) void openProject(false, false);
 else showWelcome();
 void loadIdeaProjects();
-if (!demo) window.setInterval(() => void client.refresh(), 15000);
+window.setInterval(() => void client.refresh(), 15000);

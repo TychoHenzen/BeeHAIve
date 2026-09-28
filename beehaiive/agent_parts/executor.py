@@ -20,7 +20,6 @@ from .codex_runtime_mixin import CodexRuntimeMixin
 from .codex_session_mixin import CodexSessionMixin
 from .constants import (
     _SECRET_NAME,
-    DEFAULT_DEMO_TASK,
     MAX_AGENT_TIMEOUT_SECONDS,
 )
 from .values import _nonnegative_int as _nonnegative_int
@@ -46,7 +45,7 @@ class CodexExecModelExecutor(
         executable: str = "codex",
         timeout_seconds: float = 120.0,
         model: str | None = None,
-        task: str = DEFAULT_DEMO_TASK,
+        task: str | None = None,
         repository_name: str | None = None,
     ) -> None:
         resolved_repository = repository.resolve()
@@ -61,13 +60,11 @@ class CodexExecModelExecutor(
                 "Agent timeout must be positive, finite, and no greater than "
                 f"{MAX_AGENT_TIMEOUT_SECONDS:g} seconds"
             )
-        if not task.strip():
-            raise ValueError("Agent task is required")
         self.repository = resolved_repository
         self.executable = resolve_executable(executable)
         self.timeout_seconds = timeout_seconds
         self.model = model.strip() if model and model.strip() else None
-        self.task = task.strip()
+        self.task = task.strip() if task and task.strip() else None
         self.repository_name = (
             repository_name.strip()
             if repository_name and repository_name.strip()

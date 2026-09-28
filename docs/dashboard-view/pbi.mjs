@@ -103,20 +103,6 @@ export function createPbiRenderer(dom, details, runAction) {
     if (pbi.last_error) card.append(element("p", `Failure: ${pbi.last_error}`, "status failure"));
     if (pbi.result) card.append(element("p", `Result: ${pbi.result}`, "status success"));
     if (pbi.active === false) return card;
-    if (pbi.status === "failed" && pbi.claimable && pbi.run_id
-      && !(pbi.delivery && pbi.delivery.retry_available)) {
-      const retry = element("button", "Retry writer", "secondary");
-      retry.type = "button";
-      retry.addEventListener("click", () => runAction({
-        action: "retry",
-        repository,
-        pbi_number: pbi.number,
-        run_id: pbi.run_id,
-      }));
-      const controls = element("div", undefined, "actions");
-      controls.append(retry);
-      card.append(controls);
-    }
     if (!["active", "awaiting_operator"].includes(pbi.status) || !pbi.run_id) return card;
     const controls = element("div", undefined, "actions");
     if (pbi.status === "active" && pbi.stage === "refine") {

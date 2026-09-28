@@ -21,7 +21,6 @@ from tests.support.provider.review_graph_ql_client import (
 def test_production_adapters_work_through_review_api(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("BEEHAIIVE_REVIEW_MODE", "production")
     monkeypatch.setenv("BEEHAIIVE_REVIEW_ACTOR", "operator")
     store = ReviewStore()
     pull_request_id = "owner/repo#7"

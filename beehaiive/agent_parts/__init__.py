@@ -6,8 +6,6 @@ from .constants import _SECRET_JSON as _SECRET_JSON
 from .constants import _SECRET_NAME as _SECRET_NAME
 from .constants import _SESSION_PROGRESS_EVENTS as _SESSION_PROGRESS_EVENTS
 from .constants import _URL_CREDENTIALS as _URL_CREDENTIALS
-from .constants import DEFAULT_DEMO_TASK as DEFAULT_DEMO_TASK
-from .constants import DEMO_TASK_NAME as DEMO_TASK_NAME
 from .constants import MAX_AGENT_OUTPUT_BYTES as MAX_AGENT_OUTPUT_BYTES
 from .constants import MAX_AGENT_OUTPUT_LENGTH as MAX_AGENT_OUTPUT_LENGTH
 from .constants import MAX_AGENT_TIMEOUT_SECONDS as MAX_AGENT_TIMEOUT_SECONDS
@@ -28,8 +26,6 @@ __all__ = [
     "AgentWorkerManager",
     "CancellableModelExecutor",
     "CodexExecModelExecutor",
-    "DEFAULT_DEMO_TASK",
-    "DEMO_TASK_NAME",
     "MAX_AGENT_OUTPUT_BYTES",
     "MAX_AGENT_OUTPUT_LENGTH",
     "MAX_AGENT_TIMEOUT_SECONDS",

@@ -275,13 +275,9 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
         for value in (review_provider, review_readers, review_authorizer)
     ):
         raise ValueError("Review adapters must be configured on the review service")
-    review_operations_enabled = (
-        os.environ.get("BEEHAIIVE_REVIEW_MODE", "").strip().lower() != "demo"
-    )
     if (
         review_service is None
         and require_review_adapters
-        and review_operations_enabled
         and review_provider is None
         and review_readers is None
     ):
@@ -302,7 +298,6 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("The review repair service must share one review service")
     if (
         review_repair_service is None
-        and review_operations_enabled
         and workflow_service is not None
         and review_service.provider is not None
         and callable(getattr(orchestrator.provider, "get_pull_request", None))
@@ -381,7 +376,6 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
         "agent_worker": agent_worker,
         "review_service": review_service,
         "review_repair_service": review_repair_service,
-        "review_operations_enabled": review_operations_enabled,
         "configured_projects": configured_projects,
         "project_boundary": project_boundary,
         "runtime_settings": persisted_settings,

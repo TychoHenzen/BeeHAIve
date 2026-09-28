@@ -22,7 +22,6 @@ def build_route_dependencies(
     orchestrator = runtime["orchestrator"]
     review_repair_service = runtime["review_repair_service"]
     workflow_service = runtime["workflow_service"]
-    review_operations_enabled = runtime["review_operations_enabled"]
     configured_projects = runtime["configured_projects"]
     configured_api_key = (
         api_key if api_key is not None else os.environ.get("BEEHAIIVE_API_KEY")
@@ -77,10 +76,6 @@ def build_route_dependencies(
     def require_review_access(
         supplied_api_key: str | None = Header(default=None, alias="X-API-Key"),
     ) -> str:
-        if not review_operations_enabled:
-            raise HTTPException(
-                status_code=503, detail="Review operations are disabled in demo mode"
-            )
         require_api_key(supplied_api_key)
         if configured_review_actor is None or not configured_review_actor.strip():
             raise HTTPException(

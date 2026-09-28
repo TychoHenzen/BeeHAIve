@@ -52,9 +52,7 @@ def test_agent_session_round_trips_through_project_state(tmp_path: Path) -> None
     assert run is not None
     lease_token = run.lease_token or ""
 
-    store.start_agent_session(
-        run.run_id, "agent-process-1", "bounded repository inventory", lease_token
-    )
+    store.start_agent_session(run.run_id, "agent-process-1", "worker task", lease_token)
     store.record_agent_session_event(
         run.run_id, lease_token, "progress", "turn.started", None, "turn started"
     )
@@ -71,7 +69,7 @@ def test_agent_session_round_trips_through_project_state(tmp_path: Path) -> None
     assert session is not None
     assert session["session_id"] == run.run_id
     assert session["worker_id"] == "agent-process-1"
-    assert session["task"] == "bounded repository inventory"
+    assert session["task"] == "worker task"
     assert session["state"] == "active"
     assert [event["sequence"] for event in session["events"]] == [1, 2]
 

@@ -81,9 +81,6 @@ def test_executor_validates_configuration_and_reads_environment(
         CodexExecModelExecutor(tmp_path, executable=" ")
     with pytest.raises(ValueError, match="timeout must be positive"):
         CodexExecModelExecutor(tmp_path, timeout_seconds=0)
-    with pytest.raises(ValueError, match="task is required"):
-        CodexExecModelExecutor(tmp_path, task=" ")
-
     monkeypatch.setenv("BEEHAIIVE_AGENT_TIMEOUT_SECONDS", "invalid")
     with pytest.raises(ValueError, match="must be a positive number"):
         CodexExecModelExecutor.from_environment()

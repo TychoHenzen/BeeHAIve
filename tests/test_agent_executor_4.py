@@ -93,22 +93,14 @@ def test_executor_prompt_contains_verified_repository_metadata(
 ) -> None:
     executor = CodexExecModelExecutor(tmp_path, repository_name="owner/api")
     executor.set_session_task("prompt-metadata", "persisted executable task")
-    monkeypatch.setattr(executor, "_discover_repository_branch", lambda: "feature/demo")
-    monkeypatch.setattr(
-        executor,
-        "_repository_files",
-        lambda: (Path("README.md"), Path("main.py")),
-    )
-
     router = ModelRouter(RoutingStore())
     spec = router.config.spec_for(ModelTier.LUNA)
     prompt = executor._prompt(spec, router.begin("prompt-metadata").decision)
     default_prompt = executor._prompt(spec, router.begin("default-task").decision)
 
-    assert "Verified current branch: feature/demo" in prompt
-    assert "Verified tracked file count: 2" in prompt
+    assert "BeeHAIve Codex worker" in prompt
     assert "Task: persisted executable task" in prompt
-    assert ".git" in default_prompt
+    assert "Verified current branch" not in default_prompt
 
 
 def test_executor_safe_checkout_excludes_local_secret_files(tmp_path: Path) -> None:
