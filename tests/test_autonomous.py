@@ -15,7 +15,6 @@ from beehaiive.autonomous import (
     IDEA_CAPTURE_STEP,
     AutonomousLifecycleRunner,
     AutonomousLifecycleService,
-    PlaceholderSkillExecutor,
     select_work_item,
 )
 from beehaiive.models import PbiSnapshot, ProjectSnapshot, RepositorySnapshot, Stage
@@ -28,6 +27,7 @@ from tests.support.agent.helpers import (
     make_git_repository,
     workflow_service_for,
 )
+from tests.support.agent.lifecycle_executor import SuccessfulSkillExecutor
 from tests.support.dashboard.helpers import dashboard_snapshot
 
 
@@ -93,7 +93,7 @@ def test_select_work_item_keeps_parent_priority_and_children_together() -> None:
 def test_autonomous_selection_prefers_an_orphaned_in_progress_parent() -> None:
     store = OrchestratorStore()
     service = Orchestrator(store, FakeProvider(dashboard_snapshot()))
-    automation = AutonomousLifecycleService(service, PlaceholderSkillExecutor())
+    automation = AutonomousLifecycleService(service, SuccessfulSkillExecutor())
 
     try:
         selected = automation._select(
@@ -131,7 +131,7 @@ def test_autonomous_selection_prefers_an_orphaned_in_progress_parent() -> None:
 def test_autonomous_explicit_resume_accepts_an_in_progress_pbi() -> None:
     store = OrchestratorStore()
     service = Orchestrator(store, FakeProvider(dashboard_snapshot()))
-    automation = AutonomousLifecycleService(service, PlaceholderSkillExecutor())
+    automation = AutonomousLifecycleService(service, SuccessfulSkillExecutor())
 
     try:
         selected = automation._select(
@@ -162,7 +162,7 @@ def test_autonomous_explicit_resume_accepts_an_in_progress_pbi() -> None:
 def test_autonomous_selection_resumes_after_a_published_pull_request() -> None:
     store = OrchestratorStore()
     service = Orchestrator(store, FakeProvider(dashboard_snapshot()))
-    automation = AutonomousLifecycleService(service, PlaceholderSkillExecutor())
+    automation = AutonomousLifecycleService(service, SuccessfulSkillExecutor())
     actions = [
         {
             "kind": "skill:submit-draft-pr",
@@ -343,7 +343,7 @@ def test_autonomous_start_resumes_the_next_lifecycle_skill() -> None:
     actions = store.actions_for_project("project-1")
     failed_start = next(item for item in actions if item["kind"] == "autonomous_start")
     store.finish_action(str(failed_start["id"]), "failed", error="interrupted")
-    automation = AutonomousLifecycleService(service, PlaceholderSkillExecutor())
+    automation = AutonomousLifecycleService(service, SuccessfulSkillExecutor())
 
     try:
         started = automation.start("project-1")
@@ -519,8 +519,8 @@ def test_autonomous_resume_retries_a_blocked_completion_stage() -> None:
     }
 
 
-def test_placeholder_runner_passes_one_branch_handover_through_all_skills() -> None:
-    runner = AutonomousLifecycleRunner(PlaceholderSkillExecutor())
+def test_successful_runner_passes_one_branch_handover_through_all_skills() -> None:
+    runner = AutonomousLifecycleRunner(SuccessfulSkillExecutor())
 
     result = runner.run(
         {
@@ -675,7 +675,7 @@ def test_autonomous_service_persists_skill_handoffs() -> None:
     service = Orchestrator(store, FakeProvider(dashboard_snapshot()))
     service.synchronize("project-1")
     automation = AutonomousLifecycleService(
-        service, PlaceholderSkillExecutor(), PlaceholderSkillExecutor()
+        service, SuccessfulSkillExecutor(), SuccessfulSkillExecutor()
     )
 
     try:
@@ -811,7 +811,6 @@ def test_idea_capture_isolates_codex_workspace_from_server_checkout(
             return {"status": "blocked", "summary": "fixture stopped"}
 
     monkeypatch.setenv("BEEHAIIVE_AGENT_REPOSITORY_NAME", "owner/api")
-    monkeypatch.setenv("BEEHAIIVE_AUTONOMOUS_MODE", "codex")
     monkeypatch.setattr(autonomous, "CodexSkillExecutor", WritingExecutor)
     store = OrchestratorStore()
     service = Orchestrator(store, FakeProvider(dashboard_snapshot()))
@@ -876,7 +875,7 @@ def test_autonomous_service_marks_orphaned_pending_runs_after_restart() -> None:
         1,
         "orphaned-run",
     )
-    automation = AutonomousLifecycleService(service, PlaceholderSkillExecutor())
+    automation = AutonomousLifecycleService(service, SuccessfulSkillExecutor())
 
     try:
         assert automation.recover_pending(("project-1",)) == 1
@@ -903,7 +902,7 @@ def test_restart_recovery_makes_an_orphaned_run_resumable() -> None:
         1,
         "orphaned-run",
     )
-    automation = AutonomousLifecycleService(service, PlaceholderSkillExecutor())
+    automation = AutonomousLifecycleService(service, SuccessfulSkillExecutor())
 
     try:
         assert automation.recover_pending(("project-1",)) == 1
@@ -982,7 +981,7 @@ def test_autonomous_service_marks_orphaned_idea_capture_after_restart() -> None:
         {"idea": "orphaned"},
         run_id="orphaned-idea",
     )
-    automation = AutonomousLifecycleService(service, PlaceholderSkillExecutor())
+    automation = AutonomousLifecycleService(service, SuccessfulSkillExecutor())
 
     try:
         assert automation.recover_pending(("project-1",)) == 1
@@ -1022,7 +1021,6 @@ def test_codex_autonomous_run_uses_a_server_worktree(
                 "handover": handover,
             }
 
-    monkeypatch.setenv("BEEHAIIVE_AUTONOMOUS_MODE", "codex")
     monkeypatch.setenv("BEEHAIIVE_AGENT_REPOSITORY_NAME", "owner/api")
     monkeypatch.setattr(autonomous, "CodexSkillExecutor", RecordingExecutor)
     service = AutonomousLifecycleService(
@@ -1071,7 +1069,6 @@ def test_codex_autonomous_run_rejects_a_mismatched_origin_before_leasing(
     store = OrchestratorStore()
     orchestrator = Orchestrator(store, FakeProvider(dashboard_snapshot()))
     orchestrator.synchronize("project-1")
-    monkeypatch.setenv("BEEHAIIVE_AUTONOMOUS_MODE", "codex")
     monkeypatch.setenv("BEEHAIIVE_AGENT_REPOSITORY_NAME", "owner/api")
     automation = AutonomousLifecycleService(
         orchestrator, workflow_service=workflow_service
@@ -1111,7 +1108,7 @@ def test_autonomous_workspace_heartbeat_renews_until_stop() -> None:
     store = OrchestratorStore()
     orchestrator = Orchestrator(store, FakeProvider(dashboard_snapshot()))
     automation = AutonomousLifecycleService(
-        orchestrator, PlaceholderSkillExecutor(), workflow_service=Workflow()
+        orchestrator, SuccessfulSkillExecutor(), workflow_service=Workflow()
     )
     lease = WorkspaceLease(
         "lease-1",
@@ -1175,7 +1172,7 @@ def test_autonomous_service_runs_one_pbi_at_a_time() -> None:
         def execute(self, step, context, handover):
             self.started.set()
             self.release.wait(3)
-            return PlaceholderSkillExecutor().execute(step, context, handover)
+            return SuccessfulSkillExecutor().execute(step, context, handover)
 
     store = OrchestratorStore()
     service = Orchestrator(store, FakeProvider(dashboard_snapshot()))
@@ -1210,7 +1207,7 @@ def test_autonomous_service_runs_independent_repositories_concurrently() -> None
         def execute(self, step, context, handover):
             self.started.set()
             self.release.wait(3)
-            return PlaceholderSkillExecutor().execute(step, context, handover)
+            return SuccessfulSkillExecutor().execute(step, context, handover)
 
     snapshot = ProjectSnapshot(
         "project-1",
@@ -1260,7 +1257,7 @@ def test_autonomous_service_rejects_a_different_configured_repository(
     store = OrchestratorStore()
     service = Orchestrator(store, FakeProvider(dashboard_snapshot()))
     service.synchronize("project-1")
-    automation = AutonomousLifecycleService(service, PlaceholderSkillExecutor())
+    automation = AutonomousLifecycleService(service, SuccessfulSkillExecutor())
 
     try:
         with pytest.raises(ValueError, match="outside the configured checkout"):

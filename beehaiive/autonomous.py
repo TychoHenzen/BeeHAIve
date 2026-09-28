@@ -73,7 +73,6 @@ __all__ = [
     "CodexSkillExecutor",
     "DEFAULT_AUTONOMOUS_MODEL",
     "DEFAULT_AUTONOMOUS_TIMEOUT_SECONDS",
-    "PlaceholderSkillExecutor",
     "SkillHandoff",
     "SkillStep",
     "select_work_item",
@@ -1042,35 +1041,6 @@ class AutonomousLifecycleRunner:
         return AutonomousRunResult(
             run_id, "completed", repository, pbi_number, tuple(handoffs)
         )
-
-
-class PlaceholderSkillExecutor:
-    def execute(
-        self,
-        step: SkillStep,
-        context: Mapping[str, object],
-        handover: Mapping[str, object],
-    ) -> Mapping[str, object]:
-        try:
-            step_index = next(
-                index
-                for index, candidate in enumerate(AUTONOMOUS_STEPS)
-                if candidate.name == step.name
-            )
-            remaining = AUTONOMOUS_STEPS[step_index + 1 :]
-        except StopIteration:
-            remaining = ()
-        next_step = remaining[0].name if remaining else "complete"
-        return {
-            "status": "succeeded",
-            "summary": f"Placeholder context completed {step.name}.",
-            "handover": {
-                **dict(handover),
-                "completed_skill": step.name,
-                "next_skill": next_step,
-                "context_project": context.get("project_id"),
-            },
-        }
 
 
 class CodexSkillExecutor:
@@ -2164,8 +2134,7 @@ class AutonomousLifecycleService:
         idea_heartbeat_thread: Thread | None = None
         side_effect_started = False
         try:
-            mode = os.environ.get("BEEHAIIVE_AUTONOMOUS_MODE", "codex").strip().lower()
-            if self._executor is None and mode == "codex":
+            if self._executor is None:
                 idea_workspace = self._create_idea_workspace()
             executor = self._idea_executor(
                 record_output, record_process, idea_workspace
@@ -2325,9 +2294,6 @@ class AutonomousLifecycleService:
     ) -> SkillExecutor:
         if self._executor is not None:
             return self._executor
-        mode = os.environ.get("BEEHAIIVE_AUTONOMOUS_MODE", "codex").strip().lower()
-        if mode != "codex":
-            return PlaceholderSkillExecutor()
         if not isinstance(repository, Path):
             raise RuntimeError(
                 "Idea capture requires an isolated workspace; no checkout was touched"
@@ -2397,8 +2363,7 @@ class AutonomousLifecycleService:
     def _prepare_workspace(
         self, run_id: str, context: dict[str, object], action_id: str
     ) -> dict[str, object]:
-        mode = os.environ.get("BEEHAIIVE_AUTONOMOUS_MODE", "codex").strip().lower()
-        if self._executor is not None or mode != "codex":
+        if self._executor is not None:
             return context
         requested_repository = context.get("repository")
         if self._configured_repository is None:
@@ -2627,23 +2592,19 @@ class AutonomousLifecycleService:
     ) -> SkillExecutor:
         if self._executor is not None:
             return self._executor
-        mode = os.environ.get("BEEHAIIVE_AUTONOMOUS_MODE", "codex").strip().lower()
-        if mode == "codex":
-            repository = context.get("workspace_path")
-            if not isinstance(repository, str) or not repository.strip():
-                raise RuntimeError(
-                    "Autonomous Codex execution has no leased worktree; "
-                    "no checkout was touched"
-                )
-            return CodexSkillExecutor(
-                repository,
-                os.environ.get("BEEHAIIVE_CODEX_EXECUTABLE", "codex"),
-                _autonomous_timeout(),
-                on_output=on_output,
-                on_process=on_process,
+        repository = context.get("workspace_path")
+        if not isinstance(repository, str) or not repository.strip():
+            raise RuntimeError(
+                "Autonomous Codex execution has no leased worktree; "
+                "no checkout was touched"
             )
-        del context
-        return PlaceholderSkillExecutor()
+        return CodexSkillExecutor(
+            repository,
+            os.environ.get("BEEHAIIVE_CODEX_EXECUTABLE", "codex"),
+            _autonomous_timeout(),
+            on_output=on_output,
+            on_process=on_process,
+        )
 
     def _advisor_for(
         self,
@@ -2653,9 +2614,4 @@ class AutonomousLifecycleService:
     ) -> SkillExecutor | None:
         if self._advisor is not None:
             return self._advisor
-        if (
-            os.environ.get("BEEHAIIVE_AUTONOMOUS_MODE", "codex").strip().lower()
-            == "codex"
-        ):
-            return self._executor_for(context, on_output, on_process)
-        return PlaceholderSkillExecutor()
+        return self._executor_for(context, on_output, on_process)

@@ -74,7 +74,6 @@ def register_background_handlers(app: FastAPI, runtime: dict[str, Any]) -> None:
     orchestrator = runtime["orchestrator"]
     scheduler = runtime["scheduler"]
     require_review_adapters = runtime["require_review_adapters"]
-    review_operations_enabled = runtime["review_operations_enabled"]
     review_service = runtime["review_service"]
     review_repair_service = runtime["review_repair_service"]
 
@@ -95,7 +94,7 @@ def register_background_handlers(app: FastAPI, runtime: dict[str, Any]) -> None:
                 scheduler.shutdown()
             agent_worker.shutdown()
 
-    if require_review_adapters and review_operations_enabled:
+    if require_review_adapters:
 
         @app.on_event("startup")  # pyright: ignore[reportDeprecated]
         async def require_configured_review_adapters() -> None:  # pyright: ignore[reportUnusedFunction]

@@ -107,7 +107,6 @@ def test_default_production_review_adapters_require_token_at_startup(
     review_store: ReviewStore,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("BEEHAIIVE_REVIEW_MODE", "production")
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("GH_TOKEN", raising=False)
     with (
@@ -126,7 +125,6 @@ def test_default_production_review_adapters_start_with_read_token(
     review_store: ReviewStore,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("BEEHAIIVE_REVIEW_MODE", "production")
     monkeypatch.setenv("GITHUB_TOKEN", "test-read-token")
     monkeypatch.delenv("GH_TOKEN", raising=False)
     app = create_app(

@@ -30,7 +30,6 @@ def test_autonomous_runtime_resolves_bare_codex_before_windows_launch(
     resolved_executable.write_bytes(b"native executable placeholder")
     launches: list[list[str]] = []
 
-    monkeypatch.setenv("BEEHAIIVE_AUTONOMOUS_MODE", "codex")
     monkeypatch.setenv("BEEHAIIVE_AGENT_REPOSITORY", str(tmp_path))
     monkeypatch.setenv("BEEHAIIVE_AGENT_REPOSITORY_NAME", "owner/api")
     monkeypatch.setenv("BEEHAIIVE_CODEX_EXECUTABLE", "codex")

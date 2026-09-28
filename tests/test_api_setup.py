@@ -174,35 +174,6 @@ def test_owned_app_rejects_an_executor_without_worker_capabilities(
         store.close()
 
 
-def test_demo_mode_starts_production_app_with_bounded_adapters(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
-) -> None:
-    monkeypatch.setenv("BEEHAIIVE_REVIEW_MODE", "demo")
-    monkeypatch.setenv("BEEHAIIVE_STATE_DB", str(tmp_path / "state.db"))
-    monkeypatch.setenv("BEEHAIIVE_ROUTING_DB", str(tmp_path / "routing.db"))
-    monkeypatch.setenv("BEEHAIIVE_REVIEW_DB", str(tmp_path / "review.db"))
-
-    with TestClient(
-        create_app(
-            api_key="test-key",
-            allowed_project_ids={"owner:1"},
-            require_review_adapters=True,
-        )
-    ) as demo_client:
-        response = demo_client.get("/")
-        review_response = demo_client.post(
-            "/reviews/ready",
-            headers={"X-API-Key": "test-key"},
-            json={"pull_request_id": "PR-1"},
-        )
-
-    assert response.status_code == 200
-    assert review_response.status_code == 503
-    assert review_response.json()["detail"] == (
-        "Review operations are disabled in demo mode"
-    )
-
-
 def test_production_entrypoint_serves_live_project_routes(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
@@ -213,7 +184,6 @@ def test_production_entrypoint_serves_live_project_routes(
     monkeypatch.setenv("GITHUB_PROJECT_OWNER_TYPE", "user")
     monkeypatch.setenv("BEEHAIIVE_ALLOWED_PROJECTS", "owner:7")
     monkeypatch.setenv("BEEHAIIVE_API_KEY", "test-api-key")
-    monkeypatch.setenv("BEEHAIIVE_REVIEW_MODE", "demo")
     monkeypatch.setenv("BEEHAIIVE_AGENT_REPOSITORY", str(tmp_path))
     monkeypatch.setenv("BEEHAIIVE_AGENT_REPOSITORY_NAME", "owner/api")
     monkeypatch.setenv("BEEHAIIVE_STATE_DB", str(tmp_path / "state.db"))

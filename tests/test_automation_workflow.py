@@ -12,7 +12,6 @@ from beehaiive.autonomous import (
     DEFAULT_AUTOMATION_WORKFLOW_ID,
     AutonomousLifecycleRunner,
     AutonomousLifecycleService,
-    PlaceholderSkillExecutor,
     SkillStep,
     bootstrap_automation_workflow,
 )
@@ -27,6 +26,7 @@ from beehaiive.graph_safety import GraphSafetyService
 from beehaiive.orchestrator import Orchestrator
 from beehaiive.storage import OrchestratorStore
 from tests.conftest import FakeProvider
+from tests.support.agent.lifecycle_executor import SuccessfulSkillExecutor
 from tests.support.dashboard.helpers import dashboard_snapshot
 
 
@@ -154,7 +154,7 @@ def test_unsupported_graph_is_rejected_before_worker_claim() -> None:
     evaluation = safety.evaluate(definition, {"happy": {"prompt": base}})
     safety.review(evaluation, "operator")
     safety.activate(evaluation, "operator")
-    service = AutonomousLifecycleService(orchestrator, PlaceholderSkillExecutor())
+    service = AutonomousLifecycleService(orchestrator, SuccessfulSkillExecutor())
 
     try:
         with pytest.raises(ValueError, match="unsupported node"):
@@ -286,7 +286,7 @@ def test_autonomous_run_uses_the_active_workflow_and_records_its_identity() -> N
     orchestrator = Orchestrator(store, FakeProvider(dashboard_snapshot()))
     orchestrator.synchronize("project-1")
     bootstrap_automation_workflow(store)
-    service = AutonomousLifecycleService(orchestrator, PlaceholderSkillExecutor())
+    service = AutonomousLifecycleService(orchestrator, SuccessfulSkillExecutor())
 
     try:
         started = service.start(
@@ -320,7 +320,7 @@ def test_autonomous_run_rejects_an_unavailable_workflow_before_claiming() -> Non
     store = OrchestratorStore()
     orchestrator = Orchestrator(store, FakeProvider(dashboard_snapshot()))
     orchestrator.synchronize("project-1")
-    service = AutonomousLifecycleService(orchestrator, PlaceholderSkillExecutor())
+    service = AutonomousLifecycleService(orchestrator, SuccessfulSkillExecutor())
 
     try:
         with pytest.raises(ValueError, match="active revision"):
@@ -384,7 +384,7 @@ def test_permuted_active_workflow_drives_run_and_resume_order() -> None:
     evaluation = safety.evaluate(definition, fixtures)
     safety.review(evaluation, "operator")
     safety.activate(evaluation, "operator")
-    service = AutonomousLifecycleService(orchestrator, PlaceholderSkillExecutor())
+    service = AutonomousLifecycleService(orchestrator, SuccessfulSkillExecutor())
 
     try:
         started = service.start(
