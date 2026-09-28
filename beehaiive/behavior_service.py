@@ -303,7 +303,14 @@ class BehaviorService:
             ) from exc
 
     def get(self, project_id: str, behavior_id: str) -> BehaviorRecord:
-        record = self.store.unit_behavior_for(_project_id(project_id), behavior_id)
+        try:
+            record = self.store.unit_behavior_for(_project_id(project_id), behavior_id)
+        except StoreError as exc:
+            raise BehaviorServiceError(
+                "persistence",
+                "Behavior readback is unavailable",
+                FailureCategory.PERSISTENCE,
+            ) from exc
         if record is None:
             raise BehaviorServiceError("not_found", "Behavior not found")
         return record

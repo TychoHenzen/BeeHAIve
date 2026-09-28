@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Collection, Mapping
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -15,6 +16,73 @@ from tests.test_behavior import bindings, definition
 class FakeBehaviorModel:
     def generate(self, _prompt: str) -> object:
         return definition()
+
+
+class UnavailableBehaviorModel:
+    def generate(self, prompt: str) -> object:
+        del prompt
+        from beehaiive.behavior_model import BehaviorModelError
+
+        raise BehaviorModelError("model_unavailable", "secret-token=model-secret")
+
+
+class FailingTargetWorld(RecordingUnitWorld):
+    def allowed_targets(self, project_id: str) -> Mapping[str, Collection[str]]:
+        del project_id
+        raise RuntimeError("secret-token=target-secret")
+
+
+def test_behavior_api_exposes_bounded_failure_classification(tmp_path: Path) -> None:
+    store = OrchestratorStore(tmp_path / "api-errors.sqlite3")
+    service = BehaviorService(
+        store, model_client=UnavailableBehaviorModel(), unit_world=RecordingUnitWorld()
+    )
+    client = TestClient(
+        create_app(
+            orchestrator=Orchestrator(store, ApiProvider()),
+            behavior_service=service,
+            api_key="test-key",
+            allowed_project_ids={"owner:7"},
+            workflow_actor="operator",
+        )
+    )
+    response = client.post(
+        "/projects/owner:7/behaviors/generate",
+        json={"prompt": "move the item"},
+        headers={"X-API-Key": "test-key"},
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "code": "model_unavailable",
+        "failure_class": "model",
+        "message": "secret-token=[redacted]",
+    }
+    store.close()
+
+
+def test_behavior_api_target_provider_failure_is_not_invalid_domain_state(
+    tmp_path: Path,
+) -> None:
+    store = OrchestratorStore(tmp_path / "api-target-errors.sqlite3")
+    service = BehaviorService(store, unit_world=FailingTargetWorld())
+    client = TestClient(
+        create_app(
+            orchestrator=Orchestrator(store, ApiProvider()),
+            behavior_service=service,
+            api_key="test-key",
+            allowed_project_ids={"owner:7"},
+            workflow_actor="operator",
+        )
+    )
+    response = client.post(
+        "/projects/owner:7/behaviors",
+        json={"definition": definition(), "bindings": {}},
+        headers={"X-API-Key": "test-key"},
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"]["failure_class"] == "target_provider"
+    assert "target-secret" not in response.text
+    store.close()
 
 
 def test_behavior_design_api_is_explicit_and_project_scoped(tmp_path: Path) -> None:

@@ -13,6 +13,8 @@ from beehaiive.api.models import (
 )
 from beehaiive.building_signal import BuildingSignalServiceError
 from beehaiive.building_signal_service import BuildingSignalService
+from beehaiive.contract_types.validation import _redact_text
+from beehaiive.service_failures import FailureCategory
 
 
 def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
@@ -129,13 +131,29 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
 def _http_error(error: BuildingSignalServiceError) -> HTTPException:
     if error.code == "not_found":
         status = 404
-    elif error.code == "model_unavailable":
+    elif (
+        getattr(error, "category", None)
+        in {
+            FailureCategory.MODEL.value,
+            FailureCategory.TARGET_PROVIDER.value,
+            FailureCategory.PERSISTENCE.value,
+        }
+        or error.code == "model_unavailable"
+    ):
         status = 503
     elif error.code in {"conflict", "invalid_state", "persistence"}:
         status = 409
     else:
         status = 422
-    return HTTPException(status_code=status, detail=str(error))
+    category = error.category
+    return HTTPException(
+        status_code=status,
+        detail={
+            "code": error.code,
+            "failure_class": category,
+            "message": _redact_text(str(error), 512),
+        },
+    )
 
 
 __all__ = ["register_routes"]

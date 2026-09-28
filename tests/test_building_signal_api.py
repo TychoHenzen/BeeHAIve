@@ -23,6 +23,12 @@ class FakeBuildingSignalModel:
         }
 
 
+class SecretFailureWorld(TargetBuildingSignalWorld):
+    def inventory_count(self, project_id: str, building_id: str, item_id: str) -> int:
+        del project_id, building_id, item_id
+        raise RuntimeError("secret-token=inventory-secret")
+
+
 def test_building_signal_api_is_scoped_and_persists_current_state(
     tmp_path: Path,
 ) -> None:
@@ -107,4 +113,69 @@ def test_building_signal_api_is_scoped_and_persists_current_state(
         client.get("/projects/other:7/building-signals", headers=headers).status_code
         == 403
     )
+    store.close()
+
+
+def test_building_signal_api_reads_back_safe_state_and_failure_class(
+    tmp_path: Path,
+) -> None:
+    store = OrchestratorStore(tmp_path / "api-safe-state.sqlite3")
+    world = SecretFailureWorld(
+        {
+            "owner:7": {
+                "building": {"smelter": {}},
+                "item": {"iron-plate": {}},
+                "signal": {"green": {}},
+                "inventory": {"smelter": {"iron-plate": 3}},
+            }
+        }
+    )
+    service = BuildingSignalService(
+        store, model_client=FakeBuildingSignalModel(), world=world
+    )
+    client = TestClient(
+        create_app(
+            orchestrator=Orchestrator(store, ApiProvider()),
+            building_signal_service=service,
+            api_key="test-key",
+            allowed_project_ids={"owner:7"},
+            workflow_actor="operator",
+        )
+    )
+    headers = {"X-API-Key": "test-key"}
+    saved = client.post(
+        "/projects/owner:7/building-signals",
+        json={
+            "rule": {
+                "schema_version": 1,
+                "comparison": "lte",
+                "quantity": 5,
+                "item": "iron-plate",
+                "signal": "green",
+            }
+        },
+        headers=headers,
+    )
+    rule_id = saved.json()["rule_id"]
+    client.post(
+        f"/projects/owner:7/building-signals/{rule_id}/confirm", headers=headers
+    )
+    client.post(
+        f"/projects/owner:7/building-signals/{rule_id}/assign",
+        json={"building_id": "smelter"},
+        headers=headers,
+    )
+    evaluated = client.post(
+        f"/projects/owner:7/building-signals/{rule_id}/evaluate", headers=headers
+    )
+    assert evaluated.status_code == 200
+    state = evaluated.json()["signal_state"]
+    assert state["active"] is False
+    assert state["failure_class"] == "world"
+    assert "inventory-secret" not in evaluated.text
+    readback = client.get(
+        f"/projects/owner:7/building-signals/{rule_id}", headers=headers
+    )
+    assert readback.status_code == 200
+    assert readback.json()["signal_state"] == state
     store.close()

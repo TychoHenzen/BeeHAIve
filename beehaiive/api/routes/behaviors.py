@@ -14,6 +14,8 @@ from beehaiive.api.models import (
 )
 from beehaiive.behavior_model import BehaviorModelError
 from beehaiive.behavior_service import BehaviorService, BehaviorServiceError
+from beehaiive.contract_types.validation import _redact_text
+from beehaiive.service_failures import FailureCategory
 
 
 def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
@@ -125,13 +127,31 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
 def _http_error(error: BehaviorModelError | BehaviorServiceError) -> HTTPException:
     if error.code == "not_found":
         status = 404
-    elif error.code == "model_unavailable":
+    elif (
+        getattr(error, "category", None)
+        in {
+            FailureCategory.MODEL,
+            FailureCategory.TARGET_PROVIDER,
+            FailureCategory.PERSISTENCE,
+        }
+        or error.code == "model_unavailable"
+    ):
         status = 503
     elif error.code in {"state_conflict", "persistence", "invalid_checkpoint"}:
         status = 409
     else:
         status = 422
-    return HTTPException(status_code=status, detail=str(error))
+    category = getattr(error, "category", FailureCategory.MODEL)
+    if isinstance(category, FailureCategory):
+        category = category.value
+    return HTTPException(
+        status_code=status,
+        detail={
+            "code": error.code,
+            "failure_class": str(category),
+            "message": _redact_text(str(error), 512),
+        },
+    )
 
 
 __all__ = ["register_routes"]
