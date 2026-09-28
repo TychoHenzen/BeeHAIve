@@ -5,7 +5,7 @@ import secrets
 from collections.abc import Collection, Mapping
 from typing import Protocol, cast
 
-from beehaiive.persistence import OrchestratorStore, StoreError
+from beehaiive.persistence import OrchestratorStore, StateConflictError, StoreError
 
 from .behavior import (
     MAX_BEHAVIOR_WAIT_SECONDS,
@@ -17,13 +17,24 @@ from .behavior import (
     validate_prompt,
     validate_unit_id,
 )
-from .behavior_model import BehaviorModelClient
+from .behavior_model import BehaviorModelClient, BehaviorModelError
+from .service_failures import (
+    FailureCategory,
+    TargetProviderError,
+    WorldActionError,
+)
 
 
 class BehaviorServiceError(RuntimeError):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        category: FailureCategory = FailureCategory.VALIDATION,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.category = category
 
 
 class UnitWorld(Protocol):
@@ -88,7 +99,7 @@ class RecordingUnitWorld:
                 or not isinstance(seconds, (int, float))
                 or not 0 <= float(seconds) <= MAX_BEHAVIOR_WAIT_SECONDS
             ):
-                raise ValueError("Wait duration is unavailable")
+                raise WorldActionError("Wait duration is unavailable")
             result.update({"kind": "wait", "seconds": float(seconds)})
         elif action_type == "inspect_signal":
             target_id = _target_id(arguments, "target", "signal", self._target_ids)
@@ -154,17 +165,17 @@ class TargetUnitWorld:
                 or not isinstance(seconds, (int, float))
                 or not 0 <= float(seconds) <= MAX_BEHAVIOR_WAIT_SECONDS
             ):
-                raise ValueError("Wait duration is unavailable")
+                raise WorldActionError("Wait duration is unavailable")
             result = {"ok": True, "kind": "wait", "seconds": float(seconds)}
         elif action_type == "grab":
             storage_id, _ = self._target(project_id, arguments, "storage", "storage")
             item_id, _ = self._target(project_id, arguments, "item", "item")
             held_by = self._held_items.get((project_id, item_id))
             if held_by is not None and held_by != unit_id:
-                raise ValueError("Item is already held by another unit")
+                raise WorldActionError("Item is already held by another unit")
             location = self._locations.get((project_id, item_id))
             if location is not None and location != storage_id:
-                raise ValueError("Item is not available at the requested storage")
+                raise WorldActionError("Item is not available at the requested storage")
             self._held_items[(project_id, item_id)] = unit_id
             self._locations[(project_id, item_id)] = storage_id
             result = {
@@ -178,7 +189,7 @@ class TargetUnitWorld:
             target_id, target = self._target(project_id, arguments, kind, "target")
             value = target.get("value")
             if value is None or not isinstance(value, (str, bool, int, float)):
-                raise ValueError(f"{kind} target has no bounded value")
+                raise WorldActionError(f"{kind} target has no bounded value")
             result = {
                 "ok": True,
                 "kind": kind,
@@ -196,7 +207,7 @@ class TargetUnitWorld:
                 None,
             )
             if held_item is None:
-                raise ValueError("Unit is not holding an item")
+                raise WorldActionError("Unit is not holding an item")
             self._locations[(project_id, held_item)] = factory_id
             if action_type == "deposit":
                 del self._held_items[(project_id, held_item)]
@@ -207,7 +218,7 @@ class TargetUnitWorld:
                 "value": action_type,
             }
         else:
-            raise ValueError("Action is not supported by the target world")
+            raise WorldActionError("Action is not supported by the target world")
         if idempotency_key is not None:
             self._results[idempotency_key] = dict(result)
         return result
@@ -227,7 +238,7 @@ class TargetUnitWorld:
         )
         target = self._targets.get(project_id, {}).get(kind, {}).get(target_id)
         if target is None:
-            raise ValueError(f"{kind} target is unavailable")
+            raise WorldActionError(f"{kind} target is unavailable")
         return target_id, target
 
 
@@ -249,9 +260,16 @@ class BehaviorService:
             raise BehaviorServiceError("invalid_prompt", str(exc)) from exc
         if self.model_client is None:
             raise BehaviorServiceError(
-                "model_unavailable", "A local behavior model is not configured"
+                "model_unavailable",
+                "A local behavior model is not configured",
+                FailureCategory.MODEL,
             )
-        raw_definition = self.model_client.generate(prompt_text)
+        try:
+            raw_definition = self.model_client.generate(prompt_text)
+        except BehaviorModelError as exc:
+            raise BehaviorServiceError(
+                exc.code, str(exc), FailureCategory.MODEL
+            ) from exc
         try:
             definition = normalize_definition(raw_definition)
         except BehaviorValidationError as exc:
@@ -280,10 +298,19 @@ class BehaviorService:
                 normalized_bindings,
             )
         except StoreError as exc:
-            raise BehaviorServiceError("persistence", str(exc)) from exc
+            raise BehaviorServiceError(
+                "persistence", str(exc), FailureCategory.PERSISTENCE
+            ) from exc
 
     def get(self, project_id: str, behavior_id: str) -> BehaviorRecord:
-        record = self.store.unit_behavior_for(_project_id(project_id), behavior_id)
+        try:
+            record = self.store.unit_behavior_for(_project_id(project_id), behavior_id)
+        except StoreError as exc:
+            raise BehaviorServiceError(
+                "persistence",
+                "Behavior readback is unavailable",
+                FailureCategory.PERSISTENCE,
+            ) from exc
         if record is None:
             raise BehaviorServiceError("not_found", "Behavior not found")
         return record
@@ -292,7 +319,9 @@ class BehaviorService:
         try:
             return self.store.unit_behaviors_for(_project_id(project_id))
         except StoreError as exc:
-            raise BehaviorServiceError("persistence", str(exc)) from exc
+            raise BehaviorServiceError(
+                "persistence", str(exc), FailureCategory.PERSISTENCE
+            ) from exc
 
     def bind(
         self, project_id: str, behavior_id: str, bindings: object
@@ -316,7 +345,7 @@ class BehaviorService:
                 expected_status="draft",
             )
         except StoreError as exc:
-            raise BehaviorServiceError("state_conflict", str(exc)) from exc
+            raise _behavior_update_error(exc) from exc
 
     def confirm(self, project_id: str, behavior_id: str) -> BehaviorRecord:
         record = self.get(project_id, behavior_id)
@@ -338,7 +367,7 @@ class BehaviorService:
                 expected_status="draft",
             )
         except StoreError as exc:
-            raise BehaviorServiceError("state_conflict", str(exc)) from exc
+            raise _behavior_update_error(exc) from exc
 
     def assign(
         self, project_id: str, behavior_id: str, unit_id: object
@@ -358,7 +387,7 @@ class BehaviorService:
                 expected_status="confirmed",
             )
         except StoreError as exc:
-            raise BehaviorServiceError("state_conflict", str(exc)) from exc
+            raise _behavior_update_error(exc) from exc
 
     def run(self, project_id: str, behavior_id: str) -> BehaviorRecord:
         record = self.get(project_id, behavior_id)
@@ -449,8 +478,10 @@ class BehaviorService:
                         idempotency_key=idempotency_key,
                     )
                     bounded_observation = _bounded_observation(observation)
-                except Exception as exc:
-                    return self._fail(record, execution, str(exc))
+                except WorldActionError as exc:
+                    return self._fail(
+                        record, execution, str(exc), FailureCategory.WORLD
+                    )
                 history = list(cast(list[object], execution.get("history", [])))
                 history.append(
                     {
@@ -484,7 +515,9 @@ class BehaviorService:
                         expected_status="running",
                     )
                 except StoreError as exc:
-                    raise BehaviorServiceError("persistence", str(exc)) from exc
+                    raise BehaviorServiceError(
+                        "persistence", str(exc), FailureCategory.PERSISTENCE
+                    ) from exc
             execution = {
                 **execution,
                 "state": transition["to"],
@@ -503,7 +536,7 @@ class BehaviorService:
                 expected_status="assigned",
             )
         except StoreError as exc:
-            raise BehaviorServiceError("state_conflict", str(exc)) from exc
+            raise _behavior_update_error(exc) from exc
 
     def _save_execution(
         self, record: BehaviorRecord, execution: dict[str, object]
@@ -516,15 +549,22 @@ class BehaviorService:
                 expected_status="running",
             )
         except StoreError as exc:
-            raise BehaviorServiceError("persistence", str(exc)) from exc
+            raise BehaviorServiceError(
+                "persistence", str(exc), FailureCategory.PERSISTENCE
+            ) from exc
 
     def _fail(
-        self, record: BehaviorRecord, execution: dict[str, object], message: str
+        self,
+        record: BehaviorRecord,
+        execution: dict[str, object],
+        message: str,
+        category: FailureCategory = FailureCategory.VALIDATION,
     ) -> BehaviorRecord:
         failed_execution = {
             **execution,
             "status": "failed",
             "error": _redact_text(message)[:512],
+            "failure_class": category.value,
         }
         try:
             return self.store.update_unit_behavior(
@@ -535,14 +575,18 @@ class BehaviorService:
                 expected_status="running",
             )
         except StoreError as exc:
-            raise BehaviorServiceError("persistence", str(exc)) from exc
+            raise BehaviorServiceError(
+                "persistence", str(exc), FailureCategory.PERSISTENCE
+            ) from exc
 
     def _allowed_targets(self, project_id: str) -> Mapping[str, Collection[str]]:
         try:
             return self.unit_world.allowed_targets(_project_id(project_id))
-        except Exception as exc:
+        except TargetProviderError as exc:
             raise BehaviorServiceError(
-                "invalid_bindings", "Target allowlists are unavailable"
+                "target_provider",
+                "Target allowlists are unavailable",
+                FailureCategory.TARGET_PROVIDER,
             ) from exc
 
 
@@ -660,12 +704,12 @@ def _resolved_action(
 
 def _bounded_observation(value: object) -> dict[str, object]:
     if not isinstance(value, Mapping):
-        raise BehaviorServiceError(
-            "unit_failure", "Unit returned an invalid observation"
-        )
-    observation = cast(Mapping[str, object], value)
+        raise WorldActionError("Unit returned an invalid observation")
+    observation = cast(Mapping[object, object], value)
     bounded: dict[str, object] = {}
     for key, item in observation.items():
+        if not isinstance(key, str):
+            raise WorldActionError("Unit returned an invalid observation key")
         if len(key) > 64:
             continue
         if item is None or isinstance(item, (bool, int, float)):
@@ -673,6 +717,12 @@ def _bounded_observation(value: object) -> dict[str, object]:
         elif isinstance(item, str):
             bounded[key] = _redact_text(item)
     return bounded
+
+
+def _behavior_update_error(error: StoreError) -> BehaviorServiceError:
+    if isinstance(error, StateConflictError):
+        return BehaviorServiceError("state_conflict", str(error))
+    return BehaviorServiceError("persistence", str(error), FailureCategory.PERSISTENCE)
 
 
 def _next_transition(
@@ -722,7 +772,7 @@ def _target_id(
 ) -> str:
     binding = arguments.get(argument_name)
     if not isinstance(binding, Mapping):
-        raise ValueError(f"{expected_kind} target is unavailable")
+        raise WorldActionError(f"{expected_kind} target is unavailable")
     binding_mapping = cast(Mapping[str, object], binding)
     target_id = binding_mapping.get("id")
     if (
@@ -730,7 +780,7 @@ def _target_id(
         or not isinstance(target_id, str)
         or target_id not in allowed_target_ids.get(expected_kind, ())
     ):
-        raise ValueError(f"{expected_kind} target is unavailable")
+        raise WorldActionError(f"{expected_kind} target is unavailable")
     return target_id
 
 

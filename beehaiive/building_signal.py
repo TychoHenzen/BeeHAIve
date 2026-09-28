@@ -8,15 +8,18 @@ from typing import Literal, Protocol, cast
 
 from beehaiive.contract_types.validation import _redact_text
 
+from .service_failures import WorldActionError
+
 
 class BuildingSignalValidationError(ValueError):
     """Raised when a building signal rule or target is unsafe."""
 
 
 class BuildingSignalServiceError(RuntimeError):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, category: str = "validation") -> None:
         super().__init__(message)
         self.code = code
+        self.category = category
 
 
 BuildingSignalStatus = Literal["draft", "confirmed", "assigned"]
@@ -117,11 +120,11 @@ class TargetBuildingSignalWorld:
         self._require_target(project_targets, "item", item_id)
         inventories = project_targets.get("inventory")
         if not isinstance(inventories, Mapping):
-            raise ValueError("Building inventory is unavailable")
+            raise WorldActionError("Building inventory is unavailable")
         inventories_map = cast(Mapping[str, object], inventories)
         building_inventory = inventories_map.get(building_id)
         if not isinstance(building_inventory, Mapping):
-            raise ValueError("Building inventory is unavailable")
+            raise WorldActionError("Building inventory is unavailable")
         count = cast(Mapping[str, object], building_inventory).get(item_id)
         if (
             isinstance(count, bool)
@@ -129,7 +132,7 @@ class TargetBuildingSignalWorld:
             or count < 0
             or count > MAX_BUILDING_SIGNAL_QUANTITY
         ):
-            raise ValueError("Building inventory count is invalid")
+            raise WorldActionError("Building inventory count is invalid")
         return count
 
     def set_signal(
@@ -154,7 +157,7 @@ class TargetBuildingSignalWorld:
     ) -> None:
         values = project_targets.get(kind)
         if not isinstance(values, Mapping) or target_id not in values:
-            raise ValueError(f"Unknown {kind} target")
+            raise WorldActionError(f"Unknown {kind} target")
 
 
 def normalize_rule(value: object) -> dict[str, object]:

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Collection, Mapping
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from beehaiive.behavior_service import BehaviorService, RecordingUnitWorld
 from beehaiive.orchestrator import Orchestrator
-from beehaiive.storage import OrchestratorStore
+from beehaiive.service_failures import TargetProviderError
+from beehaiive.storage import OrchestratorStore, StoreError
 from main import create_app
 from tests.support.api_provider import ApiProvider
 from tests.test_behavior import bindings, definition
@@ -15,6 +17,109 @@ from tests.test_behavior import bindings, definition
 class FakeBehaviorModel:
     def generate(self, _prompt: str) -> object:
         return definition()
+
+
+class UnavailableBehaviorModel:
+    def generate(self, prompt: str) -> object:
+        del prompt
+        from beehaiive.behavior_model import BehaviorModelError
+
+        raise BehaviorModelError("model_unavailable", "secret-token=model-secret")
+
+
+class FailingTargetWorld(RecordingUnitWorld):
+    def allowed_targets(self, project_id: str) -> Mapping[str, Collection[str]]:
+        del project_id
+        raise TargetProviderError("secret-token=target-secret")
+
+
+def test_behavior_api_exposes_bounded_failure_classification(tmp_path: Path) -> None:
+    store = OrchestratorStore(tmp_path / "api-errors.sqlite3")
+    service = BehaviorService(
+        store, model_client=UnavailableBehaviorModel(), unit_world=RecordingUnitWorld()
+    )
+    client = TestClient(
+        create_app(
+            orchestrator=Orchestrator(store, ApiProvider()),
+            behavior_service=service,
+            api_key="test-key",
+            allowed_project_ids={"owner:7"},
+            workflow_actor="operator",
+        )
+    )
+    response = client.post(
+        "/projects/owner:7/behaviors/generate",
+        json={"prompt": "move the item"},
+        headers={"X-API-Key": "test-key"},
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "code": "model_unavailable",
+        "failure_class": "model",
+        "message": "secret-token=[redacted]",
+    }
+    store.close()
+
+
+def test_behavior_api_target_provider_failure_is_not_invalid_domain_state(
+    tmp_path: Path,
+) -> None:
+    store = OrchestratorStore(tmp_path / "api-target-errors.sqlite3")
+    service = BehaviorService(store, unit_world=FailingTargetWorld())
+    client = TestClient(
+        create_app(
+            orchestrator=Orchestrator(store, ApiProvider()),
+            behavior_service=service,
+            api_key="test-key",
+            allowed_project_ids={"owner:7"},
+            workflow_actor="operator",
+        )
+    )
+    response = client.post(
+        "/projects/owner:7/behaviors",
+        json={"definition": definition(), "bindings": {}},
+        headers={"X-API-Key": "test-key"},
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"]["failure_class"] == "target_provider"
+    assert "target-secret" not in response.text
+    store.close()
+
+
+def test_behavior_api_transition_persistence_failure_is_classified(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = OrchestratorStore(tmp_path / "api-transition-persistence.sqlite3")
+    service = BehaviorService(store, unit_world=RecordingUnitWorld())
+    draft = service.create("owner:7", definition(), bindings())
+
+    def fail_transition(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise StoreError("database unavailable")
+
+    monkeypatch.setattr(store, "update_unit_behavior", fail_transition)
+    client = TestClient(
+        create_app(
+            orchestrator=Orchestrator(store, ApiProvider()),
+            behavior_service=service,
+            api_key="test-key",
+            allowed_project_ids={"owner:7"},
+            workflow_actor="operator",
+        )
+    )
+
+    response = client.post(
+        f"/projects/owner:7/behaviors/{draft.behavior_id}/confirm",
+        headers={"X-API-Key": "test-key"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "code": "persistence",
+        "failure_class": "persistence",
+        "message": "database unavailable",
+    }
+    store.close()
 
 
 def test_behavior_design_api_is_explicit_and_project_scoped(tmp_path: Path) -> None:

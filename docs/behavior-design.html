@@ -82,7 +82,12 @@
         $("assign").disabled = !state.behaviorId || draft?.status !== "confirmed";
         $("run").disabled = !state.behaviorId || !["assigned", "running"].includes(draft?.status);
       };
-      const readJson = async (response) => { const body = await response.json(); if (!response.ok) throw new Error(body.detail || "Request failed"); return body; };
+      const errorMessage = (detail) => {
+        if (!detail || typeof detail !== "object") return detail || "Request failed";
+        const context = [detail.code, detail.failure_class].filter(Boolean).join(" / ");
+        return [detail.message || "Request failed", context].filter(Boolean).join(" (") + (context ? ")" : "");
+      };
+      const readJson = async (response) => { const body = await response.json(); if (!response.ok) throw new Error(errorMessage(body.detail)); return body; };
       const reloadReadback = async () => {
         const behavior = new URLSearchParams(location.search).get("behavior");
         const suffix = behavior ? `/${encodeURIComponent(behavior)}` : "";

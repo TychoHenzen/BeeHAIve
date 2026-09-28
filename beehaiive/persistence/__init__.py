@@ -50,6 +50,7 @@ from .constants import (
 )
 from .constants import META_REVIEW_LEASE_SECONDS as META_REVIEW_LEASE_SECONDS
 from .constants import PBI_CREATION_LEASE_SECONDS as PBI_CREATION_LEASE_SECONDS
+from .errors import StateConflictError as StateConflictError
 from .errors import StoreError as StoreError
 from .helpers.claimability import (
     _task_claimability_for_run as _task_claimability_for_run,
@@ -114,6 +115,7 @@ __all__ = [
     "OrchestratorStore",
     "UnitBehaviorMixin",
     "PBI_CREATION_LEASE_SECONDS",
+    "StateConflictError",
     "StoreError",
     "_REFINEMENT_SECRET_ASSIGNMENT",
     "_REFINEMENT_URL",

@@ -6,7 +6,7 @@ from typing import Any, cast
 
 from beehaiive.behavior import BehaviorRecord, BehaviorStatus
 
-from .errors import StoreError
+from .errors import StateConflictError, StoreError
 from .helpers.lease_helpers import _now
 
 
@@ -94,7 +94,9 @@ class UnitBehaviorMixin:
                 tuple(values),
             )
             if result.rowcount != 1:
-                raise StoreError("Behavior state changed before it could be updated")
+                raise StateConflictError(
+                    "Behavior state changed before it could be updated"
+                )
         record = self.unit_behavior_for(project_id, behavior_id)
         if record is None:
             raise StoreError("Updated behavior could not be read back")
