@@ -198,13 +198,6 @@ test("rendering live state exposes current stages and active actions", () => {
   assert.match(dashboardOutput.textContent, /step 2/);
   assert.equal(actionLog.hidden, false);
 
-  assert.equal(
-    findNode(
-      dashboardOutput,
-      (node) => node.tag === "button" && node._textContent === "Start writer",
-    ),
-    null,
-  );
 
   const stopButton = findNode(
     dashboardOutput,

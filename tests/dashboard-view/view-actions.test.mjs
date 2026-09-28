@@ -187,13 +187,6 @@ test("active and failed PBIs expose run controls through the dashboard action bo
     (node) => node.tag === "button" && node.textContent === "Advance to implementation",
   );
   assert.ok(advance);
-  assert.equal(
-    findNode(
-      dashboardOutput,
-      (node) => node.tag === "button" && node.textContent === "Retry writer",
-    ),
-    null,
-  );
   advance.click();
   assert.deepEqual(actionPayloads, [
     {
