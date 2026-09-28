@@ -11,14 +11,6 @@ export function createRepositoryRenderer(dom, renderPbi, runAction) {
       : "Writer idle";
     header.append(name, element("div", writerText, `writer ${writer.status}`));
     section.append(header);
-    if (repository.active && writer.status !== "active") {
-      const controls = element("div", undefined, "actions");
-      const start = element("button", "Start writer", "secondary");
-      start.type = "button";
-      start.addEventListener("click", () => runAction({ action: "start", repository: repository.name }));
-      controls.append(start);
-      section.append(controls);
-    }
     const body = element("div", undefined, "repo-body");
     const pbis = repository.pbis || [];
     if (pbis.length === 0) body.append(element("div", "No PBIs in this repository.", "empty"));

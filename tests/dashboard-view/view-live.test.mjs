@@ -198,13 +198,13 @@ test("rendering live state exposes current stages and active actions", () => {
   assert.match(dashboardOutput.textContent, /step 2/);
   assert.equal(actionLog.hidden, false);
 
-  const startButton = findNode(
-    dashboardOutput,
-    (node) => node.tag === "button" && node._textContent === "Start writer",
+  assert.equal(
+    findNode(
+      dashboardOutput,
+      (node) => node.tag === "button" && node._textContent === "Start writer",
+    ),
+    null,
   );
-  assert.ok(startButton);
-  startButton.click();
-  assert.deepEqual(actionPayloads, [{ action: "start", repository: "owner/api" }]);
 
   const stopButton = findNode(
     dashboardOutput,
