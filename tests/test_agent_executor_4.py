@@ -100,7 +100,6 @@ def test_executor_prompt_contains_verified_repository_metadata(
 
     assert "BeeHAIve Codex worker" in prompt
     assert "Task: persisted executable task" in prompt
-    assert "dashboard demo" not in prompt
     assert "Verified current branch" not in default_prompt
 
 

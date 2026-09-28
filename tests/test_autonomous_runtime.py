@@ -27,7 +27,7 @@ def test_autonomous_runtime_resolves_bare_codex_before_windows_launch(
     skill_path.parent.mkdir()
     skill_path.write_text("# test skill\n", encoding="utf-8")
     resolved_executable = tmp_path / "codex.exe"
-    resolved_executable.write_bytes(b"native executable placeholder")
+    resolved_executable.write_bytes(b"native executable fixture")
     launches: list[list[str]] = []
 
     monkeypatch.setenv("BEEHAIIVE_AGENT_REPOSITORY", str(tmp_path))
