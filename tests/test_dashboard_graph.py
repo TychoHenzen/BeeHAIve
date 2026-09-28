@@ -129,7 +129,6 @@ def test_dashboard_launcher_loads_workflow_operator_configuration() -> None:
     launcher = Path("start_dashboard.bat").read_text(encoding="utf-8")
     assert '"BEEHAIIVE_WORKFLOW_ACTOR"' in launcher
     for name in (
-        "BEEHAIIVE_AUTONOMOUS_MODE",
         "BEEHAIIVE_AUTONOMOUS_TIMEOUT_SECONDS",
         "BEEHAIIVE_SCHEDULER_ENABLED",
         "BEEHAIIVE_SCHEDULER_POLL_INTERVAL_SECONDS",

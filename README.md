@@ -6,13 +6,7 @@
 
 BeeHAIve is a FastAPI control plane for one allowlisted GitHub Project. The
 dashboard reads the live Project state, shows one mission-control board, and
-can execute one bounded local demo task.
-
-The demo task is named **bounded repository inventory**. It asks the Codex CLI
-to inspect the exact leased Git worktree and report its repository name,
-current branch, and tracked-file count. The default task does not edit files.
-The dashboard worker can write only inside its leased worktree. Its plain-text
-result is shown in the completed work item's run inspector.
+can start the server-owned autonomous lifecycle for a claimable PBI.
 
 This delivery does not claim autonomous swarms, multi-device coordination,
 automated production review verdicts, or automatic pull-request creation.
@@ -44,15 +38,12 @@ GITHUB_PROJECT_OWNER_TYPE=user
 BEEHAIIVE_ALLOWED_PROJECTS=<owner>:<number>
 # Server-side operator authorization. The dashboard never asks for this value.
 BEEHAIIVE_API_KEY=<operator-key>
-BEEHAIIVE_REVIEW_MODE=demo
-# Set this to operator or writer when BEEHAIIVE_REVIEW_MODE=production.
 BEEHAIIVE_REVIEW_ACTOR=operator
 # BEEHAIIVE_AGENT_REPOSITORY=<path-to-BeeHAIve>
 BEEHAIIVE_AGENT_REPOSITORY_NAME=<owner>/<repository>
 # BEEHAIIVE_AGENT_TIMEOUT_SECONDS=120
 # BEEHAIIVE_CODEX_EXECUTABLE=codex
 # BEEHAIIVE_CODEX_MODEL=<model>
-# BEEHAIIVE_AUTONOMOUS_MODE=codex
 # BEEHAIIVE_AUTONOMOUS_TIMEOUT_SECONDS=0
 # BEEHAIIVE_WORKFLOW_REPOSITORY=<path-to-BeeHAIve>
 # BEEHAIIVE_STATE_DB=.beehaiive/state.db
@@ -80,10 +71,10 @@ so the dashboard's polling does not repeat the full GraphQL discovery.
 When `BEEHAIIVE_CODEX_EXECUTABLE` is a bare command such as `codex`, the
 autonomous runner resolves the native Windows executable before launching it.
 Set `BEEHAIIVE_GITHUB_DISCOVERY_CACHE_SECONDS` to a finite non-negative number
-to change that interval. Do not commit `.env` or place its values in screenshots.
-Production review reads use `GITHUB_TOKEN` or `GH_TOKEN` with repository
-Pull requests read access. Set `BEEHAIIVE_REVIEW_MODE=production` and
-`BEEHAIIVE_REVIEW_ACTOR` to `operator` or `writer` to enable review requests.
+to change that interval. Do not commit `.env` or place its values in logs or
+dashboard evidence. Production review reads use `GITHUB_TOKEN` or `GH_TOKEN`
+with repository Pull requests read access. Set `BEEHAIIVE_REVIEW_ACTOR` to
+`operator` or `writer` to enable review requests.
 The current concern adapters retain the GitHub evidence and leave verdicts
 pending until concern-specific analysis is configured. They do not write GitHub
 reviews or comments.
@@ -119,8 +110,6 @@ Use Settings to choose the project and a stored workflow. Use the Queue
 filters to switch between active and archived work. Mission control keeps
 recent delivery evidence visible while terminal work stays out of the active
 queue.
-Use `/dashboard?demo=true` on that same origin for the guided placeholder
-lifecycle. Demo actions stay in the browser and make no external changes.
 Use `/dashboard?project=<owner>:<number>` on the same origin to open mission
 control for the configured Project.
 Use `/building-signal-design?project=<owner>:<number>` to define, review,
@@ -141,12 +130,9 @@ outcomes, commit, push, and blocker evidence for the run. The scheduler
 applies the configured worker capacity and does not start a second lifecycle
 for the same project.
 
-Set `BEEHAIIVE_AUTONOMOUS_MODE=placeholder` for deterministic browser proof.
-The default `codex` mode invokes the named local skill files. The guided demo
-is the browser-local placeholder path: it does not invoke the production
-runner or make external changes. This documentation covers the configured
-single-run lifecycle only; autonomous swarms and multi-device coordination
-are not supported claims.
+The configured `codex` runner invokes the named local skill files. This
+documentation covers the configured single-run lifecycle only; autonomous
+swarms and multi-device coordination are not supported claims.
 
 The Queue view separates Refinement, Implementation, Publish, Review, Repair,
 Completion, Blocked, and Completed work. The server assigns each PBI one queue
@@ -209,82 +195,34 @@ with changed content returns `409`. If GitHub may have created the issue but
 BeeHAIve did not save its identity, the result is `outcome_unknown`; BeeHAIve
 will not create another issue for that key, and an operator must reconcile it.
 
-## Run the live demo
+## Operate the live dashboard
 
-1. Confirm the dashboard shows the expected project and linked repositories.
-2. Open Queue and select **Start work** on the desired claimable PBI.
-3. The dashboard claims that PBI and starts the bounded repository-inventory
-   worker.
-4. Watch the repository writer and PBI status change to active.
-5. Wait for the completed work item. Its run inspector contains the agent's
-   plain-text **Result**, and the completed-run count increases.
+1. Confirm the dashboard shows the expected live Project and linked repositories.
+2. Open Queue and select **Run full lifecycle** on a claimable PBI.
+3. BeeHAIve claims the PBI and runs the ordered autonomous lifecycle through
+   refinement, implementation, publish, review, repair, and completion.
+4. Inspect the current stage, handoffs, checks, questions, and delivery state
+   in the work-item inspector.
+5. Confirm the recorded commit SHA and push result before treating delivery as
+   complete.
 
-The dashboard worker uses `codex exec --sandbox workspace-write --ephemeral
---json` in a unique leased worktree. It disables network access and child
-agents, passes a filtered environment, and rejects credential-like tracked
-files. The service renews both run and worktree leases while the process runs.
-On success, the service commits dirty changes with the host Git identity and
-pushes the exact leased branch to the configured `origin` without force. A
-clean tree is a no-op. A blocked push keeps its commit and worktree for the
-dashboard retry action. Failed or cancelled worktrees with changes are kept
-for recovery rather than discarded.
+The lifecycle runner uses the configured Codex executable in the server-assigned
+workspace, with network and child-agent access disabled. It passes a filtered
+environment and rejects credential-like tracked files. Git delivery uses the
+host Git identity and authentication, never sends credentials to the model
+child, and records the commit SHA and push result in the run evidence.
 
-Set `git config user.name` and `git config user.email` in the host checkout.
-Push uses host Git authentication. Credentials are not sent to the model child
-or saved in delivery evidence. Check the work item's run inspector for the
-commit SHA and push result.
-
-If the demo fails, open the work-item inspector and read **Failure/Problem** and recent
-activity. Check the
-GitHub token, exact project allowlist, `codex` availability, and the local
-checkout path. Restarting the service does not create a second active writer.
-Stop the run before removing local `.beehaiive` state.
+If a run fails or waits for an operator, open its inspector and read the
+failure, question, and recent activity. Check the GitHub token, exact Project
+allowlist, Codex availability, and configured repository identity. Stop the run before removing local `.beehaiive` state.
 
 ## Evidence and verification
 
-Redacted, versioned browser evidence is kept here:
-
-- [Configured dashboard](docs/screenshots/dashboard-configured.png)
-- [Active demo](docs/screenshots/active-demo.png)
-- [Completed result](docs/screenshots/completed-demo.png)
-- [Stopped or failed run](docs/screenshots/stopped-demo.png)
-
-These captures come from the local placeholder browser proof and are redacted
-before they are written. They contain no project identifiers, repository names,
-or credentials. Regenerate them with:
-
-```powershell
-$env:BEEHAIIVE_SCREENSHOT_MODE = "fixture"
-uv run python -m scripts.dashboard_screenshots
-```
-
-`BEEHAIIVE_SCREENSHOT_MODE=fixture` keeps screenshot generation local and
-makes no GitHub or repository changes.
-
-Run the deterministic fixture proof without GitHub mutations:
-
-```powershell
-uv run python scripts/dashboard_smoke.py --mode fixture --report .beehaiive/dashboard-smoke.json
-```
-
-Run the browser-level lifecycle use cases with a locally installed
-Chromium-compatible browser:
-
-```powershell
-uv run pytest -m e2e tests/e2e/test_dashboard_lifecycle.py -q
-```
-
-Run the live browser proof with the environment configuration above:
-
-```powershell
-uv run python scripts/dashboard_smoke.py --mode live --project "$env:GITHUB_PROJECT_OWNER`:$env:GITHUB_PROJECT_NUMBER" --allow-mutations --live-timeout 180 --report .beehaiive/dashboard-live-smoke.json
-```
-
-The live smoke exercises the real GitHub Project discovery path. Its local
-dashboard actions remain bounded local state changes. The report is redacted
-and `.beehaiive` is ignored by Git.
-
-The fixture smoke report runs the same 90 percent coverage threshold as CI.
+The live proof uses the configured service and a real allowlisted Project. Open
+`http://127.0.0.1:8000/dashboard?project=<owner>:<number>` in Edge or another
+Chromium-compatible browser, record the served URL, visible PBI identifiers,
+HTTP statuses, dashboard network outcomes, and any console errors. Do not use
+synthetic Project data or local proof modes for this check.
 
 For the full local gate, run:
 

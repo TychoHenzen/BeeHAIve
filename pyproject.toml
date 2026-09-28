@@ -22,7 +22,6 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-markers = ["e2e: browser-level dashboard use-case tests"]
 
 [tool.ruff]
 target-version = "py313"
@@ -32,5 +31,5 @@ line-length = 88
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.pyright]
-include = ["main.py", "beehaiive", "scripts/dashboard_smoke.py"]
+include = ["main.py", "beehaiive"]
 typeCheckingMode = "strict"
