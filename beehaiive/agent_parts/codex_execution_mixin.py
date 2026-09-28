@@ -44,9 +44,7 @@ class CodexExecutionMixin:
                     AttemptOutcome.FAILURE,
                     failure_context="Leased worker worktree does not exist",
                 )
-        prompt = self._prompt(
-            spec, decision, contract, execution_repository, workspace_lease is not None
-        )
+        prompt = self._prompt(spec, decision, contract, workspace_lease is not None)
         with self._lock:
             self._active_attempts.add(problem_id)
             if problem_id in self._cancelled:

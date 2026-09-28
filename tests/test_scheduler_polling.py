@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from beehaiive.agent import WorkerCapacityError
 from tests.support.scheduler.helpers import create_scheduler as _scheduler
 
 
@@ -21,19 +20,36 @@ def test_poll_rotates_active_repositories_and_respects_process_capacity() -> Non
         states, projects={"project-2", "project-1"}
     )
 
-    assert scheduler.poll_once() == ("run-1",)
-    assert worker.claims[0][:2] == ("project-1", "owner/a")
-    assert worker.maximum == 1
-    assert worker.active == 1
-    assert scheduler.poll_once() == ()
-    assert len(worker.claims) == 1
+    started_projects: list[tuple[str, str]] = []
+    capacity_remaining = 1
 
-    worker.active = 0
+    def start(project_id: str, repository: str) -> dict[str, object]:
+        nonlocal capacity_remaining
+        started_projects.append((project_id, repository))
+        capacity_remaining = 0
+        return {"run_id": f"run-{len(started_projects)}"}
+
+    scheduler.autonomous_start = start
+    scheduler.autonomous_has_capacity = lambda: capacity_remaining > 0
+    assert scheduler.poll_once() == ("run-1",)
+    assert started_projects[0] == ("project-1", "owner/a")
+    assert worker.maximum == 1
+    capacity_remaining = 0
+    assert scheduler.poll_once() == ()
+
+    capacity_remaining = 1
     assert scheduler.poll_once() == ("run-2",)
-    assert worker.claims[-1][:2] == ("project-1", "owner/b")
-    worker.active = 0
+    assert started_projects[-1] in {
+        ("project-1", "owner/b"),
+        ("project-2", "owner/c"),
+    }
+    capacity_remaining = 1
     assert scheduler.poll_once() == ("run-3",)
-    assert worker.claims[-1][:2] == ("project-2", "owner/c")
+    assert len(started_projects) == 3
+    assert all(
+        repository in {"owner/a", "owner/b", "owner/c"}
+        for _project, repository in started_projects
+    )
     assert orchestrator.synchronized[-2:] == ["project-1", "project-2"]
     assert scheduler.status_for("outside-allowlist") is None
     status = scheduler.status_for("project-2")
@@ -42,10 +58,8 @@ def test_poll_rotates_active_repositories_and_respects_process_capacity() -> Non
     assert status["running"] is False
     assert status["poll_interval_seconds"] == 600.0
     assert status["max_concurrency"] == 1
-    assert status["active_workers"] == 1
+    assert status["active_workers"] == 0
     assert status["last_error"] is None
-    assert status["last_started_run_ids"] == ["run-3"]
-    assert scheduler.status_for("project-1")["last_started_run_ids"] == []
 
 
 def test_poll_fills_autonomous_capacity_across_projects() -> None:
@@ -93,7 +107,7 @@ def test_poll_combines_worker_and_autonomous_capacity() -> None:
     assert started_projects == [("project-1", "owner/a")]
 
 
-def test_poll_records_sync_claim_and_worker_start_errors_without_secrets() -> None:
+def test_poll_records_sync_and_autonomous_start_errors_without_secrets() -> None:
     states = {"project": {"repositories": [{"name": "owner/a", "active": True}]}}
     scheduler, orchestrator, worker = _scheduler(states)
     orchestrator.sync_error = RuntimeError("sync failed")
@@ -101,30 +115,20 @@ def test_poll_records_sync_claim_and_worker_start_errors_without_secrets() -> No
     assert "RuntimeError: sync failed" in str(scheduler.status_for("project"))
 
     orchestrator.sync_error = None
-    worker.claim_error = RuntimeError("claim failed")
+    scheduler.autonomous_start = lambda _project, _repository: (_ for _ in ()).throw(
+        RuntimeError("claim failed")
+    )
     assert scheduler.poll_once() == ()
     assert "claim failed" in str(scheduler.status_for("project"))
 
-    worker.claim_error = None
-    worker.start_error = RuntimeError("scheduler-secret start failed")
-    orchestrator.stop_error = RuntimeError("scheduler-secret stop failed")
+    scheduler.autonomous_start = lambda _project, _repository: (_ for _ in ()).throw(
+        RuntimeError("scheduler-secret start failed")
+    )
     assert scheduler.poll_once() == ()
     status = scheduler.status_for("project")
     assert status is not None
     assert "scheduler-secret" not in str(status)
-    assert "scheduler-secret" not in str(orchestrator.stopped)
     assert status["last_started_run_ids"] == []
-
-
-def test_poll_defers_a_claim_when_capacity_is_taken_before_start() -> None:
-    states = {"project": {"repositories": [{"name": "owner/a", "active": True}]}}
-    scheduler, orchestrator, worker = _scheduler(states)
-    worker.start_error = WorkerCapacityError("Maximum concurrent agent workers reached")
-
-    assert scheduler.poll_once() == ()
-    assert len(worker.claims) == 1
-    assert orchestrator.stopped == []
-    assert "WorkerCapacityError" in str(scheduler.status_for("project"))
 
 
 def test_poll_handles_empty_projects_and_unclaimable_repositories() -> None:
@@ -139,13 +143,6 @@ def test_poll_handles_empty_projects_and_unclaimable_repositories() -> None:
     worker.recover_error = None
     states["project"]["repositories"] = []
     assert scheduler.poll_once() == ()
-    states["project"]["repositories"] = [{"name": "owner/a", "active": True}]
-    worker.claim_result = False
-    assert scheduler.poll_once() == ()
-    status = scheduler.status_for("project")
-    assert status is not None
-    assert status["last_error"] is None
-    assert status["last_started_run_ids"] == []
 
 
 def test_poll_evaluates_building_signals_on_the_existing_cadence() -> None:

@@ -34,9 +34,6 @@ from beehaiive.api.helpers.dashboard import (
 from beehaiive.api.helpers.dashboard import (
     _require_dashboard_operator_question as _require_dashboard_operator_question,
 )
-from beehaiive.api.helpers.dashboard import (
-    _require_dashboard_retry_run as _require_dashboard_retry_run,
-)
 from beehaiive.api.helpers.http import (
     _handle_meta_review_error as _handle_meta_review_error,
 )
@@ -58,8 +55,6 @@ from beehaiive.api.models import (
     DashboardIdeaCaptureRequest as DashboardIdeaCaptureRequest,
 )
 from beehaiive.api.models import DashboardRequeueRequest as DashboardRequeueRequest
-from beehaiive.api.models import DashboardRetryRequest as DashboardRetryRequest
-from beehaiive.api.models import DashboardStartRequest as DashboardStartRequest
 from beehaiive.api.models import DashboardStopRequest as DashboardStopRequest
 from beehaiive.api.models import MetaReviewDecisionRequest as MetaReviewDecisionRequest
 from beehaiive.api.models import MetaReviewRequest as MetaReviewRequest
@@ -339,21 +334,7 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
                 status_code=409,
                 detail="Selected workflow ID does not match the action workflow ID",
             )
-        if (
-            isinstance(request, DashboardStartRequest) and request.worker_id is not None
-        ) or (
-            isinstance(request, DashboardRetryRequest) and request.worker_id is not None
-        ):
-            request = request.model_copy(
-                update={
-                    "worker_id": redact_worker_text(
-                        request.worker_id,
-                        dashboard_secret_values,
-                        max_length=200,
-                    )
-                }
-            )
-        elif isinstance(request, DashboardClarifyRequest):
+        if isinstance(request, DashboardClarifyRequest):
             request = request.model_copy(
                 update={
                     "clarification": redact_worker_text(
@@ -395,15 +376,6 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
             )
         repository = getattr(request, "repository", None)
         if (
-            isinstance(request, DashboardStartRequest)
-            and request.action == "claim"
-            and request.repository is None
-        ):
-            raise HTTPException(
-                status_code=422,
-                detail="Repository is required for claim actions",
-            )
-        if (
             repository is not None
             and request.action != "stop"
             and not orchestrator.store.is_active_repository(project_id, repository)
@@ -422,15 +394,6 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
             )
             if pbi is None or pbi.get("active") is not True:
                 raise HTTPException(status_code=403, detail="PBI is not authorized")
-        if isinstance(request, DashboardRetryRequest):
-            _require_dashboard_retry_run(
-                orchestrator,
-                project_id,
-                request.repository,
-                request.pbi_number,
-                request.run_id,
-                workflow_service,
-            )
         if isinstance(
             request,
             (
@@ -438,7 +401,6 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
                 DashboardApproveRequest,
                 DashboardAnswerQuestionRequest,
                 DashboardClarifyRequest,
-                DashboardRetryRequest,
                 DashboardRequeueRequest,
                 DashboardCommitPushRequest,
             ),
@@ -489,12 +451,10 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
             if isinstance(
                 request,
                 (
-                    DashboardStartRequest,
                     DashboardAdvanceRequest,
                     DashboardApproveRequest,
                     DashboardAnswerQuestionRequest,
                     DashboardClarifyRequest,
-                    DashboardRetryRequest,
                     DashboardRequeueRequest,
                     DashboardCommitPushRequest,
                 ),
@@ -511,7 +471,6 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
                     DashboardApproveRequest,
                     DashboardAnswerQuestionRequest,
                     DashboardClarifyRequest,
-                    DashboardRetryRequest,
                     DashboardRequeueRequest,
                     DashboardCommitPushRequest,
                 ),

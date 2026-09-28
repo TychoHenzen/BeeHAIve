@@ -52,8 +52,6 @@ const ACTION_LABELS = {
   clarify: "Clarification requested",
   commit_push: "Delivery retried",
   deliver: "Delivery completed",
-  retry: "Work retried",
-  start: "Work started",
   stop: "Work stopped",
   requeue: "PBI made claimable",
 };
@@ -188,8 +186,6 @@ function activityDetail(action) {
     return `${request.enabled === true ? "Polling enabled" : "Polling disabled"} · ${text(request.max_concurrency, "?")} workers · every ${text(request.poll_interval_seconds, "?")} seconds.`;
   }
   if (kind === "stop") return `Reason: ${text(request.reason, "Stopped by operator")}`;
-  if (kind === "retry") return `Resumed ${text(request.repository, "the repository")}#${text(request.pbi_number, "?")} at attempt ${text(run.attempt, "?")}.`;
-  if (kind === "start") return `Started ${text(request.repository, "the repository")}#${text(request.pbi_number, "?")} at ${text(run.stage, "the current stage")}.`;
   if (kind === "autonomous_start") return `Selected ${text(request.repository, "the repository")}#${text(request.pbi_number, "?")} for the autonomous lifecycle.`;
   if (kind === "autonomous_complete") return text(result.summary, "All autonomous lifecycle handoffs completed.");
   if (kind === "answer_question") return `Answered operator question ${text(request.question_id, "the pending question")} and resumed the run.`;
@@ -240,10 +236,6 @@ function actionSpec(item) {
       payload: { action: "commit_push", ...identity },
     };
   }
-  if (pbi.status === "failed") {
-    if (pbi.claimable && pbi.run_id) return { label: "Retry work", testid: "retry-work", payload: { action: "retry", ...identity } };
-  }
-  if (pbi.claimable && !pbi.run_id && !isCompleted(pbi)) return { label: "Start work", testid: "start-work", description: "Claim only the current PBI stage for one interactive worker.", payload: { action: "start", repository, pbi_number: pbi.number } };
   return null;
 }
 

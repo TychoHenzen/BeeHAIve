@@ -12,18 +12,14 @@ from .dashboard_graph_request import (
 )
 from .dashboard_idea_capture_request import DashboardIdeaCaptureRequest
 from .dashboard_requeue_request import DashboardRequeueRequest
-from .dashboard_retry_request import DashboardRetryRequest
-from .dashboard_start_request import DashboardStartRequest
 from .dashboard_stop_request import DashboardStopRequest
 from .dashboard_synchronize_request import DashboardSynchronizeRequest
 
 __all__ = ["DASHBOARD_ACTIONS", "DashboardActionRequest"]
 
 DashboardActionRequest = Annotated[
-    DashboardStartRequest
-    | DashboardSynchronizeRequest
+    DashboardSynchronizeRequest
     | DashboardAdvanceRequest
-    | DashboardRetryRequest
     | DashboardRequeueRequest
     | DashboardAnswerQuestionRequest
     | DashboardStopRequest

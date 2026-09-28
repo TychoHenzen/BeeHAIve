@@ -1,16 +1,12 @@
 from __future__ import annotations
 
-import os
 from collections.abc import Callable, Collection, Mapping
 from datetime import UTC, datetime
 from threading import Event, Lock, Thread
 from typing import cast
-from uuid import uuid4
 
 from beehaiive.agent import (
-    DEFAULT_DEMO_TASK,
     AgentWorkerManager,
-    WorkerCapacityError,
     format_worker_exception,
     redact_worker_text,
 )
@@ -82,7 +78,6 @@ class AgentScheduler:
         self.budget_adapter = budget_adapter
         self.budget_policy = budget_policy or BudgetPolicy()
         self.building_signal_poll = building_signal_poll
-        self._owner_id = f"scheduler:{os.getpid()}:{uuid4().hex}"
         self._stop_event = Event()
         self._thread_lock = Lock()
         self._state_lock = Lock()
@@ -92,12 +87,6 @@ class AgentScheduler:
         self._last_error: str | None = None
         self._last_started_run_ids: dict[str, tuple[str, ...]] = {}
         self._last_budget_decisions: dict[str, dict[str, object]] = {}
-        executor_task = getattr(worker.executor, "task", DEFAULT_DEMO_TASK)
-        self._task = (
-            executor_task
-            if isinstance(executor_task, str) and executor_task.strip()
-            else DEFAULT_DEMO_TASK
-        )
 
     def start(self) -> None:
         if not self.config.enabled:
@@ -198,6 +187,13 @@ class AgentScheduler:
         ]
         started: list[str] = []
         if candidates:
+            if self.autonomous_start is None:
+                self._record_poll(
+                    ["Autonomous lifecycle starter is not configured"],
+                    started_by_project,
+                    budget_by_project,
+                )
+                return tuple(started)
             start_cursor = self._candidate_cursor % len(candidates)
             attempted = False
             for offset in range(len(candidates)):
@@ -215,71 +211,17 @@ class AgentScheduler:
                 ]
                 attempted = True
                 try:
-                    if self.autonomous_start is not None:
-                        if (
-                            self.autonomous_has_capacity is not None
-                            and not self.autonomous_has_capacity()
-                        ):
-                            break
-                        autonomous = self.autonomous_start(project_id, repository)
-                        run_id = autonomous.get("run_id")
-                        if not isinstance(run_id, str) or not run_id:
-                            raise RuntimeError("Autonomous run did not return an id")
-                        started.append(run_id)
-                        started_by_project.setdefault(project_id, []).append(run_id)
-                        self._candidate_cursor = (start_cursor + offset + 1) % len(
-                            candidates
-                        )
-                        continue
-                    run = self.worker.claim(
-                        project_id,
-                        repository,
-                        self._owner_id,
-                        task=self._task,
-                    )
-                    if run is None:
-                        continue
-                    try:
-                        if (
-                            budget_by_project.get(project_id, {}).get("action")
-                            == BudgetAction.DOWNGRADE.value
-                        ):
-                            fallback_model = budget_by_project[project_id].get(
-                                "fallback_model"
-                            )
-                            self.worker.start(
-                                run,
-                                model_override=(
-                                    fallback_model
-                                    if isinstance(fallback_model, str)
-                                    else None
-                                ),
-                            )
-                        else:
-                            self.worker.start(run)
-                    except WorkerCapacityError as exc:
-                        errors.append(self._error_summary(exc))
-                        continue
-                    except Exception as exc:
-                        error_summary = self._error_summary(exc)
-                        try:
-                            failure = (
-                                f"Scheduled worker failed to start: {error_summary}"
-                            )
-                            if getattr(
-                                self.orchestrator.store, "admission_enabled", False
-                            ):
-                                self.orchestrator.store.fail_agent_run(
-                                    run.run_id, failure, run.lease_token or ""
-                                )
-                            else:
-                                self.orchestrator.stop(run.run_id, failure)
-                        except Exception as stop_error:
-                            errors.append(self._error_summary(stop_error))
-                        errors.append(error_summary)
-                        continue
-                    started.append(run.run_id)
-                    started_by_project.setdefault(project_id, []).append(run.run_id)
+                    if (
+                        self.autonomous_has_capacity is not None
+                        and not self.autonomous_has_capacity()
+                    ):
+                        break
+                    autonomous = self.autonomous_start(project_id, repository)
+                    run_id = autonomous.get("run_id")
+                    if not isinstance(run_id, str) or not run_id:
+                        raise RuntimeError("Autonomous run did not return an id")
+                    started.append(run_id)
+                    started_by_project.setdefault(project_id, []).append(run_id)
                     self._candidate_cursor = (start_cursor + offset + 1) % len(
                         candidates
                     )

@@ -7,11 +7,8 @@ from fastapi import HTTPException
 
 from beehaiive import Orchestrator
 from beehaiive.agent import (
-    DEFAULT_DEMO_TASK,
-    DEMO_TASK_NAME,
     MAX_AGENT_OUTPUT_LENGTH,
     AgentWorkerManager,
-    format_worker_exception,
     redact_worker_text,
 )
 from beehaiive.api.models import DASHBOARD_ACTIONS as DASHBOARD_ACTIONS
@@ -35,8 +32,6 @@ from beehaiive.api.models import (
     DashboardIdeaCaptureRequest as DashboardIdeaCaptureRequest,
 )
 from beehaiive.api.models import DashboardRequeueRequest as DashboardRequeueRequest
-from beehaiive.api.models import DashboardRetryRequest as DashboardRetryRequest
-from beehaiive.api.models import DashboardStartRequest as DashboardStartRequest
 from beehaiive.api.models import DashboardStopRequest as DashboardStopRequest
 from beehaiive.api.models import (
     DashboardSynchronizeRequest as DashboardSynchronizeRequest,
@@ -59,8 +54,6 @@ from beehaiive.workflow import LeaseStatus, WorkflowService
 from .serialization import _public_run_dict as _public_run_dict
 
 DASHBOARD_ACTION_OWNERS = {
-    "start": "agent_worker",
-    "claim": "agent_worker",
     "synchronize": "orchestrator",
     "sync": "orchestrator",
     "stop": "orchestrator",
@@ -68,7 +61,6 @@ DASHBOARD_ACTION_OWNERS = {
     "approve": "action_log",
     "clarify": "action_log",
     "answer_question": "orchestrator",
-    "retry": "agent_worker",
     "requeue": "orchestrator",
     "commit_push": "agent_worker",
     "deliver": "agent_worker",
@@ -570,103 +562,6 @@ def _require_dashboard_advance_run(
     )
 
 
-def _require_dashboard_retry_run(
-    orchestrator: Orchestrator,
-    project_id: str,
-    repository: str,
-    pbi_number: int,
-    run_id: str,
-    workflow_service: WorkflowService | None = None,
-) -> RunState:
-    run = orchestrator.store.get_run(run_id)
-    pbi = _dashboard_pbi(orchestrator, project_id, repository, pbi_number)
-    if (
-        run is None
-        or pbi is None
-        or run.project_id != project_id
-        or run.repository != repository
-        or run.pbi_number != pbi_number
-        or run.status is not RunStatus.FAILED
-        or pbi.get("claimable") is not True
-    ):
-        raise HTTPException(status_code=409, detail="Run is not retryable")
-    if workflow_service is not None:
-        lease = workflow_service.workspace_for_run(run_id)
-        if lease is not None and lease.status is LeaseStatus.RETAINED:
-            raise HTTPException(
-                status_code=409,
-                detail="The run has a retained worktree; retry delivery instead",
-            )
-    return run
-
-
-def _dashboard_worker_task(
-    orchestrator: Orchestrator,
-    agent_worker: AgentWorkerManager,
-    run_id: str | None = None,
-) -> str:
-    if run_id is not None:
-        session = orchestrator.store.get_agent_session(run_id)
-        task = None if session is None else session.get("task")
-        if isinstance(task, str) and task.strip():
-            return task
-    task = getattr(getattr(agent_worker, "executor", None), "task", None)
-    return task if isinstance(task, str) and task.strip() else DEFAULT_DEMO_TASK
-
-
-def _start_dashboard_worker(
-    orchestrator: Orchestrator,
-    project_id: str,
-    repository: str,
-    worker_id: str | None,
-    agent_worker: AgentWorkerManager | None,
-    expected_run_id: str | None = None,
-    secret_values: tuple[str, ...] = (),
-) -> dict[str, object]:
-    if agent_worker is None:
-        raise StoreError("Agent worker is not configured")
-    task = _dashboard_worker_task(orchestrator, agent_worker, expected_run_id)
-    owner_id = worker_id or "dashboard-operator"
-    if expected_run_id is None:
-        run = agent_worker.claim(project_id, repository, owner_id, task=task)
-    else:
-        retry = getattr(agent_worker, "retry", None)
-        if not callable(retry):
-            raise StoreError("Agent worker does not support retries")
-        retry_worker = cast(Callable[[str, str, str, str, str], RunState | None], retry)
-        run = retry_worker(project_id, repository, owner_id, task, expected_run_id)
-    if run is None:
-        raise StoreError(
-            "No claimable PBI is available for this repository"
-            if expected_run_id is None
-            else "The failed run is no longer claimable"
-        )
-    try:
-        agent_worker.start(run)
-    except Exception as exc:
-        failure = redact_worker_text(
-            f"Agent worker failed to start: {format_worker_exception(exc)}",
-            secret_values,
-            max_length=MAX_AGENT_OUTPUT_LENGTH,
-        )
-        try:
-            if orchestrator.store.admission_enabled:
-                orchestrator.store.fail_agent_run(
-                    run.run_id, failure, run.lease_token or ""
-                )
-            else:
-                orchestrator.stop(run.run_id, failure)
-        except StoreError as stop_error:
-            raise StoreError(
-                f"Agent worker failed to start and cleanup failed: {stop_error}"
-            ) from exc
-        raise StoreError(failure) from exc
-    return {
-        "run": _public_run_dict(run),
-        "worker": {"status": "started", "task": DEMO_TASK_NAME},
-    }
-
-
 DashboardActionHandler = Callable[..., dict[str, object]]
 
 
@@ -698,86 +593,6 @@ def _execute_synchronize(
     del request, agent_worker, secret_values
     orchestrator.synchronize(project_id, force_refresh=True)
     return {"project_id": project_id, "status": "synchronized"}
-
-
-def _execute_start(
-    orchestrator: Orchestrator,
-    project_id: str,
-    request: DashboardActionRequest,
-    agent_worker: AgentWorkerManager | None,
-    secret_values: tuple[str, ...],
-) -> dict[str, object]:
-    if not isinstance(request, DashboardStartRequest):
-        raise StoreError(f"No dashboard handler for action: {request.action}")
-    if request.repository is None:
-        orchestrator.synchronize(project_id, force_refresh=True)
-        return {"project_id": project_id, "status": "synchronized"}
-    if agent_worker is None:
-        raise StoreError("Agent worker is not configured")
-    task = getattr(getattr(agent_worker, "executor", None), "task", None)
-    if not isinstance(task, str) or not task.strip():
-        task = DEFAULT_DEMO_TASK
-    if request.pbi_number is None:
-        run = agent_worker.claim(
-            project_id,
-            request.repository,
-            request.worker_id or "dashboard-operator",
-            task=task,
-        )
-    else:
-        run = agent_worker.claim(
-            project_id,
-            request.repository,
-            request.worker_id or "dashboard-operator",
-            task=task,
-            expected_pbi_number=request.pbi_number,
-        )
-    if run is None:
-        raise StoreError("No claimable PBI is available for this repository")
-    try:
-        agent_worker.start(run)
-    except Exception as exc:
-        failure = redact_worker_text(
-            f"Agent worker failed to start: {format_worker_exception(exc)}",
-            secret_values,
-            max_length=MAX_AGENT_OUTPUT_LENGTH,
-        )
-        try:
-            if orchestrator.store.admission_enabled:
-                orchestrator.store.fail_agent_run(
-                    run.run_id, failure, run.lease_token or ""
-                )
-            else:
-                orchestrator.stop(run.run_id, failure)
-        except StoreError as stop_error:
-            raise StoreError(
-                f"Agent worker failed to start and cleanup failed: {stop_error}"
-            ) from exc
-        raise StoreError(failure) from exc
-    return {
-        "run": _public_run_dict(run),
-        "worker": {"status": "started", "task": DEMO_TASK_NAME},
-    }
-
-
-def _execute_retry(
-    orchestrator: Orchestrator,
-    project_id: str,
-    request: DashboardActionRequest,
-    agent_worker: AgentWorkerManager | None,
-    secret_values: tuple[str, ...],
-) -> dict[str, object]:
-    if not isinstance(request, DashboardRetryRequest):
-        raise StoreError(f"No dashboard handler for action: {request.action}")
-    return _start_dashboard_worker(
-        orchestrator,
-        project_id,
-        request.repository,
-        request.worker_id,
-        agent_worker,
-        expected_run_id=request.run_id,
-        secret_values=secret_values,
-    )
 
 
 def _execute_requeue(
@@ -1006,8 +821,6 @@ def _execute_graph_rollback(
 
 
 DASHBOARD_ACTION_DISPATCH: dict[str, DashboardActionHandler] = {
-    "start": _execute_start,
-    "claim": _execute_start,
     "synchronize": _execute_synchronize,
     "sync": _execute_synchronize,
     "stop": _execute_stop,
@@ -1015,7 +828,6 @@ DASHBOARD_ACTION_DISPATCH: dict[str, DashboardActionHandler] = {
     "approve": _execute_approve,
     "clarify": _execute_clarify,
     "answer_question": _execute_answer_question,
-    "retry": _execute_retry,
     "requeue": _execute_requeue,
     "commit_push": _execute_delivery,
     "deliver": _execute_delivery,
@@ -1088,7 +900,6 @@ __all__ = [
     "_require_dashboard_operator_question",
     "_require_dashboard_delivery_run",
     "_require_dashboard_advance_run",
-    "_require_dashboard_retry_run",
     "DASHBOARD_ACTIONS",
     "DASHBOARD_ACTION_OWNERS",
     "DASHBOARD_ACTION_READBACK",

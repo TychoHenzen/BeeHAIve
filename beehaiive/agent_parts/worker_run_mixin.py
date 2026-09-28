@@ -158,7 +158,7 @@ class WorkerRunMixin:
                     if delivery.status is not GitDeliveryStatus.PUSHED:
                         result = self._delivery_summary(
                             routing.execution_result
-                            or "Bounded agent completed the demo",
+                            or "Agent completed without a pushed commit",
                             delivery,
                         )
                         self.orchestrator.store.complete_agent_run(
@@ -179,7 +179,7 @@ class WorkerRunMixin:
                             "pull-request handoff"
                         )
                     result = self._delivery_summary(
-                        routing.execution_result or "Bounded agent completed the demo",
+                        routing.execution_result or "Agent completed",
                         delivery,
                     )
                     secret_values = tuple(
@@ -234,7 +234,7 @@ class WorkerRunMixin:
                 failure = (
                     (attempt.failure_context if attempt is not None else "")
                     or routing.decision.failure_context
-                    or ("Bounded agent did not complete the demo")
+                    or "Agent did not complete"
                 )
                 self.orchestrator.store.fail_agent_run(
                     run_id, redact_worker_text(failure), lease_token
