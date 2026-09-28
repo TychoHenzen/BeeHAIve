@@ -1,11 +1,11 @@
 import os
 import re
 from pathlib import Path
-from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 
+from beehaiive.api.context import ApiRouteContext
 from beehaiive.api.helpers.http import _handle_store_error as _handle_store_error
 from beehaiive.api.models import (
     DashboardSettingsRequest as DashboardSettingsRequest,
@@ -14,16 +14,16 @@ from beehaiive.api.models import RoutingAttemptRequest as RoutingAttemptRequest
 from beehaiive.routing import RoutingError
 
 
-def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
-    orchestrator = context["orchestrator"]
-    require_mutation_access = context["require_mutation_access"]
-    require_dashboard_settings_mutation = context["require_dashboard_settings_mutation"]
-    require_routing_run_access = context["require_routing_run_access"]
-    routing_service = context["routing_service"]
-    configured_projects = context["configured_projects"]
-    project_boundary = context["project_boundary"]
-    scheduler = context["scheduler"]
-    runtime_settings = context["runtime_settings"]
+def register_routes(app: FastAPI, context: ApiRouteContext) -> None:
+    orchestrator = context.orchestrator
+    require_mutation_access = context.require_mutation_access
+    require_dashboard_settings_mutation = context.require_dashboard_settings_mutation
+    require_routing_run_access = context.require_routing_run_access
+    routing_service = context.routing_service
+    configured_projects = context.configured_projects
+    project_boundary = context.project_boundary
+    scheduler = context.scheduler
+    runtime_settings = context.runtime_settings
     docs_directory = Path(__file__).resolve().parents[3] / "docs"
     dashboard_view_modules = {
         "actions",

@@ -1,7 +1,6 @@
-from typing import Any
-
 from fastapi import Depends, FastAPI, HTTPException
 
+from beehaiive.api.context import ApiRouteContext
 from beehaiive.api.models import (
     GraphRollbackRequest,
     GraphSafetyRequest,
@@ -12,10 +11,10 @@ from beehaiive.graph_safety import GraphSafetyError, GraphSafetyService
 from beehaiive.storage import StoreError
 
 
-def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
-    service: GraphSafetyService = context["graph_safety_service"]
-    require_workflow_access = context["require_workflow_access"]
-    require_workflow_operator = context["require_workflow_operator"]
+def register_routes(app: FastAPI, context: ApiRouteContext) -> None:
+    service: GraphSafetyService = context.graph_safety_service
+    require_workflow_access = context.require_workflow_access
+    require_workflow_operator = context.require_workflow_operator
 
     def evaluate_request(request: GraphSafetyRequest):
         try:

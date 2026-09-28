@@ -1,7 +1,6 @@
-from typing import Any
-
 from fastapi import Depends, FastAPI, Header, HTTPException
 
+from beehaiive.api.context import ApiRouteContext
 from beehaiive.api.helpers.dashboard import (
     _dashboard_quality_gates as _dashboard_quality_gates,
 )
@@ -20,14 +19,14 @@ from beehaiive.api.models import WorkflowStopRequest as WorkflowStopRequest
 from beehaiive.api.models import WorkflowWorkspaceRequest as WorkflowWorkspaceRequest
 
 
-def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
-    conflict_repair_service = context["conflict_repair_service"]
-    require_api_key = context["require_api_key"]
-    require_handoff_lease_token = context["require_handoff_lease_token"]
-    require_routing_run_access = context["require_routing_run_access"]
-    require_workflow_access = context["require_workflow_access"]
-    require_workflow_operator = context["require_workflow_operator"]
-    require_workflow_service = context["require_workflow_service"]
+def register_routes(app: FastAPI, context: ApiRouteContext) -> None:
+    conflict_repair_service = context.conflict_repair_service
+    require_api_key = context.require_api_key
+    require_handoff_lease_token = context.require_handoff_lease_token
+    require_routing_run_access = context.require_routing_run_access
+    require_workflow_access = context.require_workflow_access
+    require_workflow_operator = context.require_workflow_operator
+    require_workflow_service = context.require_workflow_service
 
     @app.post("/workflow/workspaces")
     def acquire_workflow_workspace(  # pyright: ignore[reportUnusedFunction]

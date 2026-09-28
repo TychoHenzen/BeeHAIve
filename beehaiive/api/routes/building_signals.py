@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 
+from beehaiive.api.context import ApiRouteContext
 from beehaiive.api.models import (
     BuildingSignalAssignmentRequest,
     BuildingSignalGenerateRequest,
@@ -17,10 +17,10 @@ from beehaiive.contract_types.validation import _redact_text
 from beehaiive.service_failures import FailureCategory
 
 
-def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
-    service: BuildingSignalService = context["building_signal_service"]
-    require_project_access = context["require_project_access"]
-    require_dashboard_workflow_operator = context["require_dashboard_workflow_operator"]
+def register_routes(app: FastAPI, context: ApiRouteContext) -> None:
+    service: BuildingSignalService = context.building_signal_service
+    require_project_access = context.require_project_access
+    require_dashboard_workflow_operator = context.require_dashboard_workflow_operator
     docs_directory = Path(__file__).resolve().parents[3] / "docs"
 
     @app.get("/building-signal-design", response_class=FileResponse)

@@ -1,10 +1,11 @@
 from collections.abc import Callable
-from typing import Annotated, Any, cast
+from typing import Annotated, cast
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi import Path as FastAPIPath
 from fastapi.responses import JSONResponse
 
+from beehaiive.api.context import ApiRouteContext
 from beehaiive.api.helpers.http import _handle_store_error as _handle_store_error
 from beehaiive.api.helpers.http import (
     _pbi_refinement_failure as _pbi_refinement_failure,
@@ -30,11 +31,11 @@ from beehaiive.pbi_refinement_mutation import (
 )
 
 
-def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
-    orchestrator = context["orchestrator"]
-    refinement_path = context["refinement_path"]
-    refinement_secret_values = context["refinement_secret_values"]
-    require_refinement_operator = context["require_refinement_operator"]
+def register_routes(app: FastAPI, context: ApiRouteContext) -> None:
+    orchestrator = context.orchestrator
+    refinement_path = context.refinement_path
+    refinement_secret_values = context.refinement_secret_values
+    require_refinement_operator = context.require_refinement_operator
 
     @app.post(refinement_path)
     def start_pbi_refinement(  # pyright: ignore[reportUnusedFunction]

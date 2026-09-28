@@ -1,11 +1,11 @@
 from collections.abc import Collection, Mapping
-from typing import Any
 
 from fastapi import FastAPI
 
 from beehaiive import Orchestrator, OrchestratorStore
 from beehaiive.agent import AgentWorkerManager
 from beehaiive.agent_stations import AgentStationService
+from beehaiive.api.context import ApiRouteContext, ApiRuntimeOptions
 from beehaiive.api.dependencies import build_route_dependencies
 from beehaiive.api.lifecycle import (
     register_background_handlers,
@@ -87,32 +87,32 @@ def create_app(
     building_signal_world: BuildingSignalWorld | None = None,
     agent_station_service: AgentStationService | None = None,
 ) -> FastAPI:
-    runtime_options: dict[str, Any] = {
-        "agent_worker": agent_worker,
-        "allowed_project_ids": allowed_project_ids,
-        "conflict_repair_service": conflict_repair_service,
-        "meta_review_service": meta_review_service,
-        "model_executor": model_executor,
-        "model_router": model_router,
-        "orchestrator": orchestrator,
-        "require_review_adapters": require_review_adapters,
-        "review_authorizer": review_authorizer,
-        "review_provider": review_provider,
-        "review_readers": review_readers,
-        "review_repair_service": review_repair_service,
-        "review_service": review_service,
-        "review_store": review_store,
-        "routing_store": routing_store,
-        "store": store,
-        "workflow_service": workflow_service,
-        "graph_safety_service": graph_safety_service,
-        "autonomous_service": autonomous_service,
-        "behavior_service": behavior_service,
-        "unit_world": unit_world,
-        "building_signal_service": building_signal_service,
-        "building_signal_world": building_signal_world,
-        "agent_station_service": agent_station_service,
-    }
+    runtime_options = ApiRuntimeOptions(
+        agent_worker=agent_worker,
+        allowed_project_ids=allowed_project_ids,
+        conflict_repair_service=conflict_repair_service,
+        meta_review_service=meta_review_service,
+        model_executor=model_executor,
+        model_router=model_router,
+        orchestrator=orchestrator,
+        require_review_adapters=require_review_adapters,
+        review_authorizer=review_authorizer,
+        review_provider=review_provider,
+        review_readers=review_readers,
+        review_repair_service=review_repair_service,
+        review_service=review_service,
+        review_store=review_store,
+        routing_store=routing_store,
+        store=store,
+        workflow_service=workflow_service,
+        graph_safety_service=graph_safety_service,
+        autonomous_service=autonomous_service,
+        behavior_service=behavior_service,
+        unit_world=unit_world,
+        building_signal_service=building_signal_service,
+        building_signal_world=building_signal_world,
+        agent_station_service=agent_station_service,
+    )
     runtime = build_api_runtime(runtime_options)
     app = FastAPI(title="BeeHAIve")
     register_error_handlers(app)
@@ -120,7 +120,7 @@ def create_app(
     dependencies = build_route_dependencies(
         runtime, api_key, review_actor, workflow_actor
     )
-    route_context = runtime | dependencies
+    route_context = ApiRouteContext.from_parts(runtime, dependencies)
     register_autonomous_routes(app, route_context)
     register_behavior_routes(app, route_context)
     register_building_signal_routes(app, route_context)

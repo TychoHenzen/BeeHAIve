@@ -1,21 +1,22 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 
 from beehaiive.agent_stations import AgentStationService, AgentStationServiceError
+from beehaiive.api.context import ApiRouteContext
 from beehaiive.api.models import StationIssueActionRequest
 from beehaiive.dashboard.values import safe_dashboard_value
 
 
-def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
-    service: AgentStationService = context["agent_station_service"]
-    require_project_access = context["require_project_access"]
-    require_dashboard_workflow_operator = context["require_dashboard_workflow_operator"]
-    secret_values = context["dashboard_secret_values"]
+def register_routes(app: FastAPI, context: ApiRouteContext) -> None:
+    service: AgentStationService = context.agent_station_service
+    require_project_access = context.require_project_access
+    require_dashboard_workflow_operator = context.require_dashboard_workflow_operator
+    secret_values = context.dashboard_secret_values
     docs_directory = Path(__file__).resolve().parents[3] / "docs"
 
     @app.get("/agent-stations", response_class=FileResponse)
