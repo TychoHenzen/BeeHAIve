@@ -10,6 +10,7 @@ from beehaiive.behavior_service import (
     RecordingUnitWorld,
     TargetUnitWorld,
 )
+from beehaiive.service_failures import WorldActionError
 from beehaiive.storage import OrchestratorStore
 
 
@@ -291,7 +292,7 @@ def test_in_flight_action_is_idempotent_across_store_restart(tmp_path: Path) -> 
 def test_unit_failure_error_is_redacted(tmp_path: Path) -> None:
     class SecretFailureWorld(RecordingUnitWorld):
         def execute(self, *args: object, **kwargs: object) -> dict[str, object]:
-            raise RuntimeError("secret-token=unit-secret")
+            raise WorldActionError("secret-token=unit-secret")
 
     store = OrchestratorStore(tmp_path / "redaction.sqlite3")
     service = BehaviorService(store, unit_world=SecretFailureWorld())

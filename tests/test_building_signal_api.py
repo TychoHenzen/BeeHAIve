@@ -8,6 +8,7 @@ from beehaiive.building_signal import TargetBuildingSignalWorld
 from beehaiive.building_signal_service import BuildingSignalService
 from beehaiive.orchestrator import Orchestrator
 from beehaiive.persistence import OrchestratorStore
+from beehaiive.service_failures import WorldActionError
 from main import create_app
 from tests.support.api_provider import ApiProvider
 
@@ -26,7 +27,7 @@ class FakeBuildingSignalModel:
 class SecretFailureWorld(TargetBuildingSignalWorld):
     def inventory_count(self, project_id: str, building_id: str, item_id: str) -> int:
         del project_id, building_id, item_id
-        raise RuntimeError("secret-token=inventory-secret")
+        raise WorldActionError("secret-token=inventory-secret")
 
 
 def test_building_signal_api_is_scoped_and_persists_current_state(

@@ -99,7 +99,7 @@ class RecordingUnitWorld:
                 or not isinstance(seconds, (int, float))
                 or not 0 <= float(seconds) <= MAX_BEHAVIOR_WAIT_SECONDS
             ):
-                raise ValueError("Wait duration is unavailable")
+                raise WorldActionError("Wait duration is unavailable")
             result.update({"kind": "wait", "seconds": float(seconds)})
         elif action_type == "inspect_signal":
             target_id = _target_id(arguments, "target", "signal", self._target_ids)
@@ -165,17 +165,17 @@ class TargetUnitWorld:
                 or not isinstance(seconds, (int, float))
                 or not 0 <= float(seconds) <= MAX_BEHAVIOR_WAIT_SECONDS
             ):
-                raise ValueError("Wait duration is unavailable")
+                raise WorldActionError("Wait duration is unavailable")
             result = {"ok": True, "kind": "wait", "seconds": float(seconds)}
         elif action_type == "grab":
             storage_id, _ = self._target(project_id, arguments, "storage", "storage")
             item_id, _ = self._target(project_id, arguments, "item", "item")
             held_by = self._held_items.get((project_id, item_id))
             if held_by is not None and held_by != unit_id:
-                raise ValueError("Item is already held by another unit")
+                raise WorldActionError("Item is already held by another unit")
             location = self._locations.get((project_id, item_id))
             if location is not None and location != storage_id:
-                raise ValueError("Item is not available at the requested storage")
+                raise WorldActionError("Item is not available at the requested storage")
             self._held_items[(project_id, item_id)] = unit_id
             self._locations[(project_id, item_id)] = storage_id
             result = {
@@ -189,7 +189,7 @@ class TargetUnitWorld:
             target_id, target = self._target(project_id, arguments, kind, "target")
             value = target.get("value")
             if value is None or not isinstance(value, (str, bool, int, float)):
-                raise ValueError(f"{kind} target has no bounded value")
+                raise WorldActionError(f"{kind} target has no bounded value")
             result = {
                 "ok": True,
                 "kind": kind,
@@ -207,7 +207,7 @@ class TargetUnitWorld:
                 None,
             )
             if held_item is None:
-                raise ValueError("Unit is not holding an item")
+                raise WorldActionError("Unit is not holding an item")
             self._locations[(project_id, held_item)] = factory_id
             if action_type == "deposit":
                 del self._held_items[(project_id, held_item)]
@@ -218,7 +218,7 @@ class TargetUnitWorld:
                 "value": action_type,
             }
         else:
-            raise ValueError("Action is not supported by the target world")
+            raise WorldActionError("Action is not supported by the target world")
         if idempotency_key is not None:
             self._results[idempotency_key] = dict(result)
         return result
@@ -238,7 +238,7 @@ class TargetUnitWorld:
         )
         target = self._targets.get(project_id, {}).get(kind, {}).get(target_id)
         if target is None:
-            raise ValueError(f"{kind} target is unavailable")
+            raise WorldActionError(f"{kind} target is unavailable")
         return target_id, target
 
 
@@ -478,7 +478,7 @@ class BehaviorService:
                         idempotency_key=idempotency_key,
                     )
                     bounded_observation = _bounded_observation(observation)
-                except (WorldActionError, RuntimeError, ValueError) as exc:
+                except WorldActionError as exc:
                     return self._fail(
                         record, execution, str(exc), FailureCategory.WORLD
                     )
@@ -582,7 +582,7 @@ class BehaviorService:
     def _allowed_targets(self, project_id: str) -> Mapping[str, Collection[str]]:
         try:
             return self.unit_world.allowed_targets(_project_id(project_id))
-        except (TargetProviderError, RuntimeError, ValueError) as exc:
+        except TargetProviderError as exc:
             raise BehaviorServiceError(
                 "target_provider",
                 "Target allowlists are unavailable",
@@ -766,7 +766,7 @@ def _target_id(
 ) -> str:
     binding = arguments.get(argument_name)
     if not isinstance(binding, Mapping):
-        raise ValueError(f"{expected_kind} target is unavailable")
+        raise WorldActionError(f"{expected_kind} target is unavailable")
     binding_mapping = cast(Mapping[str, object], binding)
     target_id = binding_mapping.get("id")
     if (
@@ -774,7 +774,7 @@ def _target_id(
         or not isinstance(target_id, str)
         or target_id not in allowed_target_ids.get(expected_kind, ())
     ):
-        raise ValueError(f"{expected_kind} target is unavailable")
+        raise WorldActionError(f"{expected_kind} target is unavailable")
     return target_id
 
 

@@ -215,10 +215,7 @@ class BuildingSignalService:
         except (
             BuildingSignalServiceError,
             BuildingSignalValidationError,
-            TargetProviderError,
             WorldActionError,
-            RuntimeError,
-            ValueError,
         ) as exc:
             state = {
                 **record.signal_state,
@@ -294,7 +291,7 @@ class BuildingSignalService:
     def _allowed_targets(self, project_id: str) -> Mapping[str, Collection[str]]:
         try:
             targets = cast(object, self.world.allowed_targets(project_id))
-        except (TargetProviderError, RuntimeError, ValueError) as exc:
+        except TargetProviderError as exc:
             raise BuildingSignalServiceError(
                 "target_provider",
                 "Building signal targets are unavailable",
@@ -382,9 +379,11 @@ def _evaluation_failure_category(error: BaseException) -> str:
         return error.category
     if isinstance(error, BuildingSignalValidationError):
         return FailureCategory.VALIDATION.value
-    if isinstance(error, (TargetProviderError,)):
+    if isinstance(error, TargetProviderError):
         return FailureCategory.TARGET_PROVIDER.value
-    return FailureCategory.WORLD.value
+    if isinstance(error, WorldActionError):
+        return FailureCategory.WORLD.value
+    raise TypeError(f"Unexpected evaluation failure: {type(error).__name__}")
 
 
 __all__ = ["BuildingSignalService"]

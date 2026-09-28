@@ -12,6 +12,7 @@ from beehaiive.building_signal import (
 )
 from beehaiive.building_signal_service import BuildingSignalService
 from beehaiive.persistence import OrchestratorStore, StoreError
+from beehaiive.service_failures import WorldActionError
 
 
 def rule() -> dict[str, object]:
@@ -136,7 +137,7 @@ def test_building_signal_fails_closed_and_redacts_world_errors(
 ) -> None:
     class SecretWorld(TargetBuildingSignalWorld):
         def inventory_count(self, *_args: str) -> int:
-            raise RuntimeError(error_text)
+            raise WorldActionError(error_text)
 
     store, service = make_service(tmp_path, world=SecretWorld(targets()))
     assigned = service.assign(

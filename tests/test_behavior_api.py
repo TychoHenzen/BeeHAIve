@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from beehaiive.behavior_service import BehaviorService, RecordingUnitWorld
 from beehaiive.orchestrator import Orchestrator
+from beehaiive.service_failures import TargetProviderError
 from beehaiive.storage import OrchestratorStore
 from main import create_app
 from tests.support.api_provider import ApiProvider
@@ -29,7 +30,7 @@ class UnavailableBehaviorModel:
 class FailingTargetWorld(RecordingUnitWorld):
     def allowed_targets(self, project_id: str) -> Mapping[str, Collection[str]]:
         del project_id
-        raise RuntimeError("secret-token=target-secret")
+        raise TargetProviderError("secret-token=target-secret")
 
 
 def test_behavior_api_exposes_bounded_failure_classification(tmp_path: Path) -> None:
