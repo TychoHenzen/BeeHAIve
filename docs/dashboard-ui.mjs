@@ -213,7 +213,7 @@ function allItems(state) {
   );
 }
 
-function actionSpec(item, demo) {
+function actionSpec(item) {
   const { repository, pbi } = item;
   const identity = { repository, pbi_number: pbi.number, run_id: pbi.run_id };
   if (pbi.autonomous_status === "blocked") {
@@ -244,13 +244,6 @@ function actionSpec(item, demo) {
     if (pbi.claimable && pbi.run_id) return { label: "Retry work", testid: "retry-work", payload: { action: "retry", ...identity } };
   }
   if (pbi.claimable && !pbi.run_id && !isCompleted(pbi)) return { label: "Start work", testid: "start-work", description: "Claim only the current PBI stage for one interactive worker.", payload: { action: "start", repository, pbi_number: pbi.number } };
-  if (!demo) return null;
-  if (demo && stageId(pbi) === "pull_request" && pbi.run_id === null) return { label: "Approve review", testid: "approve-review", payload: { action: "approve", ...identity } };
-  if (pbi.status !== "active" || !pbi.run_id) return null;
-  if (stageId(pbi) === "refine") return null;
-  if (demo && stageId(pbi) === "implement") return { label: "Send to review", testid: "send-to-review", payload: { action: "approve", ...identity } };
-  if (demo && stageId(pbi) === "merge") return { label: "Merge change", testid: "merge-change", payload: { action: "merge", ...identity } };
-  if (stageId(pbi) === "implement") return { label: "Record approval", testid: "approve-step", payload: { action: "approve", ...identity } };
   return null;
 }
 
@@ -277,7 +270,6 @@ export function createDashboardUi({
   onProjectSelect = () => {},
   onQueueArchive = () => {},
   initialFilter = "all",
-  demo = false,
 }) {
   let currentState = null;
   let currentFilter = initialFilter;
@@ -307,7 +299,7 @@ export function createDashboardUi({
     return node;
   }
 
-  const autonomousLabel = demo ? "Run placeholder lifecycle" : "Run full lifecycle";
+  const autonomousLabel = "Run full lifecycle";
 
   function filterItems(items, filter) {
     return items.filter(({ pbi }) => {
@@ -693,7 +685,7 @@ export function createDashboardUi({
         payload: { repository: item.repository, pbi_number: pbi.number },
       }, "primary"));
     }
-    const spec = actionSpec(item, demo);
+    const spec = actionSpec(item);
     if (spec) controls.append(actionButton(spec.label, spec, runAutonomous ? "secondary" : "primary"));
     if (pbi.run_id && pbi.autonomous_status !== "running" && ["active", "awaiting_operator"].includes(pbi.status) && pbi.active !== false) {
       const stop = { label: "Stop run", testid: "stop-work", payload: { action: "stop", repository: item.repository, run_id: pbi.run_id } };
@@ -747,7 +739,7 @@ export function createDashboardUi({
         payload: { repository, pbi_number: pbi.number },
       }, "primary"));
     }
-    const spec = actionSpec(item, demo);
+    const spec = actionSpec(item);
     if (spec) controls.append(actionButton(spec.label, spec, runAutonomous ? "secondary" : "primary"));
     const inspect = element("button", pbi.run_id ? "Inspect run" : "Inspect", "inspect");
     inspect.type = "button";
@@ -874,7 +866,7 @@ export function createDashboardUi({
       inspect.type = "button";
       inspect.addEventListener("click", () => openInspector(item));
       controls.append(inspect);
-      const spec = actionSpec(item, demo);
+      const spec = actionSpec(item);
       if (spec) controls.append(actionButton(spec.label, spec, "primary"));
       if (pbi.run_id && pbi.autonomous_status !== "running" && pbi.autonomous_status !== "blocked") {
         const stop = { label: "Stop", testid: "stop-work", payload: { action: "stop", repository: item.repository, run_id: pbi.run_id } };
