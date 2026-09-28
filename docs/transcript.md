@@ -5,9 +5,8 @@ Chromium-compatible browser and select a claimable PBI from the live Project
 queue.
 
 **BeeHAIve:** The dashboard reads the allowlisted Project state from the
-server. Choose **Run full lifecycle** and approve the action. The server claims
-the PBI, creates its leased workspace and branch, and starts one background
-run.
+server. Choose **Run full lifecycle**. The server claims the PBI, creates its
+leased workspace and branch, and starts one background run.
 
 **BeeHAIve:** The run executes the configured stages in order:
 `refine-backlog-item`, `next-ticket`, `submit-draft-pr`, `review-pr-branch`,
