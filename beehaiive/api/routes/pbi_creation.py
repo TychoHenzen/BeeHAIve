@@ -1,9 +1,10 @@
-from typing import Annotated, Any
+from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi import Path as FastAPIPath
 from fastapi.responses import JSONResponse
 
+from beehaiive.api.context import ApiRouteContext
 from beehaiive.api.models import PbiCreationBody as PbiCreationBody
 from beehaiive.api.models import PbiRelationsBody as PbiRelationsBody
 from beehaiive.pbi_creation import PbiCreationError, PbiCreationRequest
@@ -16,10 +17,10 @@ from beehaiive.pbi_relations import (
 from beehaiive.storage import StoreError
 
 
-def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
-    pbi_creation_service = context["pbi_creation_service"]
-    pbi_relations_service = context["pbi_relations_service"]
-    require_mutation_access = context["require_mutation_access"]
+def register_routes(app: FastAPI, context: ApiRouteContext) -> None:
+    pbi_creation_service = context.pbi_creation_service
+    pbi_relations_service = context.pbi_relations_service
+    require_mutation_access = context.require_mutation_access
 
     @app.post("/projects/{project_id}/pbis")
     def create_project_pbi(  # pyright: ignore[reportUnusedFunction]

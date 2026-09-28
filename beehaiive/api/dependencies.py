@@ -1,10 +1,10 @@
 import os
 import secrets
-from typing import Any
 
 from fastapi import Header, HTTPException, Request
 
 from beehaiive.agent import worker_secret_values
+from beehaiive.api.context import ApiDependencies, ApiRuntime
 from beehaiive.api.helpers.http import _required_header as _required_header
 from beehaiive.models import RunStatus
 from beehaiive.review_repair import ReviewRepairService
@@ -14,15 +14,15 @@ from beehaiive.workflow import WorkflowRole, WorkflowService
 
 
 def build_route_dependencies(
-    runtime: dict[str, Any],
+    runtime: ApiRuntime,
     api_key: str | None,
     review_actor: str | None,
     workflow_actor: WorkflowRole | str | None,
-) -> dict[str, Any]:
-    orchestrator = runtime["orchestrator"]
-    review_repair_service = runtime["review_repair_service"]
-    workflow_service = runtime["workflow_service"]
-    configured_projects = runtime["configured_projects"]
+) -> ApiDependencies:
+    orchestrator = runtime.orchestrator
+    review_repair_service = runtime.review_repair_service
+    workflow_service = runtime.workflow_service
+    configured_projects = runtime.configured_projects
     configured_api_key = (
         api_key if api_key is not None else os.environ.get("BEEHAIIVE_API_KEY")
     )
@@ -30,7 +30,7 @@ def build_route_dependencies(
     worker_secret_values_from_executor = tuple(
         value
         for value in getattr(
-            getattr(runtime["agent_worker"], "executor", None),
+            getattr(runtime.agent_worker, "executor", None),
             "_secret_values",
             (),
         )
@@ -250,22 +250,22 @@ def build_route_dependencies(
         except RoutingError as exc:
             raise StoreError(str(exc)) from exc
 
-    return {
-        "refinement_path": refinement_path,
-        "refinement_secret_values": refinement_secret_values,
-        "dashboard_secret_values": dashboard_secret_values,
-        "routing_snapshot": routing_snapshot,
-        "require_api_key": require_api_key,
-        "require_handoff_lease_token": require_handoff_lease_token,
-        "require_mutation_access": require_mutation_access,
-        "require_dashboard_settings_mutation": require_dashboard_settings_mutation,
-        "require_project_access": require_project_access,
-        "require_refinement_operator": require_refinement_operator,
-        "require_review_access": require_review_access,
-        "require_review_repair_service": require_review_repair_service,
-        "require_routing_run_access": require_routing_run_access,
-        "require_workflow_access": require_workflow_access,
-        "require_workflow_operator": require_workflow_operator,
-        "require_dashboard_workflow_operator": require_dashboard_workflow_operator,
-        "require_workflow_service": require_workflow_service,
-    }
+    return ApiDependencies(
+        refinement_path=refinement_path,
+        refinement_secret_values=refinement_secret_values,
+        dashboard_secret_values=dashboard_secret_values,
+        routing_snapshot=routing_snapshot,
+        require_api_key=require_api_key,
+        require_handoff_lease_token=require_handoff_lease_token,
+        require_mutation_access=require_mutation_access,
+        require_dashboard_settings_mutation=require_dashboard_settings_mutation,
+        require_project_access=require_project_access,
+        require_refinement_operator=require_refinement_operator,
+        require_review_access=require_review_access,
+        require_review_repair_service=require_review_repair_service,
+        require_routing_run_access=require_routing_run_access,
+        require_workflow_access=require_workflow_access,
+        require_workflow_operator=require_workflow_operator,
+        require_dashboard_workflow_operator=require_dashboard_workflow_operator,
+        require_workflow_service=require_workflow_service,
+    )

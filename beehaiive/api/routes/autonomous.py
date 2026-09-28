@@ -1,14 +1,13 @@
-from typing import Any
-
 from fastapi import Depends, FastAPI, HTTPException
 
+from beehaiive.api.context import ApiRouteContext
 from beehaiive.api.models import AutonomousRunRequest
 
 
-def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
-    service = context["autonomous_service"]
-    require_mutation_access = context["require_mutation_access"]
-    require_project_access = context["require_project_access"]
+def register_routes(app: FastAPI, context: ApiRouteContext) -> None:
+    service = context.autonomous_service
+    require_mutation_access = context.require_mutation_access
+    require_project_access = context.require_project_access
 
     @app.post("/projects/{project_id}/autonomous-runs")
     def start_autonomous_run(

@@ -1,7 +1,6 @@
-from typing import Any
-
 from fastapi import Depends, FastAPI
 
+from beehaiive.api.context import ApiRouteContext
 from beehaiive.api.helpers.http import _handle_review_error as _handle_review_error
 from beehaiive.api.models import ReviewApprovalRequest as ReviewApprovalRequest
 from beehaiive.api.models import ReviewFindingRequest as ReviewFindingRequest
@@ -15,11 +14,11 @@ from beehaiive.review import ReviewAction, ReviewError
 from beehaiive.storage import StoreError
 
 
-def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
-    orchestrator = context["orchestrator"]
-    require_review_access = context["require_review_access"]
-    require_review_repair_service = context["require_review_repair_service"]
-    review_service = context["review_service"]
+def register_routes(app: FastAPI, context: ApiRouteContext) -> None:
+    orchestrator = context.orchestrator
+    require_review_access = context.require_review_access
+    require_review_repair_service = context.require_review_repair_service
+    review_service = context.review_service
 
     @app.post("/reviews/ready")
     def run_ready_review(  # pyright: ignore[reportUnusedFunction]

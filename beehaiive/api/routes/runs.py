@@ -1,9 +1,9 @@
 from pathlib import Path
-from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 
 from beehaiive import Stage
+from beehaiive.api.context import ApiRouteContext
 from beehaiive.api.helpers.http import _handle_store_error as _handle_store_error
 from beehaiive.api.helpers.http import _handle_workflow_error as _handle_workflow_error
 from beehaiive.api.helpers.http import _required_header as _required_header
@@ -17,11 +17,11 @@ from beehaiive.storage import StoreError
 from beehaiive.workflow import WorkflowError
 
 
-def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
-    orchestrator = context["orchestrator"]
-    require_mutation_access = context["require_mutation_access"]
-    require_workflow_service = context["require_workflow_service"]
-    routing_snapshot = context["routing_snapshot"]
+def register_routes(app: FastAPI, context: ApiRouteContext) -> None:
+    orchestrator = context.orchestrator
+    require_mutation_access = context.require_mutation_access
+    require_workflow_service = context.require_workflow_service
+    routing_snapshot = context.routing_snapshot
 
     @app.post("/runs/{run_id}/advance")
     def advance(  # pyright: ignore[reportUnusedFunction]

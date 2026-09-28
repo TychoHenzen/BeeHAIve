@@ -2,12 +2,13 @@ import hashlib
 import json
 from collections.abc import Callable
 from contextlib import suppress
-from typing import Any, Literal, cast
+from typing import Literal, cast
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 
 from beehaiive import Orchestrator
 from beehaiive.agent import MAX_AGENT_OUTPUT_LENGTH, redact_worker_text
+from beehaiive.api.context import ApiRouteContext
 from beehaiive.api.helpers.dashboard import (
     DASHBOARD_ACTION_OWNERS as DASHBOARD_ACTION_OWNERS,
 )
@@ -115,20 +116,20 @@ def _project_state_without_graph_trace(
     return state
 
 
-def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
-    agent_worker = context["agent_worker"]
-    autonomous_service = context["autonomous_service"]
-    dashboard_secret_values = context["dashboard_secret_values"]
-    meta_review_service = context["meta_review_service"]
-    orchestrator = context["orchestrator"]
-    pbi_creation_service = context["pbi_creation_service"]
-    require_mutation_access = context["require_mutation_access"]
-    require_project_access = context["require_project_access"]
-    scheduler = context["scheduler"]
-    scheduler_config = context["scheduler_config"]
-    workflow_service = context["workflow_service"]
-    graph_safety_service = context["graph_safety_service"]
-    require_dashboard_workflow_operator = context["require_dashboard_workflow_operator"]
+def register_routes(app: FastAPI, context: ApiRouteContext) -> None:
+    agent_worker = context.agent_worker
+    autonomous_service = context.autonomous_service
+    dashboard_secret_values = context.dashboard_secret_values
+    meta_review_service = context.meta_review_service
+    orchestrator = context.orchestrator
+    pbi_creation_service = context.pbi_creation_service
+    require_mutation_access = context.require_mutation_access
+    require_project_access = context.require_project_access
+    scheduler = context.scheduler
+    scheduler_config = context.scheduler_config
+    workflow_service = context.workflow_service
+    graph_safety_service = context.graph_safety_service
+    require_dashboard_workflow_operator = context.require_dashboard_workflow_operator
 
     @app.get("/projects/{project_id}")
     def project_state(  # pyright: ignore[reportUnusedFunction]
@@ -230,7 +231,7 @@ def register_routes(app: FastAPI, context: dict[str, Any]) -> None:
                     max_concurrency=request.max_concurrency,
                 )
             )
-            status = cast(dict[str, object], scheduler.status_for(project_id) or {})
+            status = scheduler.status_for(project_id) or {}
             result: dict[str, object] = {"scheduler": status}
             orchestrator.store.update_runtime_settings(
                 {

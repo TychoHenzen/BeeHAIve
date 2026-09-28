@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 from beehaiive import EnvironmentGitHubProvider, Orchestrator, OrchestratorStore
 from beehaiive.agent import (
@@ -9,6 +9,7 @@ from beehaiive.agent import (
     CodexExecModelExecutor,
 )
 from beehaiive.agent_stations import AgentStationService
+from beehaiive.api.context import ApiRuntime, ApiRuntimeOptions
 from beehaiive.api.helpers.configuration import (
     _configured_project_ids as _configured_project_ids,
 )
@@ -20,7 +21,7 @@ from beehaiive.autonomous import (
     bootstrap_automation_workflow,
 )
 from beehaiive.behavior_model import OllamaBehaviorModelClient
-from beehaiive.behavior_service import BehaviorService, TargetUnitWorld, UnitWorld
+from beehaiive.behavior_service import BehaviorService, TargetUnitWorld
 from beehaiive.building_signal import TargetBuildingSignalWorld
 from beehaiive.building_signal_service import BuildingSignalService
 from beehaiive.conflict_repair import ConflictRepairAgent, ConflictRepairService
@@ -39,31 +40,31 @@ from beehaiive.storage import (
 )
 
 
-def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
-    agent_worker = options["agent_worker"]
-    allowed_project_ids = options["allowed_project_ids"]
-    conflict_repair_service = options["conflict_repair_service"]
-    meta_review_service = options["meta_review_service"]
-    model_executor = options["model_executor"]
-    model_router = options["model_router"]
-    orchestrator = options["orchestrator"]
-    require_review_adapters = options["require_review_adapters"]
-    review_authorizer = options["review_authorizer"]
-    review_provider = options["review_provider"]
-    review_readers = options["review_readers"]
-    review_repair_service = options["review_repair_service"]
-    review_service = options["review_service"]
-    review_store = options["review_store"]
-    routing_store = options["routing_store"]
-    store = options["store"]
-    workflow_service = options["workflow_service"]
-    graph_safety_service = options["graph_safety_service"]
-    autonomous_service = options.get("autonomous_service")
-    behavior_service = options.get("behavior_service")
-    unit_world: UnitWorld | None = options.get("unit_world")
-    building_signal_service = options.get("building_signal_service")
-    building_signal_world = options.get("building_signal_world")
-    agent_station_service = options.get("agent_station_service")
+def build_api_runtime(options: ApiRuntimeOptions) -> ApiRuntime:
+    agent_worker = options.agent_worker
+    allowed_project_ids = options.allowed_project_ids
+    conflict_repair_service = options.conflict_repair_service
+    meta_review_service = options.meta_review_service
+    model_executor = options.model_executor
+    model_router = options.model_router
+    orchestrator = options.orchestrator
+    require_review_adapters = options.require_review_adapters
+    review_authorizer = options.review_authorizer
+    review_provider = options.review_provider
+    review_readers = options.review_readers
+    review_repair_service = options.review_repair_service
+    review_service = options.review_service
+    review_store = options.review_store
+    routing_store = options.routing_store
+    store = options.store
+    workflow_service = options.workflow_service
+    graph_safety_service = options.graph_safety_service
+    autonomous_service = options.autonomous_service
+    behavior_service = options.behavior_service
+    unit_world = options.unit_world
+    building_signal_service = options.building_signal_service
+    building_signal_world = options.building_signal_world
+    agent_station_service = options.agent_station_service
     owns_orchestrator = orchestrator is None
     if orchestrator is not None and orchestrator.model_router is not None:
         if model_router is not None and model_router is not orchestrator.model_router:
@@ -365,30 +366,30 @@ def build_api_runtime(options: dict[str, Any]) -> dict[str, Any]:
             allow_disabled=not scheduler_config.enabled,
             building_signal_poll=building_signal_service.poll,
         )
-    return {
-        "orchestrator": orchestrator,
-        "routing_service": routing_service,
-        "pbi_creation_service": pbi_creation_service,
-        "pbi_relations_service": pbi_relations_service,
-        "conflict_repair_service": conflict_repair_service,
-        "meta_review_service": meta_review_service,
-        "effective_executor": effective_executor,
-        "agent_worker": agent_worker,
-        "review_service": review_service,
-        "review_repair_service": review_repair_service,
-        "configured_projects": configured_projects,
-        "project_boundary": project_boundary,
-        "runtime_settings": persisted_settings,
-        "scheduler_config": scheduler_config,
-        "scheduler": scheduler,
-        "workflow_service": workflow_service,
-        "graph_safety_service": graph_safety_service,
-        "behavior_service": behavior_service,
-        "building_signal_service": building_signal_service,
-        "agent_station_service": agent_station_service,
-        "autonomous_service": autonomous_service,
-        "require_review_adapters": require_review_adapters,
-    }
+    return ApiRuntime(
+        orchestrator=orchestrator,
+        routing_service=routing_service,
+        pbi_creation_service=pbi_creation_service,
+        pbi_relations_service=pbi_relations_service,
+        conflict_repair_service=conflict_repair_service,
+        meta_review_service=meta_review_service,
+        effective_executor=effective_executor,
+        agent_worker=agent_worker,
+        review_service=review_service,
+        review_repair_service=review_repair_service,
+        configured_projects=configured_projects,
+        project_boundary=project_boundary,
+        runtime_settings=persisted_settings,
+        scheduler_config=scheduler_config,
+        scheduler=scheduler,
+        workflow_service=workflow_service,
+        graph_safety_service=graph_safety_service,
+        behavior_service=behavior_service,
+        building_signal_service=building_signal_service,
+        agent_station_service=agent_station_service,
+        autonomous_service=autonomous_service,
+        require_review_adapters=require_review_adapters,
+    )
 
 
 def _worker_host_slots(default: int) -> int:
