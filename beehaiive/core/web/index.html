@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>BeeHAIve Core</title>
+    <link rel="stylesheet" href="/web/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <h1>BeeHAIve</h1>
+      <p>read-only control surface</p>
+    </header>
+    <nav class="tabs" aria-label="Core sections">
+      <button class="tab active" data-tab="board" type="button">Board</button>
+      <button class="tab" data-tab="workflows" type="button">Workflows</button>
+      <button class="tab" data-tab="agents" type="button">Agents</button>
+      <button class="tab" data-tab="hive" type="button">Hive</button>
+    </nav>
+    <main>
+      <section class="panel active" data-panel="board" aria-labelledby="board-title">
+        <div class="panel-heading">
+          <div>
+            <h2 id="board-title">Project Board</h2>
+            <p id="snapshot-status">Loading the linked Project snapshot…</p>
+          </div>
+          <button id="refresh" type="button">Refresh</button>
+        </div>
+        <div id="board" class="board" aria-live="polite"></div>
+      </section>
+      <section class="panel" data-panel="workflows" aria-labelledby="workflows-title">
+        <h2 id="workflows-title">Workflows</h2>
+        <p>This tab is reserved for workflow definitions in the next core slice.</p>
+      </section>
+      <section class="panel" data-panel="agents" aria-labelledby="agents-title">
+        <h2 id="agents-title">Agents</h2>
+        <p>This tab is reserved for agent-runner state in the next core slice.</p>
+      </section>
+      <section class="panel" data-panel="hive" aria-labelledby="hive-title">
+        <h2 id="hive-title">Hive</h2>
+        <p>This tab is reserved for RTS observability in the next core slice.</p>
+      </section>
+    </main>
+    <script type="module" src="/web/app.js"></script>
+  </body>
+</html>

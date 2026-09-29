@@ -103,6 +103,18 @@ on an occupied port, and closes its server process tree when the launcher exits.
 Direct Uvicorn startup is supported only when the same variables are already
 present in the process environment.
 
+The new read-only core Board runs separately on port 8001. Configure
+`BEEHAIIVE_PROJECT_OWNER`, `BEEHAIIVE_PROJECT_OWNER_TYPE`, and
+`BEEHAIIVE_PROJECT_NUMBER`, then start it with:
+
+```powershell
+uv run python -m beehaiive.core
+```
+
+It reads Project status, issues, pull requests, and draft issues through the
+GitHub REST API and serves the Board at `http://127.0.0.1:8001/`. It does not
+write GitHub state or replace the legacy port-8000 service.
+
 Open the URLs printed by the launcher. Viewing and operating the dashboard uses the
 server-side `BEEHAIIVE_API_KEY`; the browser does not request, store, or display
 that value. Direct API clients still send it as `X-API-Key`.
