@@ -4,9 +4,10 @@ import sqlite3
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from threading import RLock
 from typing import Any
 from uuid import uuid4
+
+from beehaiive.sqlite_store_core import SQLiteStoreCoreMixin
 
 from .constants import DEFAULT_LEASE_TTL_SECONDS
 from .helpers import current_timestamp, lease_expiry
@@ -15,7 +16,7 @@ from .repair_status import RepairStatus
 from .workflow_error import WorkflowError
 
 
-class WorkflowStoreCoreMixin:
+class WorkflowStoreCoreMixin(SQLiteStoreCoreMixin):
     def __init__(
         self: Any,
         database: str | Path = ":memory:",
@@ -24,14 +25,7 @@ class WorkflowStoreCoreMixin:
         if lease_ttl_seconds <= 0:
             raise WorkflowError("Lease TTL must be positive")
         self._lease_ttl_seconds = lease_ttl_seconds
-        if database != ":memory:":
-            Path(database).parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(
-            str(database), check_same_thread=False, isolation_level=None
-        )
-        self._connection.row_factory = sqlite3.Row
-        self._lock = RLock()
-        self._initialize()
+        SQLiteStoreCoreMixin.__init__(self, database, self._initialize)
 
     @property
     def lease_heartbeat_seconds(self: Any) -> float:
@@ -45,17 +39,9 @@ class WorkflowStoreCoreMixin:
     def _transaction(
         self: Any, *, reclaim_expired: bool = True
     ) -> Generator[sqlite3.Connection]:
-        with self._lock:
-            self._connection.execute("BEGIN IMMEDIATE")
-            try:
-                if reclaim_expired:
-                    self._expire_active_leases(self._connection)
-                yield self._connection
-            except Exception:
-                self._connection.rollback()
-                raise
-            else:
-                self._connection.commit()
+        before_yield = self._expire_active_leases if reclaim_expired else None
+        with self._sqlite_transaction(before_yield=before_yield) as connection:
+            yield connection
 
     def _initialize(self: Any) -> None:
         with self._lock:

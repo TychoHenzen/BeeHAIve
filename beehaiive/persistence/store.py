@@ -4,7 +4,8 @@ import sqlite3
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from threading import RLock
+
+from beehaiive.sqlite_store_core import SQLiteStoreCoreMixin
 
 from .actions import ActionsMixin
 from .admission import AdmissionMixin
@@ -46,6 +47,7 @@ from .worker_hosts import WorkerHostsMixin
 
 
 class OrchestratorStore(
+    SQLiteStoreCoreMixin,
     AdmissionMixin,
     StorageSchemaMixin,
     StorageMigrationMixin,
@@ -99,40 +101,20 @@ class OrchestratorStore(
         ):
             raise ValueError("admission_capacity must be a positive integer")
         self._admission_capacity = admission_capacity
-        if database != ":memory:":
-            Path(database).parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(
-            str(database),
-            check_same_thread=False,
-            isolation_level=None,
-        )
-        self._connection.row_factory = sqlite3.Row
-        self._lock = RLock()
-        try:
-            self._initialize()
-            self._initialize_admission()
-            if self._admission_capacity is not None:
-                self.recover_expired_admissions()
-        except Exception:
-            self._connection.close()
-            raise
+        SQLiteStoreCoreMixin.__init__(self, database, self._initialize_store)
 
-    def close(self) -> None:
-        with self._lock:
-            self._connection.close()
+    def _initialize_store(self) -> None:
+        self._initialize()
+        self._initialize_admission()
+        if self._admission_capacity is not None:
+            self.recover_expired_admissions()
 
     @contextmanager
     def _transaction(self) -> Generator[sqlite3.Connection]:
-        with self._lock:
-            self._connection.execute("BEGIN IMMEDIATE")
-            try:
-                self._check_admission_configuration(self._connection)
-                yield self._connection
-            except Exception:
-                self._connection.rollback()
-                raise
-            else:
-                self._connection.commit()
+        with self._sqlite_transaction(
+            before_yield=self._check_admission_configuration
+        ) as connection:
+            yield connection
 
     def _initialize(self) -> None:
         with self._lock:

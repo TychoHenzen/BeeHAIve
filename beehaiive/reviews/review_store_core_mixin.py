@@ -4,39 +4,22 @@ import sqlite3
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from threading import RLock
 from typing import Any
+
+from beehaiive.sqlite_store_core import SQLiteStoreCoreMixin
 
 from .helpers import finding_fingerprint
 from .review_concern import ReviewConcern
 
 
-class ReviewStoreCoreMixin:
+class ReviewStoreCoreMixin(SQLiteStoreCoreMixin):
     def __init__(self: Any, database: str | Path = ":memory:") -> None:
-        if database != ":memory:":
-            Path(database).parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(
-            str(database), check_same_thread=False, isolation_level=None
-        )
-        self._connection.row_factory = sqlite3.Row
-        self._lock = RLock()
-        self._initialize()
-
-    def close(self: Any) -> None:
-        with self._lock:
-            self._connection.close()
+        SQLiteStoreCoreMixin.__init__(self, database, self._initialize)
 
     @contextmanager
     def transaction(self: Any) -> Generator[sqlite3.Connection]:
-        with self._lock:
-            self._connection.execute("BEGIN IMMEDIATE")
-            try:
-                yield self._connection
-            except Exception:
-                self._connection.rollback()
-                raise
-            else:
-                self._connection.commit()
+        with self._sqlite_transaction() as connection:
+            yield connection
 
     def _initialize(self: Any) -> None:
         with self._lock:
