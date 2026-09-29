@@ -99,9 +99,11 @@ def create_app(
         agent_station_service=agent_station_service,
     )
     runtime = build_api_runtime(runtime_options)
-    app = FastAPI(title="BeeHAIve")
+    app = FastAPI(
+        title="BeeHAIve",
+        lifespan=register_background_handlers(runtime),
+    )
     register_error_handlers(app)
-    register_background_handlers(app, runtime)
     dependencies = build_route_dependencies(
         runtime, api_key, review_actor, workflow_actor
     )
