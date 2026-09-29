@@ -11,6 +11,7 @@ let cursor = "";
 let pollHandle = null;
 let forcedReducedMotion = null;
 const previousPositions = new Map();
+const mapView = { scale: 1, x: 0, y: 0, width: 0, height: 0 };
 
 export function interpolatePosition(start, end, progress) {
   const amount = Math.max(0, Math.min(1, Number(progress)));
@@ -57,6 +58,66 @@ export function regionSize(region) {
   };
 }
 
+function mapViewBox(width, height) {
+  const visibleWidth = width / mapView.scale;
+  const visibleHeight = height / mapView.scale;
+  mapView.x = Math.max(0, Math.min(mapView.x, width - visibleWidth));
+  mapView.y = Math.max(0, Math.min(mapView.y, height - visibleHeight));
+  return `${mapView.x} ${mapView.y} ${visibleWidth} ${visibleHeight}`;
+}
+
+function bindMapViewport(svg, width, height) {
+  const controls = dom.createElement("div");
+  controls.className = "hive-map-controls";
+  const addControl = (label, action) => {
+    const button = dom.createElement("button");
+    button.type = "button";
+    button.setAttribute("aria-label", label);
+    button.textContent = label;
+    button.addEventListener("click", action);
+    controls.append(button);
+  };
+  const update = () => svg.setAttribute("viewBox", mapViewBox(width, height));
+  const zoom = (factor) => {
+    mapView.scale = Math.max(0.75, Math.min(3, mapView.scale * factor));
+    update();
+  };
+  addControl("Zoom in", () => zoom(1.2));
+  addControl("Zoom out", () => zoom(1 / 1.2));
+  addControl("Reset view", () => {
+    mapView.scale = 1;
+    mapView.x = 0;
+    mapView.y = 0;
+    update();
+  });
+  let drag = null;
+  svg.addEventListener("wheel", (event) => {
+    event.preventDefault();
+    zoom(event.deltaY < 0 ? 1.15 : 1 / 1.15);
+  });
+  svg.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    drag = { x: event.clientX, y: event.clientY };
+    svg.setPointerCapture?.(event.pointerId);
+    svg.classList.add("panning");
+  });
+  svg.addEventListener("pointermove", (event) => {
+    if (!drag) return;
+    const bounds = svg.getBoundingClientRect();
+    mapView.x -= (event.clientX - drag.x) / bounds.width * (width / mapView.scale);
+    mapView.y -= (event.clientY - drag.y) / bounds.height * (height / mapView.scale);
+    drag = { x: event.clientX, y: event.clientY };
+    update();
+  });
+  const stopDragging = () => {
+    drag = null;
+    svg.classList.remove("panning");
+  };
+  svg.addEventListener("pointerup", stopDragging);
+  svg.addEventListener("pointercancel", stopDragging);
+  return controls;
+}
+
 function animateUnit(element, start, end) {
   if (reducedMotion() || !start || !end || typeof requestAnimationFrame !== "function") {
     element.setAttribute("transform", `translate(${end.x} ${end.y})`);
@@ -85,7 +146,16 @@ function renderMap(value) {
     width = Math.max(width, size.width);
     height += size.height + 58;
   }
-  const svg = svgElement("svg", { viewBox: `0 0 ${width} ${Math.max(height, 220)}`, role: "img" });
+  const mapHeight = Math.max(height, 220);
+  if (mapView.width !== width || mapView.height !== mapHeight) {
+    mapView.scale = 1;
+    mapView.x = 0;
+    mapView.y = 0;
+    mapView.width = width;
+    mapView.height = mapHeight;
+  }
+  const svg = svgElement("svg", { viewBox: mapViewBox(width, mapHeight), role: "img" });
+  const controls = bindMapViewport(svg, width, mapHeight);
   for (const region of regions) {
     const offset = regionOffsets.get(`${region.workflow_id}:${region.revision}`) || 30;
     const group = svgElement("g");
@@ -174,7 +244,7 @@ function renderMap(value) {
     animateUnit(group, previousPositions.get(unit.agent_id), destination);
     previousPositions.set(unit.agent_id, destination);
   }
-  map.append(svg);
+  map.append(controls, svg);
 }
 
 function appendField(container, label, value) {

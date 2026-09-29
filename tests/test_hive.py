@@ -373,9 +373,17 @@ def test_hive_http_events_cursor_and_acknowledgement(tmp_path: Path) -> None:
         events = client.get("/api/hive/events?since=0")
         cursor = events.json()["cursor"]
         replay = client.get("/api/hive/events", params={"since": cursor})
+        forged = client.post(
+            f"/api/passes/{alert_pass_id}/acknowledge",
+            json={"acknowledged_by": "forged"},
+        )
+        no_alert = client.post(
+            "/api/passes/finished-2/acknowledge",
+            json={"acknowledged_by": "operator"},
+        )
         acknowledged = client.post(
             f"/api/passes/{alert_pass_id}/acknowledge",
-            json={"acknowledged_by": "operator@example.test"},
+            json={"acknowledged_by": "operator"},
         )
         after_ack = client.get("/api/hive")
         page = client.get("/")
@@ -388,8 +396,10 @@ def test_hive_http_events_cursor_and_acknowledgement(tmp_path: Path) -> None:
     assert events.status_code == 200
     assert events.json()["events"]
     assert replay.json()["events"] == []
+    assert forged.status_code == 403
+    assert no_alert.status_code == 409
     assert acknowledged.status_code == 200
-    assert acknowledged.json()["acknowledged_by"] == "operator@example.test"
+    assert acknowledged.json()["acknowledged_by"] == "operator"
     assert after_ack.json()["alerts"] == []
     assert page.status_code == 200
     assert 'id="hive-map"' in page.text
@@ -399,5 +409,5 @@ def test_hive_http_events_cursor_and_acknowledgement(tmp_path: Path) -> None:
         value for value in history.json()["passes"] if value["id"] == alert_pass_id
     )
     assert acknowledged_pass["acknowledged_at"]
-    assert acknowledged_pass["acknowledged_by"] == "operator@example.test"
+    assert acknowledged_pass["acknowledged_by"] == "operator"
     database.close()

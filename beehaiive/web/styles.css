@@ -335,11 +335,34 @@ input, select, textarea {
   min-height: 32rem;
   overflow: auto;
   padding: 0.5rem;
+  position: relative;
+}
+
+.hive-map-controls {
+  display: flex;
+  gap: 0.35rem;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.hive-map-controls button {
+  background: #172238;
+  border: 1px solid #496080;
+  border-radius: 0.3rem;
+  color: #d9e8ff;
+  cursor: pointer;
+  padding: 0.3rem 0.5rem;
 }
 
 .hive-map svg {
   display: block;
   min-width: 42rem;
+  touch-action: none;
+}
+
+.hive-map svg.panning {
+  cursor: grabbing;
 }
 
 .hive-map text {

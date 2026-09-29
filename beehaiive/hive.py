@@ -14,6 +14,10 @@ from .models import ProjectCard, ProjectSnapshot
 _ALERT_KINDS = frozenset({"blocked", "escalated", "interrupted", "stalled"})
 
 
+class HiveAcknowledgementConflict(ValueError):
+    pass
+
+
 def _json_object(value: Any) -> dict[str, Any]:
     try:
         parsed = json.loads(str(value))
@@ -193,6 +197,17 @@ class HiveProjection:
             if row is None:
                 return None
             if row["acknowledged_at"] is None:
+                active_alert = connection.execute(
+                    "SELECT 1 FROM agent_alerts WHERE pass_id = ? "
+                    "AND kind IN ('blocked', 'escalated', 'interrupted', 'stalled') "
+                    "UNION ALL SELECT 1 FROM agent_passes WHERE id = ? "
+                    "AND status IN ('interrupted', 'stalled') "
+                    "UNION ALL SELECT 1 FROM agent_steps WHERE pass_id = ? "
+                    "AND outcome = 'blocked' LIMIT 1",
+                    (pass_id, pass_id, pass_id),
+                ).fetchone()
+                if active_alert is None:
+                    raise HiveAcknowledgementConflict("pass has no active alert")
                 connection.execute(
                     "UPDATE agent_passes SET acknowledged_at = ?, acknowledged_by = ? "
                     "WHERE id = ?",

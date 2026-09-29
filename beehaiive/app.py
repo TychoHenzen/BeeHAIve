@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from .agents import AgentConflict, AgentError, AgentService, item_key
 from .config import CoreConfig, CoreConfigurationError
 from .database import SnapshotDatabase
-from .hive import HiveProjection
+from .hive import HiveAcknowledgementConflict, HiveProjection
 from .project import ProjectDataError, ProjectProvider
 from .rest import GithubRestError
 from .snapshot import ProjectSnapshotService
@@ -190,9 +190,18 @@ def create_app(
         pass_id: str, body: dict[str, Any] | None = None
     ) -> dict[str, str]:
         acknowledged_by = "operator"
-        if body is not None and body.get("acknowledged_by") is not None:
-            acknowledged_by = str(body["acknowledged_by"])
-        result = resolved_hive.acknowledge(pass_id, acknowledged_by)
+        if (
+            body is not None
+            and body.get("acknowledged_by") is not None
+            and body["acknowledged_by"] != acknowledged_by
+        ):
+            raise HTTPException(
+                status_code=403, detail="operator acknowledgement required"
+            )
+        try:
+            result = resolved_hive.acknowledge(pass_id, acknowledged_by)
+        except HiveAcknowledgementConflict as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         if result is None:
             raise HTTPException(status_code=404, detail="pass not found")
         return result
