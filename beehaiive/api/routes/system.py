@@ -1,11 +1,11 @@
 import os
 import re
-from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 
 from beehaiive.api.context import ApiRouteContext
+from beehaiive.api.helpers.assets import docs_asset
 from beehaiive.api.helpers.http import _handle_store_error as _handle_store_error
 from beehaiive.api.models import (
     DashboardSettingsRequest as DashboardSettingsRequest,
@@ -24,7 +24,6 @@ def register_routes(app: FastAPI, context: ApiRouteContext) -> None:
     project_boundary = context.project_boundary
     scheduler = context.scheduler
     runtime_settings = context.runtime_settings
-    docs_directory = Path(__file__).resolve().parents[3] / "docs"
     dashboard_view_modules = {
         "actions",
         "details",
@@ -73,10 +72,7 @@ def register_routes(app: FastAPI, context: ApiRouteContext) -> None:
 
     @app.get("/dashboard", response_class=FileResponse)
     def dashboard() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
-        return FileResponse(
-            docs_directory / "dashboard.html",
-            media_type="text/html",
-        )
+        return docs_asset("dashboard.html", media_type="text/html")
 
     @app.get("/dashboard/config")
     def dashboard_config() -> dict[str, object]:
@@ -174,31 +170,19 @@ def register_routes(app: FastAPI, context: ApiRouteContext) -> None:
 
     @app.get("/dashboard.js", response_class=FileResponse)
     def dashboard_script() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
-        return FileResponse(
-            docs_directory / "dashboard.js",
-            media_type="application/javascript",
-        )
+        return docs_asset("dashboard.js", media_type="application/javascript")
 
     @app.get("/dashboard-client.mjs", response_class=FileResponse)
     def dashboard_client_script() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
-        return FileResponse(
-            docs_directory / "dashboard-client.mjs",
-            media_type="application/javascript",
-        )
+        return docs_asset("dashboard-client.mjs", media_type="application/javascript")
 
     @app.get("/dashboard-ui.mjs", response_class=FileResponse)
     def dashboard_ui_module() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
-        return FileResponse(
-            docs_directory / "dashboard-ui.mjs",
-            media_type="application/javascript",
-        )
+        return docs_asset("dashboard-ui.mjs", media_type="application/javascript")
 
     @app.get("/dashboard-view.mjs", response_class=FileResponse)
     def dashboard_view_script() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
-        return FileResponse(
-            docs_directory / "dashboard-view.mjs",
-            media_type="application/javascript",
-        )
+        return docs_asset("dashboard-view.mjs", media_type="application/javascript")
 
     @app.get("/dashboard-view/{module}.mjs", response_class=FileResponse)
     def dashboard_view_module(module: str) -> FileResponse:  # pyright: ignore[reportUnusedFunction]
@@ -206,9 +190,8 @@ def register_routes(app: FastAPI, context: ApiRouteContext) -> None:
             raise HTTPException(
                 status_code=404, detail="Dashboard view module not found"
             )
-        return FileResponse(
-            docs_directory / "dashboard-view" / f"{module}.mjs",
-            media_type="application/javascript",
+        return docs_asset(
+            f"dashboard-view/{module}.mjs", media_type="application/javascript"
         )
 
     @app.post("/projects/{project_id}/sync")

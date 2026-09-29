@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 
 from beehaiive.api.context import ApiRouteContext
+from beehaiive.api.helpers.assets import docs_asset
+from beehaiive.api.helpers.service_errors import (
+    ServiceErrorPolicy,
+    service_error_http_exception,
+)
 from beehaiive.api.models import (
     BuildingSignalAssignmentRequest,
     BuildingSignalGenerateRequest,
@@ -13,21 +16,29 @@ from beehaiive.api.models import (
 )
 from beehaiive.building_signal import BuildingSignalServiceError
 from beehaiive.building_signal_service import BuildingSignalService
-from beehaiive.contract_types.validation import _redact_text
 from beehaiive.service_failures import FailureCategory
+
+_ERROR_POLICY = ServiceErrorPolicy(
+    unavailable_categories=frozenset(
+        {
+            FailureCategory.MODEL.value,
+            FailureCategory.TARGET_PROVIDER.value,
+            FailureCategory.PERSISTENCE.value,
+        }
+    ),
+    unavailable_codes=frozenset({"model_unavailable"}),
+    conflict_codes=frozenset({"conflict", "invalid_state", "persistence"}),
+)
 
 
 def register_routes(app: FastAPI, context: ApiRouteContext) -> None:
     service: BuildingSignalService = context.building_signal_service
     require_project_access = context.require_project_access
     require_dashboard_workflow_operator = context.require_dashboard_workflow_operator
-    docs_directory = Path(__file__).resolve().parents[3] / "docs"
 
     @app.get("/building-signal-design", response_class=FileResponse)
     def building_signal_design() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
-        return FileResponse(
-            docs_directory / "building-signal.html", media_type="text/html"
-        )
+        return docs_asset("building-signal.html", media_type="text/html")
 
     @app.get("/projects/{project_id}/building-signals")
     def building_signal_list(
@@ -129,31 +140,7 @@ def register_routes(app: FastAPI, context: ApiRouteContext) -> None:
 
 
 def _http_error(error: BuildingSignalServiceError) -> HTTPException:
-    if error.code == "not_found":
-        status = 404
-    elif (
-        getattr(error, "category", None)
-        in {
-            FailureCategory.MODEL.value,
-            FailureCategory.TARGET_PROVIDER.value,
-            FailureCategory.PERSISTENCE.value,
-        }
-        or error.code == "model_unavailable"
-    ):
-        status = 503
-    elif error.code in {"conflict", "invalid_state", "persistence"}:
-        status = 409
-    else:
-        status = 422
-    category = error.category
-    return HTTPException(
-        status_code=status,
-        detail={
-            "code": error.code,
-            "failure_class": category,
-            "message": _redact_text(str(error), 512),
-        },
-    )
+    return service_error_http_exception(error, _ERROR_POLICY)
 
 
 __all__ = ["register_routes"]

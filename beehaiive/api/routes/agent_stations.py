@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import cast
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -8,8 +7,21 @@ from fastapi.responses import FileResponse
 
 from beehaiive.agent_stations import AgentStationService, AgentStationServiceError
 from beehaiive.api.context import ApiRouteContext
+from beehaiive.api.helpers.assets import docs_asset
+from beehaiive.api.helpers.service_errors import (
+    ServiceErrorPolicy,
+    service_error_http_exception,
+)
 from beehaiive.api.models import StationIssueActionRequest
 from beehaiive.dashboard.values import safe_dashboard_value
+
+_ERROR_POLICY = ServiceErrorPolicy(
+    conflict_codes=frozenset({"persistence"}),
+    invalid_codes=frozenset({"invalid_action"}),
+    default_status=400,
+    classified_detail=False,
+    redact_message=False,
+)
 
 
 def register_routes(app: FastAPI, context: ApiRouteContext) -> None:
@@ -17,19 +29,14 @@ def register_routes(app: FastAPI, context: ApiRouteContext) -> None:
     require_project_access = context.require_project_access
     require_dashboard_workflow_operator = context.require_dashboard_workflow_operator
     secret_values = context.dashboard_secret_values
-    docs_directory = Path(__file__).resolve().parents[3] / "docs"
 
     @app.get("/agent-stations", response_class=FileResponse)
     def agent_stations_page() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
-        return FileResponse(
-            docs_directory / "agent-stations.html", media_type="text/html"
-        )
+        return docs_asset("agent-stations.html", media_type="text/html")
 
     @app.get("/agent-stations.js", response_class=FileResponse)
     def agent_stations_script() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
-        return FileResponse(
-            docs_directory / "agent-stations.js", media_type="application/javascript"
-        )
+        return docs_asset("agent-stations.js", media_type="application/javascript")
 
     @app.get("/projects/{project_id}/agent-stations")
     def agent_stations(
@@ -60,15 +67,7 @@ def register_routes(app: FastAPI, context: ApiRouteContext) -> None:
 
 
 def _http_error(error: AgentStationServiceError) -> HTTPException:
-    if error.code == "not_found":
-        status = 404
-    elif error.code == "persistence":
-        status = 409
-    elif error.code == "invalid_action":
-        status = 422
-    else:
-        status = 400
-    return HTTPException(status_code=status, detail=str(error))
+    return service_error_http_exception(error, _ERROR_POLICY)
 
 
 __all__ = ["register_routes"]
