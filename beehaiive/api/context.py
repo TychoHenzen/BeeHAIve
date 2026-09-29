@@ -10,9 +10,6 @@ from beehaiive import Orchestrator, OrchestratorStore
 from beehaiive.agent import AgentWorkerManager
 from beehaiive.agent_stations import AgentStationService
 from beehaiive.autonomous import AutonomousLifecycleService
-from beehaiive.behavior_service import BehaviorService, UnitWorld
-from beehaiive.building_signal import BuildingSignalWorld
-from beehaiive.building_signal_service import BuildingSignalService
 from beehaiive.conflict_repair import ConflictRepairService
 from beehaiive.graph_safety import GraphSafetyService
 from beehaiive.meta_review import MetaReviewService
@@ -70,10 +67,6 @@ class ApiRuntimeOptions:
     workflow_service: WorkflowService | None = None
     graph_safety_service: GraphSafetyService | None = None
     autonomous_service: AutonomousLifecycleService | None = None
-    behavior_service: BehaviorService | None = None
-    unit_world: UnitWorld | None = None
-    building_signal_service: BuildingSignalService | None = None
-    building_signal_world: BuildingSignalWorld | None = None
     agent_station_service: AgentStationService | None = None
 
 
@@ -96,8 +89,6 @@ class ApiRuntime:
     scheduler: AgentScheduler | None
     workflow_service: WorkflowService | None
     graph_safety_service: GraphSafetyService
-    behavior_service: BehaviorService
-    building_signal_service: BuildingSignalService
     agent_station_service: AgentStationService
     autonomous_service: AutonomousLifecycleService
     require_review_adapters: bool
@@ -142,8 +133,6 @@ class ApiRouteContext:
     scheduler: AgentScheduler | None
     workflow_service: WorkflowService | None
     graph_safety_service: GraphSafetyService
-    behavior_service: BehaviorService
-    building_signal_service: BuildingSignalService
     agent_station_service: AgentStationService
     autonomous_service: AutonomousLifecycleService
     refinement_path: str
@@ -185,8 +174,6 @@ class ApiRouteContext:
             scheduler=runtime.scheduler,
             workflow_service=runtime.workflow_service,
             graph_safety_service=runtime.graph_safety_service,
-            behavior_service=runtime.behavior_service,
-            building_signal_service=runtime.building_signal_service,
             agent_station_service=runtime.agent_station_service,
             autonomous_service=runtime.autonomous_service,
             refinement_path=dependencies.refinement_path,

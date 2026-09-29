@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from threading import Event, Lock, Thread
 from typing import cast
@@ -58,7 +58,6 @@ class AgentScheduler:
         allow_disabled: bool = False,
         budget_adapter: BudgetAdapter | None = None,
         budget_policy: BudgetPolicy | None = None,
-        building_signal_poll: Callable[[Collection[str]], object] | None = None,
     ) -> None:
         self.orchestrator = orchestrator
         self.worker = worker
@@ -77,7 +76,6 @@ class AgentScheduler:
         self.autonomous_active_count = autonomous_active_count
         self.budget_adapter = budget_adapter
         self.budget_policy = budget_policy or BudgetPolicy()
-        self.building_signal_poll = building_signal_poll
         self._stop_event = Event()
         self._thread_lock = Lock()
         self._state_lock = Lock()
@@ -145,11 +143,6 @@ class AgentScheduler:
         errors: list[str] = []
         started_by_project: dict[str, list[str]] = {}
         budget_by_project: dict[str, dict[str, object]] = {}
-        if self.building_signal_poll is not None:
-            try:
-                self.building_signal_poll(self.project_ids)
-            except Exception as exc:
-                errors.append(f"building signals: {self._error_summary(exc)}")
         try:
             self.worker.recover(self.project_ids)
         except Exception as exc:

@@ -155,6 +155,24 @@ def test_storage_migrates_legacy_columns(tmp_path: Path) -> None:
             pbi_number INTEGER, branch TEXT, pull_request_url TEXT,
             pull_request_number INTEGER, created_at TEXT
         );
+        CREATE TABLE unit_behaviors(
+            behavior_id TEXT PRIMARY KEY, project_id TEXT, status TEXT,
+            definition_json TEXT, bindings_json TEXT, assignment_json TEXT,
+            execution_json TEXT, created_at TEXT, updated_at TEXT
+        );
+        CREATE INDEX unit_behaviors_by_project
+            ON unit_behaviors(project_id, created_at, behavior_id);
+        CREATE TABLE building_signal_rules(
+            rule_id TEXT PRIMARY KEY, project_id TEXT, status TEXT,
+            rule_json TEXT, assignment_json TEXT, signal_state_json TEXT,
+            created_at TEXT, updated_at TEXT
+        );
+        CREATE INDEX building_signal_rules_by_project
+            ON building_signal_rules(project_id, created_at, rule_id);
+        CREATE UNIQUE INDEX building_signal_assigned_building
+            ON building_signal_rules(
+                project_id, json_extract(assignment_json, '$.building_id')
+            );
         """
     )
     connection.close()
@@ -191,6 +209,19 @@ def test_storage_migrates_legacy_columns(tmp_path: Path) -> None:
         "graph_transition_claims",
         "budget_decision_evidence",
     } <= tables
+    assert "unit_behaviors" not in tables
+    assert "building_signal_rules" not in tables
+    indexes = {
+        str(row[0])
+        for row in store._connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index'"
+        )
+    }
+    assert {
+        "unit_behaviors_by_project",
+        "building_signal_rules_by_project",
+        "building_signal_assigned_building",
+    }.isdisjoint(indexes)
     assert {
         "canonical_state",
         "canonical_facts_json",
