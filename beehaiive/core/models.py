@@ -14,9 +14,10 @@ class ProjectCard:
     state: str | None
     labels: tuple[str, ...]
     linked_issue_numbers: tuple[int, ...]
+    item_key: str | None = None
 
-    def as_dict(self) -> dict[str, object]:
-        return {
+    def as_dict(self, *, include_item_key: bool = False) -> dict[str, object]:
+        value: dict[str, object] = {
             "type": self.type,
             "repository": self.repository,
             "number": self.number,
@@ -26,6 +27,9 @@ class ProjectCard:
             "labels": list(self.labels),
             "linked_issue_numbers": list(self.linked_issue_numbers),
         }
+        if include_item_key and self.item_key is not None:
+            value["item_key"] = self.item_key
+        return value
 
 
 @dataclass(frozen=True)
@@ -33,10 +37,12 @@ class ProjectColumn:
     status: str
     items: tuple[ProjectCard, ...]
 
-    def as_dict(self) -> dict[str, object]:
+    def as_dict(self, *, include_item_keys: bool = False) -> dict[str, object]:
         return {
             "status": self.status,
-            "items": [item.as_dict() for item in self.items],
+            "items": [
+                item.as_dict(include_item_key=include_item_keys) for item in self.items
+            ],
         }
 
 
@@ -46,11 +52,14 @@ class ProjectSnapshot:
     rate_limited_until: str | None
     columns: tuple[ProjectColumn, ...]
 
-    def as_dict(self) -> dict[str, object]:
+    def as_dict(self, *, include_item_keys: bool = False) -> dict[str, object]:
         return {
             "fetched_at": self.fetched_at,
             "rate_limited_until": self.rate_limited_until,
-            "columns": [column.as_dict() for column in self.columns],
+            "columns": [
+                column.as_dict(include_item_keys=include_item_keys)
+                for column in self.columns
+            ],
         }
 
     @classmethod
@@ -81,6 +90,7 @@ class ProjectSnapshot:
                         linked_issue_numbers=tuple(
                             int(number) for number in linked if _is_int(number)
                         ),
+                        item_key=_optional_string(raw_item.get("item_key")),
                     )
                 )
             columns.append(

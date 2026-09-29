@@ -48,6 +48,80 @@ def _migration_two(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migration_three(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS agents (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            workflow_id INTEGER NOT NULL,
+            workflow_revision INTEGER NOT NULL,
+            parameters_json TEXT NOT NULL,
+            repository TEXT NOT NULL,
+            checkout_path TEXT NOT NULL,
+            model TEXT,
+            status TEXT NOT NULL,
+            current_state TEXT,
+            current_pass_id TEXT,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (workflow_id) REFERENCES workflows(id)
+        );
+        CREATE TABLE IF NOT EXISTS agent_passes (
+            id TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL,
+            item_key TEXT NOT NULL,
+            item_json TEXT NOT NULL,
+            workflow_id INTEGER NOT NULL,
+            workflow_revision INTEGER NOT NULL,
+            current_state TEXT NOT NULL,
+            status TEXT NOT NULL,
+            step_count INTEGER NOT NULL DEFAULT 0,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            stalled_reason TEXT,
+            FOREIGN KEY (agent_id) REFERENCES agents(id)
+        );
+        CREATE TABLE IF NOT EXISTS agent_claims (
+            item_key TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL UNIQUE,
+            pass_id TEXT NOT NULL UNIQUE,
+            claimed_at TEXT NOT NULL,
+            FOREIGN KEY (agent_id) REFERENCES agents(id),
+            FOREIGN KEY (pass_id) REFERENCES agent_passes(id)
+        );
+        CREATE TABLE IF NOT EXISTS agent_steps (
+            pass_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            state_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            status TEXT NOT NULL,
+            outcome TEXT,
+            summary TEXT NOT NULL DEFAULT '',
+            handover_json TEXT NOT NULL DEFAULT '{}',
+            command_json TEXT NOT NULL DEFAULT '[]',
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            exit_code INTEGER,
+            log_path TEXT,
+            PRIMARY KEY (pass_id, sequence),
+            FOREIGN KEY (pass_id) REFERENCES agent_passes(id)
+        );
+        CREATE TABLE IF NOT EXISTS agent_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_id TEXT NOT NULL,
+            pass_id TEXT,
+            sequence INTEGER,
+            kind TEXT NOT NULL,
+            message TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (agent_id) REFERENCES agents(id)
+        );
+        """
+    )
+
+
 def _migration_one(connection: sqlite3.Connection) -> None:
     connection.executescript(
         """
@@ -65,7 +139,11 @@ def _migration_one(connection: sqlite3.Connection) -> None:
     )
 
 
-MIGRATIONS: tuple[Migration, ...] = (_migration_one, _migration_two)
+MIGRATIONS: tuple[Migration, ...] = (
+    _migration_one,
+    _migration_two,
+    _migration_three,
+)
 
 
 class SnapshotDatabase:
@@ -156,7 +234,12 @@ class SnapshotDatabase:
                 VALUES (1, ?)
                 ON CONFLICT(id) DO UPDATE SET payload = excluded.payload
                 """,
-                (json.dumps(snapshot.as_dict(), separators=(",", ":")),),
+                (
+                    json.dumps(
+                        snapshot.as_dict(include_item_keys=True),
+                        separators=(",", ":"),
+                    ),
+                ),
             )
 
     def close(self) -> None:

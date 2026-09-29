@@ -113,6 +113,38 @@ main {
   padding-top: 0.5rem;
 }
 
+.agent-list {
+  display: grid;
+  gap: 0.8rem;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+
+.agent-card {
+  background: #171e2b;
+  border: 1px solid #2e3a4f;
+  border-radius: 0.6rem;
+  display: grid;
+  gap: 0.6rem;
+  padding: 0.8rem;
+}
+
+.agent-card pre {
+  margin: 0;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+.agent-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.agent-status {
+  color: #a6b1c2;
+  min-height: 1.4rem;
+}
+
 .workflow-actions, .workflow-toolbar {
   align-items: center;
   display: flex;

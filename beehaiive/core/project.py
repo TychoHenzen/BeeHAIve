@@ -151,6 +151,23 @@ def _normalise_item(item: Mapping[str, Any]) -> ProjectCard | None:
     body = _text(content.get("body"))
     labels = _labels(content.get("labels"))
     linked = parse_closing_issue_numbers(body) if type_name == "PullRequest" else ()
+    item_key = _optional_text(
+        item.get("id")
+        or item.get("item_id")
+        or content.get("id")
+        or content.get("node_id")
+    )
+    if item_key is None:
+        item_key = ":".join(
+            value
+            for value in (
+                type_name,
+                repository or "",
+                str(number) if number is not None else "",
+                _optional_text(content.get("html_url") or content.get("url")) or "",
+            )
+            if value
+        )
     return ProjectCard(
         type=type_name,
         repository=None if type_name == "DraftIssue" else repository,
@@ -160,6 +177,7 @@ def _normalise_item(item: Mapping[str, Any]) -> ProjectCard | None:
         state=_optional_text(content.get("state")),
         labels=labels,
         linked_issue_numbers=linked,
+        item_key=item_key,
     )
 
 

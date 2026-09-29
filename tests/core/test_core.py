@@ -296,7 +296,8 @@ def test_cursor_pagination_and_read_only_api() -> None:
     assert all(label in page.text for label in ("Board", "Workflows", "Agents", "Hive"))
     assert script.status_code == 200
     assert "fetch" in script.text
-    assert "held by agent X" in script.text
+    assert "held by agent X" not in script.text
+    assert "unclaimed" in script.text
     assert 'load("/api/project/refresh", "POST")' in script.text
     assert set(app.openapi()["paths"]["/api/project"]) == {"get"}
     assert set(app.openapi()["paths"]["/api/project/refresh"]) == {"post"}
@@ -483,7 +484,7 @@ def test_database_persists_schema_and_snapshot(tmp_path: Path) -> None:
     assert second.load_snapshot() is not None
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT version FROM schema_version").fetchone() == (
-            2,
+            3,
         )
     second.close()
 

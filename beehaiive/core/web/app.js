@@ -10,6 +10,8 @@ const workflowCanvas = document.querySelector("#workflow-canvas");
 const workflowJson = document.querySelector("#workflow-json");
 const workflowErrors = document.querySelector("#workflow-errors");
 const workflowSave = document.querySelector("#workflow-save");
+const agentList = document.querySelector("#agent-list");
+const agentsStatus = document.querySelector("#agents-status");
 let currentWorkflowId = null;
 let currentDefinition = null;
 let validationRevision = 0;
@@ -48,7 +50,7 @@ function render(snapshot) {
       labels.textContent = (item.labels ?? []).join(" · ");
       const holder = document.createElement("p");
       holder.className = "card-holder";
-      holder.textContent = "held by agent X";
+      holder.textContent = item.holder?.name ? `held by ${item.holder.name}` : "unclaimed";
       card.append(meta, title, labels, holder);
       columnElement.append(card);
     }
@@ -598,6 +600,89 @@ async function loadWorkflows() {
   }
 }
 
+function renderAgents(payload) {
+  agentList.replaceChildren();
+  const agents = payload.agents ?? [];
+  if (!agents.length) {
+    agentList.textContent = "No assigned agents.";
+    return;
+  }
+  for (const agent of agents) {
+    const card = document.createElement("article");
+    card.className = `agent-card agent-${text(agent.status)}`;
+    const title = document.createElement("h3");
+    title.textContent = `${text(agent.name)} · ${text(agent.status)}`;
+    const detail = document.createElement("p");
+    const held = agent.current_pass?.item?.title ? ` · ${agent.current_pass.item.title}` : "";
+    detail.textContent = `${text(agent.repository)} · workflow ${text(agent.workflow_id)} r${text(agent.workflow_revision)}${held}`;
+    const actions = document.createElement("div");
+    actions.className = "agent-actions";
+    const start = document.createElement("button");
+    start.type = "button";
+    start.textContent = "Start";
+    start.disabled = ["working", "stalled"].includes(agent.status);
+    start.addEventListener("click", () => agentRequest(`/api/agents/${agent.id}/start`));
+    const stop = document.createElement("button");
+    stop.type = "button";
+    stop.textContent = "Stop";
+    stop.disabled = agent.status === "stopped";
+    stop.addEventListener("click", () => agentRequest(`/api/agents/${agent.id}/stop`));
+    const reset = document.createElement("button");
+    reset.type = "button";
+    reset.textContent = "Reset stall";
+    reset.disabled = agent.status !== "stalled";
+    reset.addEventListener("click", () => agentRequest(`/api/agents/${agent.id}/reset`));
+    const logs = document.createElement("button");
+    logs.type = "button";
+    logs.textContent = "Log tail";
+    logs.disabled = !agent.history?.length;
+    logs.addEventListener("click", async () => {
+      const response = await fetch(`/api/agents/${agent.id}/logs`);
+      const payload = await response.json();
+      if (!response.ok) {
+        agentsStatus.textContent = payload.detail || `Log request failed: ${response.status}`;
+        return;
+      }
+      const output = document.createElement("pre");
+      output.textContent = payload.lines?.join("\n") || "No log events recorded.";
+      card.append(output);
+    });
+    actions.append(start, stop, reset, logs);
+    const history = document.createElement("small");
+    history.textContent = `${agent.history?.length ?? 0} passes · ${agent.alerts?.length ?? 0} alerts`;
+    card.append(title, detail, history, actions);
+    if (agent.last_error) {
+      const error = document.createElement("pre");
+      error.textContent = text(agent.last_error);
+      card.append(error);
+    }
+    agentList.append(card);
+  }
+}
+
+async function loadAgents() {
+  agentsStatus.textContent = "Loading agent state…";
+  try {
+    const response = await fetch("/api/agents");
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.detail || `Agent request failed: ${response.status}`);
+    renderAgents(payload);
+    agentsStatus.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+  } catch (error) {
+    agentsStatus.textContent = error.message;
+  }
+}
+
+async function agentRequest(path) {
+  const response = await fetch(path, { method: "POST" });
+  const payload = await response.json();
+  if (!response.ok) {
+    agentsStatus.textContent = payload.detail || `Agent request failed: ${response.status}`;
+    return;
+  }
+  await loadAgents();
+}
+
 async function generateWorkflow() {
   workflowStatus.textContent = "Generating with codex exec…";
   const parameters = currentDefinition?.parameters ?? [];
@@ -673,8 +758,12 @@ for (const tab of document.querySelectorAll("[data-tab]")) {
     if (tab.dataset.tab === "workflows") {
       loadWorkflows().catch((error) => { workflowStatus.textContent = error.message; });
     }
+    if (tab.dataset.tab === "agents") loadAgents();
   });
 }
+
+const agentsRefresh = document.querySelector("#agents-refresh");
+if (agentsRefresh) agentsRefresh.addEventListener("click", () => loadAgents());
 
 load().catch((error) => {
   statusText.textContent = error.message;

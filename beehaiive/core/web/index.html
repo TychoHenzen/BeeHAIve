@@ -62,8 +62,15 @@
         </div>
       </section>
       <section class="panel" data-panel="agents" aria-labelledby="agents-title">
-        <h2 id="agents-title">Agents</h2>
-        <p>This tab is reserved for agent-runner state in the next core slice.</p>
+        <div class="panel-heading">
+          <div>
+            <h2 id="agents-title">Agents</h2>
+            <p>Assigned runners, held items, and the last bounded pass.</p>
+          </div>
+          <button id="agents-refresh" type="button">Refresh agents</button>
+        </div>
+        <div id="agents-status" class="agent-status" aria-live="polite"></div>
+        <div id="agent-list" class="agent-list"></div>
       </section>
       <section class="panel" data-panel="hive" aria-labelledby="hive-title">
         <h2 id="hive-title">Hive</h2>
