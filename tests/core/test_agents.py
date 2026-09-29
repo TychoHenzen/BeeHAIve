@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import subprocess
 import time
@@ -8,7 +9,12 @@ from typing import Any
 
 from fastapi.testclient import TestClient
 
-from beehaiive.core.agents import AgentStore, _skill_prompt
+from beehaiive.core.agents import (
+    AgentService,
+    AgentStore,
+    _remote_repository,
+    _skill_prompt,
+)
 from beehaiive.core.app import create_app
 from beehaiive.core.config import CoreConfig
 from beehaiive.core.database import SnapshotDatabase
@@ -65,6 +71,58 @@ class FakeCodexProcess:
 
     def kill(self) -> None:
         self.returncode = -9
+
+
+class StreamingProcess:
+    def __init__(self) -> None:
+        self.stdout = io.StringIO("stdout first\nstdout second\n")
+        self.stderr = io.StringIO("stderr first\n")
+        self.stdin = RecordingStdin()
+        self.returncode = 7
+
+    def wait(self, *, timeout: float) -> int:
+        del timeout
+        return self.returncode
+
+
+class RecordingStdin:
+    def __init__(self) -> None:
+        self.value = ""
+
+    def write(self, value: str) -> None:
+        self.value += value
+
+    def close(self) -> None:
+        pass
+
+
+def test_streaming_process_keeps_stdout_stderr_and_exit_code(tmp_path: Path) -> None:
+    process = StreamingProcess()
+    log_path = tmp_path / "step.jsonl"
+
+    result = AgentService._communicate_process(
+        AgentService.__new__(AgentService),
+        process,
+        "prompt",
+        log_path,
+        timeout=1,
+    )
+
+    assert result == 7
+    assert process.stdin.value == "prompt"
+    events = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert {(event["event"], event["line"]) for event in events} == {
+        ("stdout", "stdout first"),
+        ("stdout", "stdout second"),
+        ("stderr", "stderr first"),
+    }
+
+
+def test_remote_repository_accepts_github_urls_only() -> None:
+    assert _remote_repository("https://github.com/Owner/Repo.git") == "Owner/Repo"
+    assert _remote_repository("git@github.com:Owner/Repo.git") == "Owner/Repo"
+    assert _remote_repository("https://gitlab.com/Owner/Repo.git") is None
+    assert _remote_repository("") is None
 
 
 def workflow_definition() -> dict[str, Any]:
@@ -221,6 +279,36 @@ def test_agent_api_runs_one_fresh_codex_process_per_skill_state(tmp_path: Path) 
         log_lines = client.get(f"/api/agents/{agent_id}/logs").json()["lines"]
         assert any(len(line) > 20_000 for line in log_lines)
         assert any("stderr event" in line for line in log_lines)
+        duplicate_checkout = client.post(
+            "/api/agents",
+            json={
+                "name": "duplicate-checkout",
+                "workflow_id": created_workflow.json()["id"],
+                "parameters": {},
+                "repository": "TychoHenzen/BeeHAIve",
+                "checkout_path": str(checkout),
+            },
+        )
+        assert duplicate_checkout.status_code == 409
+        second_agent = client.post(
+            "/api/agents",
+            json={
+                "name": "second-agent",
+                "workflow_id": created_workflow.json()["id"],
+                "parameters": {},
+                "repository": "TychoHenzen/BeeHAIve",
+                "checkout_path": str(tmp_path / "second-checkout"),
+            },
+        )
+        assert second_agent.status_code == 200, second_agent.text
+        update_conflict = client.patch(
+            f"/api/agents/{second_agent.json()['id']}",
+            json={"checkout_path": str(checkout)},
+        )
+        assert update_conflict.status_code == 409
+        assert (
+            client.delete(f"/api/agents/{second_agent.json()['id']}").status_code == 200
+        )
         assert (
             client.delete(f"/api/workflows/{created_workflow.json()['id']}").status_code
             == 409
