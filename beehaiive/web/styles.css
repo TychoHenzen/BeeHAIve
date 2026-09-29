@@ -314,3 +314,198 @@ input, select, textarea {
   color: #ffb4ab;
   white-space: pre-wrap;
 }
+
+.hive-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.hive-layout {
+  align-items: start;
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: minmax(0, 1fr) minmax(17rem, 22rem);
+}
+
+.hive-map {
+  background: #0c111b;
+  border: 1px solid #2e3a4f;
+  border-radius: 0.6rem;
+  min-height: 32rem;
+  overflow: auto;
+  padding: 0.5rem;
+}
+
+.hive-map svg {
+  display: block;
+  min-width: 42rem;
+}
+
+.hive-map text {
+  fill: #d9e8ff;
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.hive-region-label {
+  fill: #a6b1c2 !important;
+  font-size: 15px !important;
+  font-weight: 700;
+}
+
+.hive-road {
+  stroke: #566987;
+  stroke-width: 2;
+}
+
+.hive-road-label {
+  fill: #8e9bb1 !important;
+  font-size: 10px !important;
+}
+
+.hive-station {
+  cursor: pointer;
+  fill: #202a3b;
+  stroke: #7182a4;
+  stroke-width: 2;
+}
+
+.hive-station[data-depot="true"] {
+  stroke: #e3b341;
+}
+
+.hive-station[data-terminal="true"] {
+  fill: #3a2331;
+  stroke: #f27e9b;
+}
+
+.hive-unit {
+  cursor: pointer;
+  transition: opacity 150ms ease;
+}
+
+.hive-unit:hover, .hive-unit:focus {
+  opacity: 0.7;
+}
+
+.hive-unit circle {
+  stroke: #f2f5f8;
+  stroke-width: 2;
+}
+
+.hive-unit .hive-unit-progress {
+  stroke: #e3b341;
+  stroke-linecap: round;
+  stroke-width: 3;
+  transform: rotate(-90deg);
+  transform-origin: center;
+}
+
+.hive-unit[data-status="stopped"] {
+  filter: grayscale(1);
+  opacity: 0.55;
+}
+
+.hive-unit[data-status="stalled"] circle {
+  stroke: #ffb454;
+}
+
+.hive-unit-alert {
+  fill: #ffb454 !important;
+  font-size: 16px !important;
+  font-weight: 800;
+}
+
+.hive-unit-label {
+  font-size: 10px !important;
+}
+
+.hive-station-badge {
+  fill: #a6b1c2 !important;
+  font-size: 10px !important;
+}
+
+.hive-details, .hive-alerts {
+  background: #171e2b;
+  border: 1px solid #2e3a4f;
+  border-radius: 0.6rem;
+  padding: 0.8rem;
+}
+
+.hive-details {
+  min-height: 18rem;
+}
+
+.hive-details h3, .hive-details h4, .hive-alerts h3 {
+  margin-bottom: 0.6rem;
+}
+
+.hive-detail-list, .hive-alert-list {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0;
+}
+
+.hive-detail-list div {
+  border-bottom: 1px solid #2e3a4f;
+  padding-bottom: 0.35rem;
+}
+
+.hive-detail-list dt {
+  color: #a6b1c2;
+  font-size: 0.78rem;
+}
+
+.hive-detail-list dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.hive-log {
+  max-height: 12rem;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+.hive-alerts {
+  margin-top: 1rem;
+}
+
+.hive-alert-card {
+  align-items: center;
+  border-top: 1px solid #2e3a4f;
+  display: flex;
+  gap: 0.7rem;
+  justify-content: space-between;
+  padding: 0.65rem 0;
+}
+
+.hive-alert-card p {
+  margin: 0;
+}
+
+.hive-alert-card small {
+  color: #a6b1c2;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@media (max-width: 800px) {
+  .hive-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .hive-details {
+    min-height: 0;
+  }
+
+  .hive-map svg {
+    min-width: 34rem;
+  }
+}

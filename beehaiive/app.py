@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from .agents import AgentConflict, AgentError, AgentService, item_key
 from .config import CoreConfig, CoreConfigurationError
 from .database import SnapshotDatabase
+from .hive import HiveProjection
 from .project import ProjectDataError, ProjectProvider
 from .rest import GithubRestError
 from .snapshot import ProjectSnapshotService
@@ -56,6 +57,7 @@ def create_app(
         resolved_workflow_store,
         resolved_service,
     )
+    resolved_hive = HiveProjection(resolved_database)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -71,6 +73,7 @@ def create_app(
     app.state.workflow_store = resolved_workflow_store
     app.state.workflow_generator = resolved_workflow_generator
     app.state.agent_service = resolved_agent_service
+    app.state.hive = resolved_hive
 
     @app.get("/", include_in_schema=False)
     def index() -> FileResponse:
@@ -173,6 +176,26 @@ def create_app(
         if value is None:
             raise HTTPException(status_code=404, detail="agent not found")
         return {"passes": value["history"], "alerts": value["alerts"]}
+
+    @app.get("/api/hive")
+    def hive() -> dict[str, Any]:
+        return resolved_hive.snapshot()
+
+    @app.get("/api/hive/events")
+    def hive_events(since: str | None = None) -> dict[str, Any]:
+        return resolved_hive.events(since)
+
+    @app.post("/api/passes/{pass_id}/acknowledge")
+    def acknowledge_pass(
+        pass_id: str, body: dict[str, Any] | None = None
+    ) -> dict[str, str]:
+        acknowledged_by = "operator"
+        if body is not None and body.get("acknowledged_by") is not None:
+            acknowledged_by = str(body["acknowledged_by"])
+        result = resolved_hive.acknowledge(pass_id, acknowledged_by)
+        if result is None:
+            raise HTTPException(status_code=404, detail="pass not found")
+        return result
 
     @app.post("/api/workflows/generate")
     def generate_workflow(body: dict[str, Any]) -> dict[str, Any]:

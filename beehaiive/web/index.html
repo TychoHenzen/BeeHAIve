@@ -89,10 +89,30 @@
         <div id="agent-list" class="agent-list"></div>
       </section>
       <section class="panel" data-panel="hive" aria-labelledby="hive-title">
-        <h2 id="hive-title">Hive</h2>
-        <p>This tab is reserved for RTS observability in the next core slice.</p>
+        <div class="panel-heading">
+          <div>
+            <h2 id="hive-title">Hive</h2>
+            <p id="hive-status">Loading workflow stations and agent units…</p>
+          </div>
+          <div class="hive-toolbar">
+            <button id="hive-refresh" type="button">Refresh Hive</button>
+            <button id="hive-motion" type="button">Reduced motion: system</button>
+          </div>
+        </div>
+        <div class="hive-layout">
+          <div id="hive-map" class="hive-map" role="application" aria-label="Live workflow map" aria-live="polite"></div>
+          <aside id="hive-details" class="hive-details" aria-live="polite">
+            <h3>Hive details</h3>
+            <p>Select an agent or station.</p>
+          </aside>
+        </div>
+        <section class="hive-alerts" aria-labelledby="hive-alerts-title">
+          <h3 id="hive-alerts-title">Active alerts</h3>
+          <div id="hive-alert-list"></div>
+        </section>
       </section>
     </main>
     <script type="module" src="/web/app.js"></script>
+    <script type="module" src="/web/hive.js"></script>
   </body>
 </html>

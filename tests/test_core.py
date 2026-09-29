@@ -544,7 +544,7 @@ def test_database_persists_schema_and_snapshot(tmp_path: Path) -> None:
     assert loaded.status_option_ids == (("todo", "Todo"), ("done", "Done"))
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT version FROM schema_version").fetchone() == (
-            4,
+            5,
         )
     second.close()
 

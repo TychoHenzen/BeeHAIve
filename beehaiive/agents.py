@@ -666,6 +666,8 @@ class AgentStore:
             "started_at": str(row["started_at"]),
             "finished_at": row["finished_at"],
             "stalled_reason": row["stalled_reason"],
+            "acknowledged_at": row["acknowledged_at"],
+            "acknowledged_by": row["acknowledged_by"],
             "steps": [
                 cls._step_dict(step)
                 for step in connection.execute(
