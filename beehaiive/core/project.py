@@ -76,6 +76,7 @@ class ProjectProvider:
                 for name in (*options, "No status")
             ),
             status_field_id=str(status_field["id"]),
+            status_option_ids=tuple(option_ids.items()),
         )
 
     def fetch_item(
@@ -84,8 +85,9 @@ class ProjectProvider:
         *,
         status_field_id: str | None,
         status_options: tuple[str, ...] = (),
+        status_option_ids: Mapping[str, str] | None = None,
     ) -> tuple[ProjectCard, str]:
-        option_ids: dict[str, str] = {}
+        option_ids = dict(status_option_ids or {})
         options = status_options
         if status_field_id is None:
             fields_payload = self.client.get_json(f"{self.project_url}/fields")

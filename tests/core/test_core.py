@@ -221,17 +221,28 @@ def test_project_provider_fetches_one_held_item_with_cached_status_field() -> No
                             "html_url": "https://github.com/TychoHenzen/BeeHAIve/issues/7",
                             "repository": {"full_name": "TychoHenzen/BeeHAIve"},
                         },
-                        "fields": [{"id": 407, "value": {"name": {"raw": "Done"}}}],
+                        "fields": [{"id": 407, "value": {"id": "done"}}],
                     }
                 )
             ]
         }
     )
     database, provider = project_responses(config(), transport)
-
-    card, status = provider.fetch_item(
-        "project-item-7", status_field_id="407", status_options=("Todo", "Done")
+    database.save_snapshot(
+        ProjectSnapshot(
+            fetched_at="2026-09-29T10:00:00+00:00",
+            rate_limited_until=None,
+            columns=(
+                ProjectColumn(status="Todo", items=()),
+                ProjectColumn(status="Done", items=()),
+            ),
+            status_field_id="407",
+            status_option_ids=(("todo", "Todo"), ("done", "Done")),
+        )
     )
+    service = ProjectSnapshotService(provider, database, minimum_refresh_seconds=0)
+
+    card, status = service.fetch_held_item("project-item-7")
 
     assert card.item_key == "project-item-7"
     assert status == "Done"
@@ -512,6 +523,7 @@ def test_database_persists_schema_and_snapshot(tmp_path: Path) -> None:
             rate_limited_until=None,
             columns=(ProjectColumn(status="Todo", items=()),),
             status_field_id="407",
+            status_option_ids=(("todo", "Todo"), ("done", "Done")),
         )
     )
     first.close()
@@ -519,6 +531,7 @@ def test_database_persists_schema_and_snapshot(tmp_path: Path) -> None:
     loaded = second.load_snapshot()
     assert loaded is not None
     assert loaded.status_field_id == "407"
+    assert loaded.status_option_ids == (("todo", "Todo"), ("done", "Done"))
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT version FROM schema_version").fetchone() == (
             4,

@@ -52,6 +52,7 @@ class ProjectSnapshot:
     rate_limited_until: str | None
     columns: tuple[ProjectColumn, ...]
     status_field_id: str | None = None
+    status_option_ids: tuple[tuple[str, str], ...] = ()
 
     def as_dict(self, *, include_item_keys: bool = False) -> dict[str, object]:
         value: dict[str, object] = {
@@ -64,6 +65,8 @@ class ProjectSnapshot:
         }
         if include_item_keys and self.status_field_id is not None:
             value["status_field_id"] = self.status_field_id
+        if include_item_keys and self.status_option_ids:
+            value["status_option_ids"] = dict(self.status_option_ids)
         return value
 
     @classmethod
@@ -108,6 +111,10 @@ class ProjectSnapshot:
             rate_limited_until=_optional_string(payload.get("rate_limited_until")),
             columns=tuple(columns),
             status_field_id=_optional_string(payload.get("status_field_id")),
+            status_option_ids=tuple(
+                (str(option_id), str(name))
+                for option_id, name in _object(payload.get("status_option_ids")).items()
+            ),
         )
 
 

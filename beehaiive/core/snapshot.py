@@ -39,10 +39,14 @@ class ProjectSnapshotService:
         status_options = tuple(
             column.status for column in snapshot.columns if column.status != "No status"
         )
+        status_field_id = snapshot.status_field_id
+        if not snapshot.status_option_ids:
+            status_field_id = None
         return self.provider.fetch_item(
             item_key,
-            status_field_id=snapshot.status_field_id,
+            status_field_id=status_field_id,
             status_options=status_options,
+            status_option_ids=dict(snapshot.status_option_ids),
         )
 
     def _get_or_refresh(self) -> ProjectSnapshot:

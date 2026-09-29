@@ -36,8 +36,9 @@ class StaticProvider:
         *,
         status_field_id: str | None,
         status_options: tuple[str, ...],
+        status_option_ids: dict[str, str] | None = None,
     ) -> tuple[ProjectCard, str]:
-        del status_field_id, status_options
+        del status_field_id, status_options, status_option_ids
         for column in self.snapshot.columns:
             for card in column.items:
                 if card.item_key == item_key:
