@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from fastapi.testclient import TestClient
 
@@ -251,6 +251,35 @@ def test_hive_projection_exposes_units_layout_timing_waiting_and_alerts(
     assert unit["overdue"] is True
     assert payload["alerts"][0]["pass_id"] == alert_pass_id
     assert payload["alerts"][0]["station"] == "run"
+    database.close()
+
+
+def test_hive_timing_caps_finished_steps_per_state() -> None:
+    database = SnapshotDatabase(":memory:")
+    projection = HiveProjection(database)
+    pass_row = {
+        "id": "pass-1",
+        "workflow_id": 1,
+        "workflow_revision": 1,
+        "finished_at": "2026-09-29T12:00:00+00:00",
+    }
+    steps: list[dict[str, Any]] = []
+    for index in range(1, 32):
+        finished = datetime(2026, 9, 29, 11, 0, tzinfo=UTC) + timedelta(minutes=index)
+        started = finished - timedelta(seconds=index)
+        steps.append(
+            {
+                "pass_id": "pass-1",
+                "state_id": "run",
+                "status": "completed",
+                "started_at": started.isoformat(),
+                "finished_at": finished.isoformat(),
+            }
+        )
+    timing = projection._timing(
+        cast(list[Any], [pass_row]), cast(list[Any], steps), datetime.now(UTC)
+    )
+    assert timing[(1, 1, "run")] == (30, 16.5)
     database.close()
 
 

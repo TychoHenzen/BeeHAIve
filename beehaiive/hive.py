@@ -410,33 +410,35 @@ class HiveProjection:
         steps: list[sqlite3.Row],
         now: datetime,
     ) -> dict[tuple[int, int, str], tuple[int, float | None]]:
-        pass_keys: set[str] = set()
-        by_workflow: defaultdict[tuple[int, int], list[sqlite3.Row]] = defaultdict(list)
-        for value in passes:
-            if value["finished_at"] is not None:
-                by_workflow[
-                    (int(value["workflow_id"]), int(value["workflow_revision"]))
-                ].append(value)
-        for values in by_workflow.values():
-            values.sort(key=lambda value: str(value["finished_at"] or ""), reverse=True)
-            pass_keys.update(str(value["id"]) for value in values[:30])
-        durations: defaultdict[tuple[int, int, str], list[float]] = defaultdict(list)
-        pass_by_id = {str(value["id"]): value for value in passes}
+        finished_passes = {
+            str(value["id"]): value
+            for value in passes
+            if value["finished_at"] is not None
+        }
+        steps_by_state: defaultdict[tuple[int, int, str], list[sqlite3.Row]] = (
+            defaultdict(list)
+        )
         for step in steps:
             pass_id = str(step["pass_id"])
-            if pass_id not in pass_keys or str(step["status"]) != "completed":
+            if str(step["status"]) != "completed":
                 continue
-            value = _duration(step["started_at"], step["finished_at"])
-            if value is not None:
-                current_pass = pass_by_id.get(pass_id)
-                if current_pass is not None:
-                    durations[
-                        (
-                            int(current_pass["workflow_id"]),
-                            int(current_pass["workflow_revision"]),
-                            str(step["state_id"]),
-                        )
-                    ].append(value)
+            current_pass = finished_passes.get(pass_id)
+            if current_pass is None:
+                continue
+            steps_by_state[
+                (
+                    int(current_pass["workflow_id"]),
+                    int(current_pass["workflow_revision"]),
+                    str(step["state_id"]),
+                )
+            ].append(step)
+        durations: defaultdict[tuple[int, int, str], list[float]] = defaultdict(list)
+        for key, values in steps_by_state.items():
+            values.sort(key=lambda value: str(value["finished_at"] or ""), reverse=True)
+            for step in values[:30]:
+                duration = _duration(step["started_at"], step["finished_at"])
+                if duration is not None:
+                    durations[key].append(duration)
         del now
         return {
             key: (len(values), float(median(values)))
