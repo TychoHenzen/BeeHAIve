@@ -10,9 +10,23 @@ const workflowCanvas = document.querySelector("#workflow-canvas");
 const workflowJson = document.querySelector("#workflow-json");
 const workflowErrors = document.querySelector("#workflow-errors");
 const workflowSave = document.querySelector("#workflow-save");
+const agentList = document.querySelector("#agent-list");
+const agentsStatus = document.querySelector("#agents-status");
+const agentForm = document.querySelector("#agent-form");
+const agentFormTitle = document.querySelector("#agent-form-title");
+const agentName = document.querySelector("#agent-name");
+const agentWorkflow = document.querySelector("#agent-workflow");
+const agentParameters = document.querySelector("#agent-parameters");
+const agentRepository = document.querySelector("#agent-repository");
+const agentCheckout = document.querySelector("#agent-checkout");
+const agentModel = document.querySelector("#agent-model");
 let currentWorkflowId = null;
 let currentDefinition = null;
 let validationRevision = 0;
+let agentWorkflows = [];
+let editingAgentId = null;
+let agentFormValues = {};
+const logPollers = new Set();
 
 function text(value) {
   return value == null ? "" : String(value);
@@ -48,7 +62,7 @@ function render(snapshot) {
       labels.textContent = (item.labels ?? []).join(" · ");
       const holder = document.createElement("p");
       holder.className = "card-holder";
-      holder.textContent = "held by agent X";
+      holder.textContent = item.holder?.name ? `held by ${item.holder.name}` : "unclaimed";
       card.append(meta, title, labels, holder);
       columnElement.append(card);
     }
@@ -598,6 +612,247 @@ async function loadWorkflows() {
   }
 }
 
+async function loadAgentWorkflows() {
+  if (!agentWorkflow) return;
+  const payload = await workflowRequest("/api/workflows");
+  agentWorkflows = await Promise.all(
+    (payload.workflows ?? []).map((workflow) => workflowRequest(`/api/workflows/${workflow.id}`)),
+  );
+  agentWorkflow.replaceChildren();
+  for (const workflow of agentWorkflows) {
+    const option = makeOption(document, `${workflow.id}`, "");
+    option.textContent = `${workflow.name} · #${workflow.id}`;
+    agentWorkflow.append(option);
+  }
+  if (editingAgentId === null && !agentWorkflow.value && agentWorkflows.length) {
+    agentWorkflow.value = text(agentWorkflows[0].id);
+  }
+  renderAgentParameters();
+}
+
+function selectedAgentWorkflow() {
+  return agentWorkflows.find((workflow) => String(workflow.id) === String(agentWorkflow?.value)) ?? null;
+}
+
+function renderAgentParameters() {
+  if (!agentParameters) return;
+  agentParameters.replaceChildren();
+  const definition = selectedAgentWorkflow()?.latest?.definition;
+  for (const parameter of definition?.parameters ?? []) {
+    const row = document.createElement("label");
+    row.className = "agent-parameter";
+    row.textContent = `${text(parameter.name)} (${text(parameter.type)})`;
+    if (parameter.const === true) {
+      const constant = document.createElement("span");
+      constant.textContent = `constant: ${text(parameter.value)}`;
+      row.append(constant);
+    } else {
+      const input = document.createElement("input");
+      input.dataset.agentParameterName = text(parameter.name);
+      input.type = parameter.type === "boolean" ? "checkbox" : parameter.type === "number" ? "number" : "text";
+      if (input.type === "checkbox") input.checked = agentFormValues[parameter.name] === true;
+      else input.value = text(agentFormValues[parameter.name]);
+      input.required = parameter.type !== "boolean";
+      row.append(input);
+    }
+    agentParameters.append(row);
+  }
+}
+
+function readAgentParameters() {
+  const values = {};
+  for (const input of agentParameters?.querySelectorAll("[data-agent-parameter-name]") ?? []) {
+    const name = input.dataset.agentParameterName;
+    if (!name) continue;
+    if (input.type === "checkbox") values[name] = input.checked;
+    else if (input.type === "number") values[name] = Number(input.value);
+    else values[name] = input.value;
+  }
+  return values;
+}
+
+function openAgentForm(agent = null) {
+  if (!agentForm) return;
+  editingAgentId = agent?.id ?? null;
+  agentFormTitle.textContent = editingAgentId ? "Edit agent" : "Create agent";
+  agentName.value = text(agent?.name);
+  agentWorkflow.value = text(agent?.workflow_id || agentWorkflows[0]?.id);
+  agentRepository.value = text(agent?.repository);
+  agentCheckout.value = text(agent?.checkout_path);
+  agentModel.value = text(agent?.model);
+  agentFormValues = { ...(agent?.parameters ?? {}) };
+  agentForm.hidden = false;
+  renderAgentParameters();
+}
+
+function closeAgentForm() {
+  if (!agentForm) return;
+  editingAgentId = null;
+  agentForm.hidden = true;
+}
+
+async function saveAgent(event) {
+  event.preventDefault();
+  const body = {
+    name: agentName.value,
+    workflow_id: Number(agentWorkflow.value),
+    parameters: readAgentParameters(),
+    repository: agentRepository.value,
+    checkout_path: agentCheckout.value,
+    model: agentModel.value || null,
+  };
+  const path = editingAgentId ? `/api/agents/${editingAgentId}` : "/api/agents";
+  await workflowRequest(path, {
+    method: editingAgentId ? "PATCH" : "POST",
+    body: JSON.stringify(body),
+  });
+  closeAgentForm();
+  await loadAgents();
+}
+
+function renderAgents(payload) {
+  for (const stop of logPollers) stop();
+  logPollers.clear();
+  agentList.replaceChildren();
+  const agents = payload.agents ?? [];
+  if (!agents.length) {
+    agentList.textContent = "No assigned agents.";
+    return;
+  }
+  for (const agent of agents) {
+    const card = document.createElement("article");
+    card.className = `agent-card agent-${text(agent.status)}`;
+    const title = document.createElement("h3");
+    title.textContent = `${text(agent.name)} · ${text(agent.status)}`;
+    const detail = document.createElement("p");
+    const held = agent.current_pass?.item?.title ? ` · ${agent.current_pass.item.title}` : "";
+    const state = agent.current_state ? ` · state ${text(agent.current_state)}` : "";
+    detail.textContent = `${text(agent.repository)} · workflow ${text(agent.workflow_id)} r${text(agent.workflow_revision)}${state}${held}`;
+    const actions = document.createElement("div");
+    actions.className = "agent-actions";
+    const start = document.createElement("button");
+    start.type = "button";
+    start.textContent = "Start";
+    start.disabled = ["working", "stalled"].includes(agent.status);
+    start.addEventListener("click", () => agentRequest(`/api/agents/${agent.id}/start`));
+    const stop = document.createElement("button");
+    stop.type = "button";
+    stop.textContent = "Stop";
+    stop.disabled = agent.status === "stopped";
+    stop.addEventListener("click", () => agentRequest(`/api/agents/${agent.id}/stop`));
+    const reset = document.createElement("button");
+    reset.type = "button";
+    reset.textContent = "Reset stall";
+    reset.disabled = agent.status !== "stalled";
+    reset.addEventListener("click", () => agentRequest(`/api/agents/${agent.id}/reset`));
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.textContent = "Edit";
+    edit.disabled = agent.status !== "stopped";
+    edit.addEventListener("click", async () => {
+      try {
+        await loadAgentWorkflows();
+        openAgentForm(agent);
+      } catch (error) {
+        agentsStatus.textContent = error.message;
+      }
+    });
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "Delete";
+    remove.disabled = agent.status !== "stopped";
+    remove.addEventListener("click", () => agentRequest(`/api/agents/${agent.id}`, "DELETE"));
+    const logs = document.createElement("button");
+    logs.type = "button";
+    logs.textContent = "Log tail";
+    logs.disabled = !agent.history?.length;
+    logs.addEventListener("click", async () => {
+      const response = await fetch(`/api/agents/${agent.id}/logs`);
+      const payload = await response.json();
+      if (!response.ok) {
+        agentsStatus.textContent = payload.detail || `Log request failed: ${response.status}`;
+        return;
+      }
+      const output = document.createElement("pre");
+      output.textContent = payload.lines?.join("\n") || "No log events recorded.";
+      card.append(output);
+    });
+    actions.append(start, stop, reset, edit, remove, logs);
+    card.append(title, detail, actions);
+    const history = document.createElement("details");
+    const historySummary = document.createElement("summary");
+    historySummary.textContent = `${agent.history?.length ?? 0} passes · ${agent.alerts?.length ?? 0} alerts`;
+    history.append(historySummary);
+    for (const pass of agent.history ?? []) {
+      const passDetails = document.createElement("div");
+      passDetails.textContent = `Pass ${text(pass.id)} · ${text(pass.status)} · ${text(pass.item?.title)}`;
+      for (const step of pass.steps ?? []) {
+        const stepDetails = document.createElement("p");
+        stepDetails.textContent = `Step ${text(step.sequence)} ${text(step.state_id)} · ${text(step.status)} · ${text(step.outcome)} · ${text(step.summary)}`;
+        passDetails.append(stepDetails);
+      }
+      history.append(passDetails);
+    }
+    if ((agent.alerts ?? []).length) {
+      const alerts = document.createElement("ul");
+      for (const alert of agent.alerts) {
+        const item = document.createElement("li");
+        item.textContent = `${text(alert.kind)}: ${text(alert.message)}`;
+        alerts.append(item);
+      }
+      history.append(alerts);
+    }
+    card.append(history);
+    if (agent.last_error) {
+      const error = document.createElement("pre");
+      error.textContent = text(agent.last_error);
+      card.append(error);
+    }
+    if (agent.status === "working" && agent.current_pass_id) {
+      const output = document.createElement("pre");
+      output.className = "agent-log-tail";
+      output.textContent = "Loading live log tail…";
+      card.append(output);
+      const refreshLog = async () => {
+        try {
+          const response = await fetch(`/api/agents/${agent.id}/logs?pass_id=${encodeURIComponent(agent.current_pass_id)}`);
+          const result = await response.json();
+          if (response.ok) output.textContent = result.lines?.join("\n") || "No log events recorded.";
+        } catch (error) {
+          output.textContent = error.message;
+        }
+      };
+      refreshLog();
+      const timer = setInterval(refreshLog, 2000);
+      logPollers.add(() => clearInterval(timer));
+    }
+    agentList.append(card);
+  }
+}
+
+async function loadAgents() {
+  agentsStatus.textContent = "Loading agent state…";
+  try {
+    const response = await fetch("/api/agents");
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.detail || `Agent request failed: ${response.status}`);
+    renderAgents(payload);
+    agentsStatus.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+  } catch (error) {
+    agentsStatus.textContent = error.message;
+  }
+}
+
+async function agentRequest(path, method = "POST") {
+  const response = await fetch(path, { method });
+  const payload = await response.json();
+  if (!response.ok) {
+    agentsStatus.textContent = payload.detail || `Agent request failed: ${response.status}`;
+    return;
+  }
+  await loadAgents();
+}
+
 async function generateWorkflow() {
   workflowStatus.textContent = "Generating with codex exec…";
   const parameters = currentDefinition?.parameters ?? [];
@@ -673,8 +928,30 @@ for (const tab of document.querySelectorAll("[data-tab]")) {
     if (tab.dataset.tab === "workflows") {
       loadWorkflows().catch((error) => { workflowStatus.textContent = error.message; });
     }
+    if (tab.dataset.tab === "agents") {
+      loadAgentWorkflows().catch((error) => { agentsStatus.textContent = error.message; });
+      loadAgents();
+    }
   });
 }
+
+const agentsRefresh = document.querySelector("#agents-refresh");
+if (agentsRefresh) agentsRefresh.addEventListener("click", () => loadAgents());
+const agentNew = document.querySelector("#agent-new");
+if (agentNew) {
+  agentNew.addEventListener("click", async () => {
+    try {
+      await loadAgentWorkflows();
+      openAgentForm();
+    } catch (error) {
+      agentsStatus.textContent = error.message;
+    }
+  });
+}
+if (agentWorkflow) agentWorkflow.addEventListener("change", renderAgentParameters);
+if (agentForm) agentForm.addEventListener("submit", (event) => saveAgent(event).catch((error) => { agentsStatus.textContent = error.message; }));
+const agentCancel = document.querySelector("#agent-cancel");
+if (agentCancel) agentCancel.addEventListener("click", closeAgentForm);
 
 load().catch((error) => {
   statusText.textContent = error.message;

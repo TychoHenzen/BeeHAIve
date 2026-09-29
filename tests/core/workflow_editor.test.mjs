@@ -127,6 +127,9 @@ class FakeDocument extends FakeNode {
       "workflow-json", "workflow-errors", "workflow-save", "refresh", "workflow-new",
       "workflow-example", "workflow-return", "workflow-generate", "workflow-add-state",
       "workflow-add-transition", "workflow-add-parameter", "workflow-help", "workflow-advanced",
+      "agents-refresh", "agent-new", "agent-form", "agent-form-title", "agent-name",
+      "agent-workflow", "agent-parameters", "agent-repository", "agent-checkout",
+      "agent-model", "agent-save", "agent-cancel", "agent-list", "agents-status",
     ]) {
       this.append(new FakeNode("div", id));
     }
@@ -170,7 +173,7 @@ function invalidValidation() {
   };
 }
 
-async function createHarness({ deferredValidation = false } = {}) {
+async function createHarness({ deferredValidation = false, agents = [], workflows = [] } = {}) {
   const document = new FakeDocument();
   const validationPayloads = [];
   const validationResolvers = [];
@@ -184,7 +187,13 @@ async function createHarness({ deferredValidation = false } = {}) {
       }
       return response(invalid ? invalidValidation() : { valid: true, errors: [], warnings: [] });
     }
-    if (path === "/api/workflows") return response({ workflows: [] });
+    if (path === "/api/workflows") return response({ workflows });
+    if (path.startsWith("/api/workflows/")) {
+      const id = Number(path.split("/").at(-1));
+      const workflow = workflows.find((candidate) => candidate.id === id);
+      return response(workflow?.detail ?? { id, latest: { definition: {} } });
+    }
+    if (path === "/api/agents") return response({ agents });
     throw new Error(`unexpected fetch ${path}`);
   };
   const context = {
@@ -288,4 +297,46 @@ test("workflow editor ignores stale validation responses", async () => {
 
   assert.equal(document.querySelector("#workflow-save").disabled, false);
   assert.equal(document.querySelector("#workflow-errors").textContent, "Definition is valid.");
+});
+
+test("agents view exposes assignment form and durable run evidence", async () => {
+  const definition = {
+    parameters: [
+      { name: "skill", type: "skill", const: false, value: null },
+      { name: "status", type: "status", const: true, value: "Todo" },
+    ],
+  };
+  const harness = await createHarness({
+    workflows: [{ id: 7, name: "Delivery", detail: { id: 7, latest: { definition } } }],
+    agents: [{
+      id: "agent-1",
+      name: "runner",
+      status: "stopped",
+      workflow_id: 7,
+      workflow_revision: 1,
+      repository: "owner/repo",
+      checkout_path: "C:/agents/runner",
+      current_state: null,
+      history: [{
+        id: "pass-1",
+        status: "completed",
+        item: { title: "PBI" },
+        steps: [{ sequence: 1, state_id: "run", status: "completed", outcome: "done", summary: "finished" }],
+      }],
+      alerts: [{ kind: "escalated", message: "needs operator" }],
+    }],
+  });
+  const { document } = harness;
+  document.querySelector("#agents-refresh").click();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.match(document.querySelector("#agent-list").textContent, /runner/);
+  assert.match(document.querySelector("#agent-list").textContent, /run/);
+  assert.match(document.querySelector("#agent-list").textContent, /needs operator/);
+
+  document.querySelector("#agent-new").click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(document.querySelector("#agent-form").hidden, false);
+  assert.equal(document.querySelector("#agent-parameters").querySelectorAll("[data-agent-parameter-name]").length, 1);
+  assert.match(document.querySelector("#agent-parameters").textContent, /constant: Todo/);
 });

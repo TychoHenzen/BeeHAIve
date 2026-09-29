@@ -205,6 +205,51 @@ def test_project_api_normalizes_mixed_items_and_status_order() -> None:
     database.close()
 
 
+def test_project_provider_fetches_one_held_item_with_cached_status_field() -> None:
+    project_url = "https://api.github.com/users/TychoHenzen/projectsV2/2"
+    item_url = f"{project_url}/items/project-item-7?fields=407"
+    transport = FakeTransport(
+        {
+            item_url: [
+                response(
+                    {
+                        "id": "project-item-7",
+                        "content_type": "Issue",
+                        "content": {
+                            "number": 7,
+                            "title": "Fresh item",
+                            "html_url": "https://github.com/TychoHenzen/BeeHAIve/issues/7",
+                            "repository": {"full_name": "TychoHenzen/BeeHAIve"},
+                        },
+                        "fields": [{"id": 407, "value": {"id": "done"}}],
+                    }
+                )
+            ]
+        }
+    )
+    database, provider = project_responses(config(), transport)
+    database.save_snapshot(
+        ProjectSnapshot(
+            fetched_at="2026-09-29T10:00:00+00:00",
+            rate_limited_until=None,
+            columns=(
+                ProjectColumn(status="Todo", items=()),
+                ProjectColumn(status="Done", items=()),
+            ),
+            status_field_id="407",
+            status_option_ids=(("todo", "Todo"), ("done", "Done")),
+        )
+    )
+    service = ProjectSnapshotService(provider, database, minimum_refresh_seconds=0)
+
+    card, status = service.fetch_held_item("project-item-7")
+
+    assert card.item_key == "project-item-7"
+    assert status == "Done"
+    assert [call[0] for call in transport.calls] == [item_url]
+    database.close()
+
+
 def test_project_provider_uses_org_prefix_and_rejects_ambiguous_status() -> None:
     org_config = config("org")
     transport = FakeTransport({})
@@ -296,7 +341,8 @@ def test_cursor_pagination_and_read_only_api() -> None:
     assert all(label in page.text for label in ("Board", "Workflows", "Agents", "Hive"))
     assert script.status_code == 200
     assert "fetch" in script.text
-    assert "held by agent X" in script.text
+    assert "held by agent X" not in script.text
+    assert "unclaimed" in script.text
     assert 'load("/api/project/refresh", "POST")' in script.text
     assert set(app.openapi()["paths"]["/api/project"]) == {"get"}
     assert set(app.openapi()["paths"]["/api/project/refresh"]) == {"post"}
@@ -476,14 +522,19 @@ def test_database_persists_schema_and_snapshot(tmp_path: Path) -> None:
             fetched_at="2026-09-29T10:00:00+00:00",
             rate_limited_until=None,
             columns=(ProjectColumn(status="Todo", items=()),),
+            status_field_id="407",
+            status_option_ids=(("todo", "Todo"), ("done", "Done")),
         )
     )
     first.close()
     second = SnapshotDatabase(path)
-    assert second.load_snapshot() is not None
+    loaded = second.load_snapshot()
+    assert loaded is not None
+    assert loaded.status_field_id == "407"
+    assert loaded.status_option_ids == (("todo", "Todo"), ("done", "Done"))
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT version FROM schema_version").fetchone() == (
-            2,
+            4,
         )
     second.close()
 

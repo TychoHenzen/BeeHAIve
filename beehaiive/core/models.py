@@ -14,9 +14,10 @@ class ProjectCard:
     state: str | None
     labels: tuple[str, ...]
     linked_issue_numbers: tuple[int, ...]
+    item_key: str | None = None
 
-    def as_dict(self) -> dict[str, object]:
-        return {
+    def as_dict(self, *, include_item_key: bool = False) -> dict[str, object]:
+        value: dict[str, object] = {
             "type": self.type,
             "repository": self.repository,
             "number": self.number,
@@ -26,6 +27,9 @@ class ProjectCard:
             "labels": list(self.labels),
             "linked_issue_numbers": list(self.linked_issue_numbers),
         }
+        if include_item_key and self.item_key is not None:
+            value["item_key"] = self.item_key
+        return value
 
 
 @dataclass(frozen=True)
@@ -33,10 +37,12 @@ class ProjectColumn:
     status: str
     items: tuple[ProjectCard, ...]
 
-    def as_dict(self) -> dict[str, object]:
+    def as_dict(self, *, include_item_keys: bool = False) -> dict[str, object]:
         return {
             "status": self.status,
-            "items": [item.as_dict() for item in self.items],
+            "items": [
+                item.as_dict(include_item_key=include_item_keys) for item in self.items
+            ],
         }
 
 
@@ -45,13 +51,23 @@ class ProjectSnapshot:
     fetched_at: str | None
     rate_limited_until: str | None
     columns: tuple[ProjectColumn, ...]
+    status_field_id: str | None = None
+    status_option_ids: tuple[tuple[str, str], ...] = ()
 
-    def as_dict(self) -> dict[str, object]:
-        return {
+    def as_dict(self, *, include_item_keys: bool = False) -> dict[str, object]:
+        value: dict[str, object] = {
             "fetched_at": self.fetched_at,
             "rate_limited_until": self.rate_limited_until,
-            "columns": [column.as_dict() for column in self.columns],
+            "columns": [
+                column.as_dict(include_item_keys=include_item_keys)
+                for column in self.columns
+            ],
         }
+        if include_item_keys and self.status_field_id is not None:
+            value["status_field_id"] = self.status_field_id
+        if include_item_keys and self.status_option_ids:
+            value["status_option_ids"] = dict(self.status_option_ids)
+        return value
 
     @classmethod
     def from_dict(cls, value: Any) -> ProjectSnapshot:
@@ -81,6 +97,7 @@ class ProjectSnapshot:
                         linked_issue_numbers=tuple(
                             int(number) for number in linked if _is_int(number)
                         ),
+                        item_key=_optional_string(raw_item.get("item_key")),
                     )
                 )
             columns.append(
@@ -93,6 +110,11 @@ class ProjectSnapshot:
             fetched_at=_optional_string(payload.get("fetched_at")),
             rate_limited_until=_optional_string(payload.get("rate_limited_until")),
             columns=tuple(columns),
+            status_field_id=_optional_string(payload.get("status_field_id")),
+            status_option_ids=tuple(
+                (str(option_id), str(name))
+                for option_id, name in _object(payload.get("status_option_ids")).items()
+            ),
         )
 
 

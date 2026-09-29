@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -21,6 +22,8 @@ class CoreConfig:
     codex: str = "codex"
     skills_dirs: tuple[Path, ...] = ()
     refresh_seconds: float = 60.0
+    codex_args: tuple[str, ...] = ()
+    agent_step_timeout_seconds: float = 900.0
 
     def __post_init__(self) -> None:
         if self.owner_type not in {"user", "org"}:
@@ -29,6 +32,10 @@ class CoreConfig:
             )
         if self.project_number <= 0:
             raise CoreConfigurationError("BEEHAIIVE_PROJECT_NUMBER must be positive")
+        if not 1 <= self.agent_step_timeout_seconds <= 900:
+            raise CoreConfigurationError(
+                "BEEHAIIVE_AGENT_STEP_TIMEOUT_SECONDS must be between 1 and 900"
+            )
 
     @classmethod
     def from_environment(
@@ -61,6 +68,24 @@ class CoreConfig:
             raise CoreConfigurationError(
                 "BEEHAIIVE_PROJECT_REFRESH_SECONDS must be a number"
             ) from error
+        raw_timeout = values.get("BEEHAIIVE_AGENT_STEP_TIMEOUT_SECONDS", "900")
+        try:
+            agent_step_timeout_seconds = float(raw_timeout)
+        except ValueError as error:
+            raise CoreConfigurationError(
+                "BEEHAIIVE_AGENT_STEP_TIMEOUT_SECONDS must be a number"
+            ) from error
+        if not 1 <= agent_step_timeout_seconds <= 900:
+            raise CoreConfigurationError(
+                "BEEHAIIVE_AGENT_STEP_TIMEOUT_SECONDS must be between 1 and 900"
+            )
+        raw_codex_args = values.get("BEEHAIIVE_CODEX_ARGS", "")
+        try:
+            codex_args = tuple(shlex.split(raw_codex_args))
+        except ValueError as error:
+            raise CoreConfigurationError(
+                "BEEHAIIVE_CODEX_ARGS must contain valid shell-like arguments"
+            ) from error
         token = values.get("GITHUB_TOKEN", "").strip()
         if not token:
             token = values.get("GH_TOKEN", "").strip()
@@ -80,6 +105,8 @@ class CoreConfig:
             codex=values.get("BEEHAIIVE_CODEX", "codex") or "codex",
             skills_dirs=skills_dirs,
             refresh_seconds=refresh_seconds,
+            codex_args=codex_args,
+            agent_step_timeout_seconds=agent_step_timeout_seconds,
         )
 
 

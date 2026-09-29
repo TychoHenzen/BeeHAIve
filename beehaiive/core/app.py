@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from .agents import AgentConflict, AgentError, AgentService, item_key
 from .config import CoreConfig, CoreConfigurationError
 from .database import SnapshotDatabase
 from .project import ProjectDataError, ProjectProvider
@@ -27,6 +28,7 @@ def create_app(
     service: ProjectSnapshotService | None = None,
     workflow_store: WorkflowStore | None = None,
     workflow_generator: WorkflowGenerationService | None = None,
+    agent_service: AgentService | None = None,
 ) -> FastAPI:
     resolved_config = config or CoreConfig.from_environment()
     owned_database = database is None
@@ -48,10 +50,17 @@ def create_app(
     resolved_workflow_generator = workflow_generator or WorkflowGenerationService(
         resolved_config, resolved_service
     )
+    resolved_agent_service = agent_service or AgentService(
+        resolved_config,
+        resolved_database,
+        resolved_workflow_store,
+        resolved_service,
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         yield
+        resolved_agent_service.shutdown()
         if owned_database:
             resolved_database.close()
 
@@ -61,6 +70,7 @@ def create_app(
     app.state.owned_database = owned_database
     app.state.workflow_store = resolved_workflow_store
     app.state.workflow_generator = resolved_workflow_generator
+    app.state.agent_service = resolved_agent_service
 
     @app.get("/", include_in_schema=False)
     def index() -> FileResponse:
@@ -68,11 +78,101 @@ def create_app(
 
     @app.get("/api/project")
     def project() -> dict[str, object]:
-        return _read_snapshot(resolved_service)
+        return _read_snapshot(resolved_service, resolved_agent_service)
 
     @app.post("/api/project/refresh")
     def refresh() -> dict[str, object]:
-        return _read_snapshot(resolved_service, refresh=True)
+        return _read_snapshot(resolved_service, resolved_agent_service, refresh=True)
+
+    @app.get("/api/agents")
+    def agents() -> dict[str, Any]:
+        return {"agents": resolved_agent_service.list_agents()}
+
+    @app.post("/api/agents")
+    def create_agent(body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return resolved_agent_service.create_agent(body)
+        except AgentConflict as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except AgentError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except (OSError, RuntimeError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.get("/api/agents/{agent_id}")
+    def agent(agent_id: str) -> dict[str, Any]:
+        value = resolved_agent_service.get_agent(agent_id)
+        if value is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        return value
+
+    @app.patch("/api/agents/{agent_id}")
+    def update_agent(agent_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            value = resolved_agent_service.update_agent(agent_id, body)
+        except AgentConflict as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except AgentError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        if value is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        return value
+
+    @app.delete("/api/agents/{agent_id}")
+    def delete_agent(agent_id: str) -> dict[str, bool]:
+        outcome = resolved_agent_service.delete_agent(agent_id)
+        if outcome == "missing":
+            raise HTTPException(status_code=404, detail="agent not found")
+        if outcome == "running":
+            raise HTTPException(
+                status_code=409, detail="agent must be stopped before deletion"
+            )
+        return {"deleted": True}
+
+    @app.post("/api/agents/{agent_id}/start")
+    def start_agent(agent_id: str) -> dict[str, Any]:
+        try:
+            value = resolved_agent_service.start_agent(agent_id)
+        except AgentConflict as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except (AgentError, OSError, RuntimeError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        if value is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        return value
+
+    @app.post("/api/agents/{agent_id}/stop")
+    def stop_agent(agent_id: str) -> dict[str, Any]:
+        value = resolved_agent_service.stop_agent(agent_id)
+        if value is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        return value
+
+    @app.post("/api/agents/{agent_id}/reset")
+    def reset_agent(agent_id: str) -> dict[str, Any]:
+        try:
+            value = resolved_agent_service.reset_agent(agent_id)
+        except AgentConflict as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        if value is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        return value
+
+    @app.get("/api/agents/{agent_id}/logs")
+    def agent_logs(
+        agent_id: str, pass_id: str | None = None, limit: int = 100
+    ) -> dict[str, Any]:
+        value = resolved_agent_service.logs(agent_id, pass_id=pass_id, limit=limit)
+        if value is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        return value
+
+    @app.get("/api/agents/{agent_id}/history")
+    def agent_history(agent_id: str) -> dict[str, Any]:
+        value = resolved_agent_service.get_agent(agent_id)
+        if value is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        return {"passes": value["history"], "alerts": value["alerts"]}
 
     @app.post("/api/workflows/generate")
     def generate_workflow(body: dict[str, Any]) -> dict[str, Any]:
@@ -185,7 +285,10 @@ def create_app(
 
 
 def _read_snapshot(
-    service: ProjectSnapshotService, *, refresh: bool = False
+    service: ProjectSnapshotService,
+    agent_service: AgentService | None = None,
+    *,
+    refresh: bool = False,
 ) -> dict[str, object]:
     try:
         snapshot = service.request_refresh() if refresh else service.get_snapshot()
@@ -193,7 +296,19 @@ def _read_snapshot(
         raise HTTPException(status_code=503, detail=str(error)) from error
     except GithubRestError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
-    return snapshot.as_dict()
+    payload = snapshot.as_dict()
+    if agent_service is not None:
+        holders = agent_service.holders()
+        payload_columns = cast(list[dict[str, Any]], payload["columns"])
+        for column_index, column in enumerate(payload_columns):
+            source_column = snapshot.columns[column_index]
+            for item_index, item in enumerate(
+                cast(list[dict[str, Any]], column["items"])
+            ):
+                holder = holders.get(item_key(source_column.items[item_index]))
+                if holder is not None:
+                    item["holder"] = holder
+    return payload
 
 
 def _status_options(service: ProjectSnapshotService) -> tuple[str, ...]:

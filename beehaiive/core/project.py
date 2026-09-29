@@ -75,7 +75,37 @@ class ProjectProvider:
                 ProjectColumn(status=name, items=tuple(columns[name]))
                 for name in (*options, "No status")
             ),
+            status_field_id=str(status_field["id"]),
+            status_option_ids=tuple(option_ids.items()),
         )
+
+    def fetch_item(
+        self,
+        item_key: str,
+        *,
+        status_field_id: str | None,
+        status_options: tuple[str, ...] = (),
+        status_option_ids: Mapping[str, str] | None = None,
+    ) -> tuple[ProjectCard, str]:
+        option_ids = dict(status_option_ids or {})
+        options = status_options
+        if status_field_id is None:
+            fields_payload = self.client.get_json(f"{self.project_url}/fields")
+            status_field = _status_field(_list_payload(fields_payload.value, "fields"))
+            status_field_id = str(status_field["id"])
+            options = _status_options(status_field)
+            option_ids = _status_option_ids(status_field)
+        payload = self.client.get_json(
+            f"{self.project_url}/items/{quote(item_key, safe='')}",
+            params={"fields": status_field_id},
+        )
+        raw_item = _object(payload.value)
+        if isinstance(raw_item.get("item"), dict):
+            raw_item = _object(raw_item["item"])
+        card = _normalise_item(raw_item)
+        if card is None:
+            raise ProjectDataError(f"GitHub Project item {item_key!r} is unavailable")
+        return card, _item_status(raw_item, status_field_id, options, option_ids)
 
 
 def _list_payload(value: Any, key: str) -> list[Any]:
@@ -151,6 +181,23 @@ def _normalise_item(item: Mapping[str, Any]) -> ProjectCard | None:
     body = _text(content.get("body"))
     labels = _labels(content.get("labels"))
     linked = parse_closing_issue_numbers(body) if type_name == "PullRequest" else ()
+    item_key = _optional_text(
+        item.get("id")
+        or item.get("item_id")
+        or content.get("id")
+        or content.get("node_id")
+    )
+    if item_key is None:
+        item_key = ":".join(
+            value
+            for value in (
+                type_name,
+                repository or "",
+                str(number) if number is not None else "",
+                _optional_text(content.get("html_url") or content.get("url")) or "",
+            )
+            if value
+        )
     return ProjectCard(
         type=type_name,
         repository=None if type_name == "DraftIssue" else repository,
@@ -160,6 +207,7 @@ def _normalise_item(item: Mapping[str, Any]) -> ProjectCard | None:
         state=_optional_text(content.get("state")),
         labels=labels,
         linked_issue_numbers=linked,
+        item_key=item_key,
     )
 
 

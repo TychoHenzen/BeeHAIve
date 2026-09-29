@@ -5,7 +5,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 from .database import SnapshotDatabase
-from .models import ProjectColumn, ProjectSnapshot
+from .models import ProjectCard, ProjectColumn, ProjectSnapshot
 from .project import ProjectProvider
 from .rest import RateLimitError
 
@@ -31,6 +31,23 @@ class ProjectSnapshotService:
 
     def request_refresh(self) -> ProjectSnapshot:
         return self._get_or_refresh()
+
+    def fetch_held_item(self, item_key: str) -> tuple[ProjectCard, str]:
+        snapshot = self.database.load_snapshot()
+        if snapshot is None:
+            snapshot = self.get_snapshot()
+        status_options = tuple(
+            column.status for column in snapshot.columns if column.status != "No status"
+        )
+        status_field_id = snapshot.status_field_id
+        if not snapshot.status_option_ids:
+            status_field_id = None
+        return self.provider.fetch_item(
+            item_key,
+            status_field_id=status_field_id,
+            status_options=status_options,
+            status_option_ids=dict(snapshot.status_option_ids),
+        )
 
     def _get_or_refresh(self) -> ProjectSnapshot:
         existing = self.database.load_snapshot()
