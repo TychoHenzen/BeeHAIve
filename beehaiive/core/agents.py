@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urlsplit
 
 from .config import CoreConfig
 from .database import SnapshotDatabase
@@ -19,7 +20,10 @@ from .snapshot import ProjectSnapshotService
 from .workflows import WorkflowStore, validate_workflow
 
 AGENT_STATUSES = frozenset({"stopped", "waiting", "working", "stalled"})
-PASS_TERMINAL_STATUSES = frozenset({"completed", "stalled", "reset", "interrupted"})
+PASS_TERMINAL_STATUSES = frozenset(
+    {"completed", "stalled", "reset", "stopped", "interrupted"}
+)
+_LOG_LOCK = threading.Lock()
 
 
 class AgentError(ValueError):
@@ -31,7 +35,9 @@ class AgentConflict(AgentError):
 
 
 class AgentExecutionError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, exit_code: int | None = None) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
 
 
 def _now(clock: Callable[[], datetime]) -> str:
@@ -78,6 +84,12 @@ class AgentStore:
                     "UPDATE agent_passes SET status = 'interrupted', finished_at = ?, "
                     "stalled_reason = ? WHERE id = ?",
                     (now, "server restarted while pass was running", row["id"]),
+                )
+                connection.execute(
+                    "UPDATE agent_steps SET status = 'interrupted', "
+                    "finished_at = ?, summary = ? WHERE pass_id = ? "
+                    "AND status = 'running'",
+                    (now, "server restarted while step was running", row["id"]),
                 )
                 connection.execute(
                     "DELETE FROM agent_claims WHERE pass_id = ?", (row["id"],)
@@ -438,6 +450,22 @@ class AgentStore:
             )
         )
 
+    def record_alert(
+        self,
+        agent_id: str,
+        pass_id: str,
+        sequence: int | None,
+        kind: str,
+        message: str,
+    ) -> None:
+        self.database.transaction(
+            lambda connection: connection.execute(
+                "INSERT INTO agent_alerts(agent_id, pass_id, sequence, kind, "
+                "message, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (agent_id, pass_id, sequence, kind, message, _now(self._clock)),
+            )
+        )
+
     def complete_pass(self, agent_id: str, pass_id: str) -> None:
         self._finish_pass(agent_id, pass_id, "completed", None, release=True)
 
@@ -532,8 +560,13 @@ class AgentStore:
             pass_id = row["current_pass_id"]
             if pass_id:
                 connection.execute(
-                    "UPDATE agent_passes SET status = 'interrupted', finished_at = ?, "
+                    "UPDATE agent_passes SET status = 'stopped', finished_at = ?, "
                     "stalled_reason = ? WHERE id = ? AND status = 'running'",
+                    (now, reason, pass_id),
+                )
+                connection.execute(
+                    "UPDATE agent_steps SET status = 'stopped', finished_at = ?, "
+                    "summary = ? WHERE pass_id = ? AND status = 'running'",
                     (now, reason, pass_id),
                 )
                 connection.execute(
@@ -574,6 +607,17 @@ class AgentStore:
         path = Path(checkout_path).expanduser() / ".beehaiive" / "logs" / pass_id
         path.mkdir(parents=True, exist_ok=True)
         return path / f"{sequence}.jsonl"
+
+    def next_step_sequence(self, pass_id: str) -> int:
+        return self.database.transaction(
+            lambda connection: int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence "
+                    "FROM agent_steps WHERE pass_id = ?",
+                    (pass_id,),
+                ).fetchone()["sequence"]
+            )
+        )
 
     @staticmethod
     def _agent_dict(row: Any) -> dict[str, Any]:
@@ -729,6 +773,10 @@ class AgentService:
         except Exception as error:
             if "UNIQUE constraint failed: agents.name" in str(error):
                 raise AgentConflict("agent name already exists") from error
+            if "agents_checkout_path_unique" in str(
+                error
+            ) or "agents.checkout_path" in str(error):
+                raise AgentConflict("checkout path is already assigned") from error
             raise
 
     def update_agent(
@@ -759,6 +807,10 @@ class AgentService:
         except Exception as error:
             if "UNIQUE constraint failed: agents.name" in str(error):
                 raise AgentConflict("agent name already exists") from error
+            if "agents_checkout_path_unique" in str(
+                error
+            ) or "agents.checkout_path" in str(error):
+                raise AgentConflict("checkout path is already assigned") from error
             raise
 
     def delete_agent(self, agent_id: str) -> str:
@@ -942,7 +994,7 @@ class AgentService:
             "workflow_revision": revision,
             "parameters": resolved_parameters,
             "repository": repository,
-            "checkout_path": str(checkout),
+            "checkout_path": os.path.normcase(str(checkout)),
             "model": model,
         }
 
@@ -978,24 +1030,36 @@ class AgentService:
             ):
                 raise AgentError("assigned workflow revision no longer exists")
             definition = cast(dict[str, Any], revision["definition"])
-            snapshot = self.project_service.get_snapshot()
-            candidate = self._find_candidate(snapshot, definition, agent)
-            if candidate is None:
-                self.store.set_status(agent_id, "waiting")
-                return
-            card, column_status = candidate
-            pass_id = self.store.claim(
-                agent_id,
-                card,
-                status=column_status,
-                workflow_id=int(agent["workflow_id"]),
-                workflow_revision=int(agent["workflow_revision"]),
-                initial_state=str(definition["initial"]),
-            )
-            if pass_id is None:
-                self.store.set_status(agent_id, "waiting")
-                return
-            self._run_pass(agent, definition, card, column_status, pass_id, stop_event)
+            while not stop_event.is_set():
+                agent = self.store.get(agent_id)
+                if agent is None:
+                    return
+                snapshot = self.project_service.get_snapshot()
+                candidate = self._find_candidate(snapshot, definition, agent)
+                if candidate is None:
+                    self.store.set_status(agent_id, "waiting")
+                    self._wait_for_next_cycle(stop_event)
+                    continue
+                card, column_status = candidate
+                pass_id = self.store.claim(
+                    agent_id,
+                    card,
+                    status=column_status,
+                    workflow_id=int(agent["workflow_id"]),
+                    workflow_revision=int(agent["workflow_revision"]),
+                    initial_state=str(definition["initial"]),
+                )
+                if pass_id is None:
+                    self.store.set_status(agent_id, "waiting")
+                    self._wait_for_next_cycle(stop_event)
+                    continue
+                self._run_pass(
+                    agent, definition, card, column_status, pass_id, stop_event
+                )
+                current = self.store.get(agent_id)
+                if current is None or current["status"] in {"stopped", "stalled"}:
+                    return
+                self._wait_for_next_cycle(stop_event)
         except AgentExecutionError as error:
             if stop_event.is_set():
                 return
@@ -1027,6 +1091,10 @@ class AgentService:
                 self._threads.pop(agent_id, None)
                 self._stop_events.pop(agent_id, None)
                 self._processes.pop(agent_id, None)
+
+    def _wait_for_next_cycle(self, stop_event: threading.Event) -> None:
+        interval = min(max(self.config.refresh_seconds, 0.05), 60.0)
+        stop_event.wait(interval)
 
     def _run_pass(
         self,
@@ -1080,18 +1148,22 @@ class AgentService:
                 )
                 return
             action = str(state.get("action"))
+            sequence = self.store.next_step_sequence(pass_id)
             log_path = self.store.log_path(
-                str(agent["checkout_path"]), pass_id, visit_counts[current]
+                str(agent["checkout_path"]), pass_id, sequence
             )
             command = (
                 self._skill_command(agent, state, log_path)
                 if action == "run_skill"
                 else []
             )
-            sequence = self.store.begin_step(
+            inserted_sequence = self.store.begin_step(
                 pass_id, current, action, command, str(log_path)
             )
+            if inserted_sequence != sequence:
+                raise AgentExecutionError("step sequence changed while starting step")
             try:
+                exit_code: int | None = None
                 if action == "wait_for_work":
                     step_outcome = "item_claimed"
                     summary = "held Project item selected in deterministic order"
@@ -1111,18 +1183,32 @@ class AgentService:
                     step_outcome = result["outcome"]
                     summary = result["summary"]
                     handover = result["handover"]
+                    exit_code = result["exit_code"]
                     try:
-                        refreshed = self.project_service.request_refresh()
+                        refreshed_card, refreshed_status = (
+                            self.project_service.fetch_held_item(item_key(card))
+                        )
                     except Exception as error:
                         raise AgentExecutionError(
                             f"held item reread failed: {error}"
                         ) from error
-                    if not self._held_item_exists(refreshed, card):
-                        raise AgentExecutionError("held item disappeared during step")
+                    if item_key(refreshed_card) != item_key(card):
+                        raise AgentExecutionError(
+                            "held item reread returned another item"
+                        )
+                    card = refreshed_card
+                    column_status = refreshed_status
                 elif action == "escalate":
                     step_outcome = "escalated"
-                    summary = "operator attention required"
-                    handover = {"reason": "workflow escalation"}
+                    summary = (
+                        str(recent_steps[-1]["summary"])
+                        if recent_steps
+                        else "operator attention required"
+                    )
+                    self.store.record_alert(
+                        agent_id, pass_id, sequence, "escalated", summary
+                    )
+                    handover = {"reason": summary}
                 else:
                     raise AgentExecutionError(f"unsupported state action {action!r}")
                 self.store.finish_step(
@@ -1132,6 +1218,7 @@ class AgentService:
                     outcome=step_outcome,
                     summary=summary,
                     handover=handover,
+                    exit_code=exit_code,
                 )
                 recent_steps.append(
                     {
@@ -1170,6 +1257,7 @@ class AgentService:
                     sequence,
                     status="stalled",
                     summary=str(error),
+                    exit_code=error.exit_code,
                 )
                 self.store.stall_pass(
                     agent_id,
@@ -1219,7 +1307,12 @@ class AgentService:
             encoding="utf-8",
         )
         prompt = _skill_prompt(
-            state, card, column_status, parameters, recent_steps=recent_steps
+            state,
+            card,
+            column_status,
+            parameters,
+            skills_dirs=self.config.skills_dirs,
+            recent_steps=recent_steps,
         )
         _append_log(log_path, {"event": "start", "command": command})
         try:
@@ -1230,55 +1323,115 @@ class AgentService:
             self._processes[str(agent["id"])] = process
         try:
             try:
-                stdout, stderr = process.communicate(
-                    prompt, timeout=self.config.agent_step_timeout_seconds
+                return_code = self._communicate_process(
+                    process,
+                    prompt,
+                    log_path,
+                    timeout=self.config.agent_step_timeout_seconds,
                 )
             except subprocess.TimeoutExpired as error:
                 _terminate_process(process)
                 raise AgentExecutionError(
                     "codex exec timed out after "
-                    f"{self.config.agent_step_timeout_seconds:g} seconds"
+                    f"{self.config.agent_step_timeout_seconds:g} seconds",
+                    exit_code=getattr(process, "returncode", None),
                 ) from error
             except OSError as error:
-                raise AgentExecutionError(f"codex exec failed: {error}") from error
+                raise AgentExecutionError(
+                    f"codex exec failed: {error}",
+                    exit_code=getattr(process, "returncode", None),
+                ) from error
         finally:
             with self._lock:
                 self._processes.pop(str(agent["id"]), None)
-        _append_log(
-            log_path,
-            {
-                "event": "finish",
-                "returncode": process.returncode,
-                "stdout": _bounded_text(stdout),
-                "stderr": _bounded_text(stderr),
-            },
-        )
+        _append_log(log_path, {"event": "finish", "returncode": return_code})
         if stop_event.is_set():
-            raise AgentExecutionError("agent stopped while codex exec was running")
-        if process.returncode != 0:
             raise AgentExecutionError(
-                f"codex exec exited with status {process.returncode}"
+                "agent stopped while codex exec was running", exit_code=return_code
+            )
+        if return_code != 0:
+            raise AgentExecutionError(
+                f"codex exec exited with status {return_code}",
+                exit_code=return_code,
             )
         try:
             payload = json.loads(result_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise AgentExecutionError(
-                "codex exec produced no valid structured result"
+                "codex exec produced no valid structured result",
+                exit_code=return_code,
             ) from error
         if not isinstance(payload, dict):
-            raise AgentExecutionError("codex exec result must be an object")
+            raise AgentExecutionError(
+                "codex exec result must be an object", exit_code=return_code
+            )
         allowed = state.get("outcomes", [])
         result = cast(dict[str, Any], payload)
         outcome = result.get("outcome")
         summary = result.get("summary")
         handover = result.get("handover")
         if not isinstance(outcome, str) or outcome not in allowed:
-            raise AgentExecutionError("codex exec returned an undeclared outcome")
+            raise AgentExecutionError(
+                "codex exec returned an undeclared outcome", exit_code=return_code
+            )
         if not isinstance(summary, str) or not isinstance(handover, dict):
             raise AgentExecutionError(
-                "codex exec result has invalid summary or handover"
+                "codex exec result has invalid summary or handover",
+                exit_code=return_code,
             )
-        return {"outcome": outcome, "summary": summary, "handover": handover}
+        return {
+            "outcome": outcome,
+            "summary": summary,
+            "handover": handover,
+            "exit_code": return_code,
+        }
+
+    def _communicate_process(
+        self,
+        process: Any,
+        prompt: str,
+        log_path: Path,
+        *,
+        timeout: float,
+    ) -> int:
+        stdout = getattr(process, "stdout", None)
+        stderr = getattr(process, "stderr", None)
+        wait = getattr(process, "wait", None)
+        if stdout is None or stderr is None or not callable(wait):
+            output, error_output = process.communicate(prompt, timeout=timeout)
+            _append_stream_text(log_path, "stdout", output)
+            _append_stream_text(log_path, "stderr", error_output)
+            return int(process.returncode)
+        readers = [
+            threading.Thread(
+                target=_stream_log,
+                args=(stdout, log_path, "stdout"),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=_stream_log,
+                args=(stderr, log_path, "stderr"),
+                daemon=True,
+            ),
+        ]
+        for reader in readers:
+            reader.start()
+        stdin = getattr(process, "stdin", None)
+        if stdin is None:
+            raise OSError("codex exec stdin is unavailable")
+        stdin.write(prompt)
+        stdin.close()
+        try:
+            result = wait(timeout=timeout)
+        finally:
+            for reader in readers:
+                reader.join(timeout=1)
+        return_code = (
+            result if result is not None else getattr(process, "returncode", None)
+        )
+        if not isinstance(return_code, int):
+            raise OSError("codex exec exited without a return code")
+        return return_code
 
     def _skill_command(
         self, agent: Mapping[str, Any], state: Mapping[str, Any], log_path: Path
@@ -1325,6 +1478,17 @@ class AgentService:
         if path.exists():
             if not path.is_dir():
                 raise AgentError("agent checkout path is not a directory")
+            remote_result = subprocess.run(
+                ["git", "-C", str(path), "config", "--get", "remote.origin.url"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            remote_repository = _remote_repository(remote_result.stdout)
+            if remote_result.returncode != 0 or remote_repository is None:
+                raise AgentError("agent checkout path is not a Git clone")
+            if remote_repository.casefold() != str(agent["repository"]).casefold():
+                raise AgentError("agent checkout repository does not match assignment")
             return
         path.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(
@@ -1388,6 +1552,18 @@ def _is_operator_checkout(path: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _remote_repository(value: str) -> str | None:
+    remote = value.strip()
+    if remote.startswith("git@github.com:"):
+        path = remote.split(":", 1)[1]
+    else:
+        parsed = urlsplit(remote)
+        if parsed.hostname is None or parsed.hostname.casefold() != "github.com":
+            return None
+        path = parsed.path
+    return path.strip("/").removesuffix(".git") or None
 
 
 def _parameter_values(value: Any) -> dict[str, Any]:
@@ -1603,6 +1779,7 @@ def _skill_prompt(
     column_status: str,
     parameters: Mapping[str, Any],
     *,
+    skills_dirs: Sequence[Path] = (),
     recent_steps: Sequence[Mapping[str, Any]] = (),
 ) -> str:
     prompt = _resolve(state.get("prompt", ""), parameters)
@@ -1616,25 +1793,47 @@ def _skill_prompt(
         "recent_handovers": [dict(step) for step in recent_steps[-5:]],
         "authority": (
             "Only the checked-out repository and the held Project item are in "
-            "scope; do not request input, credentials, destructive actions, or "
-            "GitHub writes."
+            "scope. Work unattended and never wait for input. The core remains "
+            "read-only, while this child skill may use its authorized gh/git "
+            "workflow on the held item and repository. Return blocked only when "
+            "authority, credentials, or a destructive choice is missing."
         ),
     }
     facts_json = json.dumps(facts, sort_keys=True)
+    skill_path = _skill_path(str(skill), skills_dirs)
     return (
         f"{prompt}\n\nRead and follow the resolved skill at "
-        f"<skills>/{skill}/SKILL.md.\nResolved skill: {skill}\nFacts: {facts_json}"
+        f"{skill_path}.\nResolved skill: {skill}\nFacts: {facts_json}"
     )
 
 
 def _append_log(path: Path, event: Mapping[str, Any]) -> None:
-    with path.open("a", encoding="utf-8") as stream:
+    with _LOG_LOCK, path.open("a", encoding="utf-8") as stream:
         stream.write(_json(dict(event)) + "\n")
 
 
-def _bounded_text(value: Any, limit: int = 16_384) -> str:
+def _append_stream_text(path: Path, event: str, value: Any) -> None:
     text = "" if value is None else str(value)
-    return text if len(text) <= limit else text[:limit] + "…"
+    for line in text.splitlines() or ([text] if text else []):
+        _append_log(path, {"event": event, "line": line})
+
+
+def _stream_log(stream: Any, path: Path, event: str) -> None:
+    for line in iter(stream.readline, ""):
+        _append_log(path, {"event": event, "line": line.rstrip("\r\n")})
+
+
+def _skill_path(name: str, skills_dirs: Sequence[Path]) -> str:
+    for directory in skills_dirs:
+        try:
+            root = directory.expanduser().resolve()
+            candidate = (root / name / "SKILL.md").resolve()
+            candidate.relative_to(root)
+        except (OSError, ValueError):
+            continue
+        if candidate.is_file():
+            return str(candidate)
+    return f"<unresolved-skill>/{name}/SKILL.md"
 
 
 def _terminate_process(process: Any) -> None:

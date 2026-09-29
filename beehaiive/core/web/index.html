@@ -65,10 +65,26 @@
         <div class="panel-heading">
           <div>
             <h2 id="agents-title">Agents</h2>
-            <p>Assigned runners, held items, and the last bounded pass.</p>
+            <p>Assigned runners, held items, durable pass history, and live logs.</p>
           </div>
-          <button id="agents-refresh" type="button">Refresh agents</button>
+          <div class="agent-toolbar">
+            <button id="agent-new" type="button">New agent</button>
+            <button id="agents-refresh" type="button">Refresh agents</button>
+          </div>
         </div>
+        <form id="agent-form" class="agent-form" hidden>
+          <h3 id="agent-form-title">Create agent</h3>
+          <label>Name <input id="agent-name" required type="text"></label>
+          <label>Workflow <select id="agent-workflow" required></select></label>
+          <div id="agent-parameters" class="agent-parameters"></div>
+          <label>Repository <input id="agent-repository" required placeholder="owner/name" type="text"></label>
+          <label>Dedicated checkout <input id="agent-checkout" required type="text"></label>
+          <label>Model <input id="agent-model" placeholder="optional" type="text"></label>
+          <div class="agent-form-actions">
+            <button id="agent-save" type="submit">Save agent</button>
+            <button id="agent-cancel" type="button">Cancel</button>
+          </div>
+        </form>
         <div id="agents-status" class="agent-status" aria-live="polite"></div>
         <div id="agent-list" class="agent-list"></div>
       </section>

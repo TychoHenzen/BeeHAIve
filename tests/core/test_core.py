@@ -205,6 +205,40 @@ def test_project_api_normalizes_mixed_items_and_status_order() -> None:
     database.close()
 
 
+def test_project_provider_fetches_one_held_item_with_cached_status_field() -> None:
+    project_url = "https://api.github.com/users/TychoHenzen/projectsV2/2"
+    item_url = f"{project_url}/items/project-item-7?fields=407"
+    transport = FakeTransport(
+        {
+            item_url: [
+                response(
+                    {
+                        "id": "project-item-7",
+                        "content_type": "Issue",
+                        "content": {
+                            "number": 7,
+                            "title": "Fresh item",
+                            "html_url": "https://github.com/TychoHenzen/BeeHAIve/issues/7",
+                            "repository": {"full_name": "TychoHenzen/BeeHAIve"},
+                        },
+                        "fields": [{"id": 407, "value": {"name": {"raw": "Done"}}}],
+                    }
+                )
+            ]
+        }
+    )
+    database, provider = project_responses(config(), transport)
+
+    card, status = provider.fetch_item(
+        "project-item-7", status_field_id="407", status_options=("Todo", "Done")
+    )
+
+    assert card.item_key == "project-item-7"
+    assert status == "Done"
+    assert [call[0] for call in transport.calls] == [item_url]
+    database.close()
+
+
 def test_project_provider_uses_org_prefix_and_rejects_ambiguous_status() -> None:
     org_config = config("org")
     transport = FakeTransport({})
@@ -477,14 +511,17 @@ def test_database_persists_schema_and_snapshot(tmp_path: Path) -> None:
             fetched_at="2026-09-29T10:00:00+00:00",
             rate_limited_until=None,
             columns=(ProjectColumn(status="Todo", items=()),),
+            status_field_id="407",
         )
     )
     first.close()
     second = SnapshotDatabase(path)
-    assert second.load_snapshot() is not None
+    loaded = second.load_snapshot()
+    assert loaded is not None
+    assert loaded.status_field_id == "407"
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT version FROM schema_version").fetchone() == (
-            3,
+            4,
         )
     second.close()
 

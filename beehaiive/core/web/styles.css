@@ -119,6 +119,39 @@ main {
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
 }
 
+.agent-toolbar, .agent-form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.agent-form {
+  background: #171e2b;
+  border: 1px solid #2e3a4f;
+  border-radius: 0.6rem;
+  display: grid;
+  gap: 0.7rem;
+  margin-bottom: 1rem;
+  max-width: 42rem;
+  padding: 0.8rem;
+}
+
+.agent-form label, .agent-parameter {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.agent-parameters {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.agent-log-tail {
+  max-height: 16rem;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
 .agent-card {
   background: #171e2b;
   border: 1px solid #2e3a4f;

@@ -75,7 +75,35 @@ class ProjectProvider:
                 ProjectColumn(status=name, items=tuple(columns[name]))
                 for name in (*options, "No status")
             ),
+            status_field_id=str(status_field["id"]),
         )
+
+    def fetch_item(
+        self,
+        item_key: str,
+        *,
+        status_field_id: str | None,
+        status_options: tuple[str, ...] = (),
+    ) -> tuple[ProjectCard, str]:
+        option_ids: dict[str, str] = {}
+        options = status_options
+        if status_field_id is None:
+            fields_payload = self.client.get_json(f"{self.project_url}/fields")
+            status_field = _status_field(_list_payload(fields_payload.value, "fields"))
+            status_field_id = str(status_field["id"])
+            options = _status_options(status_field)
+            option_ids = _status_option_ids(status_field)
+        payload = self.client.get_json(
+            f"{self.project_url}/items/{quote(item_key, safe='')}",
+            params={"fields": status_field_id},
+        )
+        raw_item = _object(payload.value)
+        if isinstance(raw_item.get("item"), dict):
+            raw_item = _object(raw_item["item"])
+        card = _normalise_item(raw_item)
+        if card is None:
+            raise ProjectDataError(f"GitHub Project item {item_key!r} is unavailable")
+        return card, _item_status(raw_item, status_field_id, options, option_ids)
 
 
 def _list_payload(value: Any, key: str) -> list[Any]:

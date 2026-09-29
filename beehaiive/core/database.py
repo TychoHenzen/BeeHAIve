@@ -122,6 +122,13 @@ def _migration_three(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migration_four(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS agents_checkout_path_unique "
+        "ON agents(checkout_path)"
+    )
+
+
 def _migration_one(connection: sqlite3.Connection) -> None:
     connection.executescript(
         """
@@ -143,6 +150,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     _migration_one,
     _migration_two,
     _migration_three,
+    _migration_four,
 )
 
 

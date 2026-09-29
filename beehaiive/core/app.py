@@ -92,6 +92,8 @@ def create_app(
     def create_agent(body: dict[str, Any]) -> dict[str, Any]:
         try:
             return resolved_agent_service.create_agent(body)
+        except AgentConflict as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         except AgentError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         except (OSError, RuntimeError) as error:

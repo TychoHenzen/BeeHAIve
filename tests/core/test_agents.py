@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
 from fastapi.testclient import TestClient
 
-from beehaiive.core.agents import AgentStore
+from beehaiive.core.agents import AgentStore, _skill_prompt
 from beehaiive.core.app import create_app
 from beehaiive.core.config import CoreConfig
 from beehaiive.core.database import SnapshotDatabase
@@ -22,6 +23,20 @@ class StaticProvider:
 
     def fetch_snapshot(self) -> ProjectSnapshot:
         return self.snapshot
+
+    def fetch_item(
+        self,
+        item_key: str,
+        *,
+        status_field_id: str | None,
+        status_options: tuple[str, ...],
+    ) -> tuple[ProjectCard, str]:
+        del status_field_id, status_options
+        for column in self.snapshot.columns:
+            for card in column.items:
+                if card.item_key == item_key:
+                    return card, column.status
+        raise AssertionError(f"missing fake Project item {item_key}")
 
 
 class FakeCodexProcess:
@@ -43,7 +58,7 @@ class FakeCodexProcess:
             ),
             encoding="utf-8",
         )
-        return "", ""
+        return "event " + ("x" * 20_000), "stderr event"
 
     def terminate(self) -> None:
         self.returncode = -15
@@ -104,6 +119,20 @@ def test_agent_api_runs_one_fresh_codex_process_per_skill_state(tmp_path: Path) 
     skill.write_text("deliver", encoding="utf-8")
     checkout = tmp_path / "agent-checkout"
     checkout.mkdir()
+    subprocess.run(["git", "init", str(checkout)], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(checkout),
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/TychoHenzen/BeeHAIve.git",
+        ],
+        check=True,
+        capture_output=True,
+    )
     snapshot = ProjectSnapshot(
         fetched_at="2026-09-29T10:00:00+00:00",
         rate_limited_until=None,
@@ -188,6 +217,10 @@ def test_agent_api_runs_one_fresh_codex_process_per_skill_state(tmp_path: Path) 
         assert current["status"] == "waiting"
         assert current["history"][0]["status"] == "completed"
         assert current["history"][0]["steps"][1]["outcome"] == "done"
+        assert current["history"][0]["steps"][1]["exit_code"] == 0
+        log_lines = client.get(f"/api/agents/{agent_id}/logs").json()["lines"]
+        assert any(len(line) > 20_000 for line in log_lines)
+        assert any("stderr event" in line for line in log_lines)
         assert (
             client.delete(f"/api/workflows/{created_workflow.json()['id']}").status_code
             == 409
@@ -276,3 +309,113 @@ def test_agent_claim_is_unique_and_stop_releases_it() -> None:
     assert store.holders()["item-1"]["id"] == second["id"]
     store.stop(second["id"])
     database.close()
+
+
+def test_agent_stop_and_restart_recovery_close_running_steps(tmp_path: Path) -> None:
+    database = SnapshotDatabase(":memory:")
+    store = AgentStore(database)
+    agent = store.create(
+        name="runner",
+        workflow_id=1,
+        workflow_revision=1,
+        parameters={},
+        repository="TychoHenzen/BeeHAIve",
+        checkout_path=str(tmp_path / "runner"),
+        model=None,
+    )
+    store.set_status(agent["id"], "waiting")
+    card = ProjectCard(
+        type="Issue",
+        repository="TychoHenzen/BeeHAIve",
+        number=229,
+        title="runner",
+        url="https://github.com/TychoHenzen/BeeHAIve/issues/229",
+        state="open",
+        labels=(),
+        linked_issue_numbers=(),
+        item_key="item-229",
+    )
+    pass_id = store.claim(
+        agent["id"],
+        card,
+        status="Todo",
+        workflow_id=1,
+        workflow_revision=1,
+        initial_state="wait",
+    )
+    assert pass_id is not None
+    sequence = store.next_step_sequence(pass_id)
+    log_path = store.log_path(str(tmp_path / "runner"), pass_id, sequence)
+    store.begin_step(pass_id, "run", "run_skill", ["codex", "exec"], str(log_path))
+    store.stop(agent["id"])
+    stopped = store.get(agent["id"])
+    assert stopped is not None
+    assert stopped["history"][0]["status"] == "stopped"
+    assert stopped["history"][0]["steps"][0]["status"] == "stopped"
+
+    second_database = SnapshotDatabase(":memory:")
+    second_store = AgentStore(second_database)
+    second_agent = second_store.create(
+        name="restarted-runner",
+        workflow_id=1,
+        workflow_revision=1,
+        parameters={},
+        repository="TychoHenzen/BeeHAIve",
+        checkout_path=str(tmp_path / "restarted"),
+        model=None,
+    )
+    second_store.set_status(second_agent["id"], "waiting")
+    second_pass = second_store.claim(
+        second_agent["id"],
+        card,
+        status="Todo",
+        workflow_id=1,
+        workflow_revision=1,
+        initial_state="wait",
+    )
+    assert second_pass is not None
+    second_sequence = second_store.next_step_sequence(second_pass)
+    second_log = second_store.log_path(
+        str(tmp_path / "restarted"), second_pass, second_sequence
+    )
+    second_store.begin_step(
+        second_pass, "run", "run_skill", ["codex", "exec"], str(second_log)
+    )
+    AgentStore(second_database).recover_abandoned()
+    recovered = second_store.get(second_agent["id"])
+    assert recovered is not None
+    assert recovered["status"] == "stopped"
+    assert recovered["history"][0]["status"] == "interrupted"
+    assert recovered["history"][0]["steps"][0]["status"] == "interrupted"
+    second_database.close()
+    database.close()
+
+
+def test_skill_prompt_exposes_real_skill_path_and_child_authority(
+    tmp_path: Path,
+) -> None:
+    skill_path = tmp_path / "deliver" / "SKILL.md"
+    skill_path.parent.mkdir()
+    skill_path.write_text("deliver", encoding="utf-8")
+    card = ProjectCard(
+        type="Issue",
+        repository="TychoHenzen/BeeHAIve",
+        number=229,
+        title="runner",
+        url=None,
+        state="open",
+        labels=(),
+        linked_issue_numbers=(),
+    )
+
+    prompt = _skill_prompt(
+        {"skill": "deliver", "prompt": "Work the item.", "outcomes": ["done"]},
+        card,
+        "Todo",
+        {},
+        skills_dirs=(tmp_path,),
+    )
+
+    assert str(skill_path.resolve()) in prompt
+    assert "authorized gh/git workflow" in prompt
+    assert "Return blocked only when authority" in prompt
