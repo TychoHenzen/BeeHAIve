@@ -112,3 +112,95 @@ main {
   margin-top: 0.6rem;
   padding-top: 0.5rem;
 }
+
+.workflow-actions, .workflow-toolbar {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.workflow-list {
+  display: grid;
+  gap: 0.6rem;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  margin-bottom: 1rem;
+}
+
+.workflow-editor {
+  display: grid;
+  gap: 0.8rem;
+  max-width: 1500px;
+}
+
+.workflow-editor label {
+  display: grid;
+  gap: 0.35rem;
+}
+
+input, textarea {
+  background: #111827;
+  border: 1px solid #3e4b63;
+  border-radius: 0.35rem;
+  color: inherit;
+  font: inherit;
+  padding: 0.55rem;
+}
+
+.workflow-parameters {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.parameter-row, .state-card, .transition-card {
+  background: #171e2b;
+  border: 1px solid #2e3a4f;
+  border-radius: 0.45rem;
+  padding: 0.7rem;
+}
+
+.workflow-canvas {
+  display: grid;
+  gap: 0.8rem;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+}
+
+.state-card {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.parameter-row {
+  align-items: center;
+  display: grid;
+  gap: 0.45rem;
+  grid-template-columns: minmax(8rem, 1fr) minmax(8rem, 1fr) auto minmax(8rem, 1fr) auto;
+}
+
+.workflow-transitions {
+  display: grid;
+  gap: 0.45rem;
+  grid-column: 1 / -1;
+}
+
+.transition-card {
+  align-items: center;
+  display: flex;
+  gap: 0.6rem;
+  justify-content: space-between;
+}
+
+.state-card p {
+  color: #a6b1c2;
+}
+
+.workflow-json {
+  font-family: ui-monospace, monospace;
+  min-height: 20rem;
+  width: 100%;
+}
+
+.workflow-errors {
+  color: #ffb4ab;
+  white-space: pre-wrap;
+}

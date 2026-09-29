@@ -29,8 +29,37 @@
         <div id="board" class="board" aria-live="polite"></div>
       </section>
       <section class="panel" data-panel="workflows" aria-labelledby="workflows-title">
-        <h2 id="workflows-title">Workflows</h2>
-        <p>This tab is reserved for workflow definitions in the next core slice.</p>
+        <div class="panel-heading">
+          <div>
+            <h2 id="workflows-title">Workflows</h2>
+            <p id="workflow-status">Choose a workflow or start a new definition.</p>
+          </div>
+          <div class="workflow-actions">
+            <button id="workflow-new" type="button">New</button>
+            <button id="workflow-example" type="button">Example</button>
+            <button id="workflow-return" type="button">Return</button>
+          </div>
+        </div>
+        <div id="workflow-list" class="workflow-list"></div>
+        <div id="workflow-editor" class="workflow-editor" hidden>
+          <label>Workflow name <input id="workflow-name" type="text"></label>
+          <label>Operator prompt
+            <textarea id="workflow-prompt" rows="4" placeholder="Wait for an issue in {backlog}, then run {skill}."></textarea>
+          </label>
+          <div class="workflow-toolbar">
+            <button id="workflow-generate" type="button">Generate workflow</button>
+            <button id="workflow-help" type="button">?</button>
+            <button id="workflow-add-state" type="button">Add state</button>
+            <button id="workflow-add-transition" type="button">Add transition</button>
+            <button id="workflow-add-parameter" type="button">Add parameter</button>
+            <button id="workflow-save" type="button" disabled>Save revision</button>
+            <label class="advanced-toggle"><input id="workflow-advanced" type="checkbox"> Advanced JSON</label>
+          </div>
+          <div id="workflow-parameters" class="workflow-parameters"></div>
+          <div id="workflow-canvas" class="workflow-canvas" aria-live="polite"></div>
+          <textarea id="workflow-json" class="workflow-json" rows="18" hidden></textarea>
+          <pre id="workflow-errors" class="workflow-errors" aria-live="polite"></pre>
+        </div>
       </section>
       <section class="panel" data-panel="agents" aria-labelledby="agents-title">
         <h2 id="agents-title">Agents</h2>
