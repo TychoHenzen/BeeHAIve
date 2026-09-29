@@ -107,6 +107,7 @@ GENERATOR_OUTPUT_SCHEMA: dict[str, Any] = {
 }
 
 _PLACEHOLDER = re.compile(r"\{([a-z][a-z0-9_]*)\}")
+CODEX_TIMEOUT_SECONDS = 300
 
 WORKFLOW_SEMANTIC_CONTRACT = (
     "Parameter names match [a-z][a-z0-9_]{0,31}; parameter types are status, "
@@ -114,7 +115,8 @@ WORKFLOW_SEMANTIC_CONTRACT = (
     "A const parameter must have a non-null value of its declared type; a "
     "non-const parameter has value null. Item types are issue or pull_request.",
     "Placeholders are exactly {parameter_name}, must be declared, and must use "
-    "the type required by their field or condition.",
+    "the type required by their field or condition; source and state prompts "
+    "use text parameters.",
     "Condition kinds are item_status_is, item_type_is, item_has_label, "
     "item_lacks_label, item_repository_is, outcome_is, and always.",
     "always omits value (or uses null); every other condition has a non-empty "
@@ -369,13 +371,19 @@ def _skill_description(path: Path) -> str:
 
 
 def _run_codex(command: list[str], prompt: str, result_path: Path) -> str:
-    result = subprocess.run(
-        command,
-        input=prompt,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=CODEX_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            f"codex exec timed out after {CODEX_TIMEOUT_SECONDS} seconds"
+        ) from error
     if result.returncode != 0:
         message = result.stderr.strip() or result.stdout.strip() or "codex exec failed"
         raise RuntimeError(message)

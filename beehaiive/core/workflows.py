@@ -28,6 +28,26 @@ ITEM_CONDITION_KINDS = frozenset(
 CONDITION_KINDS = ITEM_CONDITION_KINDS | {"outcome_is", "always"}
 _PARAMETER_NAME = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _PLACEHOLDER = re.compile(r"\{([a-z][a-z0-9_]*)\}")
+_DEFINITION_FIELDS = frozenset(
+    {
+        "schema_version",
+        "name",
+        "description",
+        "source_prompt",
+        "auto_reset_on_stall",
+        "max_steps_per_pass",
+        "parameters",
+        "initial",
+        "states",
+        "transitions",
+    }
+)
+_PARAMETER_FIELDS = frozenset({"name", "type", "const", "value"})
+_STATE_FIELDS = frozenset(
+    {"id", "title", "action", "layout", "max_visits", "skill", "prompt", "outcomes"}
+)
+_TRANSITION_FIELDS = frozenset({"from", "to", "priority", "conditions"})
+_CONDITION_FIELDS = frozenset({"kind", "value"})
 
 
 @dataclass(frozen=True)
@@ -63,13 +83,203 @@ class WorkflowValidation:
         }
 
 
+def _validate_definition_shape(
+    value: Any,
+    error: Callable[[str, str], None],
+) -> bool:
+    valid = True
+
+    def invalid(location: str, message: str) -> None:
+        nonlocal valid
+        valid = False
+        error(location, message)
+
+    def check_keys(
+        value_object: Mapping[Any, Any],
+        location: str,
+        allowed: frozenset[str],
+        required: frozenset[str],
+    ) -> None:
+        for key in value_object:
+            if not isinstance(key, str) or key not in allowed:
+                invalid(f"{location}.{key}", "unknown field")
+        for key in required:
+            if key not in value_object:
+                invalid(f"{location}.{key}", "is required")
+
+    if not isinstance(value, Mapping):
+        invalid("definition", "must be an object")
+        return False
+    definition = cast(Mapping[str, Any], value)
+    check_keys(
+        definition,
+        "definition",
+        _DEFINITION_FIELDS,
+        frozenset(_DEFINITION_FIELDS),
+    )
+    if not isinstance(definition.get("schema_version"), int) or isinstance(
+        definition.get("schema_version"), bool
+    ):
+        invalid("schema_version", "must be an integer")
+    for field in ("name", "description", "source_prompt", "initial"):
+        if not isinstance(definition.get(field), str):
+            invalid(field, "must be a string")
+    if not isinstance(definition.get("auto_reset_on_stall"), bool):
+        invalid("auto_reset_on_stall", "must be a boolean")
+    if not isinstance(definition.get("max_steps_per_pass"), int) or isinstance(
+        definition.get("max_steps_per_pass"), bool
+    ):
+        invalid("max_steps_per_pass", "must be an integer")
+
+    parameters = definition.get("parameters")
+    if not isinstance(parameters, list):
+        invalid("parameters", "must be an array")
+    else:
+        for index, raw_parameter in enumerate(cast(list[Any], parameters)):
+            location = f"parameters[{index}]"
+            if not isinstance(raw_parameter, Mapping):
+                invalid(location, "must be an object")
+                continue
+            parameter = cast(Mapping[str, Any], raw_parameter)
+            check_keys(
+                parameter,
+                location,
+                _PARAMETER_FIELDS,
+                frozenset(_PARAMETER_FIELDS),
+            )
+            if not isinstance(parameter.get("name"), str):
+                invalid(f"{location}.name", "must be a string")
+            if not isinstance(parameter.get("type"), str):
+                invalid(f"{location}.type", "must be a string")
+            if not isinstance(parameter.get("const"), bool):
+                invalid(f"{location}.const", "must be a boolean")
+
+    states = definition.get("states")
+    if not isinstance(states, list):
+        invalid("states", "must be an array")
+    else:
+        for index, raw_state in enumerate(cast(list[Any], states)):
+            location = f"states[{index}]"
+            if not isinstance(raw_state, Mapping):
+                invalid(location, "must be an object")
+                continue
+            state = cast(Mapping[str, Any], raw_state)
+            check_keys(
+                state,
+                location,
+                _STATE_FIELDS,
+                frozenset({"id", "title", "action", "max_visits"}),
+            )
+            if not isinstance(state.get("id"), str):
+                invalid(f"{location}.id", "must be a string")
+            if not isinstance(state.get("title"), str):
+                invalid(f"{location}.title", "must be a string")
+            if not isinstance(state.get("action"), str):
+                invalid(f"{location}.action", "must be a string")
+            if not isinstance(state.get("max_visits"), int) or isinstance(
+                state.get("max_visits"), bool
+            ):
+                invalid(f"{location}.max_visits", "must be an integer")
+            for field in ("skill", "prompt"):
+                if (
+                    field in state
+                    and state[field] is not None
+                    and not isinstance(state[field], str)
+                ):
+                    invalid(f"{location}.{field}", "must be a string or null")
+            if "outcomes" in state:
+                outcomes = state["outcomes"]
+                if not isinstance(outcomes, list) or not all(
+                    isinstance(outcome, str) for outcome in cast(list[Any], outcomes)
+                ):
+                    invalid(f"{location}.outcomes", "must be an array of strings")
+            if "layout" in state:
+                layout = state["layout"]
+                if not isinstance(layout, Mapping):
+                    invalid(f"{location}.layout", "must be an object")
+                else:
+                    layout_object = cast(Mapping[str, Any], layout)
+                    check_keys(
+                        layout_object,
+                        f"{location}.layout",
+                        frozenset({"x", "y"}),
+                        frozenset({"x", "y"}),
+                    )
+                    for axis in ("x", "y"):
+                        if not isinstance(
+                            layout_object.get(axis), (int, float)
+                        ) or isinstance(layout_object.get(axis), bool):
+                            invalid(f"{location}.layout.{axis}", "must be a number")
+            action = state.get("action")
+            if action == "run_skill":
+                for field in ("skill", "prompt", "outcomes"):
+                    if field not in state:
+                        invalid(f"{location}.{field}", "is required for run_skill")
+
+    transitions = definition.get("transitions")
+    if not isinstance(transitions, list):
+        invalid("transitions", "must be an array")
+    else:
+        for index, raw_transition in enumerate(cast(list[Any], transitions)):
+            location = f"transitions[{index}]"
+            if not isinstance(raw_transition, Mapping):
+                invalid(location, "must be an object")
+                continue
+            transition = cast(Mapping[str, Any], raw_transition)
+            check_keys(
+                transition,
+                location,
+                _TRANSITION_FIELDS,
+                frozenset(_TRANSITION_FIELDS),
+            )
+            for field in ("from", "to"):
+                if not isinstance(transition.get(field), str):
+                    invalid(f"{location}.{field}", "must be a string")
+            if not isinstance(transition.get("priority"), int) or isinstance(
+                transition.get("priority"), bool
+            ):
+                invalid(f"{location}.priority", "must be an integer")
+            conditions = transition.get("conditions")
+            if not isinstance(conditions, list):
+                invalid(f"{location}.conditions", "must be an array")
+                continue
+            for condition_index, raw_condition in enumerate(
+                cast(list[Any], conditions)
+            ):
+                condition_location = f"{location}.conditions[{condition_index}]"
+                if not isinstance(raw_condition, Mapping):
+                    invalid(condition_location, "must be an object")
+                    continue
+                condition = cast(Mapping[str, Any], raw_condition)
+                check_keys(
+                    condition,
+                    condition_location,
+                    _CONDITION_FIELDS,
+                    frozenset({"kind"}),
+                )
+                if not isinstance(condition.get("kind"), str):
+                    invalid(f"{condition_location}.kind", "must be a string")
+                if (
+                    "value" in condition
+                    and condition["value"] is not None
+                    and not isinstance(condition["value"], str)
+                ):
+                    invalid(
+                        f"{condition_location}.value",
+                        "must be a string or null",
+                    )
+                if condition.get("kind") != "always" and "value" not in condition:
+                    invalid(f"{condition_location}.value", "is required")
+
+    return valid
+
+
 def validate_workflow(
     value: Any,
     *,
     skills_dirs: Sequence[Path] = (),
     status_options: Iterable[str] = (),
 ) -> WorkflowValidation:
-    definition = normalize_workflow(value)
     errors: list[WorkflowIssue] = []
     warnings: list[WorkflowIssue] = []
     statuses = {str(option) for option in status_options}
@@ -79,6 +289,12 @@ def validate_workflow(
 
     def warning(location: str, message: str) -> None:
         warnings.append(WorkflowIssue(location, message, "warning"))
+
+    if not _validate_definition_shape(value, error):
+        return WorkflowValidation(
+            normalize_workflow(value), tuple(errors), tuple(warnings)
+        )
+    definition = normalize_workflow(value)
 
     if definition["schema_version"] != SCHEMA_VERSION:
         error("schema_version", f"must be {SCHEMA_VERSION}")
@@ -137,6 +353,7 @@ def validate_workflow(
         parameter_uses,
         error,
         parameters,
+        expected_type="text",
     )
 
     raw_states = cast(list[dict[str, Any]], definition["states"])
@@ -160,7 +377,14 @@ def validate_workflow(
             error(f"{location}.max_visits", "must be an integer")
         elif max_visits < 1:
             error(f"{location}.max_visits", "must be positive")
-        _record_placeholders(state, location, parameter_uses, error, parameters)
+        _record_placeholders(
+            state,
+            location,
+            parameter_uses,
+            error,
+            parameters,
+            expected_type="text",
+        )
         if action == "run_skill":
             state_prompt = state.get("prompt")
             if not isinstance(state_prompt, str) or not state_prompt.strip():
@@ -340,71 +564,55 @@ def validate_workflow(
 
 
 def normalize_workflow(value: Any) -> dict[str, Any]:
-    source = _object(value)
-    definition: dict[str, Any] = {
-        "schema_version": _integer(source.get("schema_version"), SCHEMA_VERSION),
-        "name": str(source.get("name", "")),
-        "description": str(source.get("description", "")),
-        "source_prompt": str(source.get("source_prompt", "")),
-        "auto_reset_on_stall": source.get("auto_reset_on_stall", True) is not False,
-        "max_steps_per_pass": _integer(source.get("max_steps_per_pass"), 20),
-        "parameters": [],
-        "initial": str(source.get("initial", "")),
-        "states": [],
-        "transitions": [],
-    }
-    for raw_parameter in _list(source.get("parameters")):
-        parameter = _object(raw_parameter)
-        definition["parameters"].append(
-            {
-                "name": str(parameter.get("name", "")),
-                "type": str(parameter.get("type", "text")),
-                "const": parameter.get("const") is True,
-                "value": parameter.get("value"),
-            }
-        )
-    for raw_state in _list(source.get("states")):
-        state = _object(raw_state)
-        action = state.get("action", "")
-        action_data = _object(action) if isinstance(action, dict) else {}
-        state_data: dict[str, Any] = {
-            "id": str(state.get("id", "")),
-            "title": str(state.get("title", state.get("id", ""))),
-            "action": str(action_data.get("type", action_data.get("kind", action))),
-            "max_visits": _integer(state.get("max_visits"), 3),
-        }
-        for key in ("skill", "prompt", "outcomes"):
-            if key in state:
-                state_data[key] = state[key]
-            elif key in action_data:
-                state_data[key] = action_data[key]
-        if "layout" in state and isinstance(state["layout"], dict):
-            layout = _object(state["layout"])
-            state_data["layout"] = {
-                "x": _number(layout.get("x"), 0),
-                "y": _number(layout.get("y"), 0),
-            }
-        definition["states"].append(state_data)
-    for raw_transition in _list(source.get("transitions")):
-        transition = _object(raw_transition)
-        conditions: list[dict[str, Any]] = []
-        for raw_condition in _list(transition.get("conditions")):
-            condition = _object(raw_condition)
-            kind = str(condition.get("kind", ""))
-            normalized = {"kind": kind}
-            if "value" in condition and (
-                kind != "always" or condition["value"] is not None
-            ):
-                normalized["value"] = condition["value"]
-            conditions.append(normalized)
-        definition["transitions"].append(
-            {
-                "from": str(transition.get("from", "")),
-                "to": str(transition.get("to", "")),
-                "priority": _integer(transition.get("priority"), 0),
-                "conditions": conditions,
-            }
-        )
+    if not isinstance(value, Mapping):
+        return {}
+    source = cast(Mapping[str, Any], value)
+    definition = dict(source)
+    parameters = source.get("parameters")
+    if isinstance(parameters, list):
+        definition["parameters"] = [
+            dict(cast(Mapping[str, Any], parameter))
+            if isinstance(parameter, Mapping)
+            else parameter
+            for parameter in cast(list[Any], parameters)
+        ]
+    states = source.get("states")
+    if isinstance(states, list):
+        normalized_states: list[Any] = []
+        for raw_state in cast(list[Any], states):
+            if not isinstance(raw_state, Mapping):
+                normalized_states.append(raw_state)
+                continue
+            state = dict(cast(Mapping[str, Any], raw_state))
+            if isinstance(state.get("layout"), Mapping):
+                state["layout"] = dict(cast(Mapping[str, Any], state["layout"]))
+            normalized_states.append(state)
+        definition["states"] = normalized_states
+    transitions = source.get("transitions")
+    if isinstance(transitions, list):
+        normalized_transitions: list[Any] = []
+        for raw_transition in cast(list[Any], transitions):
+            if not isinstance(raw_transition, Mapping):
+                normalized_transitions.append(raw_transition)
+                continue
+            transition = dict(cast(Mapping[str, Any], raw_transition))
+            raw_conditions = transition.get("conditions")
+            if isinstance(raw_conditions, list):
+                conditions: list[Any] = []
+                for raw_condition in cast(list[Any], raw_conditions):
+                    if not isinstance(raw_condition, Mapping):
+                        conditions.append(raw_condition)
+                        continue
+                    condition = dict(cast(Mapping[str, Any], raw_condition))
+                    if (
+                        condition.get("kind") == "always"
+                        and condition.get("value") is None
+                    ):
+                        condition.pop("value", None)
+                    conditions.append(condition)
+                transition["conditions"] = conditions
+            normalized_transitions.append(transition)
+        definition["transitions"] = normalized_transitions
     return definition
 
 
@@ -599,13 +807,22 @@ def _record_placeholders(
     uses: defaultdict[str, list[str]],
     error: Callable[[str, str], None],
     parameters: Mapping[str, Mapping[str, Any]],
+    *,
+    expected_type: str,
 ) -> None:
-    for key in ("prompt", "skill"):
-        value = state.get(key)
-        if isinstance(value, str):
-            _record_text_placeholders(
-                value, f"{location}.{key}", uses, error, parameters
-            )
+    prompt = state.get("prompt")
+    if isinstance(prompt, str):
+        _record_text_placeholders(
+            prompt,
+            f"{location}.prompt",
+            uses,
+            error,
+            parameters,
+            expected_type=expected_type,
+        )
+    skill = state.get("skill")
+    if isinstance(skill, str):
+        _record_text_placeholders(skill, f"{location}.skill", uses, error, parameters)
 
 
 def _record_text_placeholders(
@@ -614,12 +831,18 @@ def _record_text_placeholders(
     uses: defaultdict[str, list[str]],
     error: Callable[[str, str], None],
     parameters: Mapping[str, Mapping[str, Any]],
+    *,
+    expected_type: str | None = None,
 ) -> None:
     for match in _PLACEHOLDER.finditer(text):
         name = match.group(1)
         uses[name].append(location)
         if name not in parameters:
             error(location, f"uses undeclared parameter {name!r}")
+        elif expected_type is not None and _is_placeholder(match.group(0)):
+            _check_placeholder_type(
+                match.group(0), expected_type, location, parameters, error
+            )
 
 
 def _check_placeholder_type(
@@ -748,27 +971,3 @@ def _condition_kind(value: Any) -> str:
 def _string_list(value: Any) -> list[str]:
     values = cast(list[Any], value) if isinstance(value, list) else []
     return [str(item) for item in values]
-
-
-def _object(value: Any) -> dict[str, Any]:
-    return cast(dict[str, Any], value) if isinstance(value, dict) else {}
-
-
-def _list(value: Any) -> list[Any]:
-    return cast(list[Any], value) if isinstance(value, list) else []
-
-
-def _integer(value: Any, default: int) -> int:
-    return (
-        int(value)
-        if isinstance(value, int) and not isinstance(value, bool)
-        else default
-    )
-
-
-def _number(value: Any, default: float) -> float:
-    return (
-        float(value)
-        if isinstance(value, (int, float)) and not isinstance(value, bool)
-        else default
-    )

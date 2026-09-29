@@ -12,6 +12,7 @@ const workflowErrors = document.querySelector("#workflow-errors");
 const workflowSave = document.querySelector("#workflow-save");
 let currentWorkflowId = null;
 let currentDefinition = null;
+let validationRevision = 0;
 
 function text(value) {
   return value == null ? "" : String(value);
@@ -85,7 +86,7 @@ function defaultWorkflow() {
     schema_version: 1,
     name: "Project delivery",
     description: "Wait for a project issue and run a skill.",
-    source_prompt: "Wait for an issue in {backlog}, then run {skill}.",
+    source_prompt: "Wait for a backlog item, then run the selected skill.",
     auto_reset_on_stall: true,
     max_steps_per_pass: 20,
     parameters: [
@@ -172,6 +173,9 @@ function exampleWorkflow() {
 function showEditor(definition, workflowId = null) {
   currentWorkflowId = workflowId;
   currentDefinition = structuredClone(definition);
+  if (!("parameters" in currentDefinition)) currentDefinition.parameters = [];
+  if (!("states" in currentDefinition)) currentDefinition.states = [];
+  if (!("transitions" in currentDefinition)) currentDefinition.transitions = [];
   workflowName.value = text(currentDefinition.name);
   workflowPrompt.value = text(currentDefinition.source_prompt);
   workflowEditor.hidden = false;
@@ -191,7 +195,10 @@ const conditionKinds = [
 
 function transitionConditionFor(state) {
   if (state?.action === "wait_for_work") {
-    const parameter = (currentDefinition.parameters ?? []).find((candidate) => candidate.type === "status");
+    const parameters = Array.isArray(currentDefinition.parameters)
+      ? currentDefinition.parameters
+      : [];
+    const parameter = parameters.find((candidate) => candidate.type === "status");
     return { kind: "item_status_is", value: parameter ? `{${parameter.name}}` : "Backlog" };
   }
   if (state?.action === "run_skill") {
@@ -212,7 +219,10 @@ function renderWorkflowEditor() {
   if (!currentDefinition) return;
   workflowJson.value = JSON.stringify(currentDefinition, null, 2);
   workflowParameters.replaceChildren();
-  for (const [index, parameter] of (currentDefinition.parameters ?? []).entries()) {
+  const parameters = Array.isArray(currentDefinition.parameters)
+    ? currentDefinition.parameters
+    : [];
+  for (const [index, parameter] of parameters.entries()) {
     const row = document.createElement("div");
     row.className = "parameter-row";
     row.dataset.parameterIndex = index;
@@ -221,7 +231,11 @@ function renderWorkflowEditor() {
     name.value = text(parameter.name);
     name.placeholder = "parameter name";
     name.setAttribute("aria-label", `${parameter.name || "parameter"} name`);
-    name.addEventListener("change", () => { parameter.name = name.value; validateCurrent(); });
+    name.addEventListener("change", () => {
+      parameter.name = name.value;
+      row.dataset.parameterName = name.value;
+      validateCurrent();
+    });
     const type = document.createElement("select");
     for (const option of ["status", "label", "skill", "repository", "item_type", "text", "number", "boolean"]) {
       type.append(makeOption(document, option, parameter.type));
@@ -254,13 +268,16 @@ function renderWorkflowEditor() {
     workflowParameters.append(row);
   }
   workflowCanvas.replaceChildren();
-  const states = currentDefinition.states ?? [];
+  const states = Array.isArray(currentDefinition.states) ? currentDefinition.states : [];
   const stateById = new Map(states.map((state) => [state.id, state]));
   for (const [stateIndex, state] of states.entries()) {
     state.layout ??= { x: 0, y: stateIndex * 160 };
   }
   const canvasHeight = Math.max(420, ...states.map((state) => Number(state.layout?.y ?? 0) + 190)) + 230;
   const canvasWidth = Math.max(960, ...states.map((state) => Number(state.layout?.x ?? 0) + 280));
+  const transitionsForCanvas = Array.isArray(currentDefinition.transitions)
+    ? currentDefinition.transitions
+    : [];
   workflowCanvas.style.minHeight = `${canvasHeight}px`;
   const edgeLayer = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   edgeLayer.classList.add("workflow-edges");
@@ -268,7 +285,7 @@ function renderWorkflowEditor() {
   edgeLayer.setAttribute("viewBox", `0 0 ${canvasWidth} ${canvasHeight}`);
   edgeLayer.setAttribute("width", canvasWidth);
   edgeLayer.setAttribute("height", canvasHeight);
-  for (const transition of currentDefinition.transitions ?? []) {
+  for (const transition of transitionsForCanvas) {
     const source = stateById.get(transition.from);
     const target = stateById.get(transition.to);
     if (!source || !target) continue;
@@ -374,7 +391,7 @@ function renderWorkflowEditor() {
   transitions.className = "workflow-transitions";
   transitions.style.top = `${canvasHeight - 210}px`;
   transitions.dataset.editorSection = "transitions";
-  for (const [index, transition] of (currentDefinition.transitions ?? []).entries()) {
+  for (const [index, transition] of transitionsForCanvas.entries()) {
     const edge = document.createElement("div");
     edge.className = "transition-card";
     edge.dataset.transitionIndex = index;
@@ -455,13 +472,26 @@ function markValidationErrors(issues) {
     element.removeAttribute("aria-invalid");
     delete element.dataset.validationError;
   }
+  const findByData = (attribute, value) => {
+    const datasetKey = attribute
+      .replace("data-", "")
+      .replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase());
+    return [...document.querySelectorAll(`[${attribute}]`)]
+      .find((element) => String(element.dataset[datasetKey]) === String(value));
+  };
   for (const issue of issues) {
-    const stateMatch = issue.location.match(/^states\[(\d+)\]/);
-    const parameterMatch = issue.location.match(/^parameters\[(\d+)\]/);
+    const stateMatch = issue.location.match(/^states\[([^\]]+)\]/);
+    const parameterMatch = issue.location.match(/^parameters\[([^\]]+)\]/);
     const transitionMatch = issue.location.match(/^transitions\[(\d+)\]/);
     let element = null;
-    if (stateMatch) element = document.querySelector(`[data-state-index=\"${stateMatch[1]}\"]`);
-    if (parameterMatch) element = document.querySelector(`[data-parameter-index=\"${parameterMatch[1]}\"]`);
+    if (stateMatch) {
+      element = findByData("data-state-index", stateMatch[1])
+        ?? findByData("data-state-id", stateMatch[1]);
+    }
+    if (parameterMatch) {
+      element = findByData("data-parameter-index", parameterMatch[1])
+        ?? findByData("data-parameter-name", parameterMatch[1]);
+    }
     if (transitionMatch) element = document.querySelector(`[data-transition-index=\"${transitionMatch[1]}\"]`);
     if (element) {
       element.setAttribute("aria-invalid", "true");
@@ -472,11 +502,13 @@ function markValidationErrors(issues) {
 
 async function validateCurrent() {
   if (!currentDefinition) return;
+  const revision = ++validationRevision;
   try {
     const result = await workflowRequest("/api/workflows/validate", {
       method: "POST",
       body: JSON.stringify({ definition: currentDefinition }),
     });
+    if (revision !== validationRevision) return;
     workflowSave.disabled = !result.valid;
     const issues = [...result.errors, ...result.warnings];
     markValidationErrors(issues);
@@ -484,6 +516,7 @@ async function validateCurrent() {
       ? issues.map((issue) => `${issue.level ?? "error"} ${issue.location}: ${issue.message}`).join("\n")
       : "Definition is valid.";
   } catch (error) {
+    if (revision !== validationRevision) return;
     workflowSave.disabled = true;
     markValidationErrors([]);
     workflowErrors.textContent = error.message;
@@ -491,10 +524,14 @@ async function validateCurrent() {
 }
 
 function duplicateState(stateId) {
+  if (!Array.isArray(currentDefinition.states)) currentDefinition.states = [];
   const state = currentDefinition.states.find((candidate) => candidate.id === stateId);
   if (!state) return;
   const copy = structuredClone(state);
+  const existingIds = new Set(currentDefinition.states.map((candidate) => candidate.id));
+  let suffix = 1;
   copy.id = `${stateId}_copy`;
+  while (existingIds.has(copy.id)) copy.id = `${stateId}_copy_${++suffix}`;
   copy.title = `${text(copy.title)} copy`;
   currentDefinition.states.push(copy);
   renderWorkflowEditor();
@@ -502,12 +539,15 @@ function duplicateState(stateId) {
 
 function deleteState(stateId) {
   if (stateId === currentDefinition.initial) return;
+  if (!Array.isArray(currentDefinition.states)) currentDefinition.states = [];
+  if (!Array.isArray(currentDefinition.transitions)) currentDefinition.transitions = [];
   currentDefinition.states = currentDefinition.states.filter((state) => state.id !== stateId);
   currentDefinition.transitions = currentDefinition.transitions.filter((edge) => edge.from !== stateId && edge.to !== stateId);
   renderWorkflowEditor();
 }
 
 function addState() {
+  if (!Array.isArray(currentDefinition.states)) currentDefinition.states = [];
   const id = `state_${currentDefinition.states.length + 1}`;
   currentDefinition.states.push({
     id,
@@ -522,7 +562,9 @@ function addState() {
 }
 
 function addTransition() {
-  const states = currentDefinition.states ?? [];
+  if (!Array.isArray(currentDefinition.states)) currentDefinition.states = [];
+  if (!Array.isArray(currentDefinition.transitions)) currentDefinition.transitions = [];
+  const states = currentDefinition.states;
   if (states.length < 2) return;
   const source = states.find((state) => state.id === currentDefinition.initial) ?? states[0];
   const target = states.find((state) => state.id !== source.id) ?? states[0];
@@ -536,6 +578,7 @@ function addTransition() {
 }
 
 function addParameter() {
+  if (!Array.isArray(currentDefinition.parameters)) currentDefinition.parameters = [];
   currentDefinition.parameters.push({ name: `parameter_${currentDefinition.parameters.length + 1}`, type: "text", const: false, value: null });
   renderWorkflowEditor();
 }
