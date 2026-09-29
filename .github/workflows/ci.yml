@@ -98,7 +98,7 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Run dashboard tests
+      - name: Run UI tests
         run: node --test tests/*.test.mjs
 
   python-coverage:
@@ -119,7 +119,7 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --locked --dev
       - name: Run tests with coverage
-        run: uv run pytest -q --cov=main --cov=beehaiive --cov-report=term-missing --cov-fail-under=90
+        run: uv run pytest -q --cov=beehaiive --cov-report=term-missing --cov-fail-under=90
 
   python-dependency-audit:
     name: python-dependency-audit
