@@ -38,10 +38,6 @@ def register_routes(app: FastAPI, context: ApiRouteContext) -> None:
     async def root() -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         return {"message": "Hello World"}
 
-    @app.get("/hello/{name}")
-    async def say_hello(name: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
-        return {"message": f"Hello {name}"}
-
     @app.get("/runs/{run_id}/routing")
     def routing_problem(  # pyright: ignore[reportUnusedFunction]
         run_id: str,

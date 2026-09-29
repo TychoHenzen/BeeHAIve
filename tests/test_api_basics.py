@@ -20,13 +20,6 @@ def test_root_returns_greeting() -> None:
     assert response.json() == {"message": "Hello World"}
 
 
-def test_hello_returns_name() -> None:
-    response = client.get("/hello/Developer")
-
-    assert response.status_code == 200
-    assert response.json() == {"message": "Hello Developer"}
-
-
 def test_project_routes_sync_and_claim_repository_work() -> None:
     service = Orchestrator(OrchestratorStore(), ApiProvider())
     project_client = TestClient(

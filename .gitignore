@@ -10,6 +10,9 @@ __pycache__/
 .coverage.*
 htmlcov/
 
+# quality-guard scanner output
+.quality/
+
 # Virtual environments and packaging output
 .venv/
 venv/
@@ -31,6 +34,9 @@ dist/
 .claude/
 .serena/
 .idea/
+
+# review-pr temporary output
+.pytest-review-temp/
 
 # BeeHAIve runtime state
 .beehaiive/
