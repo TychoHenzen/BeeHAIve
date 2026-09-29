@@ -112,3 +112,140 @@ main {
   margin-top: 0.6rem;
   padding-top: 0.5rem;
 }
+
+.workflow-actions, .workflow-toolbar {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.workflow-list {
+  display: grid;
+  gap: 0.6rem;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  margin-bottom: 1rem;
+}
+
+.workflow-editor {
+  display: grid;
+  gap: 0.8rem;
+  max-width: 1500px;
+}
+
+.workflow-editor label {
+  display: grid;
+  gap: 0.35rem;
+}
+
+input, select, textarea {
+  background: #111827;
+  border: 1px solid #3e4b63;
+  border-radius: 0.35rem;
+  color: inherit;
+  font: inherit;
+  padding: 0.55rem;
+}
+
+.workflow-parameters {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.parameter-row, .state-card, .transition-card {
+  background: #171e2b;
+  border: 1px solid #2e3a4f;
+  border-radius: 0.45rem;
+  padding: 0.7rem;
+}
+
+.workflow-canvas {
+  min-height: 420px;
+  overflow: auto;
+  position: relative;
+}
+
+.workflow-edges {
+  left: 0;
+  overflow: visible;
+  pointer-events: none;
+  position: absolute;
+  top: 0;
+}
+
+.workflow-edges line {
+  stroke: #7182a4;
+  stroke-width: 2;
+}
+
+.state-card {
+  position: absolute;
+  width: 230px;
+  display: grid;
+  gap: 0.45rem;
+  touch-action: none;
+}
+
+.parameter-row {
+  align-items: center;
+  display: grid;
+  gap: 0.45rem;
+  grid-template-columns: minmax(8rem, 1fr) minmax(8rem, 1fr) auto minmax(8rem, 1fr) auto;
+}
+
+.workflow-transitions {
+  display: grid;
+  left: 0;
+  position: absolute;
+  right: 0;
+  gap: 0.45rem;
+}
+
+.transition-card {
+  align-items: stretch;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  justify-content: space-between;
+}
+
+.transition-route, .condition-row {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.transition-route {
+  flex: 1 1 20rem;
+}
+
+.transition-conditions {
+  display: grid;
+  flex: 1 1 100%;
+  gap: 0.35rem;
+}
+
+.condition-row select, .condition-row input {
+  min-width: 12rem;
+}
+
+[aria-invalid="true"] {
+  border-color: #ff6b6b;
+  box-shadow: 0 0 0 1px #ff6b6b;
+}
+
+.state-card p {
+  color: #a6b1c2;
+}
+
+.workflow-json {
+  font-family: ui-monospace, monospace;
+  min-height: 20rem;
+  width: 100%;
+}
+
+.workflow-errors {
+  color: #ffb4ab;
+  white-space: pre-wrap;
+}

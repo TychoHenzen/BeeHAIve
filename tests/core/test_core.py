@@ -483,7 +483,7 @@ def test_database_persists_schema_and_snapshot(tmp_path: Path) -> None:
     assert second.load_snapshot() is not None
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT version FROM schema_version").fetchone() == (
-            1,
+            2,
         )
     second.close()
 

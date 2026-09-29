@@ -21,6 +21,33 @@ class HttpCacheEntry:
 Migration = Callable[[sqlite3.Connection], None]
 
 
+def _migration_two(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS workflows (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS workflow_revisions (
+            workflow_id INTEGER NOT NULL,
+            revision INTEGER NOT NULL,
+            source_prompt TEXT NOT NULL,
+            definition_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (workflow_id, revision),
+            FOREIGN KEY (workflow_id) REFERENCES workflows(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS workflow_assignments (
+            workflow_id INTEGER NOT NULL,
+            agent_id TEXT NOT NULL,
+            PRIMARY KEY (workflow_id, agent_id),
+            FOREIGN KEY (workflow_id) REFERENCES workflows(id) ON DELETE CASCADE
+        );
+        """
+    )
+
+
 def _migration_one(connection: sqlite3.Connection) -> None:
     connection.executescript(
         """
@@ -38,7 +65,7 @@ def _migration_one(connection: sqlite3.Connection) -> None:
     )
 
 
-MIGRATIONS: tuple[Migration, ...] = (_migration_one,)
+MIGRATIONS: tuple[Migration, ...] = (_migration_one, _migration_two)
 
 
 class SnapshotDatabase:
@@ -135,3 +162,7 @@ class SnapshotDatabase:
     def close(self) -> None:
         with self._lock:
             self._connection.close()
+
+    def transaction(self, operation: Callable[[sqlite3.Connection], Any]) -> Any:
+        with self._lock, self._connection:
+            return operation(self._connection)
