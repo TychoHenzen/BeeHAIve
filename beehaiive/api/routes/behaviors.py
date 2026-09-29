@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 
 from beehaiive.api.context import ApiRouteContext
+from beehaiive.api.helpers.assets import docs_asset
+from beehaiive.api.helpers.service_errors import (
+    ServiceErrorPolicy,
+    service_error_http_exception,
+)
 from beehaiive.api.models import (
     BehaviorAssignmentRequest,
     BehaviorBindingsRequest,
@@ -14,21 +17,30 @@ from beehaiive.api.models import (
 )
 from beehaiive.behavior_model import BehaviorModelError
 from beehaiive.behavior_service import BehaviorService, BehaviorServiceError
-from beehaiive.contract_types.validation import _redact_text
 from beehaiive.service_failures import FailureCategory
+
+_ERROR_POLICY = ServiceErrorPolicy(
+    unavailable_categories=frozenset(
+        {
+            FailureCategory.MODEL.value,
+            FailureCategory.TARGET_PROVIDER.value,
+            FailureCategory.PERSISTENCE.value,
+        }
+    ),
+    unavailable_codes=frozenset({"model_unavailable"}),
+    conflict_codes=frozenset({"state_conflict", "persistence", "invalid_checkpoint"}),
+    default_category=FailureCategory.MODEL,
+)
 
 
 def register_routes(app: FastAPI, context: ApiRouteContext) -> None:
     service: BehaviorService = context.behavior_service
     require_project_access = context.require_project_access
     require_dashboard_workflow_operator = context.require_dashboard_workflow_operator
-    docs_directory = Path(__file__).resolve().parents[3] / "docs"
 
     @app.get("/behavior-design", response_class=FileResponse)
     def behavior_design() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
-        return FileResponse(
-            docs_directory / "behavior-design.html", media_type="text/html"
-        )
+        return docs_asset("behavior-design.html", media_type="text/html")
 
     @app.get("/projects/{project_id}/behaviors")
     def behavior_list(
@@ -125,33 +137,7 @@ def register_routes(app: FastAPI, context: ApiRouteContext) -> None:
 
 
 def _http_error(error: BehaviorModelError | BehaviorServiceError) -> HTTPException:
-    if error.code == "not_found":
-        status = 404
-    elif (
-        getattr(error, "category", None)
-        in {
-            FailureCategory.MODEL,
-            FailureCategory.TARGET_PROVIDER,
-            FailureCategory.PERSISTENCE,
-        }
-        or error.code == "model_unavailable"
-    ):
-        status = 503
-    elif error.code in {"state_conflict", "persistence", "invalid_checkpoint"}:
-        status = 409
-    else:
-        status = 422
-    category = getattr(error, "category", FailureCategory.MODEL)
-    if isinstance(category, FailureCategory):
-        category = category.value
-    return HTTPException(
-        status_code=status,
-        detail={
-            "code": error.code,
-            "failure_class": str(category),
-            "message": _redact_text(str(error), 512),
-        },
-    )
+    return service_error_http_exception(error, _ERROR_POLICY)
 
 
 __all__ = ["register_routes"]
