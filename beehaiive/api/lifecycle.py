@@ -1,4 +1,6 @@
 import asyncio
+from collections.abc import AsyncGenerator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exception_handlers import (
@@ -69,7 +71,9 @@ def register_error_handlers(app: FastAPI) -> None:
         return await http_exception_handler(request, exc)
 
 
-def register_background_handlers(app: FastAPI, runtime: ApiRuntime) -> None:
+def register_background_handlers(
+    runtime: ApiRuntime,
+) -> Callable[[FastAPI], AbstractAsyncContextManager[None]]:
     agent_worker = runtime.agent_worker
     orchestrator = runtime.orchestrator
     scheduler = runtime.scheduler
@@ -77,8 +81,8 @@ def register_background_handlers(app: FastAPI, runtime: ApiRuntime) -> None:
     review_service = runtime.review_service
     review_repair_service = runtime.review_repair_service
 
-    @app.on_event("startup")  # pyright: ignore[reportDeprecated]
-    async def recover_operator_notification_outbox() -> None:  # pyright: ignore[reportUnusedFunction]
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
         await asyncio.to_thread(
             orchestrator.store.recover_interrupted_operator_notifications
         )
@@ -86,18 +90,7 @@ def register_background_handlers(app: FastAPI, runtime: ApiRuntime) -> None:
             dispatch_pending_operator_notifications, orchestrator.store
         )
 
-    if agent_worker is not None:
-
-        @app.on_event("shutdown")  # pyright: ignore[reportDeprecated]
-        async def shutdown_background_workers() -> None:  # pyright: ignore[reportUnusedFunction]
-            if scheduler is not None:
-                scheduler.shutdown()
-            agent_worker.shutdown()
-
-    if require_review_adapters:
-
-        @app.on_event("startup")  # pyright: ignore[reportDeprecated]
-        async def require_configured_review_adapters() -> None:  # pyright: ignore[reportUnusedFunction]
+        if require_review_adapters:
             missing = [
                 concern.value
                 for concern in REQUIRED_CONCERNS
@@ -116,19 +109,23 @@ def register_background_handlers(app: FastAPI, runtime: ApiRuntime) -> None:
             if callable(validate_configuration):
                 validate_configuration()
 
-    if review_repair_service is not None:
-
-        @app.on_event("startup")  # pyright: ignore[reportDeprecated]
-        async def recover_review_repairs() -> None:  # pyright: ignore[reportUnusedFunction]
+        if review_repair_service is not None:
             review_repair_service.recover()
 
-    if agent_worker is not None:
-
-        @app.on_event("startup")  # pyright: ignore[reportDeprecated]
-        async def recover_agent_workers() -> None:  # pyright: ignore[reportUnusedFunction]
+        if agent_worker is not None:
             if scheduler is not None:
                 agent_worker.recover(scheduler.project_ids)
             else:
                 agent_worker.recover()
             if scheduler is not None and scheduler.config.enabled:
                 scheduler.start()
+
+        try:
+            yield
+        finally:
+            if agent_worker is not None:
+                if scheduler is not None:
+                    scheduler.shutdown()
+                agent_worker.shutdown()
+
+    return lifespan
