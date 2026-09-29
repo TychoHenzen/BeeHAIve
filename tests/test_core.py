@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import runpy
 import sqlite3
 import threading
@@ -608,7 +609,7 @@ def test_config_environment_and_validation(
                 "BEEHAIIVE_DB='custom.db'",
                 "BEEHAIIVE_CODEX='codex-custom'",
                 "BEEHAIIVE_CODEX_ARGS=--model 'fast model'",
-                "BEEHAIIVE_SKILLS_DIRS=one;two",
+                f"BEEHAIIVE_SKILLS_DIRS=one{os.pathsep}two",
                 "BEEHAIIVE_PROJECT_REFRESH_SECONDS=120",
                 "BEEHAIIVE_AGENT_STEP_TIMEOUT_SECONDS=12",
                 "ignored line",
