@@ -75,7 +75,12 @@ class GithubRestClient:
             headers["Authorization"] = f"Bearer {self._token}"
         if cache is not None and cache.etag:
             headers["If-None-Match"] = cache.etag
-        response = self._transport(request_url, headers)
+        try:
+            response = self._transport(request_url, headers)
+        except OSError as error:
+            raise GithubRestError(
+                f"GitHub REST request failed for {request_url}: {error}"
+            ) from error
         response_headers = _normalise_headers(response.headers)
         if response.status_code == 304:
             if cache is None:
@@ -89,7 +94,9 @@ class GithubRestClient:
                 url=request_url,
                 from_cache=True,
             )
-        if response.status_code in {403, 429}:
+        if response.status_code in {403, 429} and _is_rate_limit_response(
+            response.status_code, response_headers, response.body
+        ):
             raise self._rate_limit_error(request_url, response_headers)
         if response.status_code < 200 or response.status_code >= 300:
             message = _response_message(response.body)
@@ -197,6 +204,18 @@ def _response_message(body: bytes | str) -> str:
         if isinstance(payload.get("message"), str):
             return payload["message"]
     return text[:200]
+
+
+def _is_rate_limit_response(
+    status_code: int, headers: Mapping[str, str], body: bytes | str
+) -> bool:
+    if status_code == 429:
+        return True
+    if _parse_int(headers.get("x-ratelimit-remaining")) == 0:
+        return True
+    if headers.get("retry-after"):
+        return True
+    return "rate limit" in _response_message(body).casefold()
 
 
 def _parse_int(value: str | None) -> int | None:

@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.error import URLError
 
 import pytest
 from fastapi.testclient import TestClient
@@ -21,6 +22,7 @@ from beehaiive.core.project import (
     parse_closing_issue_numbers,
 )
 from beehaiive.core.rest import (
+    GithubResponseError,
     GithubRestClient,
     HttpResponse,
     RateLimitError,
@@ -263,7 +265,10 @@ def test_cursor_pagination_and_read_only_api() -> None:
     assert all(label in page.text for label in ("Board", "Workflows", "Agents", "Hive"))
     assert script.status_code == 200
     assert "fetch" in script.text
+    assert "held by agent X" in script.text
+    assert 'load("/api/project/refresh", "POST")' in script.text
     assert set(app.openapi()["paths"]["/api/project"]) == {"get"}
+    assert set(app.openapi()["paths"]["/api/project/refresh"]) == {"post"}
     database.close()
 
 
@@ -306,6 +311,51 @@ def test_etag_reuses_cached_body_and_rate_limit_uses_headers() -> None:
     assert raised.value.primary
     assert raised.value.rate_limited_until.timestamp() >= reset
     limited_database.close()
+    database.close()
+
+
+def test_forbidden_response_is_not_treated_as_rate_limit() -> None:
+    url = "https://api.github.com/users/owner/projectsV2/2"
+    database = SnapshotDatabase(":memory:")
+    transport = FakeTransport(
+        {
+            url: [
+                HttpResponse(
+                    status_code=403,
+                    headers={"X-RateLimit-Remaining": "4999"},
+                    body='{"message":"Resource not accessible by integration"}',
+                )
+            ]
+        }
+    )
+    client = GithubRestClient("token", database, transport=transport)
+
+    with pytest.raises(GithubResponseError, match="403"):
+        client.get_json(url)
+
+    database.close()
+
+
+def test_transport_io_failure_returns_controlled_api_error() -> None:
+    database = SnapshotDatabase(":memory:")
+
+    def failing_transport(_url: str, _headers: Mapping[str, str]) -> HttpResponse:
+        raise URLError("offline")
+
+    provider = ProjectProvider(
+        config(), GithubRestClient("token", database, transport=failing_transport)
+    )
+    app = create_app(
+        config(),
+        database=database,
+        service=ProjectSnapshotService(provider, database, minimum_refresh_seconds=0),
+    )
+
+    with TestClient(app) as client:
+        result = client.get("/api/project")
+
+    assert result.status_code == 502
+    assert "offline" in result.json()["detail"]
     database.close()
 
 

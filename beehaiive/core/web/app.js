@@ -35,7 +35,7 @@ function render(snapshot) {
       labels.textContent = (item.labels ?? []).join(" · ");
       const holder = document.createElement("p");
       holder.className = "card-holder";
-      holder.textContent = "held by agent —";
+      holder.textContent = "held by agent X";
       card.append(meta, title, labels, holder);
       columnElement.append(card);
     }
@@ -47,9 +47,9 @@ function render(snapshot) {
   statusText.textContent = `Snapshot ${text(snapshot.fetched_at) || "not fetched"}${limited}`;
 }
 
-async function load(path = "/api/project") {
+async function load(path = "/api/project", method = "GET") {
   statusText.textContent = "Loading the linked Project snapshot…";
-  const response = await fetch(path);
+  const response = await fetch(path, { method });
   if (!response.ok) {
     throw new Error(`Project request failed: ${response.status}`);
   }
@@ -58,7 +58,7 @@ async function load(path = "/api/project") {
 
 document.querySelector("#refresh").addEventListener("click", async () => {
   try {
-    await load("/api/project/refresh");
+    await load("/api/project/refresh", "POST");
   } catch (error) {
     statusText.textContent = error.message;
   }
