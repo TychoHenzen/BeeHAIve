@@ -31,10 +31,6 @@ class WorkflowStoreCoreMixin(SQLiteStoreCoreMixin):
     def lease_heartbeat_seconds(self: Any) -> float:
         return max(self._lease_ttl_seconds / 3, 0.01)
 
-    def close(self: Any) -> None:
-        with self._lock:
-            self._connection.close()
-
     @contextmanager
     def _transaction(
         self: Any, *, reclaim_expired: bool = True
