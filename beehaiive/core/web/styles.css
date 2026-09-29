@@ -138,7 +138,7 @@ main {
   gap: 0.35rem;
 }
 
-input, textarea {
+input, select, textarea {
   background: #111827;
   border: 1px solid #3e4b63;
   border-radius: 0.35rem;
@@ -160,14 +160,30 @@ input, textarea {
 }
 
 .workflow-canvas {
-  display: grid;
-  gap: 0.8rem;
-  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  min-height: 420px;
+  overflow: auto;
+  position: relative;
+}
+
+.workflow-edges {
+  left: 0;
+  overflow: visible;
+  pointer-events: none;
+  position: absolute;
+  top: 0;
+}
+
+.workflow-edges line {
+  stroke: #7182a4;
+  stroke-width: 2;
 }
 
 .state-card {
+  position: absolute;
+  width: 230px;
   display: grid;
   gap: 0.45rem;
+  touch-action: none;
 }
 
 .parameter-row {
@@ -179,15 +195,44 @@ input, textarea {
 
 .workflow-transitions {
   display: grid;
+  left: 0;
+  position: absolute;
+  right: 0;
   gap: 0.45rem;
-  grid-column: 1 / -1;
 }
 
 .transition-card {
-  align-items: center;
+  align-items: stretch;
   display: flex;
+  flex-wrap: wrap;
   gap: 0.6rem;
   justify-content: space-between;
+}
+
+.transition-route, .condition-row {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.transition-route {
+  flex: 1 1 20rem;
+}
+
+.transition-conditions {
+  display: grid;
+  flex: 1 1 100%;
+  gap: 0.35rem;
+}
+
+.condition-row select, .condition-row input {
+  min-width: 12rem;
+}
+
+[aria-invalid="true"] {
+  border-color: #ff6b6b;
+  box-shadow: 0 0 0 1px #ff6b6b;
 }
 
 .state-card p {

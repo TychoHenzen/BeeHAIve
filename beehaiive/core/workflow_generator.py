@@ -108,6 +108,29 @@ GENERATOR_OUTPUT_SCHEMA: dict[str, Any] = {
 
 _PLACEHOLDER = re.compile(r"\{([a-z][a-z0-9_]*)\}")
 
+WORKFLOW_SEMANTIC_CONTRACT = (
+    "Parameter names match [a-z][a-z0-9_]{0,31}; parameter types are status, "
+    "label, skill, repository, item_type, text, number, or boolean.",
+    "A const parameter must have a non-null value of its declared type; a "
+    "non-const parameter has value null. Item types are issue or pull_request.",
+    "Placeholders are exactly {parameter_name}, must be declared, and must use "
+    "the type required by their field or condition.",
+    "Condition kinds are item_status_is, item_type_is, item_has_label, "
+    "item_lacks_label, item_repository_is, outcome_is, and always.",
+    "always omits value (or uses null); every other condition has a non-empty "
+    "string literal or a typed placeholder. Status literals must be known "
+    "Project Status options when options are available; otherwise report a "
+    "warning rather than inventing an option.",
+    "The initial state is wait_for_work. wait_for_work edges use item conditions "
+    "and never outcome_is; run_skill declares outcomes and has one outcome_is "
+    "edge for each; escalate has exactly one always edge.",
+    "Every state is reachable from initial and can reach initial; transition "
+    "priorities are integers. Literal skills must resolve to a configured "
+    "<skill>/SKILL.md.",
+    "Prompts are non-empty and at most 8 KB. Limits are 32 parameters, 32 states, "
+    "128 transitions, and 100 max steps per pass.",
+)
+
 
 Runner = Callable[[list[str], str, Path], str]
 
@@ -306,12 +329,7 @@ def build_generator_prompt(
             json.dumps(list(skills), indent=2),
             f"Known Project Status options: {json.dumps(list(statuses))}",
             f"Known labels: {json.dumps(list(labels))}",
-            "States are wait_for_work, run_skill, or escalate.",
-            "run_skill needs a skill, prompt, and declared outcomes; "
-            "every outcome needs an outcome_is edge.",
-            "wait_for_work edges need item conditions; escalate has one always edge.",
-            "Use no more than 32 states, 128 transitions, 32 parameters, "
-            "and 8 KB of prompt text.",
+            *WORKFLOW_SEMANTIC_CONTRACT,
         )
     )
 
@@ -402,15 +420,25 @@ def _complete_generated_definition(
         else []
     )
     merged: list[dict[str, Any]] = []
+    names: set[str] = set()
+    for parameter in parameters:
+        parameter_copy = dict(parameter)
+        parameter_name = str(parameter_copy.get("name", ""))
+        if parameter_name not in names:
+            merged.append(parameter_copy)
+            names.add(parameter_name)
     for parameter in generated_values:
-        if isinstance(parameter, Mapping):
-            merged.append(dict(cast(Mapping[str, Any], parameter)))
-    names = {str(parameter.get("name")) for parameter in merged}
-    inferred = [dict(parameter) for parameter in parameters]
-    known = {str(parameter.get("name")) for parameter in inferred}
+        if not isinstance(parameter, Mapping):
+            continue
+        generated = dict(cast(Mapping[str, Any], parameter))
+        parameter_name = str(generated.get("name", ""))
+        if parameter_name not in names:
+            merged.append(generated)
+            names.add(parameter_name)
+    known = set(names)
     for placeholder in _PLACEHOLDER.findall(operator_prompt):
         if placeholder not in known:
-            inferred.append(
+            merged.append(
                 {
                     "name": placeholder,
                     "type": _infer_parameter_type(placeholder),
@@ -419,18 +447,6 @@ def _complete_generated_definition(
                 }
             )
             known.add(placeholder)
-    for parameter in inferred:
-        parameter_name = str(parameter.get("name", ""))
-        if parameter_name not in names:
-            merged.append(
-                {
-                    "name": parameter_name,
-                    "type": str(parameter.get("type", "text")),
-                    "const": parameter.get("const") is True,
-                    "value": parameter.get("value"),
-                }
-            )
-            names.add(parameter_name)
     result["parameters"] = merged
     return result
 

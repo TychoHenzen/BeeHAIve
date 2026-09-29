@@ -107,6 +107,68 @@ function defaultWorkflow() {
   };
 }
 
+function exampleWorkflow() {
+  const skills = [
+    ["refine", "refine-backlog-item"],
+    ["next", "next-ticket"],
+    ["submit", "submit-draft-pr"],
+    ["review", "review-pr"],
+    ["fix", "fix-pr-review"],
+    ["complete", "complete-pr"],
+  ];
+  const parameters = [
+    { name: "backlog", type: "status", const: true, value: "Backlog" },
+    ...skills.map(([name, value]) => ({ name: `${name}_skill`, type: "skill", const: true, value })),
+  ];
+  const runState = (id, title, skill, prompt, outcomes, x, y) => ({
+    id,
+    title,
+    action: "run_skill",
+    skill: `{${skill}_skill}`,
+    prompt,
+    outcomes,
+    max_visits: 3,
+    layout: { x, y },
+  });
+  return {
+    schema_version: 1,
+    name: "Operator delivery lifecycle",
+    description: "Refine, implement, review, repair, and complete one held Project item.",
+    source_prompt: "Refine a Backlog item, start its ticket, submit a draft PR, review it, repair findings, complete it, and escalate blockers.",
+    auto_reset_on_stall: true,
+    max_steps_per_pass: 20,
+    parameters,
+    initial: "wait",
+    states: [
+      { id: "wait", title: "Wait for Backlog", action: "wait_for_work", max_visits: 3, layout: { x: 0, y: 170 } },
+      runState("refine", "Refine backlog item", "refine", "Research the held PBI and move it to Todo.", ["done", "blocked"], 300, 0),
+      runState("next", "Start next ticket", "next", "Implement the refined PBI and push its branch.", ["done", "blocked"], 600, 0),
+      runState("submit", "Submit draft PR", "submit", "Create or update the draft pull request.", ["done", "blocked"], 900, 0),
+      runState("review", "Review PR", "review", "Review the branch against the live acceptance contract.", ["approved", "changes_requested", "blocked"], 1200, 0),
+      runState("fix", "Fix review findings", "fix", "Apply only valid findings, verify them, and reply.", ["fixed", "blocked"], 1200, 260),
+      runState("complete", "Complete PR", "complete", "Run the guarded checks, merge, and finalize the linked issue.", ["done", "blocked"], 900, 260),
+      { id: "escalate", title: "Escalate blocker", action: "escalate", max_visits: 3, layout: { x: 600, y: 260 } },
+    ],
+    transitions: [
+      { from: "wait", to: "refine", priority: 1, conditions: [{ kind: "item_status_is", value: "{backlog}" }] },
+      { from: "refine", to: "next", priority: 1, conditions: [{ kind: "outcome_is", value: "done" }] },
+      { from: "refine", to: "escalate", priority: 2, conditions: [{ kind: "outcome_is", value: "blocked" }] },
+      { from: "next", to: "submit", priority: 1, conditions: [{ kind: "outcome_is", value: "done" }] },
+      { from: "next", to: "escalate", priority: 2, conditions: [{ kind: "outcome_is", value: "blocked" }] },
+      { from: "submit", to: "review", priority: 1, conditions: [{ kind: "outcome_is", value: "done" }] },
+      { from: "submit", to: "escalate", priority: 2, conditions: [{ kind: "outcome_is", value: "blocked" }] },
+      { from: "review", to: "complete", priority: 1, conditions: [{ kind: "outcome_is", value: "approved" }] },
+      { from: "review", to: "fix", priority: 2, conditions: [{ kind: "outcome_is", value: "changes_requested" }] },
+      { from: "review", to: "escalate", priority: 3, conditions: [{ kind: "outcome_is", value: "blocked" }] },
+      { from: "fix", to: "review", priority: 1, conditions: [{ kind: "outcome_is", value: "fixed" }] },
+      { from: "fix", to: "escalate", priority: 2, conditions: [{ kind: "outcome_is", value: "blocked" }] },
+      { from: "complete", to: "wait", priority: 1, conditions: [{ kind: "outcome_is", value: "done" }] },
+      { from: "complete", to: "escalate", priority: 2, conditions: [{ kind: "outcome_is", value: "blocked" }] },
+      { from: "escalate", to: "wait", priority: 1, conditions: [{ kind: "always" }] },
+    ],
+  };
+}
+
 function showEditor(definition, workflowId = null) {
   currentWorkflowId = workflowId;
   currentDefinition = structuredClone(definition);
@@ -117,6 +179,35 @@ function showEditor(definition, workflowId = null) {
   renderWorkflowEditor();
 }
 
+const conditionKinds = [
+  "item_status_is",
+  "item_type_is",
+  "item_has_label",
+  "item_lacks_label",
+  "item_repository_is",
+  "outcome_is",
+  "always",
+];
+
+function transitionConditionFor(state) {
+  if (state?.action === "wait_for_work") {
+    const parameter = (currentDefinition.parameters ?? []).find((candidate) => candidate.type === "status");
+    return { kind: "item_status_is", value: parameter ? `{${parameter.name}}` : "Backlog" };
+  }
+  if (state?.action === "run_skill") {
+    return { kind: "outcome_is", value: text(state.outcomes?.[0] || "done") };
+  }
+  return { kind: "always" };
+}
+
+function makeOption(documentObject, value, selectedValue) {
+  const item = documentObject.createElement("option");
+  item.value = value;
+  item.textContent = value;
+  item.selected = value === selectedValue;
+  return item;
+}
+
 function renderWorkflowEditor() {
   if (!currentDefinition) return;
   workflowJson.value = JSON.stringify(currentDefinition, null, 2);
@@ -124,23 +215,23 @@ function renderWorkflowEditor() {
   for (const [index, parameter] of (currentDefinition.parameters ?? []).entries()) {
     const row = document.createElement("div");
     row.className = "parameter-row";
+    row.dataset.parameterIndex = index;
+    row.dataset.parameterName = text(parameter.name);
     const name = document.createElement("input");
     name.value = text(parameter.name);
     name.placeholder = "parameter name";
+    name.setAttribute("aria-label", `${parameter.name || "parameter"} name`);
     name.addEventListener("change", () => { parameter.name = name.value; validateCurrent(); });
     const type = document.createElement("select");
     for (const option of ["status", "label", "skill", "repository", "item_type", "text", "number", "boolean"]) {
-      const item = document.createElement("option");
-      item.value = option;
-      item.textContent = option;
-      item.selected = parameter.type === option;
-      type.append(item);
+      type.append(makeOption(document, option, parameter.type));
     }
+    type.setAttribute("aria-label", `${parameter.name || "parameter"} type`);
     type.addEventListener("change", () => { parameter.type = type.value; validateCurrent(); });
     const constant = document.createElement("input");
     constant.type = "checkbox";
     constant.checked = parameter.const === true;
-    constant.setAttribute("aria-label", "constant parameter");
+    constant.setAttribute("aria-label", `${parameter.name || "parameter"} constant`);
     constant.addEventListener("change", () => {
       parameter.const = constant.checked;
       parameter.value = constant.checked ? (parameter.value ?? "") : null;
@@ -150,6 +241,7 @@ function renderWorkflowEditor() {
     value.value = text(parameter.value);
     value.disabled = !constant.checked;
     value.placeholder = constant.checked ? "constant value" : "assigned at runtime";
+    value.setAttribute("aria-label", `${parameter.name || "parameter"} value`);
     value.addEventListener("change", () => { parameter.value = value.value; validateCurrent(); });
     const remove = document.createElement("button");
     remove.type = "button";
@@ -162,31 +254,73 @@ function renderWorkflowEditor() {
     workflowParameters.append(row);
   }
   workflowCanvas.replaceChildren();
-  for (const state of currentDefinition.states ?? []) {
+  const states = currentDefinition.states ?? [];
+  const stateById = new Map(states.map((state) => [state.id, state]));
+  for (const [stateIndex, state] of states.entries()) {
+    state.layout ??= { x: 0, y: stateIndex * 160 };
+  }
+  const canvasHeight = Math.max(420, ...states.map((state) => Number(state.layout?.y ?? 0) + 190)) + 230;
+  const canvasWidth = Math.max(960, ...states.map((state) => Number(state.layout?.x ?? 0) + 280));
+  workflowCanvas.style.minHeight = `${canvasHeight}px`;
+  const edgeLayer = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  edgeLayer.classList.add("workflow-edges");
+  edgeLayer.setAttribute("aria-hidden", "true");
+  edgeLayer.setAttribute("viewBox", `0 0 ${canvasWidth} ${canvasHeight}`);
+  edgeLayer.setAttribute("width", canvasWidth);
+  edgeLayer.setAttribute("height", canvasHeight);
+  for (const transition of currentDefinition.transitions ?? []) {
+    const source = stateById.get(transition.from);
+    const target = stateById.get(transition.to);
+    if (!source || !target) continue;
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("x1", Number(source.layout?.x ?? 0) + 115);
+    line.setAttribute("y1", Number(source.layout?.y ?? 0) + 70);
+    line.setAttribute("x2", Number(target.layout?.x ?? 0) + 115);
+    line.setAttribute("y2", Number(target.layout?.y ?? 0) + 70);
+    edgeLayer.append(line);
+  }
+  workflowCanvas.append(edgeLayer);
+  for (const [stateIndex, state] of states.entries()) {
     const card = document.createElement("article");
     card.className = "state-card";
+    card.dataset.stateId = text(state.id);
+    card.dataset.stateIndex = stateIndex;
+    card.style.left = `${Number(state.layout.x ?? 0)}px`;
+    card.style.top = `${Number(state.layout.y ?? 0)}px`;
     const title = document.createElement("h3");
     title.textContent = `${state.id === currentDefinition.initial ? "★ " : ""}${text(state.title || state.id)}`;
-    const action = document.createElement("p");
-    action.textContent = text(state.action);
     const titleInput = document.createElement("input");
     titleInput.value = text(state.title || state.id);
     titleInput.setAttribute("aria-label", `${state.id} title`);
     titleInput.addEventListener("change", () => { state.title = titleInput.value; renderWorkflowEditor(); });
     const actionSelect = document.createElement("select");
     for (const option of ["wait_for_work", "run_skill", "escalate"]) {
-      const item = document.createElement("option");
-      item.value = option;
-      item.textContent = option;
-      item.selected = state.action === option;
-      actionSelect.append(item);
+      actionSelect.append(makeOption(document, option, state.action));
     }
+    actionSelect.setAttribute("aria-label", `${state.id} action`);
     actionSelect.addEventListener("change", () => { state.action = actionSelect.value; validateCurrent(); });
-    const promptInput = document.createElement("input");
-    promptInput.value = text(state.prompt);
-    promptInput.placeholder = "state-specific prompt";
-    promptInput.setAttribute("aria-label", `${state.id} prompt`);
-    promptInput.addEventListener("change", () => { state.prompt = promptInput.value; validateCurrent(); });
+    const fields = [titleInput, actionSelect];
+    if (state.action === "run_skill") {
+      const skillInput = document.createElement("input");
+      skillInput.value = text(state.skill);
+      skillInput.placeholder = "skill or {skill_parameter}";
+      skillInput.setAttribute("aria-label", `${state.id} skill`);
+      skillInput.addEventListener("change", () => { state.skill = skillInput.value; validateCurrent(); });
+      const promptInput = document.createElement("input");
+      promptInput.value = text(state.prompt);
+      promptInput.placeholder = "state-specific prompt";
+      promptInput.setAttribute("aria-label", `${state.id} prompt`);
+      promptInput.addEventListener("change", () => { state.prompt = promptInput.value; validateCurrent(); });
+      const outcomesInput = document.createElement("input");
+      outcomesInput.value = (state.outcomes ?? []).join(", ");
+      outcomesInput.placeholder = "outcomes, comma separated";
+      outcomesInput.setAttribute("aria-label", `${state.id} outcomes`);
+      outcomesInput.addEventListener("change", () => {
+        state.outcomes = outcomesInput.value.split(",").map((item) => item.trim()).filter(Boolean);
+        renderWorkflowEditor();
+      });
+      fields.push(skillInput, promptInput, outcomesInput);
+    }
     const edit = document.createElement("button");
     edit.type = "button";
     edit.textContent = "Edit JSON";
@@ -204,15 +338,103 @@ function renderWorkflowEditor() {
     remove.textContent = "Delete";
     remove.disabled = state.id === currentDefinition.initial;
     remove.addEventListener("click", () => deleteState(state.id));
-    card.append(title, titleInput, action, actionSelect, promptInput, edit, duplicate, remove);
+    card.append(title, ...fields, edit, duplicate, remove);
+    let drag = null;
+    card.addEventListener("pointerdown", (event) => {
+      const tag = String(event.target?.tagName ?? "").toLowerCase();
+      if (["input", "select", "textarea", "button"].includes(tag)) return;
+      const bounds = workflowCanvas.getBoundingClientRect();
+      drag = {
+        pointerId: event.pointerId,
+        offsetX: event.clientX - bounds.left - Number(state.layout.x),
+        offsetY: event.clientY - bounds.top - Number(state.layout.y),
+      };
+      card.setPointerCapture?.(event.pointerId);
+    });
+    card.addEventListener("pointermove", (event) => {
+      if (!drag || drag.pointerId !== event.pointerId) return;
+      const bounds = workflowCanvas.getBoundingClientRect();
+      state.layout = {
+        x: Math.max(0, Math.round(event.clientX - bounds.left - drag.offsetX)),
+        y: Math.max(0, Math.round(event.clientY - bounds.top - drag.offsetY)),
+      };
+      card.style.left = `${state.layout.x}px`;
+      card.style.top = `${state.layout.y}px`;
+      workflowJson.value = JSON.stringify(currentDefinition, null, 2);
+    });
+    const stopDrag = () => {
+      if (drag) renderWorkflowEditor();
+      drag = null;
+    };
+    card.addEventListener("pointerup", stopDrag);
+    card.addEventListener("pointercancel", stopDrag);
     workflowCanvas.append(card);
   }
   const transitions = document.createElement("div");
   transitions.className = "workflow-transitions";
+  transitions.style.top = `${canvasHeight - 210}px`;
+  transitions.dataset.editorSection = "transitions";
   for (const [index, transition] of (currentDefinition.transitions ?? []).entries()) {
     const edge = document.createElement("div");
     edge.className = "transition-card";
-    edge.textContent = `${text(transition.from)} → ${text(transition.to)} · ${(transition.conditions ?? []).map((condition) => `${condition.kind}${condition.value == null ? "" : `=${condition.value}`}`).join(" & ")}`;
+    edge.dataset.transitionIndex = index;
+    const route = document.createElement("div");
+    route.className = "transition-route";
+    const from = document.createElement("select");
+    from.setAttribute("aria-label", `transition ${index} source`);
+    for (const state of states) from.append(makeOption(document, state.id, transition.from));
+    from.addEventListener("change", () => { transition.from = from.value; renderWorkflowEditor(); });
+    const to = document.createElement("select");
+    to.setAttribute("aria-label", `transition ${index} target`);
+    for (const state of states) to.append(makeOption(document, state.id, transition.to));
+    to.addEventListener("change", () => { transition.to = to.value; renderWorkflowEditor(); });
+    const priority = document.createElement("input");
+    priority.type = "number";
+    priority.min = "0";
+    priority.value = text(transition.priority);
+    priority.setAttribute("aria-label", `transition ${index} priority`);
+    priority.addEventListener("change", () => { transition.priority = Number(priority.value); validateCurrent(); });
+    route.append(from, document.createTextNode(" → "), to, priority);
+    const conditions = document.createElement("div");
+    conditions.className = "transition-conditions";
+    for (const [conditionIndex, condition] of (transition.conditions ?? []).entries()) {
+      const row = document.createElement("div");
+      row.className = "condition-row";
+      row.dataset.conditionIndex = conditionIndex;
+      const kind = document.createElement("select");
+      kind.setAttribute("aria-label", `transition ${index} condition ${conditionIndex} kind`);
+      for (const value of conditionKinds) kind.append(makeOption(document, value, condition.kind));
+      kind.addEventListener("change", () => {
+        condition.kind = kind.value;
+        if (kind.value === "always") delete condition.value;
+        else condition.value = condition.value ?? "";
+        renderWorkflowEditor();
+      });
+      const value = document.createElement("input");
+      value.value = text(condition.value);
+      value.disabled = condition.kind === "always";
+      value.placeholder = condition.kind === "always" ? "no value" : "literal or {parameter}";
+      value.setAttribute("aria-label", `transition ${index} condition ${conditionIndex} value`);
+      value.addEventListener("change", () => { condition.value = value.value; validateCurrent(); });
+      const removeCondition = document.createElement("button");
+      removeCondition.type = "button";
+      removeCondition.textContent = "Remove condition";
+      removeCondition.addEventListener("click", () => {
+        transition.conditions.splice(conditionIndex, 1);
+        renderWorkflowEditor();
+      });
+      row.append(kind, value, removeCondition);
+      conditions.append(row);
+    }
+    const addCondition = document.createElement("button");
+    addCondition.type = "button";
+    addCondition.textContent = "Add condition";
+    addCondition.addEventListener("click", () => {
+      const state = stateById.get(transition.from);
+      transition.conditions ??= [];
+      transition.conditions.push(transitionConditionFor(state));
+      renderWorkflowEditor();
+    });
     const remove = document.createElement("button");
     remove.type = "button";
     remove.textContent = "Delete";
@@ -220,12 +442,32 @@ function renderWorkflowEditor() {
       currentDefinition.transitions.splice(index, 1);
       renderWorkflowEditor();
     });
-    edge.append(remove);
+    edge.append(route, conditions, addCondition, remove);
     transitions.append(edge);
   }
   workflowCanvas.append(transitions);
   workflowErrors.textContent = "";
   validateCurrent();
+}
+
+function markValidationErrors(issues) {
+  for (const element of document.querySelectorAll("[aria-invalid=\"true\"]")) {
+    element.removeAttribute("aria-invalid");
+    delete element.dataset.validationError;
+  }
+  for (const issue of issues) {
+    const stateMatch = issue.location.match(/^states\[(\d+)\]/);
+    const parameterMatch = issue.location.match(/^parameters\[(\d+)\]/);
+    const transitionMatch = issue.location.match(/^transitions\[(\d+)\]/);
+    let element = null;
+    if (stateMatch) element = document.querySelector(`[data-state-index=\"${stateMatch[1]}\"]`);
+    if (parameterMatch) element = document.querySelector(`[data-parameter-index=\"${parameterMatch[1]}\"]`);
+    if (transitionMatch) element = document.querySelector(`[data-transition-index=\"${transitionMatch[1]}\"]`);
+    if (element) {
+      element.setAttribute("aria-invalid", "true");
+      element.dataset.validationError = issue.message;
+    }
+  }
 }
 
 async function validateCurrent() {
@@ -236,9 +478,14 @@ async function validateCurrent() {
       body: JSON.stringify({ definition: currentDefinition }),
     });
     workflowSave.disabled = !result.valid;
-    workflowErrors.textContent = JSON.stringify([...result.errors, ...result.warnings], null, 2);
+    const issues = [...result.errors, ...result.warnings];
+    markValidationErrors(issues);
+    workflowErrors.textContent = issues.length
+      ? issues.map((issue) => `${issue.level ?? "error"} ${issue.location}: ${issue.message}`).join("\n")
+      : "Definition is valid.";
   } catch (error) {
     workflowSave.disabled = true;
+    markValidationErrors([]);
     workflowErrors.textContent = error.message;
   }
 }
@@ -277,11 +524,13 @@ function addState() {
 function addTransition() {
   const states = currentDefinition.states ?? [];
   if (states.length < 2) return;
+  const source = states.find((state) => state.id === currentDefinition.initial) ?? states[0];
+  const target = states.find((state) => state.id !== source.id) ?? states[0];
   currentDefinition.transitions.push({
-    from: states[0].id,
-    to: states[1].id,
+    from: source.id,
+    to: target.id,
     priority: currentDefinition.transitions.length + 1,
-    conditions: [{ kind: "always" }],
+    conditions: [transitionConditionFor(source)],
   });
   renderWorkflowEditor();
 }
@@ -344,7 +593,7 @@ document.querySelector("#refresh").addEventListener("click", async () => {
 });
 
 document.querySelector("#workflow-new").addEventListener("click", () => showEditor(defaultWorkflow()));
-document.querySelector("#workflow-example").addEventListener("click", () => showEditor(defaultWorkflow()));
+document.querySelector("#workflow-example").addEventListener("click", () => showEditor(exampleWorkflow()));
 document.querySelector("#workflow-return").addEventListener("click", async () => {
   workflowEditor.hidden = true;
   workflowList.hidden = false;

@@ -224,10 +224,14 @@ def validate_workflow(
             kind = str(condition_object.get("kind", ""))
             if kind not in CONDITION_KINDS:
                 error(f"{condition_location}.kind", "is not a supported condition kind")
-            if kind == "always" and condition_object.get("value") is not None:
-                error(f"{condition_location}.value", "must be omitted for always")
-            if kind != "always" and "value" not in condition_object:
+                continue
+            if kind == "always":
+                if condition_object.get("value") is not None:
+                    error(f"{condition_location}.value", "must be omitted for always")
+                continue
+            if "value" not in condition_object:
                 error(f"{condition_location}.value", "is required")
+                continue
             value_for_placeholder = condition_object.get("value")
             if isinstance(value_for_placeholder, str):
                 _record_text_placeholders(
@@ -237,36 +241,15 @@ def validate_workflow(
                     error,
                     parameters,
                 )
-            if kind in ITEM_CONDITION_KINDS and isinstance(value_for_placeholder, str):
-                expected = _condition_parameter_type(kind)
-                if _is_placeholder(value_for_placeholder):
-                    _check_placeholder_type(
-                        value_for_placeholder,
-                        expected,
-                        condition_location,
-                        parameters,
-                        error,
-                    )
-                elif kind == "item_status_is":
-                    _validate_status(
-                        value_for_placeholder,
-                        statuses,
-                        f"{condition_location}.value",
-                        error,
-                        warning,
-                    )
-            if (
-                kind == "outcome_is"
-                and isinstance(value_for_placeholder, str)
-                and _is_placeholder(value_for_placeholder)
-            ):
-                _check_placeholder_type(
-                    value_for_placeholder,
-                    "text",
-                    condition_location,
-                    parameters,
-                    error,
-                )
+            _validate_condition_value(
+                kind,
+                value_for_placeholder,
+                condition_location,
+                parameters,
+                statuses,
+                error,
+                warning,
+            )
 
     initial = str(definition.get("initial", ""))
     if initial not in states:
@@ -407,8 +390,11 @@ def normalize_workflow(value: Any) -> dict[str, Any]:
         conditions: list[dict[str, Any]] = []
         for raw_condition in _list(transition.get("conditions")):
             condition = _object(raw_condition)
-            normalized = {"kind": str(condition.get("kind", ""))}
-            if "value" in condition:
+            kind = str(condition.get("kind", ""))
+            normalized = {"kind": kind}
+            if "value" in condition and (
+                kind != "always" or condition["value"] is not None
+            ):
                 normalized["value"] = condition["value"]
             conditions.append(normalized)
         definition["transitions"].append(
@@ -664,6 +650,29 @@ def _condition_parameter_type(kind: str) -> str:
     }[kind]
 
 
+def _validate_condition_value(
+    kind: str,
+    value: Any,
+    location: str,
+    parameters: Mapping[str, Mapping[str, Any]],
+    statuses: set[str],
+    error: Callable[[str, str], None],
+    warning: Callable[[str, str], None],
+) -> None:
+    value_location = f"{location}.value"
+    if not isinstance(value, str) or not value:
+        error(value_location, "must be a non-empty string")
+        return
+    if _is_placeholder(value):
+        expected = "text" if kind == "outcome_is" else _condition_parameter_type(kind)
+        _check_placeholder_type(value, expected, value_location, parameters, error)
+        return
+    if kind == "item_type_is" and value not in {"issue", "pull_request"}:
+        error(value_location, "must be issue or pull_request")
+    elif kind == "item_status_is":
+        _validate_status(value, statuses, value_location, error, warning)
+
+
 def _validate_status(
     value: str,
     statuses: set[str],
@@ -700,7 +709,18 @@ def _validate_parameter_value(
 
 
 def _skill_exists(name: str, skills_dirs: Sequence[Path]) -> bool:
-    return any((directory / name / "SKILL.md").is_file() for directory in skills_dirs)
+    if not name or Path(name).name != name or name in {".", ".."}:
+        return False
+    for directory in skills_dirs:
+        try:
+            root = directory.expanduser().resolve()
+            candidate = (root / name / "SKILL.md").resolve()
+            candidate.relative_to(root)
+        except (OSError, ValueError):
+            continue
+        if candidate.is_file():
+            return True
+    return False
 
 
 def _is_placeholder(value: str) -> bool:

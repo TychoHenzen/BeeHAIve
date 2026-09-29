@@ -12,7 +12,11 @@ from beehaiive.core.config import CoreConfig
 from beehaiive.core.database import SnapshotDatabase
 from beehaiive.core.project import ProjectDataError
 from beehaiive.core.snapshot import ProjectSnapshotService
-from beehaiive.core.workflow_generator import WorkflowGenerationService
+from beehaiive.core.workflow_generator import (
+    WorkflowGenerationService,
+    _complete_generated_definition,
+    build_generator_prompt,
+)
 from beehaiive.core.workflows import (
     WorkflowStore,
     assign_layered_layout,
@@ -114,6 +118,102 @@ def test_validator_checks_reachability_types_and_skill_resolution(
     assert not result.valid
     assert any("type 'skill'" in message for message in messages)
     assert any("has no matching edge" in message for message in messages)
+
+
+def test_validator_normalizes_generated_always_null_and_rejects_bad_condition_values(
+    tmp_path: Path,
+) -> None:
+    skill_file = tmp_path / "next-ticket" / "SKILL.md"
+    skill_file.parent.mkdir()
+    skill_file.write_text("---\ndescription: ticket\n---\n", encoding="utf-8")
+
+    generated = definition()
+    generated["transitions"][-1]["conditions"] = [{"kind": "always", "value": None}]
+    valid = validate_workflow(
+        generated, skills_dirs=(tmp_path,), status_options=("Backlog",)
+    )
+    assert valid.valid
+    assert valid.definition["transitions"][-1]["conditions"] == [{"kind": "always"}]
+
+    invalid = definition()
+    invalid["transitions"][0]["conditions"] = [{"kind": "item_type_is", "value": None}]
+    invalid["transitions"][1]["conditions"] = [{"kind": "outcome_is", "value": ""}]
+    result = validate_workflow(
+        invalid, skills_dirs=(tmp_path,), status_options=("Backlog",)
+    )
+    messages = [issue.message for issue in result.errors]
+    assert any("non-empty string" in message for message in messages)
+
+    wrong_literal = definition()
+    wrong_literal["transitions"][0]["conditions"] = [
+        {"kind": "item_type_is", "value": "draft_issue"}
+    ]
+    result = validate_workflow(
+        wrong_literal, skills_dirs=(tmp_path,), status_options=("Backlog",)
+    )
+    assert any("issue or pull_request" in issue.message for issue in result.errors)
+
+    non_null_always = definition()
+    non_null_always["transitions"][-1]["conditions"] = [
+        {"kind": "always", "value": "unexpected"}
+    ]
+    result = validate_workflow(
+        non_null_always, skills_dirs=(tmp_path,), status_options=("Backlog",)
+    )
+    assert any("must be omitted for always" in issue.message for issue in result.errors)
+
+
+def test_skill_resolution_confines_literal_names_to_configured_roots(
+    tmp_path: Path,
+) -> None:
+    skills = tmp_path / "skills"
+    outside = tmp_path / "outside"
+    (skills / "next-ticket").mkdir(parents=True)
+    outside.mkdir()
+    (outside / "SKILL.md").write_text("skill", encoding="utf-8")
+    escaped = definition(skill="../outside")
+
+    result = validate_workflow(
+        escaped, skills_dirs=(skills,), status_options=("Backlog",)
+    )
+
+    assert any("does not resolve" in issue.message for issue in result.errors)
+
+
+def test_generation_preserves_operator_parameter_rows_and_includes_contract() -> None:
+    operator_parameters = [
+        {"name": "backlog", "type": "status", "const": True, "value": "Backlog"}
+    ]
+    completed = _complete_generated_definition(
+        {
+            "parameters": [
+                {"name": "backlog", "type": "text", "const": False, "value": None},
+                {"name": "generated", "type": "text", "const": False, "value": None},
+            ]
+        },
+        name="Delivery",
+        operator_prompt="Wait for {backlog}.",
+        parameters=operator_parameters,
+    )
+
+    assert completed["parameters"][:1] == operator_parameters
+    assert completed["parameters"][1]["name"] == "generated"
+    prompt = build_generator_prompt(
+        name="Delivery",
+        operator_prompt="Wait for {backlog}.",
+        parameters=operator_parameters,
+        skills=(),
+        statuses=("Backlog",),
+        labels=(),
+    )
+    for phrase in (
+        "item_repository_is",
+        "always omits value",
+        "Every state is reachable",
+        "Literal skills must resolve",
+        "const parameter",
+    ):
+        assert phrase in prompt
 
 
 def test_layered_layout_only_fills_missing_positions() -> None:
