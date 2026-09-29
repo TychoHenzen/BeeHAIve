@@ -61,11 +61,16 @@ class GithubRestClient:
         self._transport = transport or _urlopen
         self._clock = clock or (lambda: datetime.now(UTC))
         self._secondary_attempts: dict[str, int] = {}
+        self._blocked_until: datetime | None = None
+        self._blocked_primary = False
 
     def get_json(
         self, url: str, params: Mapping[str, str | int] | None = None
     ) -> RestPayload:
         request_url = _with_query(url, params)
+        blocked = self._blocked_error(request_url)
+        if blocked is not None:
+            raise blocked
         cache = self._database.get_http_cache(request_url)
         headers = {
             "Accept": "application/vnd.github+json",
@@ -97,7 +102,12 @@ class GithubRestClient:
         if response.status_code in {403, 429} and _is_rate_limit_response(
             response.status_code, response_headers, response.body
         ):
-            raise self._rate_limit_error(request_url, response_headers)
+            error = self._rate_limit_error(request_url, response_headers)
+            blocked_until = error.rate_limited_until.astimezone(UTC)
+            if self._blocked_until is None or blocked_until > self._blocked_until:
+                self._blocked_until = blocked_until
+                self._blocked_primary = error.primary
+            raise error
         if response.status_code < 200 or response.status_code >= 300:
             message = _response_message(response.body)
             raise GithubResponseError(
@@ -121,6 +131,21 @@ class GithubRestClient:
             headers=response_headers,
             url=request_url,
             from_cache=False,
+        )
+
+    def _blocked_error(self, url: str) -> RateLimitError | None:
+        if self._blocked_until is None:
+            return None
+        now = self._clock().astimezone(UTC)
+        if self._blocked_until <= now:
+            self._blocked_until = None
+            self._blocked_primary = False
+            return None
+        return RateLimitError(
+            f"GitHub rate limit remains active until {self._blocked_until.isoformat()} "
+            f"for {url}",
+            self._blocked_until,
+            primary=self._blocked_primary,
         )
 
     def _rate_limit_error(self, url: str, headers: Mapping[str, str]) -> RateLimitError:

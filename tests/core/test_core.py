@@ -167,13 +167,41 @@ def test_project_api_normalizes_mixed_items_and_status_order() -> None:
         "Done",
         "No status",
     ]
+    assert payload["fetched_at"]
+    assert payload["rate_limited_until"] is None
     backlog = payload["columns"][0]["items"][0]
-    assert backlog["type"] == "DraftIssue"
-    assert backlog["repository"] is None
-    assert backlog["number"] is None
-    assert payload["columns"][1]["items"][0]["repository"] == "TychoHenzen/BeeHAIve"
+    assert backlog == {
+        "type": "DraftIssue",
+        "repository": None,
+        "number": None,
+        "title": "Unassigned idea",
+        "url": None,
+        "state": None,
+        "labels": [],
+        "linked_issue_numbers": [],
+    }
+    issue = payload["columns"][1]["items"][0]
+    assert issue == {
+        "type": "Issue",
+        "repository": "TychoHenzen/BeeHAIve",
+        "number": 7,
+        "title": "Build board",
+        "url": "https://github.com/TychoHenzen/BeeHAIve/issues/7",
+        "state": "open",
+        "labels": ["enhancement"],
+        "linked_issue_numbers": [],
+    }
     pull_request = payload["columns"][2]["items"][0]
-    assert pull_request["linked_issue_numbers"] == [7, 12]
+    assert pull_request == {
+        "type": "PullRequest",
+        "repository": "TychoHenzen/BeeHAIve",
+        "number": 8,
+        "title": "Ship board",
+        "url": "https://github.com/TychoHenzen/BeeHAIve/pull/8",
+        "state": "open",
+        "labels": [],
+        "linked_issue_numbers": [7, 12],
+    }
     database.close()
 
 
@@ -246,15 +274,18 @@ def test_cursor_pagination_and_read_only_api() -> None:
     app = create_app(
         config(),
         database=database,
-        service=ProjectSnapshotService(provider, database, 0),
+        service=ProjectSnapshotService(provider, database, 60),
     )
 
     with TestClient(app) as client:
         result = client.get("/api/project")
+        refresh = client.post("/api/project/refresh")
         page = client.get("/")
         script = client.get("/web/app.js")
 
     assert result.status_code == 200
+    assert refresh.status_code == 200
+    assert refresh.json() == result.json()
     assert [call[0] for call in transport.calls] == [
         project_url,
         fields_url,
@@ -310,7 +341,85 @@ def test_etag_reuses_cached_body_and_rate_limit_uses_headers() -> None:
         limited_client.get_json(url + "/fields")
     assert raised.value.primary
     assert raised.value.rate_limited_until.timestamp() >= reset
+    with pytest.raises(RateLimitError) as blocked:
+        limited_client.get_json(url + "/fields")
+    assert blocked.value.primary
+    assert len(limited.calls) == 1
     limited_database.close()
+    database.close()
+
+
+def test_secondary_deadlines_and_429_are_enforced() -> None:
+    url = "https://api.github.com/users/owner/projectsV2/2"
+    now = datetime(2026, 9, 29, 12, 0, tzinfo=UTC)
+    current = [now]
+
+    def secondary_response(
+        status_code: int, headers: Mapping[str, str]
+    ) -> HttpResponse:
+        return HttpResponse(
+            status_code=status_code,
+            headers=headers,
+            body='{"message":"You have exceeded a secondary rate limit"}',
+        )
+
+    transport = FakeTransport(
+        {
+            url: [
+                secondary_response(
+                    403,
+                    {
+                        "X-RateLimit-Remaining": "10",
+                        "Retry-After": "7",
+                    },
+                ),
+                secondary_response(403, {"X-RateLimit-Remaining": "10"}),
+                secondary_response(403, {"X-RateLimit-Remaining": "10"}),
+                secondary_response(
+                    429,
+                    {
+                        "X-RateLimit-Remaining": "10",
+                        "Retry-After": "5",
+                    },
+                ),
+            ]
+        }
+    )
+    database = SnapshotDatabase(":memory:")
+    client = GithubRestClient(
+        "token", database, transport=transport, clock=lambda: current[0]
+    )
+
+    with pytest.raises(RateLimitError) as retry_after:
+        client.get_json(url)
+    assert not retry_after.value.primary
+    assert retry_after.value.rate_limited_until == now + timedelta(seconds=7)
+
+    with pytest.raises(RateLimitError) as blocked:
+        client.get_json(url)
+    assert blocked.value.rate_limited_until == retry_after.value.rate_limited_until
+    assert len(transport.calls) == 1
+
+    current[0] += timedelta(seconds=7)
+    with pytest.raises(RateLimitError) as first_backoff:
+        client.get_json(url)
+    assert first_backoff.value.rate_limited_until == current[0] + timedelta(seconds=60)
+
+    current[0] += timedelta(seconds=60)
+    with pytest.raises(RateLimitError) as second_backoff:
+        client.get_json(url)
+    assert second_backoff.value.rate_limited_until == current[0] + timedelta(
+        seconds=120
+    )
+
+    current[0] += timedelta(seconds=120)
+    with pytest.raises(RateLimitError) as too_many_requests:
+        client.get_json(url)
+    assert not too_many_requests.value.primary
+    assert too_many_requests.value.rate_limited_until == current[0] + timedelta(
+        seconds=5
+    )
+    assert len(transport.calls) == 4
     database.close()
 
 
