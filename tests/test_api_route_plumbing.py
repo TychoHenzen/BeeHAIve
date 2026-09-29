@@ -9,14 +9,6 @@ from fastapi import HTTPException
 from beehaiive.agent_stations import AgentStationServiceError
 from beehaiive.api.helpers.assets import docs_asset
 from beehaiive.api.routes.agent_stations import _http_error as station_http_error
-from beehaiive.api.routes.behaviors import _http_error as behavior_http_error
-from beehaiive.api.routes.building_signals import (
-    _http_error as building_signal_http_error,
-)
-from beehaiive.behavior_model import BehaviorModelError
-from beehaiive.behavior_service import BehaviorServiceError
-from beehaiive.building_signal_service import BuildingSignalServiceError
-from beehaiive.service_failures import FailureCategory
 
 
 def test_docs_asset_resolves_repo_docs_and_media_type() -> None:
@@ -29,29 +21,6 @@ def test_docs_asset_resolves_repo_docs_and_media_type() -> None:
 @pytest.mark.parametrize(
     ("mapper", "error", "status"),
     [
-        (behavior_http_error, BehaviorServiceError("not_found", "missing"), 404),
-        (
-            behavior_http_error,
-            BehaviorModelError("model_unavailable", "model unavailable"),
-            503,
-        ),
-        (
-            behavior_http_error,
-            BehaviorServiceError("state_conflict", "conflict"),
-            409,
-        ),
-        (
-            building_signal_http_error,
-            BuildingSignalServiceError(
-                "persistence", "database unavailable", FailureCategory.PERSISTENCE.value
-            ),
-            503,
-        ),
-        (
-            behavior_http_error,
-            BehaviorModelError("invalid_prompt", "prompt required"),
-            422,
-        ),
         (
             station_http_error,
             AgentStationServiceError("invalid_action", "unsupported action"),
@@ -65,18 +34,6 @@ def test_service_error_policies_preserve_status_boundaries(
     response = mapper(error)
 
     assert response.status_code == status
-
-
-def test_classified_service_error_detail_remains_bounded_and_redacted() -> None:
-    response = behavior_http_error(
-        BehaviorModelError("model_unavailable", "secret-token=hidden")
-    )
-
-    assert response.detail == {
-        "code": "model_unavailable",
-        "failure_class": "model",
-        "message": "secret-token=[redacted]",
-    }
 
 
 @pytest.mark.parametrize(

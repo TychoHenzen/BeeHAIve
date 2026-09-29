@@ -11,7 +11,6 @@ from .actions import ActionsMixin
 from .admission import AdmissionMixin
 from .agent_sessions import AgentSessionsMixin
 from .budget_evidence import BudgetEvidenceMixin
-from .building_signals import BuildingSignalMixin
 from .canonical_lifecycle import CanonicalLifecycleMixin
 from .execution_lease import ExecutionLeaseMixin
 from .graph_definitions import GraphDefinitionMixin
@@ -42,7 +41,6 @@ from .runtime_settings import RuntimeSettingsMixin
 from .schema import StorageSchemaMixin
 from .station_issues import StationIssueMixin
 from .task_contract import TaskContractMixin
-from .unit_behaviors import UnitBehaviorMixin
 from .worker_hosts import WorkerHostsMixin
 
 
@@ -78,12 +76,10 @@ class OrchestratorStore(
     GraphSafetyMixin,
     GraphTransitionMixin,
     BudgetEvidenceMixin,
-    BuildingSignalMixin,
     CanonicalLifecycleMixin,
     MetaReviewMixin,
     ProjectReadMixin,
     RowMappingMixin,
-    UnitBehaviorMixin,
     WorkerHostsMixin,
 ):
     def __init__(

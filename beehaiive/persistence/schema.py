@@ -210,47 +210,6 @@ class StorageSchemaMixin:
                 CREATE INDEX IF NOT EXISTS graph_definitions_by_workflow
                     ON graph_definitions(workflow_id, revision);
 
-                CREATE TABLE IF NOT EXISTS unit_behaviors (
-                    behavior_id TEXT PRIMARY KEY,
-                    project_id TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK (status IN (
-                        'draft', 'confirmed', 'assigned', 'running',
-                        'completed', 'failed'
-                    )),
-                    definition_json TEXT NOT NULL,
-                    bindings_json TEXT NOT NULL,
-                    assignment_json TEXT,
-                    execution_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS unit_behaviors_by_project
-                    ON unit_behaviors(project_id, created_at, behavior_id);
-
-                CREATE TABLE IF NOT EXISTS building_signal_rules (
-                    rule_id TEXT PRIMARY KEY,
-                    project_id TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK (status IN (
-                        'draft', 'confirmed', 'assigned'
-                    )),
-                    rule_json TEXT NOT NULL,
-                    assignment_json TEXT,
-                    signal_state_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS building_signal_rules_by_project
-                    ON building_signal_rules(project_id, created_at, rule_id);
-
-                CREATE UNIQUE INDEX IF NOT EXISTS building_signal_assigned_building
-                    ON building_signal_rules(
-                        project_id,
-                        json_extract(assignment_json, '$.building_id')
-                    )
-                    WHERE status = 'assigned' AND assignment_json IS NOT NULL;
-
                 CREATE TABLE IF NOT EXISTS graph_transitions (
                     transition_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     replay_id TEXT NOT NULL UNIQUE,

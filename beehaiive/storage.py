@@ -59,7 +59,6 @@ from .persistence import META_REVIEW_LEASE_SECONDS as META_REVIEW_LEASE_SECONDS
 from .persistence import PBI_CREATION_LEASE_SECONDS as PBI_CREATION_LEASE_SECONDS
 from .persistence import OrchestratorStore as OrchestratorStore
 from .persistence import StoreError as StoreError
-from .persistence import UnitBehaviorMixin as UnitBehaviorMixin
 from .persistence import _archive_eligible as _archive_eligible
 from .persistence import _bounded_event_details as _bounded_event_details
 from .persistence import _contains_signed_url as _contains_signed_url
@@ -110,7 +109,6 @@ __all__ = [
     "MAX_PBI_REFINEMENT_TEXT_LENGTH",
     "META_REVIEW_LEASE_SECONDS",
     "OrchestratorStore",
-    "UnitBehaviorMixin",
     "PBI_CREATION_LEASE_SECONDS",
     "StoreError",
     "_REFINEMENT_SECRET_ASSIGNMENT",

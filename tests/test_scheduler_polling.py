@@ -139,19 +139,6 @@ def test_poll_handles_empty_projects_and_unclaimable_repositories() -> None:
     assert worker.claims == []
     assert "recovery failed" in str(scheduler.status_for("project"))
     assert worker.recovered_projects == ("project",)
-
     worker.recover_error = None
     states["project"]["repositories"] = []
     assert scheduler.poll_once() == ()
-
-
-def test_poll_evaluates_building_signals_on_the_existing_cadence() -> None:
-    states = {"project": {"repositories": []}}
-    scheduler, _orchestrator, _worker = _scheduler(states)
-    evaluations: list[tuple[str, ...]] = []
-    scheduler.building_signal_poll = lambda projects: evaluations.append(
-        tuple(projects)
-    )
-
-    assert scheduler.poll_once() == ()
-    assert evaluations == [("project",)]

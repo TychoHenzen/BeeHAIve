@@ -172,60 +172,13 @@ class StorageMigrationMixin:
                 ON graph_definitions(workflow_id, revision)
             """
         )
-        self._connection.execute(
+        self._connection.executescript(
             """
-            CREATE TABLE IF NOT EXISTS unit_behaviors (
-                behavior_id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL,
-                status TEXT NOT NULL CHECK (status IN (
-                    'draft', 'confirmed', 'assigned', 'running',
-                    'completed', 'failed'
-                )),
-                definition_json TEXT NOT NULL,
-                bindings_json TEXT NOT NULL,
-                assignment_json TEXT,
-                execution_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        self._connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS unit_behaviors_by_project
-                ON unit_behaviors(project_id, created_at, behavior_id)
-            """
-        )
-        self._connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS building_signal_rules (
-                rule_id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL,
-                status TEXT NOT NULL CHECK (status IN (
-                    'draft', 'confirmed', 'assigned'
-                )),
-                rule_json TEXT NOT NULL,
-                assignment_json TEXT,
-                signal_state_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        self._connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS building_signal_rules_by_project
-                ON building_signal_rules(project_id, created_at, rule_id)
-            """
-        )
-        self._connection.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS building_signal_assigned_building
-                ON building_signal_rules(
-                    project_id,
-                    json_extract(assignment_json, '$.building_id')
-                )
-                WHERE status = 'assigned' AND assignment_json IS NOT NULL
+            DROP INDEX IF EXISTS unit_behaviors_by_project;
+            DROP INDEX IF EXISTS building_signal_rules_by_project;
+            DROP INDEX IF EXISTS building_signal_assigned_building;
+            DROP TABLE IF EXISTS unit_behaviors;
+            DROP TABLE IF EXISTS building_signal_rules;
             """
         )
         self._connection.execute(

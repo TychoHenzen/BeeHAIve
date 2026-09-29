@@ -20,10 +20,6 @@ from beehaiive.autonomous import (
     AutonomousLifecycleService,
     bootstrap_automation_workflow,
 )
-from beehaiive.behavior_model import OllamaBehaviorModelClient
-from beehaiive.behavior_service import BehaviorService, TargetUnitWorld
-from beehaiive.building_signal import TargetBuildingSignalWorld
-from beehaiive.building_signal_service import BuildingSignalService
 from beehaiive.conflict_repair import ConflictRepairAgent, ConflictRepairService
 from beehaiive.graph_safety import GraphSafetyService
 from beehaiive.meta_review import MetaReviewService
@@ -60,10 +56,6 @@ def build_api_runtime(options: ApiRuntimeOptions) -> ApiRuntime:
     workflow_service = options.workflow_service
     graph_safety_service = options.graph_safety_service
     autonomous_service = options.autonomous_service
-    behavior_service = options.behavior_service
-    unit_world = options.unit_world
-    building_signal_service = options.building_signal_service
-    building_signal_world = options.building_signal_world
     agent_station_service = options.agent_station_service
     owns_orchestrator = orchestrator is None
     if orchestrator is not None and orchestrator.model_router is not None:
@@ -123,28 +115,6 @@ def build_api_runtime(options: ApiRuntimeOptions) -> ApiRuntime:
         raise ValueError("The graph safety service and API must share one state store")
     if graph_safety_service is None:
         graph_safety_service = GraphSafetyService(orchestrator.store)
-    if (
-        behavior_service is not None
-        and behavior_service.store is not orchestrator.store
-    ):
-        raise ValueError("The behavior service and API must share one state store")
-    model_client = OllamaBehaviorModelClient()
-    if behavior_service is None:
-        behavior_service = BehaviorService(
-            orchestrator.store,
-            model_client=model_client,
-            unit_world=unit_world or TargetUnitWorld(),
-        )
-    if building_signal_service is None:
-        building_signal_service = BuildingSignalService(
-            orchestrator.store,
-            model_client=model_client,
-            world=building_signal_world or TargetBuildingSignalWorld(),
-        )
-    elif building_signal_service.store is not orchestrator.store:
-        raise ValueError(
-            "The building signal service and API must share one state store"
-        )
     if agent_station_service is None:
         agent_station_service = AgentStationService(orchestrator.store)
     elif agent_station_service.store is not orchestrator.store:
@@ -364,7 +334,6 @@ def build_api_runtime(options: ApiRuntimeOptions) -> ApiRuntime:
                 else None
             ),
             allow_disabled=not scheduler_config.enabled,
-            building_signal_poll=building_signal_service.poll,
         )
     return ApiRuntime(
         orchestrator=orchestrator,
@@ -384,8 +353,6 @@ def build_api_runtime(options: ApiRuntimeOptions) -> ApiRuntime:
         scheduler=scheduler,
         workflow_service=workflow_service,
         graph_safety_service=graph_safety_service,
-        behavior_service=behavior_service,
-        building_signal_service=building_signal_service,
         agent_station_service=agent_station_service,
         autonomous_service=autonomous_service,
         require_review_adapters=require_review_adapters,

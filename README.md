@@ -112,8 +112,6 @@ recent delivery evidence visible while terminal work stays out of the active
 queue.
 Use `/dashboard?project=<owner>:<number>` on the same origin to open mission
 control for the configured Project.
-Use `/building-signal-design?project=<owner>:<number>` to define, review,
-confirm, assign, and read back one bounded inventory signal rule.
 
 ## Autonomous lifecycle
 
