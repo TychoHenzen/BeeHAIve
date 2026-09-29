@@ -129,6 +129,11 @@ def _migration_four(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migration_five(connection: sqlite3.Connection) -> None:
+    connection.execute("ALTER TABLE agent_passes ADD COLUMN acknowledged_at TEXT")
+    connection.execute("ALTER TABLE agent_passes ADD COLUMN acknowledged_by TEXT")
+
+
 def _migration_one(connection: sqlite3.Connection) -> None:
     connection.executescript(
         """
@@ -151,6 +156,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     _migration_two,
     _migration_three,
     _migration_four,
+    _migration_five,
 )
 
 

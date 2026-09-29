@@ -133,6 +133,15 @@ class FakeDocument extends FakeNode {
     ]) {
       this.append(new FakeNode("div", id));
     }
+    for (const name of ["board", "workflows", "agents", "hive"]) {
+      const tab = new FakeNode("button");
+      tab.setAttribute("data-tab", name);
+      if (name === "board") tab.className = "active";
+      const panel = new FakeNode("section");
+      panel.setAttribute("data-panel", name);
+      if (name === "board") panel.className = "active";
+      this.append(tab, panel);
+    }
   }
 
   querySelector(selector) {
@@ -297,6 +306,17 @@ test("workflow editor ignores stale validation responses", async () => {
 
   assert.equal(document.querySelector("#workflow-save").disabled, false);
   assert.equal(document.querySelector("#workflow-errors").textContent, "Definition is valid.");
+});
+
+test("core tabs activate the Hive panel", async () => {
+  const { document } = await createHarness();
+  const hiveTab = document.querySelector('[data-tab="hive"]');
+  const hivePanel = document.querySelector('[data-panel="hive"]');
+  hiveTab.click();
+  assert.ok(hiveTab.className.split(/\s+/).includes("active"));
+  assert.ok(hivePanel.className.split(/\s+/).includes("active"));
+  assert.ok(!document.querySelector('[data-tab="board"]').className.split(/\s+/).includes("active"));
+  assert.ok(!document.querySelector('[data-panel="board"]').className.split(/\s+/).includes("active"));
 });
 
 test("agents view exposes assignment form and durable run evidence", async () => {
