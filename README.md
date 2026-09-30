@@ -4,20 +4,16 @@
   <img src="docs/assets/beehaive-logo.png" alt="BeeHAIve logo" width="360">
 </p>
 
-BeeHAIve is a FastAPI control plane for one allowlisted GitHub Project. The
-dashboard reads the live Project state, shows one mission-control board, and
-can start the server-owned autonomous lifecycle for a claimable PBI.
+BeeHAIve is a local FastAPI control plane for one GitHub Project: it reads the
+live Board, turns an operator prompt into a validated workflow state machine,
+and runs an assigned workflow on an agent with one fresh Codex process per
+state. Durable SQLite history keeps the Board, workflow editor, and Agents tab
+looking at the same run.
 
-This delivery does not claim autonomous swarms, multi-device coordination,
-automated production review verdicts, or automatic pull-request creation.
+## Setup
 
-## Clean Windows setup
-
-Prerequisites are Windows, Git, Python 3.13, `uv`, GitHub CLI, Node.js, the
-Codex CLI, and Chromium. GitHub access must include the selected Project and
-its linked issue metadata.
-
-Install Python 3.13 and `uv`, then check out the repository:
+Use Windows, Python 3.13, `uv`, GitHub CLI, the Codex CLI, and Node.js. GitHub
+access must include the selected Project and its linked issue metadata.
 
 ```powershell
 git clone https://github.com/TychoHenzen/BeeHAIve.git
@@ -27,215 +23,65 @@ gh auth status
 Copy-Item .env.example .env
 ```
 
-Edit `.env` with the selected project and credentials:
+Set `BEEHAIIVE_PROJECT_OWNER`, `BEEHAIIVE_PROJECT_OWNER_TYPE`, and
+`BEEHAIIVE_PROJECT_NUMBER` in `.env`. `GITHUB_TOKEN` or `GH_TOKEN` is optional
+when `gh auth status` can provide a token. Keep `.env` local.
 
-```dotenv
-GITHUB_TOKEN=<fine-grained-token>
-GITHUB_PROJECT_OWNER=<owner>
-GITHUB_PROJECT_NUMBER=<number>
-GITHUB_PROJECT_OWNER_TYPE=user
-# BEEHAIIVE_GITHUB_DISCOVERY_CACHE_SECONDS=600
-BEEHAIIVE_ALLOWED_PROJECTS=<owner>:<number>
-# Server-side operator authorization. The dashboard never asks for this value.
-BEEHAIIVE_API_KEY=<operator-key>
-BEEHAIIVE_REVIEW_ACTOR=operator
-# BEEHAIIVE_AGENT_REPOSITORY=<path-to-BeeHAIve>
-BEEHAIIVE_AGENT_REPOSITORY_NAME=<owner>/<repository>
-# BEEHAIIVE_AGENT_TIMEOUT_SECONDS=120
-# BEEHAIIVE_CODEX_EXECUTABLE=codex
-# BEEHAIIVE_CODEX_MODEL=<model>
-# BEEHAIIVE_AUTONOMOUS_TIMEOUT_SECONDS=0
-# BEEHAIIVE_WORKFLOW_REPOSITORY=<path-to-BeeHAIve>
-# BEEHAIIVE_STATE_DB=.beehaiive/state.db
-# BEEHAIIVE_ROUTING_DB=.beehaiive/routing.db
-# BEEHAIIVE_REVIEW_DB=.beehaiive/reviews.db
-# BEEHAIIVE_WORKFLOW_DB=.beehaiive/workflow.db
-# BEEHAIIVE_SCHEDULER_ENABLED=false
-# BEEHAIIVE_SCHEDULER_POLL_INTERVAL_SECONDS=600
-# BEEHAIIVE_SCHEDULER_MAX_CONCURRENCY=1
-# BEEHAIIVE_WORKER_HOST_ID=stable-host-id
-# BEEHAIIVE_WORKER_SLOTS=1
-# BEEHAIIVE_WORKER_CAPABILITIES=codex,python
-# BEEHAIIVE_WORKER_HEARTBEAT_SECONDS=30
-# BEEHAIIVE_WORKER_STALE_SECONDS=90
-```
-
-The project ID is exactly `<owner>:<number>`. The tracked launcher reads the
-gitignored `.env` file before checking these values. Existing process variables
-take precedence. `BEEHAIIVE_AGENT_REPOSITORY_NAME` must match the repository
-selected in the Project. The timeout must be finite and no greater than 900
-seconds for regular worker runs. Autonomous skill contexts have no hard
-wall-clock timeout by default. Set `BEEHAIIVE_AUTONOMOUS_TIMEOUT_SECONDS` to a
-positive value only when you explicitly want a limit. Project discovery is cached for 10 minutes by default,
-so the dashboard's polling does not repeat the full GraphQL discovery.
-When `BEEHAIIVE_CODEX_EXECUTABLE` is a bare command such as `codex`, the
-autonomous runner resolves the native Windows executable before launching it.
-Set `BEEHAIIVE_GITHUB_DISCOVERY_CACHE_SECONDS` to a finite non-negative number
-to change that interval. Do not commit `.env` or place its values in logs or
-dashboard evidence. Production review reads use `GITHUB_TOKEN` or `GH_TOKEN`
-with repository Pull requests read access. Set `BEEHAIIVE_REVIEW_ACTOR` to
-`operator` or `writer` to enable review requests.
-The current concern adapters retain the GitHub evidence and leave verdicts
-pending until concern-specific analysis is configured. They do not write GitHub
-reviews or comments.
-The continuous scheduler is off by default. Enable it with
-`BEEHAIIVE_SCHEDULER_ENABLED=true`; it polls only `BEEHAIIVE_ALLOWED_PROJECTS`
-and starts the autonomous lifecycle. Settings can apply polling and worker
-capacity to a running server when the workflow-backed worker is configured.
-Validated project, workflow, and scheduler settings persist in the server
-state store and are restored after restart. Credentials and checkout paths
-remain environment-owned.
-When `BEEHAIIVE_WORKER_HOST_ID` is configured, the server registers that stable
-host identity in the shared state store and refreshes its bounded heartbeat.
-`BEEHAIIVE_WORKER_SLOTS` defaults to the scheduler worker capacity; stale hosts
-advertise zero available slots. Host facts and derived liveness are included in
-the read-only dashboard state.
-
-Start the service from the repository root so the launcher loads `.env`:
+Start the only supported application entrypoint from the repository root:
 
 ```powershell
 .\start_dashboard.bat
 ```
 
-The launcher checks `uv`, the configured Codex executable, GitHub configuration,
-and the API key. It starts Uvicorn on port 8000, refuses to start a second server
-on an occupied port, and closes its server process tree when the launcher exits.
-Direct Uvicorn startup is supported only when the same variables are already
-present in the process environment.
-
-Open the URLs printed by the launcher. Viewing and operating the dashboard uses the
-server-side `BEEHAIIVE_API_KEY`; the browser does not request, store, or display
-that value. Direct API clients still send it as `X-API-Key`.
-Use Settings to choose the project and a stored workflow. Use the Queue
-filters to switch between active and archived work. Mission control keeps
-recent delivery evidence visible while terminal work stays out of the active
-queue.
-Use `/dashboard?project=<owner>:<number>` on the same origin to open mission
-control for the configured Project.
-
-## Autonomous lifecycle
-
-Select **Run lifecycle on server** for a claimable PBI. BeeHAIve starts one
-server-side background run. In production `codex` mode, that run invokes the
-real lifecycle runner through the ordered stages `refine-backlog-item`,
-`next-ticket`, published `submit-draft-pr`, `review-pr-branch`,
-`fix-pr-review`, and `complete-pr`. Each stage runs in its own Codex context
-and receives the previous stage's JSON handover.
-
-The runner confines execution to the server-assigned unique leased worktree
-and branch. The run inspector and action log retain the stage handoffs,
-outcomes, commit, push, and blocker evidence for the run. The scheduler
-applies the configured worker capacity and does not start a second lifecycle
-for the same project.
-
-The configured `codex` runner invokes the named local skill files. This
-documentation covers the configured single-run lifecycle only; autonomous
-swarms and multi-device coordination are not supported claims.
-
-The Queue view separates Refinement, Implementation, Publish, Review, Repair,
-Completion, Blocked, and Completed work. The server assigns each PBI one queue
-from Project Status and current handoff evidence, so the browser and scheduler
-use the same next-skill decision.
-
-Quick idea entry accepts bounded text and an allowlisted Project selection, then
-starts one add-backlog-idea context. Its pending, succeeded, or failed action
-appears in the dashboard, and a successful capture is visible in that
-Project's Backlog. The read-only dashboard config endpoint supplies the
-allowlisted Project IDs.
-
-## Shared worker admission
-
-Set `BEEHAIIVE_ADMISSION_ENABLED=true` to enable a central run budget.
-`BEEHAIIVE_ADMISSION_CAPACITY` is a positive integer and defaults to `1`.
-The server persists the cap in `BEEHAIIVE_STATE_DB`. All server processes must
-use the same local database and configuration. Conflicting configurations fail
-closed, including an older local-mode process after activation. Restart server
-processes together when enabling this mode. Activation accounts for existing
-active runs and rejects excess capacity or duplicate repository ownership.
-
-Worker hosts use the authenticated HTTP claim and run APIs. Do not share SQLite
-files across hosts. Separate databases are separate coordination domains. This
-provides admission primitives, not remote executor installation or recovery.
-
-A successful claim reserves a slot before execution starts. It also leases the
-case-insensitive repository identity across projects. Renewal retains that slot.
-Expiry permits reclamation during a subsequent claim. Heartbeat absence alone
-does not release capacity. Failure, completion, operator stop and start failure
-release the matching reservation. Repository generations survive release and
-restart. Each opaque lease token binds its owner to that generation. Stale or
-expired workers cannot mutate admitted run state or initiate a handoff.
-Fencing cannot undo filesystem or provider operations already in flight.
-
-`GET /projects/{project_id}/admission` requires `X-API-Key` and project access.
-It returns global capacity, used/free counts, and up to 100 current reservations
-for that project, including repository, run ID, generation and expiry. It never
-returns lease tokens. Claims return `admission_generation` alongside the private
-lease token. Enabled-mode claim denials return HTTP 409 with `detail.reason` of
-`capacity_exhausted` or `repository_owned`. Authority failures return HTTP 503
-with `admission_authority_unavailable`. Local mode remains the default.
-
-## Create a PBI through the API
-
-Send an authenticated request for a repository linked to the configured
-Project. Existing repository labels are optional.
+The launcher loads `.env`, checks `uv`, `codex`, and `gh auth status`, refuses
+an occupied port, starts `uv run python -m beehaiive`, and cleans up its server
+process tree on exit. Direct startup uses the same port and configuration:
 
 ```powershell
-curl.exe -X POST "http://127.0.0.1:8000/projects/<project-id>/pbis" `
-  -H "X-API-Key: <api-key>" -H "Idempotency-Key: <request-id>" `
-  -H "Content-Type: application/json" `
-  -d '{"repository":"<owner>/<repo>","title":"<title>","body":"<body>","labels":[]}'
+uv run python -m beehaiive
 ```
 
-The API preserves the supplied title and body. It returns `201` after the issue,
-labels, Project membership, and Backlog status read back. It returns `202` for
-an incomplete operation. Reuse the same key only for the same request. A key
-with changed content returns `409`. If GitHub may have created the issue but
-BeeHAIve did not save its identity, the result is `outcome_unknown`; BeeHAIve
-will not create another issue for that key, and an operator must reconcile it.
+Open `http://127.0.0.1:8000/`.
 
-## Operate the live dashboard
+## Product
 
-1. Confirm the dashboard shows the expected live Project and linked repositories.
-2. Open Queue and select **Run full lifecycle** on a claimable PBI.
-3. BeeHAIve claims the PBI and runs the ordered autonomous lifecycle through
-   refinement, implementation, publish, review, repair, and completion.
-4. Inspect the current stage, handoffs, checks, questions, and delivery state
-   in the work-item inspector.
-5. Confirm the recorded commit SHA and push result before treating delivery as
-   complete.
+- **Board** reads the configured Project through the REST API and shows the
+  current status columns, cards, holders, and refresh state.
+- **Workflows** accepts an operator prompt, generates a deterministic draft,
+  validates typed parameters, conditions, skills, and transitions, and lets
+  the operator edit or save revisions.
+- **Agents** assigns a saved workflow to a dedicated checkout, starts and
+  stops runs, claims one Project item at a time, and records each state pass,
+  output, error, and recovery event.
+- **Hive** is the local observability surface for the durable core state.
 
-The lifecycle runner uses the configured Codex executable in the server-assigned
-workspace, with network and child-agent access disabled. It passes a filtered
-environment and rejects credential-like tracked files. Git delivery uses the
-host Git identity and authentication, never sends credentials to the model
-child, and records the commit SHA and push result in the run evidence.
+An agent run resolves its workflow revision and parameters before it starts.
+Each state gets a fresh `codex exec` process with bounded time, isolated run
+logs, and the configured skill paths. A stopped or failed run releases its
+claim and records the reason; restarting recovers durable state rather than
+pretending an old child process is still authoritative. The core does not
+write GitHub state.
 
-If a run fails or waits for an operator, open its inspector and read the
-failure, question, and recent activity. Check the GitHub token, exact Project
-allowlist, Codex availability, and configured repository identity. Stop the run before removing local `.beehaiive` state.
+Project reads are REST-only. Snapshot bodies are cached in SQLite and reused
+with ETags; refreshes respect the configured minimum interval and bounded
+rate-limit retry behavior. A provider or transport failure is returned as a
+controlled API error instead of a fake empty Board.
 
-## Evidence and verification
+## Local gate
 
-The live proof uses the configured service and a real allowlisted Project. Open
-`http://127.0.0.1:8000/dashboard?project=<owner>:<number>` in Edge or another
-Chromium-compatible browser, record the served URL, visible PBI identifiers,
-HTTP statuses, dashboard network outcomes, and any console errors. Do not use
-synthetic Project data or local proof modes for this check.
-
-For the full local gate, run:
+Run the retained Python and UI tests plus the same static checks used in CI:
 
 ```powershell
 uv run pytest -q
-uv run node --test tests/*.test.mjs
+node --test tests/*.test.mjs
 uv run ruff format --check .
 uv run ruff check .
 uv run pyright
-uv run pytest --cov=beehaiive --cov=main --cov-report=term-missing --cov-fail-under=90
+uv run pytest -q --cov=beehaiive --cov-report=term-missing --cov-fail-under=90
+uv run pip-audit --progress-spinner off
 ```
 
-The worker reads its gate contract from the root `beehaiive-gates.json`.
-Checks available only in CI are reported as `external_only`, not as local passes.
-
-The dashboard details, task contracts, and security boundary are documented in
-[`docs/dashboard.md`](docs/dashboard.md), [`docs/task-contracts.md`](docs/task-contracts.md),
-[`docs/meta-review.md`](docs/meta-review.md), and [`docs/security.md`](docs/security.md).
+The disposable real-data check should use the configured Project in Edge or
+Chromium and record the served URL, visible cards, HTTP outcomes, refresh/ETag
+behavior, and browser console state. Local fixtures are not evidence of live
+Project behavior.

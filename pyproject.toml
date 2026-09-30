@@ -25,10 +25,11 @@ pythonpath = ["."]
 [tool.ruff]
 target-version = "py313"
 line-length = 88
+exclude = ["beehaiive/api/routes/system.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.pyright]
-include = ["main.py", "beehaiive"]
+include = ["beehaiive/*.py"]
 typeCheckingMode = "strict"
