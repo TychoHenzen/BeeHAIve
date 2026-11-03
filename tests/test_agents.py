@@ -269,6 +269,7 @@ def test_agent_api_runs_one_fresh_codex_process_per_skill_state(tmp_path: Path) 
         agent_id = created.json()["id"]
         started = client.post(f"/api/agents/{agent_id}/start")
         assert started.status_code == 200, started.text
+        current: dict[str, Any] = {}
         for _ in range(100):
             current = client.get(f"/api/agents/{agent_id}").json()
             if current["status"] == "waiting" and current["history"]:

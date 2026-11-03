@@ -423,6 +423,7 @@ def test_generation_retries_once_and_returns_failed_draft(tmp_path: Path) -> Non
 
     generator = WorkflowGenerationService(config, service, runner=runner)
     job = generator.start("Delivery", "Wait for a backlog item.", [])
+    result: dict[str, Any] | None = None
     for _ in range(100):
         result = generator.get(job["id"])
         assert result is not None
@@ -430,6 +431,7 @@ def test_generation_retries_once_and_returns_failed_draft(tmp_path: Path) -> Non
             break
         time.sleep(0.01)
 
+    assert result is not None
     assert result["status"] == "succeeded"
     assert result["attempts"] == 2
     assert len(calls) == 2
@@ -474,6 +476,7 @@ def test_generation_http_success_exposes_one_repair_and_codex_flags(
             json={"name": "Delivery", "prompt": "Run delivery.", "parameters": []},
         )
         assert started.status_code == 200
+        result: dict[str, Any] = {}
         for _ in range(100):
             result = client.get(
                 f"/api/workflows/generate/{started.json()['id']}"
@@ -530,6 +533,7 @@ def test_generation_http_failure_after_one_repair_keeps_draft_and_errors(
             json={"name": "Broken", "prompt": "Run delivery.", "parameters": []},
         )
         assert started.status_code == 200
+        result: dict[str, Any] = {}
         for _ in range(100):
             result = client.get(
                 f"/api/workflows/generate/{started.json()['id']}"
@@ -664,12 +668,14 @@ def test_generator_helpers_cover_catalog_metadata_and_codex_failures(
         runner=lambda *_args: (_ for _ in ()).throw(RuntimeError("runner broke")),
     )
     job = failing.start("Broken", "Prompt", [])
+    result: dict[str, Any] | None = None
     for _ in range(100):
         result = failing.get(job["id"])
         assert result is not None
         if result["status"] != "pending":
             break
         time.sleep(0.01)
+    assert result is not None
     assert result["status"] == "failed"
     assert result["error"] == "runner broke"
     database.close()
