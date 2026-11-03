@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any
 from urllib.error import URLError
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from beehaiive.app import create_app
@@ -15,97 +18,76 @@ from beehaiive.rest import (
     HttpResponse,
 )
 from beehaiive.snapshot import ProjectSnapshotService
-from tests.support import FakeTransport, config, project_responses, response
+from tests.support import (
+    FIELDS_URL,
+    ITEMS_URL,
+    PROJECT_URL,
+    REPOSITORY,
+    REPOSITORY_URL,
+    FakeTransport,
+    config,
+    expected_card,
+    issue_content,
+    option,
+    project_item,
+    project_responses,
+    response,
+    status_field,
+    status_value,
+)
+
+NEXT_URL = f"{PROJECT_URL}/items?page=2"
+
+PULL_REQUEST = {
+    "number": 8,
+    "title": "Ship board",
+    "html_url": f"{REPOSITORY_URL}/pull/8",
+    "state": "open",
+    "body": "Closes #7 and fixes acme/other#12",
+    "repository_url": f"https://api.github.com/repos/{REPOSITORY}",
+    "labels": [],
+}
 
 
-def test_project_api_normalizes_mixed_items_and_status_order() -> None:
-    project_url = "https://api.github.com/users/TychoHenzen/projectsV2/2"
-    fields_url = f"{project_url}/fields"
-    items_url = f"{project_url}/items?per_page=100&fields=407"
+def mixed_items() -> list[dict[str, Any]]:
+    labels = [{"name": "enhancement"}]
+    issue = issue_content(7, "Build board", state="open", labels=labels)
+    draft = {"title": "Unassigned idea", "body": "later"}
+    issue_status = status_value("todo", "Todo")
+    pull_request_status = status_value("done", "Done")
+    draft_status = status_value("backlog", "Backlog")
+    return [
+        project_item("Issue", issue, issue_status),
+        project_item("PullRequest", PULL_REQUEST, pull_request_status),
+        project_item("DraftIssue", draft, draft_status),
+    ]
+
+
+def fetch_project_payload() -> dict[str, Any]:
+    options = (
+        option("backlog", "Backlog", raw=True),
+        option("todo", "Todo", raw=True),
+        option("done", "Done", raw=True),
+    )
+    project = [response({"id": 25778678})]
+    fields = [response([status_field(*options)])]
+    items = [response(mixed_items())]
     transport = FakeTransport(
-        {
-            project_url: [response({"id": 25778678})],
-            fields_url: [
-                response(
-                    [
-                        {
-                            "id": 407,
-                            "name": "Status",
-                            "data_type": "single_select",
-                            "options": [
-                                {"id": "backlog", "name": {"raw": "Backlog"}},
-                                {"id": "todo", "name": {"raw": "Todo"}},
-                                {"id": "done", "name": {"raw": "Done"}},
-                            ],
-                        }
-                    ]
-                )
-            ],
-            items_url: [
-                response(
-                    [
-                        {
-                            "content_type": "Issue",
-                            "content": {
-                                "number": 7,
-                                "title": "Build board",
-                                "html_url": "https://github.com/TychoHenzen/BeeHAIve/issues/7",
-                                "state": "open",
-                                "repository": {"full_name": "TychoHenzen/BeeHAIve"},
-                                "labels": [{"name": "enhancement"}],
-                            },
-                            "fields": [
-                                {
-                                    "id": 407,
-                                    "value": {"id": "todo", "name": {"raw": "Todo"}},
-                                }
-                            ],
-                        },
-                        {
-                            "content_type": "PullRequest",
-                            "content": {
-                                "number": 8,
-                                "title": "Ship board",
-                                "html_url": "https://github.com/TychoHenzen/BeeHAIve/pull/8",
-                                "state": "open",
-                                "body": "Closes #7 and fixes acme/other#12",
-                                "repository_url": "https://api.github.com/repos/TychoHenzen/BeeHAIve",
-                                "labels": [],
-                            },
-                            "fields": [
-                                {
-                                    "id": 407,
-                                    "value": {"id": "done", "name": {"raw": "Done"}},
-                                }
-                            ],
-                        },
-                        {
-                            "content_type": "DraftIssue",
-                            "content": {"title": "Unassigned idea", "body": "later"},
-                            "fields": [
-                                {
-                                    "id": 407,
-                                    "value": {
-                                        "id": "backlog",
-                                        "name": {"raw": "Backlog"},
-                                    },
-                                }
-                            ],
-                        },
-                    ]
-                )
-            ],
-        }
+        {PROJECT_URL: project, FIELDS_URL: fields, ITEMS_URL: items}
     )
     database, provider = project_responses(config(), transport)
     service = ProjectSnapshotService(provider, database, minimum_refresh_seconds=0)
     app = create_app(config(), database=database, service=service)
-
     with TestClient(app) as client:
         result = client.get("/api/project")
-
+    database.close()
     assert result.status_code == 200
-    payload = result.json()
+    return result.json()
+
+
+def test_project_api_orders_columns_by_status_options() -> None:
+    payload = fetch_project_payload()
+
     assert [column["status"] for column in payload["columns"]] == [
         "Backlog",
         "Todo",
@@ -114,93 +96,90 @@ def test_project_api_normalizes_mixed_items_and_status_order() -> None:
     ]
     assert payload["fetched_at"]
     assert payload["rate_limited_until"] is None
-    backlog = payload["columns"][0]["items"][0]
-    assert backlog == {
-        "type": "DraftIssue",
-        "repository": None,
-        "number": None,
-        "title": "Unassigned idea",
-        "url": None,
-        "state": None,
-        "labels": [],
-        "linked_issue_numbers": [],
-    }
-    issue = payload["columns"][1]["items"][0]
-    assert issue == {
-        "type": "Issue",
-        "repository": "TychoHenzen/BeeHAIve",
-        "number": 7,
-        "title": "Build board",
-        "url": "https://github.com/TychoHenzen/BeeHAIve/issues/7",
-        "state": "open",
-        "labels": ["enhancement"],
-        "linked_issue_numbers": [],
-    }
-    pull_request = payload["columns"][2]["items"][0]
-    assert pull_request == {
-        "type": "PullRequest",
-        "repository": "TychoHenzen/BeeHAIve",
-        "number": 8,
-        "title": "Ship board",
-        "url": "https://github.com/TychoHenzen/BeeHAIve/pull/8",
-        "state": "open",
-        "labels": [],
-        "linked_issue_numbers": [7, 12],
-    }
-    database.close()
 
 
-def test_cursor_pagination_and_read_only_api() -> None:
-    project_url = "https://api.github.com/users/TychoHenzen/projectsV2/2"
-    fields_url = f"{project_url}/fields"
-    first_items_url = f"{project_url}/items?per_page=100&fields=407"
-    next_items_url = f"{project_url}/items?page=2"
+def test_project_api_normalizes_issue_pull_request_and_draft_items() -> None:
+    columns = fetch_project_payload()["columns"]
+    draft = expected_card(type="DraftIssue", title="Unassigned idea")
+    issue = expected_card(
+        type="Issue",
+        repository=REPOSITORY,
+        number=7,
+        title="Build board",
+        url=f"{REPOSITORY_URL}/issues/7",
+        state="open",
+        labels=["enhancement"],
+    )
+    pull_request = expected_card(
+        type="PullRequest",
+        repository=REPOSITORY,
+        number=8,
+        title="Ship board",
+        url=f"{REPOSITORY_URL}/pull/8",
+        state="open",
+        linked_issue_numbers=[7, 12],
+    )
+
+    assert columns[0]["items"][0] == draft
+    assert columns[1]["items"][0] == issue
+    assert columns[2]["items"][0] == pull_request
+
+
+@dataclass
+class ProjectApp:
+    app: FastAPI
+    database: SnapshotDatabase
+    transport: FakeTransport
+
+
+def project_app(transport: FakeTransport, minimum_refresh_seconds: float) -> ProjectApp:
+    database, provider = project_responses(config(), transport)
+    service = ProjectSnapshotService(
+        provider, database, minimum_refresh_seconds=minimum_refresh_seconds
+    )
+    app = create_app(config(), database=database, service=service)
+    return ProjectApp(app, database, transport)
+
+
+def test_cursor_pagination_follows_the_next_link() -> None:
+    first_page = [response([], headers={"Link": f'<{NEXT_URL}>; rel="next"'})]
+    second_page = [response([])]
+    fields = [response([status_field(option("todo", "Todo"))])]
     transport = FakeTransport(
         {
-            project_url: [response({"id": 1})],
-            fields_url: [
-                response(
-                    [
-                        {
-                            "id": 407,
-                            "name": "Status",
-                            "data_type": "single_select",
-                            "options": [{"id": "todo", "name": "Todo"}],
-                        }
-                    ]
-                )
-            ],
-            first_items_url: [
-                response(
-                    [],
-                    headers={"Link": f'<{next_items_url}>; rel="next"'},
-                )
-            ],
-            next_items_url: [response([])],
+            PROJECT_URL: [response({"id": 1})],
+            FIELDS_URL: fields,
+            ITEMS_URL: first_page,
+            NEXT_URL: second_page,
         }
     )
-    database, provider = project_responses(config(), transport)
-    app = create_app(
-        config(),
-        database=database,
-        service=ProjectSnapshotService(provider, database, 60),
-    )
+    project = project_app(transport, 60)
 
-    with TestClient(app) as client:
+    with TestClient(project.app) as client:
         result = client.get("/api/project")
         refresh = client.post("/api/project/refresh")
-        page = client.get("/")
-        script = client.get("/web/app.js")
+    project.database.close()
 
     assert result.status_code == 200
     assert refresh.status_code == 200
     assert refresh.json() == result.json()
     assert [call[0] for call in transport.calls] == [
-        project_url,
-        fields_url,
-        first_items_url,
-        next_items_url,
+        PROJECT_URL,
+        FIELDS_URL,
+        ITEMS_URL,
+        NEXT_URL,
     ]
+
+
+def test_dashboard_assets_and_read_only_project_routes() -> None:
+    project = project_app(FakeTransport({}), 60)
+
+    with TestClient(project.app) as client:
+        page = client.get("/")
+        script = client.get("/web/app.js")
+    openapi = project.app.openapi()
+    project.database.close()
+
     assert page.status_code == 200
     assert all(label in page.text for label in ("Board", "Workflows", "Agents", "Hive"))
     assert script.status_code == 200
@@ -208,16 +187,16 @@ def test_cursor_pagination_and_read_only_api() -> None:
     assert "held by agent X" not in script.text
     assert "unclaimed" in script.text
     assert 'load("/api/project/refresh", "POST")' in script.text
-    assert set(app.openapi()["paths"]["/api/project"]) == {"get"}
-    assert set(app.openapi()["paths"]["/api/project/refresh"]) == {"post"}
-    database.close()
+    assert set(openapi["paths"]["/api/project"]) == {"get"}
+    assert set(openapi["paths"]["/api/project/refresh"]) == {"post"}
+
+
+def failing_transport(_url: str, _headers: Mapping[str, str]) -> HttpResponse:
+    raise URLError("offline")
 
 
 def test_transport_io_failure_returns_controlled_api_error() -> None:
     database = SnapshotDatabase(":memory:")
-
-    def failing_transport(_url: str, _headers: Mapping[str, str]) -> HttpResponse:
-        raise URLError("offline")
 
     provider = ProjectProvider(
         config(), GithubRestClient("token", database, transport=failing_transport)

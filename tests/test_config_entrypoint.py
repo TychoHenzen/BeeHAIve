@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import runpy
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -12,36 +13,56 @@ import beehaiive.config as config_module
 from beehaiive.config import CoreConfig, CoreConfigurationError
 from tests.support import config
 
+DOTENV_LINES = (
+    "export BEEHAIIVE_PROJECT_OWNER=dotenv-owner",
+    "BEEHAIIVE_PROJECT_OWNER_TYPE='org'",
+    "BEEHAIIVE_PROJECT_NUMBER=7",
+    "GITHUB_TOKEN='dotenv-token'",
+    "BEEHAIIVE_DB='custom.db'",
+    "BEEHAIIVE_CODEX='codex-custom'",
+    "BEEHAIIVE_CODEX_ARGS=--model 'fast model'",
+    f"BEEHAIIVE_SKILLS_DIRS=one{os.pathsep}two",
+    "BEEHAIIVE_PROJECT_REFRESH_SECONDS=120",
+    "BEEHAIIVE_AGENT_STEP_TIMEOUT_SECONDS=12",
+    "ignored line",
+)
 
-def test_config_environment_and_validation(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+BASE_VALUES = {
+    "BEEHAIIVE_PROJECT_OWNER": "owner",
+    "BEEHAIIVE_PROJECT_NUMBER": "2",
+    "GITHUB_TOKEN": "token",
+}
+
+INVALID_ENVIRONMENTS = (
+    ({"BEEHAIIVE_PROJECT_OWNER_TYPE": "team"}, "OWNER_TYPE"),
+    ({"BEEHAIIVE_PROJECT_NUMBER": "not-a-number"}, "must be an integer"),
+    ({"BEEHAIIVE_PROJECT_REFRESH_SECONDS": "nope"}, "REFRESH"),
+    ({"BEEHAIIVE_AGENT_STEP_TIMEOUT_SECONDS": "nope"}, "AGENT_STEP_TIMEOUT"),
+    ({"BEEHAIIVE_CODEX_ARGS": "'unterminated"}, "shell-like"),
+)
+
+INVALID_FIELDS = (
+    ({"owner_type": "team"}, "OWNER_TYPE"),
+    ({"project_number": 0}, "positive"),
+    ({"agent_step_timeout_seconds": 901}, "between 1 and 900"),
+)
+
+DOTENV_OVERRIDES = {
+    "BEEHAIIVE_PROJECT_OWNER": "override-owner",
+    "BEEHAIIVE_PROJECT_NUMBER": "9",
+}
+
+VALID_FIELDS = {
+    "owner": "owner",
+    "owner_type": "user",
+    "project_number": 2,
+}
+
+
+def test_config_reads_dotenv_with_environment_overrides(tmp_path: Path) -> None:
     dotenv = tmp_path / ".env"
-    dotenv.write_text(
-        "\n".join(
-            (
-                "export BEEHAIIVE_PROJECT_OWNER=dotenv-owner",
-                "BEEHAIIVE_PROJECT_OWNER_TYPE='org'",
-                "BEEHAIIVE_PROJECT_NUMBER=7",
-                "GITHUB_TOKEN='dotenv-token'",
-                "BEEHAIIVE_DB='custom.db'",
-                "BEEHAIIVE_CODEX='codex-custom'",
-                "BEEHAIIVE_CODEX_ARGS=--model 'fast model'",
-                f"BEEHAIIVE_SKILLS_DIRS=one{os.pathsep}two",
-                "BEEHAIIVE_PROJECT_REFRESH_SECONDS=120",
-                "BEEHAIIVE_AGENT_STEP_TIMEOUT_SECONDS=12",
-                "ignored line",
-            )
-        ),
-        encoding="utf-8",
-    )
-    loaded = CoreConfig.from_environment(
-        environ={
-            "BEEHAIIVE_PROJECT_OWNER": "override-owner",
-            "BEEHAIIVE_PROJECT_NUMBER": "9",
-        },
-        dotenv_path=dotenv,
-    )
+    dotenv.write_text("\n".join(DOTENV_LINES), encoding="utf-8")
+    loaded = CoreConfig.from_environment(environ=DOTENV_OVERRIDES, dotenv_path=dotenv)
     assert loaded.owner == "override-owner"
     assert loaded.owner_type == "org"
     assert loaded.project_number == 9
@@ -51,6 +72,10 @@ def test_config_environment_and_validation(
     assert loaded.refresh_seconds == 120
     assert loaded.agent_step_timeout_seconds == 12
 
+
+def test_config_falls_back_to_the_gh_auth_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     monkeypatch.setattr(config_module, "_gh_auth_token", lambda: "gh-token")
     fallback = CoreConfig.from_environment(
         environ={
@@ -61,33 +86,42 @@ def test_config_environment_and_validation(
     )
     assert fallback.github_token == "gh-token"
 
-    invalid_values = (
-        ({"BEEHAIIVE_PROJECT_OWNER_TYPE": "team"}, "OWNER_TYPE"),
-        ({"BEEHAIIVE_PROJECT_NUMBER": "not-a-number"}, "must be an integer"),
-        ({"BEEHAIIVE_PROJECT_REFRESH_SECONDS": "nope"}, "REFRESH"),
-        ({"BEEHAIIVE_AGENT_STEP_TIMEOUT_SECONDS": "nope"}, "AGENT_STEP_TIMEOUT"),
-        ({"BEEHAIIVE_CODEX_ARGS": "'unterminated"}, "shell-like"),
-    )
-    for overrides, message in invalid_values:
-        values = {
-            "BEEHAIIVE_PROJECT_OWNER": "owner",
-            "BEEHAIIVE_PROJECT_NUMBER": "2",
-            "GITHUB_TOKEN": "token",
-            **overrides,
-        }
-        with pytest.raises(CoreConfigurationError, match=message):
-            CoreConfig.from_environment(values, dotenv_path=tmp_path / "missing.env")
 
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    INVALID_ENVIRONMENTS,
+    ids=[
+        "owner-type",
+        "project-number",
+        "refresh-seconds",
+        "step-timeout",
+        "codex-args",
+    ],
+)
+def test_config_rejects_invalid_environment_values(
+    overrides: dict[str, str], message: str, tmp_path: Path
+) -> None:
+    values = BASE_VALUES | overrides
+    with pytest.raises(CoreConfigurationError, match=message):
+        CoreConfig.from_environment(values, dotenv_path=tmp_path / "missing.env")
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    INVALID_FIELDS,
+    ids=["owner-type", "project-number", "step-timeout"],
+)
+def test_config_rejects_invalid_fields(overrides: dict[str, Any], message: str) -> None:
+    values = VALID_FIELDS | overrides
+    with pytest.raises(CoreConfigurationError, match=message):
+        CoreConfig(**values)
+
+
+def test_environment_rejects_unknown_owner_type() -> None:
     with pytest.raises(CoreConfigurationError, match="OWNER_TYPE"):
-        CoreConfig(owner="owner", owner_type="team", project_number=2)
-    with pytest.raises(CoreConfigurationError, match="positive"):
-        CoreConfig(owner="owner", owner_type="user", project_number=0)
-    with pytest.raises(CoreConfigurationError, match="between 1 and 900"):
-        CoreConfig(
-            owner="owner",
-            owner_type="user",
-            project_number=2,
-            agent_step_timeout_seconds=901,
+        CoreConfig.from_environment(
+            environ=BASE_VALUES | {"BEEHAIIVE_PROJECT_OWNER_TYPE": "team"},
+            dotenv_path=Path("missing.env"),
         )
 
 
