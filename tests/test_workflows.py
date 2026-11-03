@@ -33,10 +33,11 @@ from beehaiive.workflows import (
     assign_layered_layout,
     validate_workflow,
 )
+from tests.support import SnapshotOnlyProvider
 
 
-class EmptyProvider:
-    def fetch_snapshot(self) -> Any:
+class EmptyProvider(SnapshotOnlyProvider):
+    def fetch_snapshot(self) -> ProjectSnapshot:
         raise ProjectDataError("project metadata unavailable")
 
 
@@ -581,7 +582,7 @@ def test_generator_helpers_cover_catalog_metadata_and_codex_failures(
     with pytest.raises(RuntimeError, match="workflow object"):
         _decode_definition("[]")
 
-    class SnapshotProvider:
+    class SnapshotProvider(SnapshotOnlyProvider):
         def fetch_snapshot(self) -> ProjectSnapshot:
             return ProjectSnapshot(
                 fetched_at="2026-09-29T10:00:00+00:00",

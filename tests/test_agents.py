@@ -4,6 +4,7 @@ import io
 import json
 import subprocess
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -35,8 +36,8 @@ class StaticProvider:
         item_key: str,
         *,
         status_field_id: str | None,
-        status_options: tuple[str, ...],
-        status_option_ids: dict[str, str] | None = None,
+        status_options: tuple[str, ...] = (),
+        status_option_ids: Mapping[str, str] | None = None,
     ) -> tuple[ProjectCard, str]:
         del status_field_id, status_options, status_option_ids
         for column in self.snapshot.columns:
