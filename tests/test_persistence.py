@@ -60,6 +60,27 @@ def test_database_rejects_unsupported_schema_version(tmp_path: Path) -> None:
         SnapshotDatabase(unsupported)
 
 
+def test_database_closes_its_connection_when_migrations_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    unsupported = tmp_path / "unsupported.db"
+    write_schema_version(unsupported, 999)
+    opened: list[sqlite3.Connection] = []
+    real_connect = sqlite3.connect
+
+    def spy(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        connection = real_connect(*args, **kwargs)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", spy)
+    with pytest.raises(RuntimeError, match="Unsupported schema"):
+        SnapshotDatabase(unsupported)
+    assert len(opened) == 1
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        opened[0].execute("SELECT 1")
+
+
 def test_database_ignores_corrupt_cached_headers() -> None:
     database = SnapshotDatabase(":memory:")
     bad_row = ("bad", None, "{}", "not-json")

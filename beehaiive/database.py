@@ -167,8 +167,12 @@ class SnapshotDatabase:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._connection = sqlite3.connect(self.path, check_same_thread=False)
-        self._connection.row_factory = sqlite3.Row
-        self._apply_migrations()
+        try:
+            self._connection.row_factory = sqlite3.Row
+            self._apply_migrations()
+        except BaseException:
+            self._connection.close()
+            raise
 
     def _apply_migrations(self) -> None:
         with self._lock, self._connection:
