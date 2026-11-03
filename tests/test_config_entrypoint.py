@@ -150,6 +150,7 @@ def test_entrypoint_calls_uvicorn_on_the_core_port(
         )
     ]
     monkeypatch.setattr(app_module, "create_app", lambda value: value)
+    # Drop the cached module so runpy emits no RuntimeWarning (error filter).
     monkeypatch.delitem(sys.modules, "beehaiive.__main__")
     runpy.run_module("beehaiive.__main__", run_name="__main__")
     assert len(calls) == 2
