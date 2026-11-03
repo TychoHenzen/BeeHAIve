@@ -53,9 +53,9 @@ def _snapshots(
 def _assemble(
     config: CoreConfig,
     database: SnapshotDatabase,
-    owned: bool,
     overrides: AppOverrides,
 ) -> Services:
+    owned = "database" not in overrides
     snapshots = _snapshots(config, database, overrides)
     workflows = WorkflowStore(database)
     generator = overrides.get("workflow_generator") or WorkflowGenerationService(
@@ -80,7 +80,8 @@ def build_services(config: CoreConfig, overrides: AppOverrides) -> Services:
     owned = "database" not in overrides
     database = overrides.get("database") or SnapshotDatabase(config.db_path)
     try:
-        return _assemble(config, database, owned, overrides)
+        return _assemble(config, database, overrides)
+    # Broader than Exception so an interrupted startup also closes an owned connection.
     except BaseException:
         if owned:
             database.close()
