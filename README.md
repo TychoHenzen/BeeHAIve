@@ -41,6 +41,8 @@ process tree on exit. Direct startup uses the same port and configuration:
 uv run python -m beehaiive
 ```
 
+After uv sync, uv run beehaiive is equivalent to uv run python -m beehaiive.
+
 Open `http://127.0.0.1:8000/`.
 
 ## Product
