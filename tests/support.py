@@ -256,19 +256,6 @@ class LimitedProvider:
         return card(item_key, "Issue"), "Todo"
 
 
-class SnapshotReader:
-    def __init__(self, snapshot: ProjectSnapshot) -> None:
-        self.snapshot = snapshot
-
-    def get_snapshot(self) -> ProjectSnapshot:
-        return self.snapshot
-
-
-class HolderReader:
-    def holders(self) -> dict[str, dict[str, str]]:
-        return {"held": {"id": "agent"}}
-
-
 class UrlopenResponse:
     status = 200
     headers = {"ETag": "one"}

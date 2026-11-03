@@ -10,18 +10,17 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-import beehaiive.app as app_module
 from beehaiive.agents import AgentConflict, AgentError, AgentService
 from beehaiive.app import create_app
 from beehaiive.config import CoreConfig
 from beehaiive.database import SnapshotDatabase
+from beehaiive.routes import workflow_input
+from beehaiive.routes.project import snapshot_payload
 from beehaiive.snapshot import ProjectSnapshotService
 from beehaiive.workflows import WorkflowStore
 from tests.support import (
     BlankProvider,
     FailingProvider,
-    HolderReader,
-    SnapshotReader,
     config,
     held_snapshot,
     raising,
@@ -241,12 +240,12 @@ def test_workflow_routes_use_the_prepared_definition(
 ) -> None:
     accepted = SimpleNamespace(valid=True, definition={})
     monkeypatch.setattr(
-        app_module,
+        workflow_input,
         "validate_workflow",
         lambda *_args, **_kwargs: accepted,
     )
     monkeypatch.setattr(
-        app_module,
+        workflow_input,
         "assign_layered_layout",
         lambda _definition: {"name": "fallback", "source_prompt": "prompt"},
     )
@@ -257,6 +256,6 @@ def test_workflow_routes_use_the_prepared_definition(
     assert revised.status_code == 404
 
 
-def test_read_snapshot_attaches_holders() -> None:
-    payload = app_module._read_snapshot(SnapshotReader(held_snapshot()), HolderReader())
+def test_snapshot_payload_attaches_holders() -> None:
+    payload = snapshot_payload(held_snapshot(), {"held": {"id": "agent"}})
     assert payload["columns"][0]["items"][0]["holder"] == {"id": "agent"}
