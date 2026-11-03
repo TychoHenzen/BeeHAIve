@@ -834,6 +834,8 @@ def test_core_app_exposes_only_new_routes_and_controlled_errors(tmp_path: Path) 
     app = create_app(config_value, database=database, service=service)
     with TestClient(app) as client:
         assert client.get("/").status_code == 200
+        favicon = client.get("/favicon.ico")
+        assert (favicon.status_code, favicon.content) == (204, b"")
         assert client.get("/healthz").json() == {"status": "ok"}
         assert client.get("/web/styles.css").status_code == 200
         assert client.get("/api/project").status_code == 503
