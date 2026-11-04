@@ -53,7 +53,7 @@ DOTENV_OVERRIDES = {
     "BEEHAIIVE_PROJECT_NUMBER": "9",
 }
 
-VALID_FIELDS = {
+VALID_FIELDS: dict[str, Any] = {
     "owner": "owner",
     "owner_type": "user",
     "project_number": 2,
@@ -113,7 +113,7 @@ def test_config_rejects_invalid_environment_values(
     ids=["owner-type", "project-number", "step-timeout"],
 )
 def test_config_rejects_invalid_fields(overrides: dict[str, Any], message: str) -> None:
-    values = VALID_FIELDS | overrides
+    values: dict[str, Any] = VALID_FIELDS | overrides
     with pytest.raises(CoreConfigurationError, match=message):
         CoreConfig(**values)
 

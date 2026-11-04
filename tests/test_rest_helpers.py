@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import urllib.error
 from dataclasses import dataclass
+from email.message import Message
 from typing import Any
 
 import pytest
@@ -114,11 +115,13 @@ def test_urlopen_returns_the_success_response(
 def test_urlopen_returns_the_http_error_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    headers = Message()
+    headers["X-Error"] = "yes"
     error = urllib.error.HTTPError(
         "https://example.test",
         403,
         "forbidden",
-        {"X-Error": "yes"},
+        headers,
         io.BytesIO(b"forbidden"),
     )
     monkeypatch.setattr(
