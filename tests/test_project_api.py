@@ -38,7 +38,7 @@ from tests.support import (
 
 NEXT_URL = f"{PROJECT_URL}/items?page=2"
 
-PULL_REQUEST = {
+PULL_REQUEST: dict[str, Any] = {
     "number": 8,
     "title": "Ship board",
     "html_url": f"{REPOSITORY_URL}/pull/8",

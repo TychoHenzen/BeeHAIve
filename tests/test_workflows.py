@@ -636,22 +636,19 @@ def test_generator_helpers_cover_catalog_metadata_and_codex_failures(
     result_path.write_text("file result", encoding="utf-8")
     assert _run_codex(["codex"], "prompt", result_path) == "file result"
 
-    monkeypatch.setattr(
-        generator_module.subprocess,
-        "run",
-        lambda *_args, **_kwargs: generator_module.subprocess.CompletedProcess(
+    def failed_run(*_args: Any, **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return generator_module.subprocess.CompletedProcess(
             [], 1, stdout="", stderr="failed"
-        ),
-    )
+        )
+
+    monkeypatch.setattr(generator_module.subprocess, "run", failed_run)
     with pytest.raises(RuntimeError, match="failed"):
         _run_codex(["codex"], "prompt", tmp_path / "missing.json")
-    monkeypatch.setattr(
-        generator_module.subprocess,
-        "run",
-        lambda *_args, **_kwargs: generator_module.subprocess.CompletedProcess(
-            [], 0, stdout="", stderr=""
-        ),
-    )
+
+    def empty_run(*_args: Any, **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return generator_module.subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+    monkeypatch.setattr(generator_module.subprocess, "run", empty_run)
     with pytest.raises(RuntimeError, match="structured output"):
         _run_codex(["codex"], "prompt", tmp_path / "missing.json")
 
@@ -662,10 +659,13 @@ def test_generator_helpers_cover_catalog_metadata_and_codex_failures(
     with pytest.raises(RuntimeError, match="timed out"):
         _run_codex(["codex"], "prompt", tmp_path / "missing.json")
 
+    def broken_runner(*_args: object) -> str:
+        raise RuntimeError("runner broke")
+
     failing = WorkflowGenerationService(
         config_value,
         service,
-        runner=lambda *_args: (_ for _ in ()).throw(RuntimeError("runner broke")),
+        runner=broken_runner,
     )
     job = failing.start("Broken", "Prompt", [])
     result: dict[str, Any] | None = None
@@ -786,7 +786,7 @@ def test_workflow_shape_helpers_and_edge_contracts(tmp_path: Path) -> None:
     skill_file = tmp_path / "next-ticket" / "SKILL.md"
     skill_file.parent.mkdir()
     skill_file.write_text("skill", encoding="utf-8")
-    cases = []
+    cases: list[dict[str, Any]] = []
     invalid = deepcopy(base)
     invalid["schema_version"] = 2
     invalid["name"] = ""
@@ -990,7 +990,7 @@ def test_workflow_validation_covers_state_and_transition_edges(tmp_path: Path) -
         too_many_transitions, skills_dirs=(tmp_path,), status_options=("Backlog",)
     ).valid
 
-    transition_cases = []
+    transition_cases: list[dict[str, Any]] = []
     malformed_conditions = definition()
     malformed_conditions["transitions"] = [
         {

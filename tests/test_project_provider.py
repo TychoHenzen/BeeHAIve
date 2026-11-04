@@ -64,9 +64,15 @@ def test_project_provider_uses_org_prefix() -> None:
     database.close()
 
 
+STATUS_FIELD_CASES: list[list[dict[str, Any]]] = [
+    [],
+    [{"id": 1, "name": "Status", "options": []}] * 2,
+]
+
+
 @pytest.mark.parametrize(
     "status_fields",
-    [[], [{"id": 1, "name": "Status", "options": []}] * 2],
+    STATUS_FIELD_CASES,
     ids=["missing", "ambiguous"],
 )
 def test_project_snapshot_rejects_missing_or_ambiguous_status_field(
