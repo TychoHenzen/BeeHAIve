@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 
 from .config import CoreConfig
 from .database import SnapshotDatabase
+from .held_item import HeldItem
 from .models import ProjectCard, ProjectSnapshot
 from .snapshot import ProjectSnapshotService
 from .workflows import WorkflowStore, validate_workflow
@@ -1042,7 +1043,8 @@ class AgentService:
                     self.store.set_status(agent_id, "waiting")
                     self._wait_for_next_cycle(stop_event)
                     continue
-                card, column_status = candidate
+                card = candidate.card
+                column_status = candidate.status
                 pass_id = self.store.claim(
                     agent_id,
                     card,
@@ -1187,19 +1189,17 @@ class AgentService:
                     handover = result["handover"]
                     exit_code = result["exit_code"]
                     try:
-                        refreshed_card, refreshed_status = (
-                            self.project_service.fetch_held_item(item_key(card))
-                        )
+                        refreshed = self.project_service.fetch_held_item(item_key(card))
                     except Exception as error:
                         raise AgentExecutionError(
                             f"held item reread failed: {error}"
                         ) from error
-                    if item_key(refreshed_card) != item_key(card):
+                    if item_key(refreshed.card) != item_key(card):
                         raise AgentExecutionError(
                             "held item reread returned another item"
                         )
-                    card = refreshed_card
-                    column_status = refreshed_status
+                    card = refreshed.card
+                    column_status = refreshed.status
                 elif action == "escalate":
                     step_outcome = "escalated"
                     summary = (
@@ -1511,7 +1511,7 @@ class AgentService:
         snapshot: ProjectSnapshot,
         definition: Mapping[str, Any],
         agent: Mapping[str, Any],
-    ) -> tuple[ProjectCard, str] | None:
+    ) -> HeldItem | None:
         initial = str(definition["initial"])
         states: dict[str, dict[str, Any]] = {}
         for raw_state in cast(list[Any], definition.get("states", [])):
@@ -1534,7 +1534,7 @@ class AgentService:
                     )
                     and item_key(card) not in self.store.holders()
                 ):
-                    return card, column.status
+                    return HeldItem(card=card, status=column.status)
         return None
 
     @staticmethod

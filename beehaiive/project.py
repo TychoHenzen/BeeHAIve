@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, cast
 from urllib.parse import quote
 
 from .config import CoreConfig
+from .held_item import HeldItem
 from .models import ProjectCard, ProjectColumn, ProjectSnapshot
 from .rest import GithubRestClient, next_link
 
@@ -84,9 +85,9 @@ class ProjectProvider:
         item_key: str,
         *,
         status_field_id: str | None,
-        status_options: tuple[str, ...] = (),
+        status_options: Sequence[str] = (),
         status_option_ids: Mapping[str, str] | None = None,
-    ) -> tuple[ProjectCard, str]:
+    ) -> HeldItem:
         option_ids = dict(status_option_ids or {})
         options = status_options
         if status_field_id is None:
@@ -105,7 +106,8 @@ class ProjectProvider:
         card = _normalise_item(raw_item)
         if card is None:
             raise ProjectDataError(f"GitHub Project item {item_key!r} is unavailable")
-        return card, _item_status(raw_item, status_field_id, options, option_ids)
+        status = _item_status(raw_item, status_field_id, options, option_ids)
+        return HeldItem(card=card, status=status)
 
 
 def _list_payload(value: Any, key: str) -> list[Any]:
@@ -214,7 +216,7 @@ def _normalise_item(item: Mapping[str, Any]) -> ProjectCard | None:
 def _item_status(
     item: Mapping[str, Any],
     field_id: str,
-    options: tuple[str, ...],
+    options: Sequence[str],
     option_ids: Mapping[str, str],
 ) -> str:
     raw_fields = _list(item.get("fields") or item.get("field_values") or [])

@@ -142,9 +142,9 @@ def test_fetch_item_reads_a_nested_item_payload() -> None:
         }
     )
     database, provider = project_responses(config(), transport)
-    card, status = provider.fetch_item("item/1", status_field_id=None)
-    assert card.repository == "acme/repo"
-    assert status == "Todo"
+    held_item = provider.fetch_item("item/1", status_field_id=None)
+    assert held_item.card.repository == "acme/repo"
+    assert held_item.status == "Todo"
     database.close()
 
 

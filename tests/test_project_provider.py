@@ -47,10 +47,10 @@ def test_project_provider_fetches_one_held_item_with_cached_status_field() -> No
     database.save_snapshot(stored_snapshot("Todo", "Done"))
     service = ProjectSnapshotService(provider, database, minimum_refresh_seconds=0)
 
-    card, status = service.fetch_held_item("project-item-7")
+    held_item = service.fetch_held_item("project-item-7")
 
-    assert card.item_key == "project-item-7"
-    assert status == "Done"
+    assert held_item.card.item_key == "project-item-7"
+    assert held_item.status == "Done"
     assert [call[0] for call in transport.calls] == [item_url]
     database.close()
 
@@ -151,10 +151,10 @@ def test_fetch_held_item_uses_cached_status_when_rate_limited() -> None:
         clock=lambda: datetime(2026, 9, 29, 10, tzinfo=UTC),
     )
 
-    held, status = service.fetch_held_item("item-1")
+    held_item = service.fetch_held_item("item-1")
 
-    assert held.item_key == "item-1"
-    assert status == "Todo"
+    assert held_item.card.item_key == "item-1"
+    assert held_item.status == "Todo"
     assert provider.fetch_item_args == ("item-1", None, (), {})
     database.close()
 

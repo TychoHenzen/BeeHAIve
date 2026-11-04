@@ -3,13 +3,14 @@ from __future__ import annotations
 import copy
 import json
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from beehaiive.config import CoreConfig
 from beehaiive.database import SnapshotDatabase
+from beehaiive.held_item import HeldItem
 from beehaiive.models import ProjectCard, ProjectColumn, ProjectSnapshot
 from beehaiive.project import ProjectDataError, ProjectProvider
 from beehaiive.rest import GithubRestClient, HttpResponse, RateLimitError
@@ -195,9 +196,9 @@ class SnapshotOnlyProvider:
         item_key: str,
         *,
         status_field_id: str | None,
-        status_options: tuple[str, ...] = (),
+        status_options: Sequence[str] = (),
         status_option_ids: Mapping[str, str] | None = None,
-    ) -> tuple[ProjectCard, str]:
+    ) -> HeldItem:
         del item_key, status_field_id, status_options, status_option_ids
         raise NotImplementedError("fetch_item is not used by this test")
 
@@ -233,14 +234,14 @@ class LimitedProvider:
         until = datetime(2026, 9, 29, 11, tzinfo=UTC)
         raise RateLimitError("limited", until, primary=False)
 
-    def fetch_item(self, item_key: str, **options: Any) -> tuple[ProjectCard, str]:
+    def fetch_item(self, item_key: str, **options: Any) -> HeldItem:
         self.fetch_item_args = (
             item_key,
             options.get("status_field_id"),
             options.get("status_options"),
             options.get("status_option_ids"),
         )
-        return card(item_key, "Issue"), "Todo"
+        return HeldItem(card=card(item_key, "Issue"), status="Todo")
 
 
 class UrlopenResponse:
