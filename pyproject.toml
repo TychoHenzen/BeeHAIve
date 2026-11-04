@@ -37,6 +37,15 @@ line-length = 88
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
+# Tests run under full strict. The only relaxation is reportPrivateUsage in tests/, because the tests deliberately exercise module-internal helpers.
 [tool.pyright]
-include = ["beehaiive"]
+include = ["beehaiive", "tests"]
 typeCheckingMode = "strict"
+
+[[tool.pyright.executionEnvironments]]
+root = "tests"
+extraPaths = ["."]
+reportPrivateUsage = "none"
+
+[[tool.pyright.executionEnvironments]]
+root = "."
