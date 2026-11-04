@@ -1,6 +1,38 @@
 from __future__ import annotations
 
+import time
+from pathlib import Path
 from typing import Any
+
+from fastapi.testclient import TestClient
+
+from beehaiive.models import ProjectSnapshot
+from beehaiive.project import ProjectDataError
+from tests.support import SnapshotOnlyProvider
+
+TICKET_SKILL = "---\ndescription: ticket\n---\n"
+
+
+class EmptyProvider(SnapshotOnlyProvider):
+    def fetch_snapshot(self) -> ProjectSnapshot:
+        raise ProjectDataError("project metadata unavailable")
+
+
+def write_skill(root: Path, content: str = TICKET_SKILL) -> Path:
+    skill_file = root / "next-ticket" / "SKILL.md"
+    skill_file.parent.mkdir(exist_ok=True)
+    skill_file.write_text(content, encoding="utf-8")
+    return skill_file
+
+
+def await_http_job(client: TestClient, job_id: str) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for _ in range(100):
+        result = client.get(f"/api/workflows/generate/{job_id}").json()
+        if result["status"] != "pending":
+            break
+        time.sleep(0.01)
+    return result
 
 
 def workflow_state(
@@ -88,4 +120,27 @@ def valid_definition() -> dict[str, Any]:
             wait_to_escalate,
             workflow_transition("escalate", "wait", {"kind": "always"}),
         ],
+    )
+
+
+def definition(skill: str = "next-ticket") -> dict[str, Any]:
+    wait = workflow_state("wait", "Wait", "wait_for_work", max_visits=3)
+    prompt = "Work the held item."
+    run = run_state("run", "Run", skill, prompt, ["done", "blocked"], max_visits=3)
+    escalate = workflow_state("escalate", "Escalate", "escalate", max_visits=3)
+    backlog = {"kind": "item_status_is", "value": "{backlog}"}
+    transitions = [
+        workflow_transition("wait", "run", backlog),
+        outcome_transition("run", "wait", "done"),
+        outcome_transition("run", "escalate", "blocked", priority=2),
+        workflow_transition("escalate", "wait", {"kind": "always"}),
+    ]
+    return delivery_definition(
+        description="Run a skill for a backlog issue.",
+        source_prompt="Wait for a backlog item, then run the skill.",
+        auto_reset_on_stall=True,
+        max_steps_per_pass=20,
+        parameters=[status_parameter("backlog", "Backlog")],
+        states=[wait, run, escalate],
+        transitions=transitions,
     )
