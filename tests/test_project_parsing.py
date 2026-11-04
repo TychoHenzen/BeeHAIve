@@ -47,23 +47,26 @@ PULL_REQUEST_ITEM = {
 }
 
 
+MALFORMED_STATUS_FIELDS: list[tuple[list[dict[str, Any]], str]] = [
+    ([], "exactly one"),
+    (
+        [{"id": "status", "name": "Status", "data_type": "text", "options": []}],
+        "not single-select",
+    ),
+    (
+        [{"id": "status", "name": "Status", "data_type": "single_select"}],
+        "no options",
+    ),
+    (
+        [{"name": "Status", "data_type": "single_select", "options": []}],
+        "no id",
+    ),
+]
+
+
 @pytest.mark.parametrize(
     ("fields", "match"),
-    [
-        ([], "exactly one"),
-        (
-            [{"id": "status", "name": "Status", "data_type": "text", "options": []}],
-            "not single-select",
-        ),
-        (
-            [{"id": "status", "name": "Status", "data_type": "single_select"}],
-            "no options",
-        ),
-        (
-            [{"name": "Status", "data_type": "single_select", "options": []}],
-            "no id",
-        ),
-    ],
+    MALFORMED_STATUS_FIELDS,
     ids=["empty", "text", "no-options", "no-id"],
 )
 def test_status_field_rejects_malformed_shapes(
@@ -93,7 +96,11 @@ def test_normalise_item_reads_pull_request_and_draft() -> None:
     assert pull_request.number == 4
     assert pull_request.labels == ("bug", "urgent")
     assert pull_request.linked_issue_numbers == (7,)
-    draft_item = {"content_type": "DraftIssue", "title": "draft", "content": {}}
+    draft_item: dict[str, Any] = {
+        "content_type": "DraftIssue",
+        "title": "draft",
+        "content": {},
+    }
     draft = project_module._normalise_item(draft_item)
     assert draft is not None
     assert draft.repository is None

@@ -215,7 +215,20 @@ def valid_definition() -> dict[str, Any]:
     return copy.deepcopy(VALID_DEFINITION)
 
 
-class BlockingProvider:
+class SnapshotOnlyProvider:
+    def fetch_item(
+        self,
+        item_key: str,
+        *,
+        status_field_id: str | None,
+        status_options: tuple[str, ...] = (),
+        status_option_ids: Mapping[str, str] | None = None,
+    ) -> tuple[ProjectCard, str]:
+        del item_key, status_field_id, status_options, status_option_ids
+        raise NotImplementedError("fetch_item is not used by this test")
+
+
+class BlockingProvider(SnapshotOnlyProvider):
     def __init__(self) -> None:
         self.started = threading.Event()
         self.release = threading.Event()
@@ -228,12 +241,12 @@ class BlockingProvider:
         return bare_snapshot()
 
 
-class FailingProvider:
+class FailingProvider(SnapshotOnlyProvider):
     def fetch_snapshot(self) -> ProjectSnapshot:
         raise ProjectDataError("project unavailable")
 
 
-class BlankProvider:
+class BlankProvider(SnapshotOnlyProvider):
     def fetch_snapshot(self) -> ProjectSnapshot:
         return ProjectSnapshot(None, None, ())
 

@@ -239,15 +239,22 @@ def test_workflow_routes_use_the_prepared_definition(
     routed_app: RoutedApp, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     accepted = SimpleNamespace(valid=True, definition={})
+
+    def fake_validate(*_args: Any, **_kwargs: Any) -> object:
+        return accepted
+
+    def fake_layout(_definition: object) -> dict[str, str]:
+        return {"name": "fallback", "source_prompt": "prompt"}
+
     monkeypatch.setattr(
         workflow_input,
         "validate_workflow",
-        lambda *_args, **_kwargs: accepted,
+        fake_validate,
     )
     monkeypatch.setattr(
         workflow_input,
         "assign_layered_layout",
-        lambda _definition: {"name": "fallback", "source_prompt": "prompt"},
+        fake_layout,
     )
     with TestClient(routed_app.app) as client:
         created = client.post("/api/workflows", json={"definition": {}, "name": ""})

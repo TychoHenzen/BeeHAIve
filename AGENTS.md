@@ -12,3 +12,7 @@
 ## Provider data
 
 - GitHub Project V2 `fieldValues` can contain unrelated union nodes without a `field`; ignore those nodes, but fail closed if Status is missing or ambiguous.
+
+## Type checking
+
+- `uv run pyright` checks both `beehaiive/` and `tests/` under strict mode; `reportPrivateUsage` is off only for `tests/` (see `pyproject.toml`). Do not add `type: ignore` to silence it.

@@ -1,19 +1,32 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
+from typing import Protocol
 
 from .database import SnapshotDatabase
 from .models import ProjectCard, ProjectColumn, ProjectSnapshot
-from .project import ProjectProvider
 from .rest import RateLimitError
+
+
+class SnapshotSource(Protocol):
+    def fetch_snapshot(self) -> ProjectSnapshot: ...
+
+    def fetch_item(
+        self,
+        item_key: str,
+        *,
+        status_field_id: str | None,
+        status_options: tuple[str, ...] = (),
+        status_option_ids: Mapping[str, str] | None = None,
+    ) -> tuple[ProjectCard, str]: ...
 
 
 class ProjectSnapshotService:
     def __init__(
         self,
-        provider: ProjectProvider,
+        provider: SnapshotSource,
         database: SnapshotDatabase,
         minimum_refresh_seconds: float = 60.0,
         clock: Callable[[], datetime] | None = None,

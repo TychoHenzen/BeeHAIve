@@ -53,7 +53,7 @@ DOTENV_OVERRIDES = {
     "BEEHAIIVE_PROJECT_NUMBER": "9",
 }
 
-VALID_FIELDS = {
+VALID_FIELDS: dict[str, Any] = {
     "owner": "owner",
     "owner_type": "user",
     "project_number": 2,
@@ -113,7 +113,7 @@ def test_config_rejects_invalid_environment_values(
     ids=["owner-type", "project-number", "step-timeout"],
 )
 def test_config_rejects_invalid_fields(overrides: dict[str, Any], message: str) -> None:
-    values = VALID_FIELDS | overrides
+    values: dict[str, Any] = VALID_FIELDS | overrides
     with pytest.raises(CoreConfigurationError, match=message):
         CoreConfig(**values)
 
@@ -130,17 +130,28 @@ def test_entrypoint_calls_uvicorn_on_the_core_port(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config_value = config()
+
+    def fake_from_environment(_cls: type[CoreConfig]) -> CoreConfig:
+        return config_value
+
+    def fake_create_app(value: object) -> object:
+        return value
+
     monkeypatch.setattr(
         main_module.CoreConfig,
         "from_environment",
-        classmethod(lambda _cls: config_value),
+        classmethod(fake_from_environment),
     )
-    monkeypatch.setattr(main_module, "create_app", lambda value: value)
+    monkeypatch.setattr(main_module, "create_app", fake_create_app)
     calls: list[tuple[object, dict[str, object]]] = []
+
+    def fake_run(application: object, **options: object) -> None:
+        calls.append((application, options))
+
     monkeypatch.setattr(
         main_module.uvicorn,
         "run",
-        lambda application, **options: calls.append((application, options)),
+        fake_run,
     )
     main_module.main()
     assert calls == [
@@ -149,7 +160,7 @@ def test_entrypoint_calls_uvicorn_on_the_core_port(
             {"host": "127.0.0.1", "port": 8000},
         )
     ]
-    monkeypatch.setattr(app_module, "create_app", lambda value: value)
+    monkeypatch.setattr(app_module, "create_app", fake_create_app)
     # Drop the cached module so runpy emits no RuntimeWarning (error filter).
     monkeypatch.delitem(sys.modules, "beehaiive.__main__")
     runpy.run_module("beehaiive.__main__", run_name="__main__")
@@ -158,10 +169,14 @@ def test_entrypoint_calls_uvicorn_on_the_core_port(
 
 def test_config_gh_token_success_and_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     result = type("Result", (), {"stdout": " gh-token \n"})()
+
+    def fake_result_run(*_args: Any, **_kwargs: Any) -> object:
+        return result
+
     monkeypatch.setattr(
         config_module.subprocess,
         "run",
-        lambda *_args, **_kwargs: result,
+        fake_result_run,
     )
     assert config_module._gh_auth_token() == "gh-token"
 

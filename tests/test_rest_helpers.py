@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import urllib.error
 from dataclasses import dataclass
+from email.message import Message
+from typing import Any
 
 import pytest
 
@@ -97,10 +99,13 @@ def test_rest_client_reports_controlled_failures(case: FailureCase) -> None:
 def test_urlopen_returns_the_success_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    def fake_urlopen(*_args: Any, **_kwargs: Any) -> UrlopenResponse:
+        return UrlopenResponse()
+
     monkeypatch.setattr(
         rest_module.urllib.request,
         "urlopen",
-        lambda *_args, **_kwargs: UrlopenResponse(),
+        fake_urlopen,
     )
     success = rest_module._urlopen("https://example.test", {})
     assert success.status_code == 200
@@ -110,11 +115,13 @@ def test_urlopen_returns_the_success_response(
 def test_urlopen_returns_the_http_error_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    headers = Message()
+    headers["X-Error"] = "yes"
     error = urllib.error.HTTPError(
         "https://example.test",
         403,
         "forbidden",
-        {"X-Error": "yes"},
+        headers,
         io.BytesIO(b"forbidden"),
     )
     monkeypatch.setattr(

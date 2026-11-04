@@ -4,6 +4,7 @@ import io
 import json
 import subprocess
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -35,8 +36,8 @@ class StaticProvider:
         item_key: str,
         *,
         status_field_id: str | None,
-        status_options: tuple[str, ...],
-        status_option_ids: dict[str, str] | None = None,
+        status_options: tuple[str, ...] = (),
+        status_option_ids: Mapping[str, str] | None = None,
     ) -> tuple[ProjectCard, str]:
         del status_field_id, status_options, status_option_ids
         for column in self.snapshot.columns:
@@ -268,6 +269,7 @@ def test_agent_api_runs_one_fresh_codex_process_per_skill_state(tmp_path: Path) 
         agent_id = created.json()["id"]
         started = client.post(f"/api/agents/{agent_id}/start")
         assert started.status_code == 200, started.text
+        current: dict[str, Any] = {}
         for _ in range(100):
             current = client.get(f"/api/agents/{agent_id}").json()
             if current["status"] == "waiting" and current["history"]:

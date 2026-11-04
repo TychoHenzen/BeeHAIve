@@ -33,10 +33,11 @@ from beehaiive.workflows import (
     assign_layered_layout,
     validate_workflow,
 )
+from tests.support import SnapshotOnlyProvider
 
 
-class EmptyProvider:
-    def fetch_snapshot(self) -> Any:
+class EmptyProvider(SnapshotOnlyProvider):
+    def fetch_snapshot(self) -> ProjectSnapshot:
         raise ProjectDataError("project metadata unavailable")
 
 
@@ -422,6 +423,7 @@ def test_generation_retries_once_and_returns_failed_draft(tmp_path: Path) -> Non
 
     generator = WorkflowGenerationService(config, service, runner=runner)
     job = generator.start("Delivery", "Wait for a backlog item.", [])
+    result: dict[str, Any] | None = None
     for _ in range(100):
         result = generator.get(job["id"])
         assert result is not None
@@ -429,6 +431,7 @@ def test_generation_retries_once_and_returns_failed_draft(tmp_path: Path) -> Non
             break
         time.sleep(0.01)
 
+    assert result is not None
     assert result["status"] == "succeeded"
     assert result["attempts"] == 2
     assert len(calls) == 2
@@ -473,6 +476,7 @@ def test_generation_http_success_exposes_one_repair_and_codex_flags(
             json={"name": "Delivery", "prompt": "Run delivery.", "parameters": []},
         )
         assert started.status_code == 200
+        result: dict[str, Any] = {}
         for _ in range(100):
             result = client.get(
                 f"/api/workflows/generate/{started.json()['id']}"
@@ -529,6 +533,7 @@ def test_generation_http_failure_after_one_repair_keeps_draft_and_errors(
             json={"name": "Broken", "prompt": "Run delivery.", "parameters": []},
         )
         assert started.status_code == 200
+        result: dict[str, Any] = {}
         for _ in range(100):
             result = client.get(
                 f"/api/workflows/generate/{started.json()['id']}"
@@ -581,7 +586,7 @@ def test_generator_helpers_cover_catalog_metadata_and_codex_failures(
     with pytest.raises(RuntimeError, match="workflow object"):
         _decode_definition("[]")
 
-    class SnapshotProvider:
+    class SnapshotProvider(SnapshotOnlyProvider):
         def fetch_snapshot(self) -> ProjectSnapshot:
             return ProjectSnapshot(
                 fetched_at="2026-09-29T10:00:00+00:00",
@@ -631,22 +636,19 @@ def test_generator_helpers_cover_catalog_metadata_and_codex_failures(
     result_path.write_text("file result", encoding="utf-8")
     assert _run_codex(["codex"], "prompt", result_path) == "file result"
 
-    monkeypatch.setattr(
-        generator_module.subprocess,
-        "run",
-        lambda *_args, **_kwargs: generator_module.subprocess.CompletedProcess(
+    def failed_run(*_args: Any, **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return generator_module.subprocess.CompletedProcess(
             [], 1, stdout="", stderr="failed"
-        ),
-    )
+        )
+
+    monkeypatch.setattr(generator_module.subprocess, "run", failed_run)
     with pytest.raises(RuntimeError, match="failed"):
         _run_codex(["codex"], "prompt", tmp_path / "missing.json")
-    monkeypatch.setattr(
-        generator_module.subprocess,
-        "run",
-        lambda *_args, **_kwargs: generator_module.subprocess.CompletedProcess(
-            [], 0, stdout="", stderr=""
-        ),
-    )
+
+    def empty_run(*_args: Any, **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return generator_module.subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+    monkeypatch.setattr(generator_module.subprocess, "run", empty_run)
     with pytest.raises(RuntimeError, match="structured output"):
         _run_codex(["codex"], "prompt", tmp_path / "missing.json")
 
@@ -657,18 +659,23 @@ def test_generator_helpers_cover_catalog_metadata_and_codex_failures(
     with pytest.raises(RuntimeError, match="timed out"):
         _run_codex(["codex"], "prompt", tmp_path / "missing.json")
 
+    def broken_runner(*_args: object) -> str:
+        raise RuntimeError("runner broke")
+
     failing = WorkflowGenerationService(
         config_value,
         service,
-        runner=lambda *_args: (_ for _ in ()).throw(RuntimeError("runner broke")),
+        runner=broken_runner,
     )
     job = failing.start("Broken", "Prompt", [])
+    result: dict[str, Any] | None = None
     for _ in range(100):
         result = failing.get(job["id"])
         assert result is not None
         if result["status"] != "pending":
             break
         time.sleep(0.01)
+    assert result is not None
     assert result["status"] == "failed"
     assert result["error"] == "runner broke"
     database.close()
@@ -779,7 +786,7 @@ def test_workflow_shape_helpers_and_edge_contracts(tmp_path: Path) -> None:
     skill_file = tmp_path / "next-ticket" / "SKILL.md"
     skill_file.parent.mkdir()
     skill_file.write_text("skill", encoding="utf-8")
-    cases = []
+    cases: list[dict[str, Any]] = []
     invalid = deepcopy(base)
     invalid["schema_version"] = 2
     invalid["name"] = ""
@@ -983,7 +990,7 @@ def test_workflow_validation_covers_state_and_transition_edges(tmp_path: Path) -
         too_many_transitions, skills_dirs=(tmp_path,), status_options=("Backlog",)
     ).valid
 
-    transition_cases = []
+    transition_cases: list[dict[str, Any]] = []
     malformed_conditions = definition()
     malformed_conditions["transitions"] = [
         {

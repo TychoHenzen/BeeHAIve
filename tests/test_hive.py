@@ -315,7 +315,7 @@ def test_hive_helpers_cover_conditions_empty_state_and_idempotent_ack() -> None:
         ({"kind": "unknown"}, False),
     ):
         assert _condition_matches(condition, card, "Todo", parameters) is expected
-    definition = {
+    definition: dict[str, Any] = {
         "initial": "wait",
         "transitions": [
             {"from": "other", "priority": 1, "conditions": []},
