@@ -3,11 +3,12 @@ from __future__ import annotations
 import io
 import json
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 from beehaiive.agents import AgentStore
+from beehaiive.held_item import HeldItem
 from beehaiive.models import ProjectCard, ProjectColumn, ProjectSnapshot
 from tests.workflow_support import (
     delivery_definition,
@@ -38,14 +39,14 @@ class StaticProvider:
         item_key: str,
         *,
         status_field_id: str | None,
-        status_options: tuple[str, ...] = (),
+        status_options: Sequence[str] = (),
         status_option_ids: Mapping[str, str] | None = None,
-    ) -> tuple[ProjectCard, str]:
+    ) -> HeldItem:
         del status_field_id, status_options, status_option_ids
         for column in self.snapshot.columns:
             for card in column.items:
                 if card.item_key == item_key:
-                    return card, column.status
+                    return HeldItem(card=card, status=column.status)
         raise AssertionError(f"missing fake Project item {item_key}")
 
 
