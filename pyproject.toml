@@ -46,6 +46,3 @@ typeCheckingMode = "strict"
 root = "tests"
 extraPaths = ["."]
 reportPrivateUsage = "none"
-
-[[tool.pyright.executionEnvironments]]
-root = "."
