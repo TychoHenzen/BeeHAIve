@@ -9,7 +9,6 @@ from fastapi.testclient import TestClient
 
 from beehaiive.agents import AgentStore
 from beehaiive.app import create_app
-from beehaiive.config import CoreConfig
 from beehaiive.database import SnapshotDatabase
 from beehaiive.hive import (
     HiveProjection,
@@ -25,81 +24,44 @@ from beehaiive.hive import (
 )
 from beehaiive.models import ProjectCard, ProjectColumn, ProjectSnapshot
 from beehaiive.workflows import WorkflowStore
-
-
-def _config(skill_root: Path) -> CoreConfig:
-    return CoreConfig(
-        owner="TychoHenzen",
-        owner_type="user",
-        project_number=2,
-        github_token="token",
-        skills_dirs=(skill_root,),
-    )
+from tests.support import skills_config
+from tests.workflow_support import (
+    delivery_definition,
+    outcome_transition,
+    run_state,
+    workflow_state,
+    workflow_transition,
+)
 
 
 def _definition() -> dict[str, Any]:
-    return {
-        "schema_version": 1,
-        "name": "Delivery",
-        "description": "A small delivery workflow.",
-        "source_prompt": "Wait for Todo, then deliver.",
-        "auto_reset_on_stall": False,
-        "max_steps_per_pass": 6,
-        "parameters": [],
-        "initial": "wait",
-        "states": [
-            {
-                "id": "wait",
-                "title": "Depot",
-                "action": "wait_for_work",
-                "max_visits": 1,
-                "layout": {"x": 0, "y": 0},
-            },
-            {
-                "id": "run",
-                "title": "Delivery",
-                "action": "run_skill",
-                "skill": "deliver",
-                "prompt": "Deliver the item.",
-                "outcomes": ["done", "blocked"],
-                "max_visits": 1,
-                "layout": {"x": 280, "y": 0},
-            },
-            {
-                "id": "escalate",
-                "title": "Escalation",
-                "action": "escalate",
-                "max_visits": 1,
-                "layout": {"x": 560, "y": 0},
-            },
-        ],
-        "transitions": [
-            {
-                "from": "wait",
-                "to": "run",
-                "priority": 1,
-                "conditions": [{"kind": "item_status_is", "value": "Todo"}],
-            },
-            {
-                "from": "run",
-                "to": "wait",
-                "priority": 1,
-                "conditions": [{"kind": "outcome_is", "value": "done"}],
-            },
-            {
-                "from": "run",
-                "to": "escalate",
-                "priority": 2,
-                "conditions": [{"kind": "outcome_is", "value": "blocked"}],
-            },
-            {
-                "from": "escalate",
-                "to": "wait",
-                "priority": 1,
-                "conditions": [{"kind": "always"}],
-            },
-        ],
-    }
+    depot = workflow_state("wait", "Depot", "wait_for_work", layout={"x": 0, "y": 0})
+    prompt = "Deliver the item."
+    delivery = run_state(
+        "run",
+        "Delivery",
+        "deliver",
+        prompt,
+        ["done", "blocked"],
+        layout={"x": 280, "y": 0},
+    )
+    escalation = workflow_state(
+        "escalate", "Escalation", "escalate", layout={"x": 560, "y": 0}
+    )
+    todo = {"kind": "item_status_is", "value": "Todo"}
+    transitions = [
+        workflow_transition("wait", "run", todo),
+        outcome_transition("run", "wait", "done"),
+        outcome_transition("run", "escalate", "blocked", priority=2),
+        workflow_transition("escalate", "wait", {"kind": "always"}),
+    ]
+    return delivery_definition(
+        description="A small delivery workflow.",
+        source_prompt="Wait for Todo, then deliver.",
+        max_steps_per_pass=6,
+        states=[depot, delivery, escalation],
+        transitions=transitions,
+    )
 
 
 def _seed_database(tmp_path: Path) -> tuple[SnapshotDatabase, str, str, datetime]:
@@ -368,7 +330,7 @@ def test_hive_helpers_cover_conditions_empty_state_and_idempotent_ack() -> None:
 
 def test_hive_http_events_cursor_and_acknowledgement(tmp_path: Path) -> None:
     database, agent_id, alert_pass_id, now = _seed_database(tmp_path)
-    config = _config(tmp_path)
+    config = skills_config(tmp_path)
     app = create_app(config, database=database)
     database.transaction(
         lambda connection: (

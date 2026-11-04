@@ -17,11 +17,19 @@ from beehaiive.agents import (
     _skill_prompt,
 )
 from beehaiive.app import create_app
-from beehaiive.config import CoreConfig
 from beehaiive.database import SnapshotDatabase
 from beehaiive.models import ProjectCard, ProjectColumn, ProjectSnapshot
 from beehaiive.snapshot import ProjectSnapshotService
 from beehaiive.workflows import WorkflowStore
+from tests.support import skills_config
+from tests.workflow_support import (
+    delivery_definition,
+    outcome_transition,
+    run_state,
+    status_parameter,
+    workflow_state,
+    workflow_transition,
+)
 
 
 class StaticProvider:
@@ -128,49 +136,19 @@ def test_remote_repository_accepts_github_urls_only() -> None:
 
 
 def workflow_definition() -> dict[str, Any]:
-    return {
-        "schema_version": 1,
-        "name": "Delivery",
-        "description": "Run one skill.",
-        "source_prompt": "Wait for Todo.",
-        "auto_reset_on_stall": False,
-        "max_steps_per_pass": 4,
-        "parameters": [
-            {"name": "status", "type": "status", "const": True, "value": "Todo"}
+    wait = workflow_state("wait", "Wait", "wait_for_work")
+    run = run_state("run", "Run", "deliver", "Deliver the held item.", ["done"])
+    todo = {"kind": "item_status_is", "value": "{status}"}
+    return delivery_definition(
+        description="Run one skill.",
+        source_prompt="Wait for Todo.",
+        parameters=[status_parameter("status", "Todo")],
+        states=[wait, run],
+        transitions=[
+            workflow_transition("wait", "run", todo),
+            outcome_transition("run", "wait", "done"),
         ],
-        "initial": "wait",
-        "states": [
-            {
-                "id": "wait",
-                "title": "Wait",
-                "action": "wait_for_work",
-                "max_visits": 1,
-            },
-            {
-                "id": "run",
-                "title": "Run",
-                "action": "run_skill",
-                "skill": "deliver",
-                "prompt": "Deliver the held item.",
-                "outcomes": ["done"],
-                "max_visits": 1,
-            },
-        ],
-        "transitions": [
-            {
-                "from": "wait",
-                "to": "run",
-                "priority": 1,
-                "conditions": [{"kind": "item_status_is", "value": "{status}"}],
-            },
-            {
-                "from": "run",
-                "to": "wait",
-                "priority": 1,
-                "conditions": [{"kind": "outcome_is", "value": "done"}],
-            },
-        ],
-    }
+    )
 
 
 def test_agent_api_runs_one_fresh_codex_process_per_skill_state(tmp_path: Path) -> None:
@@ -218,14 +196,7 @@ def test_agent_api_runs_one_fresh_codex_process_per_skill_state(tmp_path: Path) 
     database = SnapshotDatabase(":memory:")
     provider = StaticProvider(snapshot)
     service = ProjectSnapshotService(provider, database, minimum_refresh_seconds=0)
-    config = CoreConfig(
-        owner="TychoHenzen",
-        owner_type="user",
-        project_number=2,
-        github_token="token",
-        skills_dirs=(tmp_path,),
-        agent_step_timeout_seconds=5,
-    )
+    config = skills_config(tmp_path, agent_step_timeout_seconds=5)
     commands: list[list[str]] = []
 
     def process_factory(command: list[str], **kwargs: Any) -> FakeCodexProcess:
