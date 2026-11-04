@@ -5,6 +5,7 @@ import json
 import threading
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from beehaiive.config import CoreConfig
@@ -42,6 +43,17 @@ def config(owner_type: str = "user", refresh_seconds: float = 0) -> CoreConfig:
         project_number=2,
         github_token="test-token",
         refresh_seconds=refresh_seconds,
+    )
+
+
+def skills_config(skills_dir: Path, **overrides: Any) -> CoreConfig:
+    return CoreConfig(
+        owner="TychoHenzen",
+        owner_type="user",
+        project_number=2,
+        github_token="token",
+        skills_dirs=(skills_dir,),
+        **overrides,
     )
 
 
@@ -175,44 +187,6 @@ def raising(error: Exception) -> Callable[..., Any]:
 
 def returning(value: Any) -> Callable[..., Any]:
     return lambda *_args, **_kwargs: value
-
-
-def workflow_state(state_id: str, title: str, action: str) -> dict[str, Any]:
-    return {"id": state_id, "title": title, "action": action, "max_visits": 1}
-
-
-def workflow_transition(
-    source: str, target: str, condition: dict[str, Any]
-) -> dict[str, Any]:
-    return {"from": source, "to": target, "priority": 1, "conditions": [condition]}
-
-
-VALID_DEFINITION: dict[str, Any] = {
-    "schema_version": 1,
-    "name": "Delivery",
-    "description": "Wait for work.",
-    "source_prompt": "Wait for backlog.",
-    "auto_reset_on_stall": False,
-    "max_steps_per_pass": 4,
-    "parameters": [
-        {"name": "status", "type": "status", "const": True, "value": "Backlog"}
-    ],
-    "initial": "wait",
-    "states": [
-        workflow_state("wait", "Wait", "wait_for_work"),
-        workflow_state("escalate", "Escalate", "escalate"),
-    ],
-    "transitions": [
-        workflow_transition(
-            "wait", "escalate", {"kind": "item_status_is", "value": "{status}"}
-        ),
-        workflow_transition("escalate", "wait", {"kind": "always"}),
-    ],
-}
-
-
-def valid_definition() -> dict[str, Any]:
-    return copy.deepcopy(VALID_DEFINITION)
 
 
 class SnapshotOnlyProvider:

@@ -13,7 +13,6 @@ from fastapi.testclient import TestClient
 import beehaiive.workflow_generator as generator_module
 import beehaiive.workflows as workflow_module
 from beehaiive.app import create_app
-from beehaiive.config import CoreConfig
 from beehaiive.database import SnapshotDatabase
 from beehaiive.models import ProjectColumn, ProjectSnapshot
 from beehaiive.project import ProjectDataError
@@ -33,7 +32,15 @@ from beehaiive.workflows import (
     assign_layered_layout,
     validate_workflow,
 )
-from tests.support import SnapshotOnlyProvider
+from tests.support import SnapshotOnlyProvider, skills_config
+from tests.workflow_support import (
+    delivery_definition,
+    outcome_transition,
+    run_state,
+    status_parameter,
+    workflow_state,
+    workflow_transition,
+)
 
 
 class EmptyProvider(SnapshotOnlyProvider):
@@ -42,67 +49,26 @@ class EmptyProvider(SnapshotOnlyProvider):
 
 
 def definition(skill: str = "next-ticket") -> dict[str, Any]:
-    return {
-        "schema_version": 1,
-        "name": "Delivery",
-        "description": "Run a skill for a backlog issue.",
-        "source_prompt": "Wait for a backlog item, then run the skill.",
-        "auto_reset_on_stall": True,
-        "max_steps_per_pass": 20,
-        "parameters": [
-            {"name": "backlog", "type": "status", "const": True, "value": "Backlog"}
-        ],
-        "initial": "wait",
-        "states": [
-            {
-                "id": "wait",
-                "title": "Wait",
-                "action": "wait_for_work",
-                "max_visits": 3,
-            },
-            {
-                "id": "run",
-                "title": "Run",
-                "action": "run_skill",
-                "skill": skill,
-                "prompt": "Work the held item.",
-                "outcomes": ["done", "blocked"],
-                "max_visits": 3,
-            },
-            {
-                "id": "escalate",
-                "title": "Escalate",
-                "action": "escalate",
-                "max_visits": 3,
-            },
-        ],
-        "transitions": [
-            {
-                "from": "wait",
-                "to": "run",
-                "priority": 1,
-                "conditions": [{"kind": "item_status_is", "value": "{backlog}"}],
-            },
-            {
-                "from": "run",
-                "to": "wait",
-                "priority": 1,
-                "conditions": [{"kind": "outcome_is", "value": "done"}],
-            },
-            {
-                "from": "run",
-                "to": "escalate",
-                "priority": 2,
-                "conditions": [{"kind": "outcome_is", "value": "blocked"}],
-            },
-            {
-                "from": "escalate",
-                "to": "wait",
-                "priority": 1,
-                "conditions": [{"kind": "always"}],
-            },
-        ],
-    }
+    wait = workflow_state("wait", "Wait", "wait_for_work", max_visits=3)
+    prompt = "Work the held item."
+    run = run_state("run", "Run", skill, prompt, ["done", "blocked"], max_visits=3)
+    escalate = workflow_state("escalate", "Escalate", "escalate", max_visits=3)
+    backlog = {"kind": "item_status_is", "value": "{backlog}"}
+    transitions = [
+        workflow_transition("wait", "run", backlog),
+        outcome_transition("run", "wait", "done"),
+        outcome_transition("run", "escalate", "blocked", priority=2),
+        workflow_transition("escalate", "wait", {"kind": "always"}),
+    ]
+    return delivery_definition(
+        description="Run a skill for a backlog issue.",
+        source_prompt="Wait for a backlog item, then run the skill.",
+        auto_reset_on_stall=True,
+        max_steps_per_pass=20,
+        parameters=[status_parameter("backlog", "Backlog")],
+        states=[wait, run, escalate],
+        transitions=transitions,
+    )
 
 
 def test_validator_checks_reachability_types_and_skill_resolution(
@@ -322,13 +288,7 @@ def test_workflow_http_api_rejects_invalid_save_and_persists_revision(
     service = ProjectSnapshotService(
         EmptyProvider(), database, minimum_refresh_seconds=0
     )
-    config = CoreConfig(
-        owner="TychoHenzen",
-        owner_type="user",
-        project_number=2,
-        github_token="token",
-        skills_dirs=(tmp_path,),
-    )
+    config = skills_config(tmp_path)
     skill_file = tmp_path / "next-ticket" / "SKILL.md"
     skill_file.parent.mkdir()
     skill_file.write_text("---\ndescription: ticket\n---\n", encoding="utf-8")
@@ -401,13 +361,7 @@ def test_generation_retries_once_and_returns_failed_draft(tmp_path: Path) -> Non
     service = ProjectSnapshotService(
         EmptyProvider(), database, minimum_refresh_seconds=0
     )
-    config = CoreConfig(
-        owner="TychoHenzen",
-        owner_type="user",
-        project_number=2,
-        github_token="token",
-        skills_dirs=(tmp_path,),
-    )
+    config = skills_config(tmp_path)
     skill_file = tmp_path / "next-ticket" / "SKILL.md"
     skill_file.parent.mkdir()
     skill_file.write_text("---\ndescription: ticket\n---\n", encoding="utf-8")
@@ -446,13 +400,7 @@ def test_generation_http_success_exposes_one_repair_and_codex_flags(
     service = ProjectSnapshotService(
         EmptyProvider(), database, minimum_refresh_seconds=0
     )
-    config = CoreConfig(
-        owner="TychoHenzen",
-        owner_type="user",
-        project_number=2,
-        github_token="token",
-        skills_dirs=(tmp_path,),
-    )
+    config = skills_config(tmp_path)
     skill_file = tmp_path / "next-ticket" / "SKILL.md"
     skill_file.parent.mkdir()
     skill_file.write_text("---\ndescription: ticket\n---\n", encoding="utf-8")
@@ -506,13 +454,7 @@ def test_generation_http_failure_after_one_repair_keeps_draft_and_errors(
     service = ProjectSnapshotService(
         EmptyProvider(), database, minimum_refresh_seconds=0
     )
-    config = CoreConfig(
-        owner="TychoHenzen",
-        owner_type="user",
-        project_number=2,
-        github_token="token",
-        skills_dirs=(tmp_path,),
-    )
+    config = skills_config(tmp_path)
     calls: list[str] = []
 
     def runner(_command: list[str], prompt: str, result_path: Path) -> str:
@@ -601,13 +543,7 @@ def test_generator_helpers_cover_catalog_metadata_and_codex_failures(
     service = ProjectSnapshotService(
         SnapshotProvider(), database, minimum_refresh_seconds=0
     )
-    config_value = CoreConfig(
-        owner="TychoHenzen",
-        owner_type="user",
-        project_number=2,
-        github_token="token",
-        skills_dirs=(skills,),
-    )
+    config_value = skills_config(skills)
     generator = WorkflowGenerationService(
         config_value,
         service,

@@ -25,8 +25,8 @@ from tests.support import (
     held_snapshot,
     raising,
     returning,
-    valid_definition,
 )
+from tests.workflow_support import valid_definition
 
 
 @dataclass
