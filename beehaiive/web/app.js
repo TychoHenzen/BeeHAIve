@@ -76,7 +76,11 @@ async function refresh() {
     if (!state.sessionId && state.sessions.length) state.sessionId = state.sessions[0].id;
     const base = state.sessionId ? `/api/sessions/${encodeURIComponent(state.sessionId)}` : null;
     state.detail = base ? await getJson(base).catch(() => null) : null;
-    const agentId = state.agentId ?? state.detail?.agents[0]?.id;
+    // A stale agent id in the hash falls back to the session's root agent.
+    const agents = state.detail?.agents ?? [];
+    const agentId = agents.some((agent) => agent.id === state.agentId)
+      ? state.agentId
+      : agents[0]?.id;
     state.agent =
       base && agentId
         ? await getJson(`${base}/agents/${encodeURIComponent(agentId)}`).catch(() => null)
@@ -95,7 +99,19 @@ function select(sessionId, agentId = null) {
   refresh();
 }
 
+// Panes that scroll on their own; a re-render must not move them.
+const SCROLLERS = [".sessions", ".detail", ".agent-tree", ".agent-detail"];
+
 function render() {
+  const scrolled = SCROLLERS.map((selector) => document.querySelector(selector)?.scrollTop ?? 0);
+  draw();
+  SCROLLERS.forEach((selector, i) => {
+    const node = document.querySelector(selector);
+    if (node) node.scrollTop = scrolled[i];
+  });
+}
+
+function draw() {
   const now = Date.now();
   document.getElementById("refresh-state").textContent = state.error
     ? `Refresh failed: ${state.error}`
@@ -320,4 +336,7 @@ window.addEventListener("hashchange", () => {
   refresh();
 });
 refresh();
-setInterval(refresh, REFRESH_MS);
+// Skip a timed refresh while text is selected, so it can be copied.
+setInterval(() => {
+  if (!getSelection()?.toString()) refresh();
+}, REFRESH_MS);
