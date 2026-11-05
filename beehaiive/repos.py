@@ -18,11 +18,14 @@ _GITHUB_REMOTE = re.compile(
     r"^(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
     r"(?P<owner>[\w.-]+)/(?P<name>[\w.-]+?)(?:\.git)?/?$"
 )
-_PROJECTS_QUERY = (
-    "query($owner:String!,$name:String!){repository(owner:$owner,name:$name)"
-    "{projectsV2(first:20){nodes{number title url closed}}}}"
+_REPO_QUERY = (
+    "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){"
+    "projectsV2(first:20){nodes{number title url closed}}"
+    "issues(states:OPEN,first:100){totalCount nodes{number}}"
+    "pullRequests(states:OPEN,first:100){totalCount nodes{number}}}}"
 )
-RETRY_SECONDS = 300.0
+# Open issues change while a run works, so the lookup is repeated this often.
+REFRESH_SECONDS = 300.0
 
 
 def run_command(args: Sequence[str]) -> str | None:
@@ -66,6 +69,15 @@ class ProjectLink:
     url: str
 
 
+@dataclass(frozen=True)
+class RepoState:
+    """What GitHub says about a repository: its Projects and what is open."""
+
+    projects: list[ProjectLink]
+    # None when GitHub listed only part of them, so nothing can be ruled closed.
+    open_numbers: frozenset[int] | None
+
+
 def parse_remote(url: str) -> Repository | None:
     match = _GITHUB_REMOTE.match(url.strip())
     if not match:
@@ -73,11 +85,24 @@ def parse_remote(url: str) -> Repository | None:
     return Repository(match.group("owner"), match.group("name"))
 
 
-def parse_projects(payload: str) -> list[ProjectLink]:
+def _open_numbers(data: object) -> frozenset[int] | None:
+    numbers: set[int] = set()
+    for kind in ("issues", "pullRequests"):
+        connection = as_dict(dig(data, "data", "repository", kind))
+        nodes = as_list(connection.get("nodes") if connection else None)
+        if connection is None or get_int(connection, "totalCount") > len(nodes):
+            return None
+        numbers.update(get_int(as_dict(node), "number") for node in nodes)
+    return frozenset(numbers)
+
+
+def parse_repo_state(payload: str) -> RepoState | None:
     try:
         data: object = json.loads(payload)
     except ValueError:
-        return []
+        return None
+    if as_dict(dig(data, "data", "repository")) is None:
+        return None
     links: list[ProjectLink] = []
     for item in as_list(dig(data, "data", "repository", "projectsV2", "nodes")):
         node = as_dict(item)
@@ -87,15 +112,15 @@ def parse_projects(payload: str) -> list[ProjectLink]:
         links.append(
             ProjectLink(get_int(node, "number"), get_str(node, "title") or "", url)
         )
-    return links
+    return RepoState(links, _open_numbers(data))
 
 
 class RepoResolver:
-    """Cache git remote and GitHub Project lookups, retrying failures later.
+    """Cache git remote and GitHub lookups, repeating the GitHub one now and then.
 
-    repository() and projects() may run a command; the index thread calls them.
-    known_repository() and known_projects() only read the cache, so a request
-    never waits on git or gh.
+    repository() and repo_state() may run a command; the index thread calls
+    them. The known_* methods only read the cache, so a request never waits on
+    git or gh.
     """
 
     def __init__(
@@ -107,7 +132,7 @@ class RepoResolver:
         self._clock = clock
         self._lock = threading.Lock()
         self._repos: dict[str, Repository | None] = {}
-        self._projects: dict[str, tuple[float, list[ProjectLink] | None]] = {}
+        self._states: dict[str, tuple[float, RepoState | None]] = {}
 
     def repository(self, cwd: str | None) -> Repository | None:
         if not cwd:
@@ -121,38 +146,38 @@ class RepoResolver:
             self._repos[cwd] = repo
         return repo
 
-    def projects(self, repo: Repository) -> list[ProjectLink]:
+    def repo_state(self, repo: Repository) -> RepoState | None:
         key = repo.full_name
         now = self._clock()
         with self._lock:
-            cached = self._projects.get(key)
-        if cached is not None:
-            fetched_at, links = cached
-            if links is not None or now - fetched_at < RETRY_SECONDS:
-                return links or []
+            cached = self._states.get(key)
+        if cached is not None and now - cached[0] < REFRESH_SECONDS:
+            return cached[1]
         output = self._run(
             [
                 "gh",
                 "api",
                 "graphql",
                 "-f",
-                f"query={_PROJECTS_QUERY}",
+                f"query={_REPO_QUERY}",
                 "-F",
                 f"owner={repo.owner}",
                 "-F",
                 f"name={repo.name}",
             ]
         )
-        links = parse_projects(output) if output is not None else None
+        state = parse_repo_state(output) if output is not None else None
+        if state is None and cached is not None:
+            state = cached[1]  # a failed lookup keeps the last good answer
         with self._lock:
-            self._projects[key] = (now, links)
-        return links or []
+            self._states[key] = (now, state)
+        return state
 
     def known_repository(self, cwd: str | None) -> Repository | None:
         with self._lock:
             return self._repos.get(cwd) if cwd else None
 
-    def known_projects(self, repo: Repository) -> list[ProjectLink]:
+    def known_state(self, repo: Repository) -> RepoState | None:
         with self._lock:
-            cached = self._projects.get(repo.full_name)
-        return (cached[1] or []) if cached else []
+            cached = self._states.get(repo.full_name)
+        return cached[1] if cached else None

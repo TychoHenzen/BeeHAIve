@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .activity import Agent, Step, Turn
 from .outcomes import first_sentence, issue_in, stage_name, stop_reason
-from .repos import ProjectLink, RepoResolver, Repository
+from .repos import ProjectLink, RepoResolver, Repository, RepoState
 
 GOAL_SDLC = "dod-guard:goal-sdlc"
 ACTIVE_WINDOW = timedelta(minutes=2)
@@ -65,11 +65,13 @@ class SessionView:
             self._compute_status(agent)
         self.is_goal_sdlc = GOAL_SDLC in root.skills_used
         self.repository: Repository | None = resolver.known_repository(root.cwd)
-        self.projects: list[ProjectLink] = (
-            resolver.known_projects(self.repository)
+        state: RepoState | None = (
+            resolver.known_state(self.repository)
             if self.repository is not None and self.is_goal_sdlc
-            else []
+            else None
         )
+        self.projects: list[ProjectLink] = state.projects if state else []
+        self.open_numbers = state.open_numbers if state else None
 
     # Tree and status
 
@@ -161,7 +163,9 @@ class SessionView:
     def _name(self, agent: Agent) -> str:
         if agent is self.root:
             return self.title()
-        return agent.description or agent.title or agent.agent_type or agent.id
+        first = agent.turns[0].request if agent.turns else ""
+        name = agent.description or agent.title or first_sentence(first, 80)
+        return name or agent.agent_type or agent.id
 
     def _end(self, agent: Agent) -> datetime | None:
         return self.now if self._working(agent) else agent.last_activity
@@ -220,6 +224,27 @@ class SessionView:
             for other in self._dispatches()
         )
 
+    def _handled(self, agent: Agent) -> bool:
+        """Whether something after this agent's trouble already dealt with it."""
+        if not self.is_goal_sdlc:
+            # A person who sent another request after the trouble has seen it.
+            return any(
+                turn.request
+                and turn.started_at is not None
+                and agent.last_activity is not None
+                and turn.started_at > agent.last_activity
+                for turn in self.root.turns
+            )
+        if self.parent.get(agent.id) != self.root.id:
+            return False
+        issue = self._issue(agent)
+        closed = (
+            issue is not None
+            and self.open_numbers is not None
+            and issue not in self.open_numbers
+        )
+        return closed or self._superseded(agent)
+
     def issues(self) -> tuple[list[Json], Json]:
         rows: dict[int, list[Agent]] = {}
         upkeep: list[Agent] = []
@@ -277,7 +302,7 @@ class SessionView:
                 and not self._working(parent)
             ):
                 continue
-            if dispatched_by_root and self.is_goal_sdlc and self._superseded(agent):
+            if self._handled(agent):
                 continue
             issue = self._issue(agent)
             items.append(

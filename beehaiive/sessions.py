@@ -198,7 +198,7 @@ class SessionIndex:
         root = tracker.main.agent
         repository = self.resolver.repository(root.cwd)
         if repository is not None and GOAL_SDLC in root.skills_used:
-            self.resolver.projects(repository)
+            self.resolver.repo_state(repository)
 
     def list_sessions(self) -> dict[str, object]:
         with self._lock:

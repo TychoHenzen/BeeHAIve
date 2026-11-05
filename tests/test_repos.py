@@ -6,12 +6,13 @@ from collections.abc import Sequence
 import pytest
 
 from beehaiive.repos import (
-    RETRY_SECONDS,
+    REFRESH_SECONDS,
     ProjectLink,
     RepoResolver,
     Repository,
-    parse_projects,
+    RepoState,
     parse_remote,
+    parse_repo_state,
     run_command,
 )
 
@@ -38,37 +39,51 @@ def test_parse_remote_rejects_other_hosts() -> None:
     assert parse_remote("https://gitlab.com/a/b.git") is None
 
 
-def test_parse_projects_keeps_open_projects_with_urls() -> None:
-    payload = json.dumps(
+def repo_payload(
+    projects: list[object], issues: list[int], total_issues: int | None = None
+) -> str:
+    return json.dumps(
         {
             "data": {
                 "repository": {
-                    "projectsV2": {
-                        "nodes": [
-                            {
-                                "number": 2,
-                                "title": "Board",
-                                "url": "https://p/2",
-                                "closed": False,
-                            },
-                            {
-                                "number": 3,
-                                "title": "Old",
-                                "url": "https://p/3",
-                                "closed": True,
-                            },
-                            {"number": 4, "title": "No url"},
-                            None,
-                        ]
-                    }
+                    "projectsV2": {"nodes": projects},
+                    "issues": {
+                        "totalCount": len(issues)
+                        if total_issues is None
+                        else total_issues,
+                        "nodes": [{"number": n} for n in issues],
+                    },
+                    "pullRequests": {"totalCount": 1, "nodes": [{"number": 7}]},
                 }
             }
         }
     )
 
-    assert parse_projects(payload) == [ProjectLink(2, "Board", "https://p/2")]
-    assert parse_projects("not json") == []
-    assert parse_projects('{"data": null}') == []
+
+def test_parse_repo_state_keeps_open_projects_and_open_numbers() -> None:
+    payload = repo_payload(
+        [
+            {"number": 2, "title": "Board", "url": "https://p/2", "closed": False},
+            {"number": 3, "title": "Old", "url": "https://p/3", "closed": True},
+            {"number": 4, "title": "No url"},
+            None,
+        ],
+        [5, 6],
+    )
+
+    assert parse_repo_state(payload) == RepoState(
+        [ProjectLink(2, "Board", "https://p/2")], frozenset({5, 6, 7})
+    )
+    assert parse_repo_state("not json") is None
+    assert parse_repo_state('{"data": null}') is None
+
+
+def test_open_numbers_are_unknown_when_github_listed_only_some() -> None:
+    state = parse_repo_state(repo_payload([], [5], total_issues=300))
+    assert state is not None and state.open_numbers is None
+    partial = json.dumps({"data": {"repository": {"projectsV2": {"nodes": []}}}})
+    state = parse_repo_state(partial)
+    assert state == RepoState([], None)
 
 
 class FakeRunner:
@@ -89,15 +104,8 @@ class FakeClock:
         return self.now
 
 
-PROJECTS = json.dumps(
-    {
-        "data": {
-            "repository": {
-                "projectsV2": {"nodes": [{"number": 9, "title": "T", "url": "u"}]}
-            }
-        }
-    }
-)
+PAYLOAD = repo_payload([{"number": 9, "title": "T", "url": "u"}], [1])
+STATE = RepoState([ProjectLink(9, "T", "u")], frozenset({1, 7}))
 
 
 def test_resolver_caches_repository_lookups() -> None:
@@ -122,23 +130,28 @@ def test_resolver_remembers_a_folder_without_a_github_remote() -> None:
     assert runner.calls == ["git"]
 
 
-def test_resolver_caches_projects_and_retries_failures_later() -> None:
+def test_resolver_repeats_the_github_lookup_and_keeps_the_last_good_one() -> None:
     runner = FakeRunner({"gh": None})
     clock = FakeClock()
     resolver = RepoResolver(runner, clock)
     repo = Repository("o", "r")
 
-    assert resolver.projects(repo) == []
-    assert resolver.projects(repo) == []
+    assert resolver.repo_state(repo) is None
+    assert resolver.repo_state(repo) is None
     assert runner.calls == ["gh"]
 
-    runner.outputs["gh"] = PROJECTS
-    clock.now += RETRY_SECONDS + 1
-    assert resolver.projects(repo) == [ProjectLink(9, "T", "u")]
-    assert resolver.projects(repo) == [ProjectLink(9, "T", "u")]
-    assert resolver.known_projects(repo) == [ProjectLink(9, "T", "u")]
-    assert resolver.known_projects(Repository("x", "y")) == []
+    runner.outputs["gh"] = PAYLOAD
+    clock.now += REFRESH_SECONDS + 1
+    assert resolver.repo_state(repo) == STATE
+    assert resolver.repo_state(repo) == STATE
     assert runner.calls == ["gh", "gh"]
+
+    runner.outputs["gh"] = None
+    clock.now += REFRESH_SECONDS + 1
+    assert resolver.repo_state(repo) == STATE
+    assert resolver.known_state(repo) == STATE
+    assert resolver.known_state(Repository("x", "y")) is None
+    assert runner.calls == ["gh", "gh", "gh"]
 
 
 def test_run_command_returns_none_on_failure() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from typing import cast
 
@@ -20,12 +21,28 @@ def items(value: object) -> list[Record]:
     return [obj(item) for item in cast(list[object], value)]
 
 
-def resolver() -> RepoResolver:
+def resolver(open_numbers: list[int] | None = None) -> RepoResolver:
+    nodes = [{"number": n} for n in open_numbers or []]
+    payload = json.dumps(
+        {
+            "data": {
+                "repository": {
+                    "issues": {"totalCount": len(nodes), "nodes": nodes},
+                    "pullRequests": {"totalCount": 0, "nodes": []},
+                }
+            }
+        }
+    )
+
     def run(args: Sequence[str]) -> str | None:
-        return "https://github.com/o/r.git\n" if args[0] == "git" else None
+        if args[0] == "git":
+            return "https://github.com/o/r.git\n"
+        return payload if open_numbers is not None else None
 
     repos = RepoResolver(run)
-    repos.repository("C:/work/repo")
+    repo = repos.repository("C:/work/repo")
+    assert repo is not None
+    repos.repo_state(repo)
     return repos
 
 
@@ -44,7 +61,7 @@ def subagent(
     return agent
 
 
-def goal_sdlc_view() -> SessionView:
+def goal_sdlc_view(open_numbers: list[int] | None = None) -> SessionView:
     root = Agent("s", "session")
     root.apply(human("/goal-sdlc", 0))
     root.apply(tool_use("k", "Skill", {"skill": "dod-guard:goal-sdlc"}, 1))
@@ -73,7 +90,7 @@ def goal_sdlc_view() -> SessionView:
         "u1", [human("Refresh", 600), text("ok", 660)], description="Refresh queue"
     )
     agents = [stopped_then_rerun, rerun, stopped, quiet_grandchild, upkeep]
-    return SessionView(root, agents, resolver(), at(5000))
+    return SessionView(root, agents, resolver(open_numbers), at(5000))
 
 
 def test_stage_runs_group_by_issue_newest_issue_first() -> None:
@@ -101,6 +118,26 @@ def test_attention_skips_superseded_stops_and_children_of_finished_stages() -> N
     (item,) = attention
     assert item["agent_id"] == "c3" and item["kind"] == "stopped"
     assert item["issue"] == 406 and item["note"] == "duplicate evidence"
+
+
+def test_attention_drops_a_stage_whose_issue_is_closed_since() -> None:
+    assert goal_sdlc_view(open_numbers=[405]).attention() == []
+    (item,) = goal_sdlc_view(open_numbers=[405, 406]).attention()
+    assert item["agent_id"] == "c3"
+
+
+def test_attention_outside_goal_sdlc_ends_at_the_next_request() -> None:
+    root = Agent("s", "session")
+    root.apply(human("start", 0))
+    root.apply(tool_use("a1", "Agent", {"description": "x"}, 1))
+    quiet = subagent("q", [human("Look into the slow build", 1)], "a1", finished=False)
+    view = SessionView(root, [quiet], resolver(), at(1000))
+
+    (item,) = view.attention()
+    assert item["kind"] == "stalled" and item["title"] == "Look into the slow build"
+
+    root.apply(human("never mind", 500))
+    assert SessionView(root, [quiet], resolver(), at(1000)).attention() == []
 
 
 def test_background_counts_only_the_problems_a_run_recovered_from() -> None:

@@ -31,7 +31,9 @@ PROJECTS = json.dumps(
             "repository": {
                 "projectsV2": {
                     "nodes": [{"number": 10, "title": "Board", "url": "https://p/10"}]
-                }
+                },
+                "issues": {"totalCount": 1, "nodes": [{"number": 405}]},
+                "pullRequests": {"totalCount": 0, "nodes": []},
             }
         }
     }
