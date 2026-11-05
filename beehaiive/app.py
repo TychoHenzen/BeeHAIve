@@ -1,38 +1,48 @@
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Callable
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from typing import Unpack
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from datetime import timedelta
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
+from starlette.responses import Response
+from starlette.types import Scope
 
 from .config import CoreConfig
 from .routes import ROUTERS
 from .routes.system import WEB_DIR
-from .services import AppOverrides, Services, build_services
+from .sessions import SessionIndex
 
 
-def _lifespan(
-    services: Services,
-) -> Callable[[FastAPI], AbstractAsyncContextManager[None]]:
-    @asynccontextmanager
-    async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
-        yield
-        services.agents.shutdown()
-        if services.owned_database:
-            services.database.close()
+class _RevalidatedFiles(StaticFiles):
+    """Static files the browser must recheck, so an upgrade shows on reload."""
 
-    return lifespan
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 def create_app(
-    config: CoreConfig | None = None, **overrides: Unpack[AppOverrides]
+    config: CoreConfig | None = None, index: SessionIndex | None = None
 ) -> FastAPI:
-    services = build_services(config or CoreConfig.from_environment(), overrides)
-    app = FastAPI(title="BeeHAIve Core", lifespan=_lifespan(services))
-    app.state.services = services
+    config = config or CoreConfig.from_environment()
+    session_index = index or SessionIndex(
+        config.projects_dir, timedelta(hours=config.lookback_hours)
+    )
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
+        session_index.start()
+        try:
+            yield
+        finally:
+            session_index.stop()
+
+    app = FastAPI(title="BeeHAIve", lifespan=lifespan)
+    app.state.index = session_index
     for router in ROUTERS:
         app.include_router(router)
-    app.mount("/web", StaticFiles(directory=WEB_DIR), name="core-web")
+    app.mount("/web", _RevalidatedFiles(directory=WEB_DIR), name="web")
     return app

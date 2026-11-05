@@ -9,9 +9,10 @@
 - Review is read-only until the user explicitly accepts the findings.
 - `/complete-pr` alone owns making a pull request ready, merging it, confirming the linked issue, and deleting the branch.
 
-## Provider data
+## Transcript data
 
-- GitHub Project V2 `fieldValues` can contain unrelated union nodes without a `field`; ignore those nodes, but fail closed if Status is missing or ambiguous.
+- Claude Code transcripts are an internal, undocumented format. Read every field through the `beehaiive/records.py` helpers so an unexpected shape yields "unknown", never an exception.
+- BeeHAIve is read-only: it never writes to transcripts, git, or GitHub, and it never runs `git` or `gh` while a request holds the index lock.
 
 ## Type checking
 
