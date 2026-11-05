@@ -2,14 +2,16 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
-  extraArgs,
+  backgroundText,
   folderName,
   formatAgo,
   formatClock,
   formatDuration,
   formatTokens,
+  plural,
+  shortStage,
   splitIssueRefs,
-  stageText,
+  toolSummary,
 } from "../beehaiive/web/format.js";
 
 test("formatDuration picks the two largest units", () => {
@@ -44,19 +46,30 @@ test("formatTokens shortens large counts", () => {
   assert.equal(formatTokens(2_500_000), "2.5M");
 });
 
-test("stageText adds the issue number when there is one", () => {
-  assert.equal(stageText(null), "");
-  assert.equal(stageText({ stage: "next-ticket", issue: 405 }), "next-ticket #405");
-  assert.equal(stageText({ stage: "goal-sdlc", issue: null }), "goal-sdlc");
+test("shortStage shortens goal-sdlc skills and keeps the rest", () => {
+  assert.equal(shortStage(null), "");
+  assert.equal(shortStage("submit-draft-pr"), "draft PR");
+  assert.equal(shortStage("fix-pr-review round 2"), "fix review round 2");
+  assert.equal(shortStage("review-pr"), "review");
+  assert.equal(shortStage("next-ticket"), "next-ticket");
+  assert.equal(shortStage("review-prx"), "review-prx");
 });
 
-test("extraArgs drops the issue number that stageText shows", () => {
-  assert.equal(extraArgs(null), "");
-  assert.equal(extraArgs({ args: "", issue: null }), "");
-  assert.equal(extraArgs({ args: "--resume", issue: null }), "--resume");
-  assert.equal(extraArgs({ args: "410", issue: 410 }), "");
-  assert.equal(extraArgs({ args: "#405 (resume at checkpoint 5)", issue: 405 }), "(resume at checkpoint 5)");
-  assert.equal(extraArgs({ args: "4105 x", issue: 410 }), "4105 x");
+test("toolSummary and plural describe counts in words", () => {
+  assert.equal(plural(1, "run"), "1 run");
+  assert.equal(plural(2, "run"), "2 runs");
+  assert.equal(toolSummary(0, []), "no tool calls");
+  assert.equal(toolSummary(1, null), "1 tool call");
+  assert.equal(toolSummary(5, [["Edit", 3], ["Bash", 2]]), "5 tool calls: Edit 3, Bash 2");
+});
+
+test("backgroundText lists only the counts that are not zero", () => {
+  assert.equal(backgroundText(null), "");
+  assert.equal(backgroundText({ hook_blocks: 0, tool_errors: 0, api_errors: 0, unreadable_records: 0 }), "");
+  assert.equal(
+    backgroundText({ hook_blocks: 1, tool_errors: 3, api_errors: 0, unreadable_records: 2 }),
+    "1 hook block, 3 recovered tool errors, 2 unreadable records",
+  );
 });
 
 test("splitIssueRefs links #N to the repository", () => {

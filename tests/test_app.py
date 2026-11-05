@@ -55,7 +55,7 @@ def test_session_api_lists_and_details_sessions(tmp_path: Path) -> None:
     assert listing["indexing"] is False
     assert [s["id"] for s in listing["sessions"]] == ["s1"]
     detail = client.get("/api/sessions/s1").json()
-    assert [a["id"] for a in detail["agents"]] == ["s1"]
+    assert detail["id"] == "s1" and len(detail["turns"]) == 1
     agent = client.get("/api/sessions/s1/agents/s1").json()
     assert [s["name"] for s in agent["steps"]] == ["Prompt", "Bash"]
 

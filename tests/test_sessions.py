@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from collections.abc import Sequence
 from datetime import datetime, timedelta
@@ -10,7 +11,8 @@ from typing import cast
 
 from beehaiive.records import Record
 from beehaiive.repos import RepoResolver
-from beehaiive.sessions import STEP_LIMIT, SessionIndex
+from beehaiive.sessions import SessionIndex, SessionTracker
+from beehaiive.view import STEP_LIMIT
 from tests.transcripts import (
     append_jsonl,
     at,
@@ -160,42 +162,44 @@ def test_goal_sdlc_session_links_stage_issue_project_and_subagents(
         {"number": 10, "title": "Board", "url": "https://p/10"}
     ]
     assert items(summary["pull_requests"])[0]["number"] == 12
-    stage = obj(summary["stage"])
+    (stage,) = items(obj(summary["now"])["stages"])
     assert stage["stage"] == "next-ticket" and stage["issue"] == 405
     assert stage["issue_url"] == "https://github.com/o/r/issues/405"
-    assert stage["agent_id"] == "c1" and stage["status"] == "working"
-    counts = obj(summary["counts"])
-    assert counts["agents"] == 3 and counts["working_agents"] == 2
+    assert stage["agent_id"] == "c1" and stage["outcome"] == "running"
+    (live,) = items(summary["live"])
+    assert live["agent_id"] == "c1" and live["doing"] == "Bash: pytest"
+    assert summary["attention_count"] == 0
 
     detail = index.session_detail(SESSION)
     assert detail is not None
-    agents = items(detail["agents"])
-    assert [(a["id"], a["depth"], a["parent_id"]) for a in agents] == [
-        (SESSION, 0, None),
-        ("c1", 1, SESSION),
-        ("c2", 2, "c1"),
-    ]
-    assert [a["status"] for a in agents] == ["working", "working", "finished"]
-    assert agents[1]["title"] == "next-ticket 405"
-    assert agents[1]["agent_type"] == "stage-standard"
-    assert obj(agents[1]["label"])["issue_url"] == "https://github.com/o/r/issues/405"
-    current = obj(agents[1]["current"])
-    assert current["name"] == "Bash" and current["duration_s"] == 10.0
+    (row,) = items(detail["issues"])
+    assert row["issue"] == 405 and row["outcome"] == "running"
+    assert [c["agent_id"] for c in items(row["stages"])] == ["c1"]
+    assert obj(detail["upkeep"])["runs"] == 0
+    assert "turns" not in detail
 
 
-def test_agent_detail_has_steps_problems_and_child_links(tmp_path: Path) -> None:
+def test_agent_detail_has_result_children_and_steps(tmp_path: Path) -> None:
     goal_sdlc_tree(tmp_path)
     index = make_index(tmp_path, Clock(70))
     index.refresh()
 
     root = index.agent_detail(SESSION, SESSION)
     assert root is not None
+    assert root["stage"] is None and root["outcome"] is None
     launch = next(s for s in items(root["steps"]) if s["id"] == "a1")
     assert launch["child_agent_id"] == "c1" and launch["status"] == "running"
-    child = index.agent_detail(SESSION, "c2")
-    assert child is not None
-    assert child["last_message"] == "Tests written for #405"
-    assert child["problems"] == []
+    stage = index.agent_detail(SESSION, "c1")
+    assert stage is not None
+    assert stage["stage"] == "next-ticket" and stage["outcome"] == "running"
+    assert stage["agent_type"] == "stage-standard"
+    (child,) = items(stage["children"])
+    assert child["agent_id"] == "c2" and child["outcome"] == "done"
+    assert child["note"] == "Tests written for #405"
+    leaf = index.agent_detail(SESSION, "c2")
+    assert leaf is not None
+    assert leaf["result"] == "Tests written for #405"
+    assert leaf["problem_counts"] == {} and leaf["children"] == []
     assert index.agent_detail(SESSION, "missing") is None
     assert index.agent_detail("missing", SESSION) is None
     assert index.session_detail("missing") is None
@@ -212,9 +216,13 @@ def test_projects_are_fetched_only_for_goal_sdlc_sessions(tmp_path: Path) -> Non
     index.refresh()
 
     (summary,) = items(index.list_sessions()["sessions"])
-    assert summary["workflow"] is None and summary["stage"] is None
-    assert summary["projects"] == []
+    assert summary["workflow"] is None and summary["projects"] == []
     assert runner.calls == ["git"]
+    detail = index.session_detail(SESSION)
+    assert detail is not None
+    assert "issues" not in detail
+    (turn,) = items(detail["turns"])
+    assert turn["request"] == "hi" and turn["running"] is True
 
 
 def test_statuses_follow_notifications_and_time(tmp_path: Path) -> None:
@@ -239,9 +247,11 @@ def test_statuses_follow_notifications_and_time(tmp_path: Path) -> None:
     index = make_index(tmp_path, Clock(1000))
     index.refresh()
 
-    detail = index.session_detail(SESSION)
-    assert detail is not None
-    status = {a["id"]: a["status"] for a in items(detail["agents"])}
+    status: dict[str, object] = {}
+    for agent_id in (SESSION, "d", "f", "s", "m", "o"):
+        agent = index.agent_detail(SESSION, agent_id)
+        assert agent is not None
+        status[agent_id] = agent["status"]
     assert status == {
         SESSION: "idle",
         "d": "finished",
@@ -250,7 +260,12 @@ def test_statuses_follow_notifications_and_time(tmp_path: Path) -> None:
         "m": "finished",
         "o": "stalled",
     }
-    assert obj(detail["counts"])["problems"] == 1
+    detail = index.session_detail(SESSION)
+    assert detail is not None
+    attention = {a["agent_id"]: a["kind"] for a in items(detail["attention"])}
+    assert attention == {"f": "failed", "s": "stalled", "o": "stalled"}
+    failed = next(a for a in items(detail["attention"]) if a["agent_id"] == "f")
+    assert failed["note"] == "crashed"
 
 
 def test_a_long_running_tool_keeps_an_agent_working(tmp_path: Path) -> None:
@@ -285,6 +300,26 @@ def test_refresh_reads_appended_records_and_restarts_after_truncation(
     detail = index.agent_detail(SESSION, SESSION)
     assert detail is not None
     assert [s["detail"] for s in items(detail["steps"])] == ["fresh"]
+
+
+def test_new_subagents_appear_only_after_the_whole_pass(tmp_path: Path) -> None:
+    goal_sdlc_tree(tmp_path)
+    index = make_index(tmp_path, Clock(70))
+    tracker = SessionTracker(SESSION, Tree(tmp_path).main)
+    seen: list[int] = []
+
+    class SpyLock:
+        def __enter__(self) -> None:
+            seen.append(len(tracker.subagents))
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+    tracker.refresh(cast(threading.Lock, SpyLock()))
+    assert seen == [0, 0] and set(tracker.subagents) == {"c1", "c2"}
+    index.refresh()
+    detail = index.session_detail(SESSION)
+    assert detail is not None and obj(detail["upkeep"])["runs"] == 0
 
 
 def test_subagent_truncation_keeps_its_meta(tmp_path: Path) -> None:
@@ -360,7 +395,7 @@ def test_unreadable_records_and_step_limit(tmp_path: Path) -> None:
     assert len(items(detail["steps"])) == STEP_LIMIT
     session = index.session_detail(SESSION)
     assert session is not None
-    assert obj(session["counts"])["unreadable_records"] == 1
+    assert obj(session["background"])["unreadable_records"] == 1
 
 
 def test_background_thread_indexes_and_stops(tmp_path: Path) -> None:

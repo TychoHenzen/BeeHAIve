@@ -9,17 +9,19 @@
   <body>
     <header class="topbar">
       <h1>BeeHAIve</h1>
-      <span class="subtitle">Claude Code sessions on this machine</span>
-      <label class="toggle"><input type="checkbox" id="show-idle" checked> Show idle sessions</label>
+      <span class="subtitle muted">Claude Code sessions on this machine</span>
       <span id="refresh-state" class="muted" role="status"></span>
     </header>
     <main class="layout">
-      <section class="sessions" aria-label="Sessions">
-        <ul id="session-list" class="session-list"></ul>
-        <p id="session-empty" class="muted" hidden>No sessions were active in the lookback window.</p>
-      </section>
+      <nav class="sessions" aria-label="Sessions">
+        <h2>Running now</h2>
+        <ul id="running-list" class="session-list"></ul>
+        <p id="running-empty" class="muted small" hidden>No session is working right now.</p>
+        <h2>Recent</h2>
+        <ul id="recent-list" class="recent-list"></ul>
+      </nav>
       <section id="detail" class="detail" aria-label="Session detail">
-        <p class="muted">Pick a session to see its agents and steps.</p>
+        <p class="muted">Pick a session on the left.</p>
       </section>
     </main>
     <script type="module" src="/web/app.js"></script>

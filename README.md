@@ -5,15 +5,28 @@
 </p>
 
 BeeHAIve is a local, read-only dashboard for the Claude Code sessions you run
-from the desktop app or the CLI. It shows every recently active session as an
-agent, with the subagents it dispatched nested under it. For each one it shows
-what it is doing now, every step it took and how long that step ran, and every
-problem it hit: failed tool calls, API errors, hook errors and failed
-subagents.
+from the desktop app or the CLI. The left column lists the sessions that are
+working now, each with the request or stage it is on, how long that has run,
+and one line per live subagent saying what it is doing. Below them is a short
+list of recent sessions.
 
-A session that runs dod-guard's `/goal-sdlc` gets more: the stage in flight
-(for example `next-ticket #405`), links to the issue and any pull requests,
-and links to the GitHub repository and its open GitHub Projects.
+Selecting a session shows what it did at the level you would describe it, not
+tool call by tool call:
+
+- A session that runs dod-guard's `/goal-sdlc` is shown as one row per issue,
+  with one chip per stage run (refine, next-ticket, draft PR, review, fix
+  review, complete). Each chip shows how long the stage took and whether it
+  finished, stopped, went quiet or failed. The session links to its GitHub
+  repository, its open GitHub Projects and the pull requests it touched.
+- Any other session is shown as its turns: what you asked, how long Claude
+  worked on it, the first sentence of its answer, and the subagents it started.
+- "Needs attention" lists only what a person has to act on: a stage that
+  stopped, failed or went quiet and that no later stage for the same issue
+  took over. Hook blocks, tool errors Claude recovered from and API retries
+  are only counted.
+
+Clicking a stage or subagent opens its result, its stop reason, its own
+subagents and, folded away, every tool call it made.
 
 BeeHAIve never starts, stops or steers an agent, and never writes to git or
 GitHub. You keep working in Claude Code; BeeHAIve only reads what Claude Code
@@ -56,7 +69,8 @@ seconds; the page says so while it runs.
 A thread counts as working when it wrote something in the last two minutes,
 when a tool call it started less than fifteen minutes ago has not returned, or
 when one of its subagents is working. A subagent that stopped without its
-launch call returning is shown as stalled.
+launch call returning is shown as stalled ("went quiet"). A stage counts as
+stopped when its last message gives a "Stop reason".
 
 The transcript format is internal to Claude Code and undocumented. Every field
 is read defensively, so a format change shows up as missing detail or as a

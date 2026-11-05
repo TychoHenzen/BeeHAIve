@@ -175,6 +175,61 @@ def test_only_human_prompts_become_prompt_steps() -> None:
     assert [s.detail for s in agent.steps] == ["real"]
 
 
+def test_pasted_images_and_queued_messages_are_prompts_too() -> None:
+    agent = Agent("s", "session")
+    blocks: Record = {
+        "role": "user",
+        "content": [
+            {"type": "image", "source": {}},
+            {"type": "text", "text": "look at this"},
+        ],
+    }
+    agent.apply(human("", 0) | {"message": blocks})
+    agent.apply(human("", 1) | {"message": {"content": [{"type": "image"}]}})
+    queued: Record = {
+        "type": "attachment",
+        "timestamp": ts(2),
+        "attachment": {
+            "type": "queued_command",
+            "prompt": "also this",
+            "origin": {"kind": "human"},
+        },
+    }
+    agent.apply(queued)
+    agent.apply(queued | {"attachment": {"type": "hook_success"}})
+    agent.apply(
+        queued
+        | {
+            "attachment": {
+                "type": "queued_command",
+                "prompt": "x",
+                "origin": {"kind": "task"},
+            }
+        }
+    )
+
+    assert [t.request for t in agent.turns] == ["look at this", "(image)", "also this"]
+
+
+def test_turns_collect_tools_subagents_errors_and_reply() -> None:
+    agent = Agent("s", "session")
+    agent.apply(tool_use("t0", "Read", {"file_path": "a"}, 0))
+    agent.apply(human("first", 1))
+    agent.apply(tool_use("t1", "Bash", {"command": "x"}, 2))
+    agent.apply(tool_result("t1", 3, "boom", is_error=True))
+    agent.apply(tool_use("a1", "Agent", {"description": "help"}, 4))
+    agent.apply(text("All done.", 9))
+    agent.apply(human("second", 20))
+
+    early, first, second = agent.turns
+    assert early.request == "" and early.tool_counts == {"Read": 1}
+    assert first.tool_counts == {"Bash": 1, "Agent": 1}
+    assert first.agent_step_ids == ["a1"] and first.errors == 1
+    assert first.reply == "All done."
+    assert (first.started_at, first.ended_at) == (at(1), at(9))
+    assert second.started_at == second.ended_at == at(20)
+
+
 def test_subagent_label_comes_from_its_first_prompt() -> None:
     agent = Agent("c", "subagent")
     agent.apply(human("Skill: dod-guard:next-ticket #405 resume\nmore text", 0))
@@ -205,6 +260,8 @@ def test_parse_skill_label_needs_a_skill_line() -> None:
     assert parse_skill_label("Please fix it") is None
     label = parse_skill_label("Skill: dod-guard:refine-backlog-item")
     assert label is not None and label.issue is None and label.args == ""
+    dated = parse_skill_label("Skill: dod-guard:add-backlog-idea 2026-11-05 log")
+    assert dated is not None and dated.issue is None
 
 
 def test_summarize_input_picks_the_most_telling_field() -> None:

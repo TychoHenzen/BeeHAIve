@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from .outcomes import issue_in
 from .records import (
     Record,
     as_dict,
@@ -19,14 +20,19 @@ from .records import (
 
 # The record types Agent.apply reads; TranscriptTail skips every other line.
 RECORD_MARKERS = type_markers(
-    "assistant", "user", "system", "custom-title", "agent-name", "pr-link"
+    "assistant",
+    "user",
+    "system",
+    "custom-title",
+    "agent-name",
+    "pr-link",
+    "attachment",
 )
 AGENT_TOOLS = frozenset({"Agent", "Task"})
 SNIPPET = 240
 
 _NOTIFICATION = re.compile(r"<task-notification>(.*?)</task-notification>", re.S)
 _SKILL_LINE = re.compile(r"^\s*Skill:\s*(?P<skill>[\w.:-]+)(?P<args>[^\n]*)")
-_ISSUE = re.compile(r"#?(\d{1,7})\b")
 
 
 def _tag(body: str, name: str) -> str | None:
@@ -75,12 +81,7 @@ def parse_skill_label(prompt: str) -> SkillLabel | None:
     if not match:
         return None
     args = match.group("args").strip()
-    issue = _ISSUE.search(args)
-    return SkillLabel(
-        skill=match.group("skill"),
-        args=args,
-        issue=int(issue.group(1)) if issue else None,
-    )
+    return SkillLabel(skill=match.group("skill"), args=args, issue=issue_in(args))
 
 
 @dataclass
@@ -94,6 +95,20 @@ class Step:
     status: str = "running"  # "running", "done" or "failed"
     error: str | None = None
     child_agent_id: str | None = None
+
+
+@dataclass
+class Turn:
+    """One request to an agent and the work that answered it."""
+
+    id: str
+    request: str
+    started_at: datetime | None
+    ended_at: datetime | None = None
+    reply: str = ""
+    tool_counts: dict[str, int] = field(default_factory=lambda: {})
+    agent_step_ids: list[str] = field(default_factory=lambda: [])
+    errors: int = 0
 
 
 @dataclass
@@ -132,6 +147,7 @@ class Agent:
     last_message: str = ""
     finished: bool = False
     steps: list[Step] = field(default_factory=lambda: [])
+    turns: list[Turn] = field(default_factory=lambda: [])
     problems: list[Problem] = field(default_factory=lambda: [])
     pull_requests: list[PullRequest] = field(default_factory=lambda: [])
     skills_used: set[str] = field(default_factory=lambda: set())
@@ -140,6 +156,12 @@ class Agent:
 
     def open_steps(self) -> list[Step]:
         return list(self._open.values())
+
+    def _turn(self, at: datetime | None) -> Turn:
+        # Work recorded before any human prompt still belongs to a turn.
+        if not self.turns:
+            self.turns.append(Turn(f"turn-{self.id}", "", at))
+        return self.turns[-1]
 
     def step(self, step_id: str) -> Step | None:
         return self._open.get(step_id) or next(
@@ -168,6 +190,11 @@ class Agent:
             self.title = get_str(record, "agentName") or self.title
         elif kind == "pr-link":
             self._apply_pr_link(record)
+        elif kind == "attachment":
+            self._apply_attachment(record, at)
+        # After dispatch, so a new prompt does not stretch the turn before it.
+        if at is not None and self.turns and kind in ("assistant", "user"):
+            self.turns[-1].ended_at = at
 
     def _apply_assistant(self, record: Record, at: datetime | None) -> None:
         message = as_dict(record.get("message"))
@@ -185,7 +212,8 @@ class Agent:
             if block_type == "text":
                 text = get_str(block, "text") or ""
                 if text.strip():
-                    self.last_message = _snippet(text, 600)
+                    self.last_message = _snippet(text, 1200)
+                    self._turn(at).reply = self.last_message
             elif block_type == "tool_use":
                 self._open_tool(block, at)
 
@@ -230,6 +258,10 @@ class Agent:
         )
         self.steps.append(step)
         self._open[tool_id] = step
+        turn = self._turn(at)
+        turn.tool_counts[name] = turn.tool_counts.get(name, 0) + 1
+        if step.kind == "agent":
+            turn.agent_step_ids.append(tool_id)
 
     def _apply_user(self, record: Record, at: datetime | None) -> None:
         message = as_dict(record.get("message"))
@@ -237,24 +269,39 @@ class Agent:
         text = text_of(content)
         for body in _NOTIFICATION.findall(text):
             self._apply_notification(body, at)
-        if isinstance(content, str):
-            if record.get("isMeta") is True or "<task-notification>" in content:
-                return
-            origin = get_str(as_dict(record.get("origin")), "kind")
-            if origin not in (None, "human"):
-                return
-            self._add_prompt(record, content, at)
-            return
-        result = as_dict(record.get("toolUseResult"))
-        for item in as_list(content):
-            block = as_dict(item)
-            if get_str(block, "type") == "tool_result":
+        blocks = [as_dict(item) for item in as_list(content)]
+        results = [b for b in blocks if get_str(b, "type") == "tool_result"]
+        if results:
+            result = as_dict(record.get("toolUseResult"))
+            for block in results:
                 self._close_tool(block, result, at)
+            return
+        if record.get("isMeta") is True or "<task-notification>" in text:
+            return
+        origin = get_str(as_dict(record.get("origin")), "kind")
+        if origin not in (None, "human"):
+            return
+        # A prompt with a pasted image arrives as a list of blocks.
+        if text.strip() or blocks:
+            self._add_prompt(record, text.strip() or "(image)", at)
+
+    def _apply_attachment(self, record: Record, at: datetime | None) -> None:
+        # A message typed while the agent is busy is delivered as an attachment.
+        attachment = as_dict(record.get("attachment"))
+        if get_str(attachment, "type") != "queued_command":
+            return
+        origin = get_str(
+            as_dict(attachment.get("origin") if attachment else None), "kind"
+        )
+        prompt = get_str(attachment, "prompt")
+        if prompt and origin in (None, "human"):
+            self._add_prompt(record, prompt, at)
 
     def _add_prompt(self, record: Record, content: str, at: datetime | None) -> None:
         if self.kind == "subagent" and not any(s.kind == "prompt" for s in self.steps):
             self.label = parse_skill_label(content)
         step_id = get_str(record, "uuid") or f"prompt-{len(self.steps)}"
+        self.turns.append(Turn(step_id, _snippet(content, 600), at, at))
         self.steps.append(
             Step(
                 id=step_id,
@@ -285,6 +332,7 @@ class Agent:
             step.status = "failed"
             step.error = _snippet(text_of(block.get("content")) or "error", 600)
             self.problems.append(Problem(at, "tool_error", step.error, step.id))
+            self._turn(at).errors += 1
         else:
             step.status = "done"
 

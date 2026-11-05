@@ -34,16 +34,46 @@ export function formatTokens(count) {
   return `${(count / 1_000_000).toFixed(1)}M`;
 }
 
-export function stageText(stage) {
+// goal-sdlc skill names, shortened so a row of stage chips stays readable.
+const SHORT_STAGES = [
+  ["refine-backlog-item", "refine"],
+  ["submit-draft-pr", "draft PR"],
+  ["fix-pr-review", "fix review"],
+  ["review-pr", "review"],
+  ["complete-pr", "complete"],
+];
+
+export function shortStage(stage) {
   if (!stage) return "";
-  return stage.issue ? `${stage.stage} #${stage.issue}` : stage.stage;
+  for (const [skill, short] of SHORT_STAGES) {
+    if (stage === skill || stage.startsWith(`${skill} `)) return short + stage.slice(skill.length);
+  }
+  return stage;
 }
 
-// Skill arguments without the issue number that stageText already shows.
-export function extraArgs(label) {
-  if (!label?.args) return "";
-  if (!label.issue) return label.args;
-  return label.args.replace(new RegExp(`^#?${label.issue}\\b\\s*`), "");
+export function plural(count, word) {
+  return `${count} ${word}${count === 1 ? "" : "s"}`;
+}
+
+// "32 tool calls: Edit 16, Bash 5" from a turn's counts.
+export function toolSummary(total, topTools) {
+  if (!total) return "no tool calls";
+  const top = (topTools ?? []).map(([name, count]) => `${name} ${count}`).join(", ");
+  return top ? `${plural(total, "tool call")}: ${top}` : plural(total, "tool call");
+}
+
+// Only the counts that are not zero, as one sentence fragment.
+export function backgroundText(background) {
+  if (!background) return "";
+  const parts = [
+    [background.hook_blocks, "hook block"],
+    [background.tool_errors, "recovered tool error"],
+    [background.api_errors, "API error"],
+    [background.unreadable_records, "unreadable record"],
+  ]
+    .filter(([count]) => count)
+    .map(([count, word]) => plural(count, word));
+  return parts.join(", ");
 }
 
 // Split text into plain and linked pieces so "#123" can point at the repository.
