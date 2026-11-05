@@ -13,7 +13,13 @@ health_router = APIRouter()
 
 @router.get("/", include_in_schema=False)
 def index() -> FileResponse:
-    return FileResponse(WEB_DIR / "index.html", media_type="text/html")
+    # Without this a browser may keep an old page after an upgrade and call
+    # API routes that no longer exist.
+    return FileResponse(
+        WEB_DIR / "index.html",
+        media_type="text/html",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @router.get("/favicon.ico", include_in_schema=False)
