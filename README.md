@@ -34,8 +34,10 @@ writes to disk.
 
 ## Setup
 
-Use Python 3.13 and `uv`. The GitHub CLI (`gh`), signed in, is optional: it is
-only used to find the Projects linked to a goal-sdlc session's repository.
+Use Python 3.13 and `uv`. The GitHub CLI (`gh`), signed in, is optional. For a
+goal-sdlc session it reads, over the REST API every five minutes, which issues
+and pull requests are still open and which of the owner's open Projects is
+named after the repository.
 
 ```powershell
 git clone https://github.com/TychoHenzen/BeeHAIve.git

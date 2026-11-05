@@ -11,8 +11,9 @@ from beehaiive.repos import (
     RepoResolver,
     Repository,
     RepoState,
+    parse_open_numbers,
+    parse_projects,
     parse_remote,
-    parse_repo_state,
     run_command,
 )
 
@@ -39,61 +40,49 @@ def test_parse_remote_rejects_other_hosts() -> None:
     assert parse_remote("https://gitlab.com/a/b.git") is None
 
 
-def repo_payload(
-    projects: list[object], issues: list[int], total_issues: int | None = None
-) -> str:
-    return json.dumps(
-        {
-            "data": {
-                "repository": {
-                    "projectsV2": {"nodes": projects},
-                    "issues": {
-                        "totalCount": len(issues)
-                        if total_issues is None
-                        else total_issues,
-                        "nodes": [{"number": n} for n in issues],
-                    },
-                    "pullRequests": {"totalCount": 1, "nodes": [{"number": 7}]},
-                }
-            }
-        }
-    )
+REPO = Repository("o", "Card-Cleaner")
 
 
-def test_parse_repo_state_keeps_open_projects_and_open_numbers() -> None:
-    payload = repo_payload(
+def test_parse_projects_keeps_the_open_project_named_after_the_repo() -> None:
+    payload = json.dumps(
         [
-            {"number": 2, "title": "Board", "url": "https://p/2", "closed": False},
-            {"number": 3, "title": "Old", "url": "https://p/3", "closed": True},
-            {"number": 4, "title": "No url"},
+            {"number": 2, "title": "card cleaner", "state": "open"},
+            {"number": 3, "title": "CardCleaner", "state": "closed"},
+            {"number": 4, "title": "Other", "state": "open"},
+            {"title": "CardCleaner", "state": "open"},
             None,
-        ],
-        [5, 6],
+        ]
     )
 
-    assert parse_repo_state(payload) == RepoState(
-        [ProjectLink(2, "Board", "https://p/2")], frozenset({5, 6, 7})
-    )
-    assert parse_repo_state("not json") is None
-    assert parse_repo_state('{"data": null}') is None
+    assert parse_projects(payload, REPO, "users") == [
+        ProjectLink(2, "card cleaner", "https://github.com/users/o/projects/2")
+    ]
+    assert parse_projects("not json", REPO, "users") == []
 
 
-def test_open_numbers_are_unknown_when_github_listed_only_some() -> None:
-    state = parse_repo_state(repo_payload([], [5], total_issues=300))
-    assert state is not None and state.open_numbers is None
-    partial = json.dumps({"data": {"repository": {"projectsV2": {"nodes": []}}}})
-    state = parse_repo_state(partial)
-    assert state == RepoState([], None)
+def test_parse_open_numbers_reads_one_number_per_line() -> None:
+    assert parse_open_numbers("5\n7\n") == frozenset({5, 7})
+    assert parse_open_numbers("") == frozenset()
+    assert parse_open_numbers("5\noops\n") is None
 
 
 class FakeRunner:
+    """Answer git, the Projects lookups and the open issues lookup by name."""
+
     def __init__(self, outputs: dict[str, str | None]) -> None:
         self.outputs = outputs
         self.calls: list[str] = []
 
     def __call__(self, args: Sequence[str]) -> str | None:
-        self.calls.append(args[0])
-        return self.outputs.get(args[0])
+        joined = " ".join(args)
+        if args[0] == "git":
+            key = "git"
+        elif "projectsV2" in joined:
+            key = joined.split()[2].split("/")[0]  # users or orgs
+        else:
+            key = "issues"
+        self.calls.append(key)
+        return self.outputs.get(key)
 
 
 class FakeClock:
@@ -104,8 +93,8 @@ class FakeClock:
         return self.now
 
 
-PAYLOAD = repo_payload([{"number": 9, "title": "T", "url": "u"}], [1])
-STATE = RepoState([ProjectLink(9, "T", "u")], frozenset({1, 7}))
+PROJECTS = json.dumps([{"number": 9, "title": "Card-Cleaner", "state": "open"}])
+LINK = ProjectLink(9, "Card-Cleaner", "https://github.com/orgs/o/projects/9")
 
 
 def test_resolver_caches_repository_lookups() -> None:
@@ -131,27 +120,27 @@ def test_resolver_remembers_a_folder_without_a_github_remote() -> None:
 
 
 def test_resolver_repeats_the_github_lookup_and_keeps_the_last_good_one() -> None:
-    runner = FakeRunner({"gh": None})
+    runner = FakeRunner({})
     clock = FakeClock()
     resolver = RepoResolver(runner, clock)
-    repo = Repository("o", "r")
 
-    assert resolver.repo_state(repo) is None
-    assert resolver.repo_state(repo) is None
-    assert runner.calls == ["gh"]
+    assert resolver.repo_state(REPO) == RepoState([], None)
+    assert resolver.repo_state(REPO) == RepoState([], None)
+    assert runner.calls == ["users", "orgs", "issues"]
 
-    runner.outputs["gh"] = PAYLOAD
+    runner.outputs.update(orgs=PROJECTS, issues="1\n7\n")
     clock.now += REFRESH_SECONDS + 1
-    assert resolver.repo_state(repo) == STATE
-    assert resolver.repo_state(repo) == STATE
-    assert runner.calls == ["gh", "gh"]
+    good = RepoState([LINK], frozenset({1, 7}))
+    assert resolver.repo_state(REPO) == good
+    assert resolver.repo_state(REPO) == good
+    assert runner.calls.count("issues") == 2
 
-    runner.outputs["gh"] = None
+    runner.outputs.update(orgs=None, issues=None)
     clock.now += REFRESH_SECONDS + 1
-    assert resolver.repo_state(repo) == STATE
-    assert resolver.known_state(repo) == STATE
+    assert resolver.repo_state(REPO) == good
+    assert resolver.known_state(REPO) == good
     assert resolver.known_state(Repository("x", "y")) is None
-    assert runner.calls == ["gh", "gh", "gh"]
+    assert runner.calls.count("issues") == 3
 
 
 def test_run_command_returns_none_on_failure() -> None:

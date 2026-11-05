@@ -25,19 +25,7 @@ from tests.transcripts import (
 )
 
 SESSION = "11111111-aaaa"
-PROJECTS = json.dumps(
-    {
-        "data": {
-            "repository": {
-                "projectsV2": {
-                    "nodes": [{"number": 10, "title": "Board", "url": "https://p/10"}]
-                },
-                "issues": {"totalCount": 1, "nodes": [{"number": 405}]},
-                "pullRequests": {"totalCount": 0, "nodes": []},
-            }
-        }
-    }
-)
+PROJECTS = json.dumps([{"number": 10, "title": "R", "state": "open"}])
 
 
 def obj(value: object) -> Record:
@@ -58,7 +46,9 @@ class Runner:
         self.calls.append(args[0])
         if args[0] == "git":
             return "https://github.com/o/r.git\n"
-        return PROJECTS
+        if "projectsV2" in " ".join(args):
+            return PROJECTS
+        return "405\n"
 
 
 class Clock:
@@ -161,7 +151,7 @@ def test_goal_sdlc_session_links_stage_issue_project_and_subagents(
     assert summary["status"] == "working"
     assert summary["repository"] == {"name": "o/r", "url": "https://github.com/o/r"}
     assert summary["projects"] == [
-        {"number": 10, "title": "Board", "url": "https://p/10"}
+        {"number": 10, "title": "R", "url": "https://github.com/users/o/projects/10"}
     ]
     assert items(summary["pull_requests"])[0]["number"] == 12
     (stage,) = items(obj(summary["now"])["stages"])

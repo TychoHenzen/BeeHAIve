@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Sequence
 from typing import cast
 
@@ -22,22 +21,14 @@ def items(value: object) -> list[Record]:
 
 
 def resolver(open_numbers: list[int] | None = None) -> RepoResolver:
-    nodes = [{"number": n} for n in open_numbers or []]
-    payload = json.dumps(
-        {
-            "data": {
-                "repository": {
-                    "issues": {"totalCount": len(nodes), "nodes": nodes},
-                    "pullRequests": {"totalCount": 0, "nodes": []},
-                }
-            }
-        }
-    )
-
     def run(args: Sequence[str]) -> str | None:
         if args[0] == "git":
             return "https://github.com/o/r.git\n"
-        return payload if open_numbers is not None else None
+        if "projectsV2" in " ".join(args):
+            return "[]"
+        if open_numbers is None:
+            return None
+        return "".join(f"{n}\n" for n in open_numbers)
 
     repos = RepoResolver(run)
     repo = repos.repository("C:/work/repo")

@@ -10,7 +10,7 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-from .records import as_dict, as_list, dig, get_int, get_str
+from .records import as_dict, as_list, get_int, get_str
 
 Runner = Callable[[Sequence[str]], str | None]
 
@@ -18,14 +18,10 @@ _GITHUB_REMOTE = re.compile(
     r"^(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
     r"(?P<owner>[\w.-]+)/(?P<name>[\w.-]+?)(?:\.git)?/?$"
 )
-_REPO_QUERY = (
-    "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){"
-    "projectsV2(first:20){nodes{number title url closed}}"
-    "issues(states:OPEN,first:100){totalCount nodes{number}}"
-    "pullRequests(states:OPEN,first:100){totalCount nodes{number}}}}"
-)
 # Open issues change while a run works, so the lookup is repeated this often.
 REFRESH_SECONDS = 300.0
+# GitHub is read over REST only: GraphQL has its own, much smaller budget.
+_OWNER_KINDS = ("users", "orgs")
 
 
 def run_command(args: Sequence[str]) -> str | None:
@@ -74,7 +70,8 @@ class RepoState:
     """What GitHub says about a repository: its Projects and what is open."""
 
     projects: list[ProjectLink]
-    # None when GitHub listed only part of them, so nothing can be ruled closed.
+    # Open issue and pull request numbers; None until GitHub has answered, so
+    # nothing is ruled closed on a guess.
     open_numbers: frozenset[int] | None
 
 
@@ -85,34 +82,42 @@ def parse_remote(url: str) -> Repository | None:
     return Repository(match.group("owner"), match.group("name"))
 
 
-def _open_numbers(data: object) -> frozenset[int] | None:
-    numbers: set[int] = set()
-    for kind in ("issues", "pullRequests"):
-        connection = as_dict(dig(data, "data", "repository", kind))
-        nodes = as_list(connection.get("nodes") if connection else None)
-        if connection is None or get_int(connection, "totalCount") > len(nodes):
-            return None
-        numbers.update(get_int(as_dict(node), "number") for node in nodes)
-    return frozenset(numbers)
+def _plain(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", text.lower())
 
 
-def parse_repo_state(payload: str) -> RepoState | None:
+def parse_projects(payload: str, repo: Repository, kind: str) -> list[ProjectLink]:
+    """Keep the owner's open Projects that are named after the repository.
+
+    REST cannot list the Projects linked to a repository, only an owner's.
+    ASSUMPTION: each repository has a Project with the same name, as on
+    TychoHenzen's account; a repository without one shows no Project.
+    """
     try:
         data: object = json.loads(payload)
     except ValueError:
-        return None
-    if as_dict(dig(data, "data", "repository")) is None:
-        return None
+        return []
     links: list[ProjectLink] = []
-    for item in as_list(dig(data, "data", "repository", "projectsV2", "nodes")):
-        node = as_dict(item)
-        url = get_str(node, "url")
-        if node is None or not url or node.get("closed") is True:
-            continue
-        links.append(
-            ProjectLink(get_int(node, "number"), get_str(node, "title") or "", url)
-        )
-    return RepoState(links, _open_numbers(data))
+    for item in as_list(data):
+        project = as_dict(item)
+        number = get_int(project, "number")
+        title = get_str(project, "title") or ""
+        if (
+            number
+            and get_str(project, "state") == "open"
+            and _plain(title) == _plain(repo.name)
+        ):
+            url = f"https://github.com/{kind}/{repo.owner}/projects/{number}"
+            links.append(ProjectLink(number, title, url))
+    return links
+
+
+def parse_open_numbers(output: str) -> frozenset[int] | None:
+    """Read one number per line, as `gh api --jq '.[].number'` prints them."""
+    lines = output.split()
+    if not all(line.isdigit() for line in lines):
+        return None
+    return frozenset(int(line) for line in lines)
 
 
 class RepoResolver:
@@ -153,25 +158,43 @@ class RepoResolver:
             cached = self._states.get(key)
         if cached is not None and now - cached[0] < REFRESH_SECONDS:
             return cached[1]
+        last = cached[1] if cached else None
+        # A failed lookup keeps the last good answer for that part.
+        projects = self._fetch_projects(repo)
+        if projects is None:
+            projects = last.projects if last else []
+        numbers = self._fetch_open_numbers(repo)
+        if numbers is None and last is not None:
+            numbers = last.open_numbers
+        state = RepoState(projects, numbers)
+        with self._lock:
+            self._states[key] = (now, state)
+        return state
+
+    def _fetch_projects(self, repo: Repository) -> list[ProjectLink] | None:
+        # An owner is a user or an organization; only one of the two answers.
+        for kind in _OWNER_KINDS:
+            output = self._run(
+                ["gh", "api", f"{kind}/{repo.owner}/projectsV2?per_page=100"]
+            )
+            if output is not None:
+                return parse_projects(output, repo, kind)
+        return None
+
+    def _fetch_open_numbers(self, repo: Repository) -> frozenset[int] | None:
+        # The issues list includes pull requests. --paginate reads every page,
+        # so the set is complete or the command fails.
         output = self._run(
             [
                 "gh",
                 "api",
-                "graphql",
-                "-f",
-                f"query={_REPO_QUERY}",
-                "-F",
-                f"owner={repo.owner}",
-                "-F",
-                f"name={repo.name}",
+                "--paginate",
+                f"repos/{repo.full_name}/issues?state=open&per_page=100",
+                "--jq",
+                ".[].number",
             ]
         )
-        state = parse_repo_state(output) if output is not None else None
-        if state is None and cached is not None:
-            state = cached[1]  # a failed lookup keeps the last good answer
-        with self._lock:
-            self._states[key] = (now, state)
-        return state
+        return parse_open_numbers(output) if output is not None else None
 
     def known_repository(self, cwd: str | None) -> Repository | None:
         with self._lock:
