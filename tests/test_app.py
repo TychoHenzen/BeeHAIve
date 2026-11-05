@@ -40,6 +40,7 @@ def test_dashboard_page_and_assets_are_served(tmp_path: Path) -> None:
 
     page = client.get("/")
     assert page.status_code == 200 and "BeeHAIve" in page.text
+    assert page.headers["cache-control"] == "no-cache"
     script = client.get("/web/app.js")
     assert script.status_code == 200
     assert script.headers["cache-control"] == "no-cache"
