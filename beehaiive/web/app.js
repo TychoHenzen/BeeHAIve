@@ -124,6 +124,8 @@ function select(sessionId, agentId = null) {
 function openAgent(agentId) {
   return (event) => {
     event.stopPropagation();
+    // A link would otherwise navigate to "#" and clear the selection just made.
+    event.preventDefault();
     select(state.sessionId, agentId);
   };
 }

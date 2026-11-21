@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from .outcomes import issue_in
+from .outcomes import issue_in, stop_reason
 from .records import (
     Record,
     as_dict,
@@ -151,7 +151,10 @@ class Agent:
     problems: list[Problem] = field(default_factory=lambda: [])
     pull_requests: list[PullRequest] = field(default_factory=lambda: [])
     skills_used: set[str] = field(default_factory=lambda: set())
+    # Read from the full last message: the stored copy is cut for display.
+    stop: str | None = None
     _open: dict[str, Step] = field(default_factory=lambda: {})
+    _by_id: dict[str, Step] = field(default_factory=lambda: {})
     _message_usage: dict[str, tuple[int, int]] = field(default_factory=lambda: {})
 
     def open_steps(self) -> list[Step]:
@@ -164,9 +167,11 @@ class Agent:
         return self.turns[-1]
 
     def step(self, step_id: str) -> Step | None:
-        return self._open.get(step_id) or next(
-            (step for step in reversed(self.steps) if step.id == step_id), None
-        )
+        return self._by_id.get(step_id)
+
+    def _add_step(self, step: Step) -> None:
+        self.steps.append(step)
+        self._by_id[step.id] = step
 
     def apply(self, record: Record) -> None:
         kind = get_str(record, "type")
@@ -213,6 +218,7 @@ class Agent:
                 text = get_str(block, "text") or ""
                 if text.strip():
                     self.last_message = _snippet(text, 1200)
+                    self.stop = stop_reason(text)
                     self._turn(at).reply = self.last_message
             elif block_type == "tool_use":
                 self._open_tool(block, at)
@@ -256,7 +262,7 @@ class Agent:
             detail=detail,
             started_at=at,
         )
-        self.steps.append(step)
+        self._add_step(step)
         self._open[tool_id] = step
         turn = self._turn(at)
         turn.tool_counts[name] = turn.tool_counts.get(name, 0) + 1
@@ -302,7 +308,7 @@ class Agent:
             self.label = parse_skill_label(content)
         step_id = get_str(record, "uuid") or f"prompt-{len(self.steps)}"
         self.turns.append(Turn(step_id, _snippet(content, 600), at, at))
-        self.steps.append(
+        self._add_step(
             Step(
                 id=step_id,
                 kind="prompt",

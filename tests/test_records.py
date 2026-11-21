@@ -86,6 +86,12 @@ def test_field_helpers_tolerate_wrong_types() -> None:
     assert parsed is not None and parsed.tzinfo is not None
 
 
+def test_parse_time_treats_a_time_without_an_offset_as_unknown() -> None:
+    assert parse_time("2026-11-05T12:00:00") is None
+    offset = parse_time("2026-11-05T12:00:00+01:00")
+    assert offset is not None and offset.tzinfo is not None
+
+
 def test_text_of_joins_text_blocks() -> None:
     blocks: list[object] = [
         {"type": "text", "text": "one"},

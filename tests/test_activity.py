@@ -166,6 +166,29 @@ def test_titles_last_message_and_pull_requests() -> None:
     assert [(p.number, p.repository) for p in agent.pull_requests] == [(7, "o/r")]
 
 
+def test_stop_reason_after_a_long_message_survives_the_display_cut() -> None:
+    agent = Agent("s", "session")
+    agent.apply(text("Results. " * 200 + "Stop reason: CI is red.", 0))
+
+    assert "CI is red" not in agent.last_message
+    assert agent.stop == "CI is red"
+
+    agent.apply(text("All done.", 1))
+    assert agent.stop is None
+
+
+def test_finished_steps_and_prompts_are_found_by_id() -> None:
+    agent = Agent("s", "session")
+    agent.apply(human("go", 0, uuid="p1"))
+    agent.apply(tool_use("t1", "Bash", {"command": "ls"}, 1))
+    agent.apply(tool_result("t1", 2))
+    agent.apply(tool_use("t1", "Bash", {"command": "ls"}, 3))
+
+    assert [s.id for s in agent.steps] == ["p1", "t1"]
+    assert agent.step("t1") is agent.steps[1]
+    assert agent.step("p1") is agent.steps[0]
+
+
 def test_only_human_prompts_become_prompt_steps() -> None:
     agent = Agent("s", "session")
     agent.apply(human("hello", 0) | {"isMeta": True})

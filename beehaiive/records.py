@@ -51,9 +51,11 @@ def parse_time(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+    # A time with no offset cannot be compared with the UTC clock; treat it as unknown.
+    return parsed if parsed.tzinfo is not None else None
 
 
 def text_of(content: object) -> str:

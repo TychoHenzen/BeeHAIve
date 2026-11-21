@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .activity import Agent, Step, Turn
-from .outcomes import first_sentence, issue_in, stage_name, stop_reason
+from .outcomes import first_sentence, issue_in, stage_name
 from .repos import ProjectLink, RepoResolver, Repository, RepoState
 
 GOAL_SDLC = "dod-guard:goal-sdlc"
@@ -178,7 +178,7 @@ class SessionView:
             return "running"
         if status in ("failed", "stalled"):
             return status
-        if stop_reason(agent.last_message):
+        if agent.stop:
             return "stopped"
         return "done"
 
@@ -189,7 +189,7 @@ class SessionView:
             if launch is not None and launch.error:
                 return first_sentence(launch.error)
         if outcome == "stopped":
-            return stop_reason(agent.last_message) or ""
+            return agent.stop or ""
         return first_sentence(agent.last_message)
 
     def _stage_chip(self, agent: Agent) -> Json:
@@ -507,7 +507,7 @@ class SessionView:
             "tokens": {"input": agent.input_tokens, "output": agent.output_tokens},
             "doing": self._doing(agent),
             "result": agent.last_message,
-            "stop_reason": stop_reason(agent.last_message),
+            "stop_reason": agent.stop,
             "children": [self._child_view(c) for c in children[-CHILD_LIMIT:]],
             "children_total": len(children),
             "tool_summary": sorted(tools.items(), key=lambda item: -item[1]),
