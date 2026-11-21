@@ -17,8 +17,18 @@ def test_first_sentence_stops_at_the_first_full_stop_and_caps_length() -> None:
 
 
 def test_stop_reason_reads_the_reported_reason() -> None:
-    assert stop_reason("Stopped. Stop reason: CI is red. Next: fix it.") == "CI is red"
+    assert stop_reason("Stopped.\nStop reason: CI is red. Next: fix it.") == "CI is red"
     assert stop_reason("**Stop reason** - duplicate evidence") == "duplicate evidence"
+    assert stop_reason("Done.\n  Stop reason: missing step plan") == "missing step plan"
+    assert stop_reason("Stop reason: missing step plan") == "missing step plan"
+    assert stop_reason("Skill loaded: x. Stop reason: CI red") == "CI red"
+
+
+def test_stop_reason_ignores_a_mention_inside_a_sentence() -> None:
+    assert stop_reason("Fine, the stop reason: was needed.") is None
+    assert stop_reason("Stopped. Stop reason: CI is red.") is None
+    assert stop_reason("Done.\nThe stop reason: was needed.") is None
+    assert stop_reason("Done.\nStop reason: none\nNext: ship it.") is None
     assert stop_reason("Stop reason: none.") is None
     assert stop_reason("Stop reason: N/A") is None
     assert stop_reason("All checks passed.") is None
