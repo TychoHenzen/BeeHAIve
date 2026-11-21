@@ -8,7 +8,7 @@ from .config import CoreConfig
 
 def main() -> None:
     config = CoreConfig.from_environment()
-    uvicorn.run(create_app(config), host="127.0.0.1", port=8000)
+    uvicorn.run(create_app(config), host="127.0.0.1", port=config.port)
 
 
 if __name__ == "__main__":

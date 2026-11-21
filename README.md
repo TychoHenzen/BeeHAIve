@@ -4,86 +4,88 @@
   <img src="docs/assets/beehaive-logo.png" alt="BeeHAIve logo" width="360">
 </p>
 
-BeeHAIve is a local FastAPI control plane for one GitHub Project: it reads the
-live Board, turns an operator prompt into a validated workflow state machine,
-and runs an assigned workflow on an agent with one fresh Codex process per
-state. Durable SQLite history keeps the Board, workflow editor, and Agents tab
-looking at the same run.
+BeeHAIve is a local, read-only dashboard for the Claude Code sessions you run
+from the desktop app or the CLI. The left column lists the sessions that are
+working now, each with the request or stage it is on, how long that has run,
+and one line per live subagent saying what it is doing. Below them is a short
+list of recent sessions.
+
+Selecting a session shows what it did at the level you would describe it, not
+tool call by tool call:
+
+- A session that runs dod-guard's `/goal-sdlc` is shown as one row per issue,
+  with one chip per stage run (refine, next-ticket, draft PR, review, fix
+  review, complete). Each chip shows how long the stage took and whether it
+  finished, stopped, went quiet or failed. The session links to its GitHub
+  repository, its open GitHub Projects and the pull requests it touched.
+- Any other session is shown as its turns: what you asked, how long Claude
+  worked on it, the first sentence of its answer, and the subagents it started.
+- "Needs attention" lists only what a person has to act on: a stage that
+  stopped, failed or went quiet and that no later stage for the same issue
+  took over. Hook blocks, tool errors Claude recovered from and API retries
+  are only counted.
+
+Clicking a stage or subagent opens its result, its stop reason, its own
+subagents and, folded away, every tool call it made.
+
+BeeHAIve never starts, stops or steers an agent, and never writes to git or
+GitHub. You keep working in Claude Code; BeeHAIve only reads what Claude Code
+writes to disk.
 
 ## Setup
 
-Use Windows, Python 3.13, `uv`, GitHub CLI, the Codex CLI, and Node.js. GitHub
-access must include the selected Project and its linked issue metadata.
+Use Python 3.13 and `uv`. The GitHub CLI (`gh`), signed in, is optional. For a
+goal-sdlc session it reads, over the REST API every five minutes, which issues
+and pull requests are still open and which of the owner's open Projects is
+named after the repository.
 
 ```powershell
 git clone https://github.com/TychoHenzen/BeeHAIve.git
 Set-Location BeeHAIve
 uv sync
-gh auth status
-Copy-Item .env.example .env
-```
-
-Set `BEEHAIIVE_PROJECT_OWNER`, `BEEHAIIVE_PROJECT_OWNER_TYPE`, and
-`BEEHAIIVE_PROJECT_NUMBER` in `.env`. `GITHUB_TOKEN` or `GH_TOKEN` is optional
-when `gh auth status` can provide a token. Keep `.env` local.
-
-Start the only supported application entrypoint from the repository root:
-
-```powershell
 .\start_dashboard.bat
 ```
 
-The launcher loads `.env`, checks `uv`, `codex`, and `gh auth status`, refuses
-an occupied port, starts `uv run python -m beehaiive`, and cleans up its server
-process tree on exit. Direct startup uses the same port and configuration:
+Open `http://127.0.0.1:8000/`. `uv run python -m beehaiive` starts the same
+server without the launcher. The launcher refuses a port that is already in
+use and stops the server process tree when it exits.
 
-```powershell
-uv run python -m beehaiive
-```
+Every setting is optional. Put any of them in `.env` (see `.env.example`) or in
+the environment, which wins over `.env`:
 
-After uv sync, uv run beehaiive is equivalent to uv run python -m beehaiive.
+- `BEEHAIIVE_CLAUDE_PROJECTS`: the transcript folder, by default
+  `~/.claude/projects`.
+- `BEEHAIIVE_LOOKBACK_HOURS`: how far back to show sessions, by default 24.
+- `BEEHAIIVE_PORT`: by default 8000.
 
-Open `http://127.0.0.1:8000/`.
+## How it works
 
-## Product
+Claude Code writes each session to
+`~/.claude/projects/<project>/<session-id>.jsonl`, and each subagent to a
+`subagents/agent-<id>.jsonl` file beside it with a `.meta.json` file that
+names the tool call that launched it. A background thread reads only the bytes
+added since its last pass, every two seconds, and skips record types the
+dashboard does not use. The first pass over a day of heavy use takes some
+seconds; the page says so while it runs.
 
-- **Board** reads the configured Project through the REST API and shows the
-  current status columns, cards, holders, and refresh state.
-- **Workflows** accepts an operator prompt, generates a deterministic draft,
-  validates typed parameters, conditions, skills, and transitions, and lets
-  the operator edit or save revisions.
-- **Agents** assigns a saved workflow to a dedicated checkout, starts and
-  stops runs, claims one Project item at a time, and records each state pass,
-  output, error, and recovery event.
-- **Hive** is the local observability surface for the durable core state.
+A thread counts as working when it wrote something in the last two minutes,
+when a tool call it started less than fifteen minutes ago has not returned, or
+when one of its subagents is working. A subagent that stopped without its
+launch call returning is shown as stalled ("went quiet"). A stage counts as
+stopped when its last message gives a "Stop reason".
 
-An agent run resolves its workflow revision and parameters before it starts.
-Each state gets a fresh `codex exec` process with bounded time, isolated run
-logs, and the configured skill paths. A stopped or failed run releases its
-claim and records the reason; restarting recovers durable state rather than
-pretending an old child process is still authoritative. The core does not
-write GitHub state.
-
-Project reads are REST-only. Snapshot bodies are cached in SQLite and reused
-with ETags; refreshes respect the configured minimum interval and bounded
-rate-limit retry behavior. A provider or transport failure is returned as a
-controlled API error instead of a fake empty Board.
+The transcript format is internal to Claude Code and undocumented. Every field
+is read defensively, so a format change shows up as missing detail or as a
+count of records that could not be read, not as a crash. Codex sessions are
+not read.
 
 ## Local gate
 
-Run the retained Python and UI tests plus the same static checks used in CI:
-
 ```powershell
-uv run pytest -q
-node --test tests/*.test.mjs
 uv run ruff format --check .
 uv run ruff check .
 uv run pyright
 uv run pytest -q --cov=beehaiive --cov-report=term-missing --cov-fail-under=90
+node --test tests/*.test.mjs
 uv run pip-audit --progress-spinner off
 ```
-
-The disposable real-data check should use the configured Project in Edge or
-Chromium and record the served URL, visible cards, HTTP outcomes, refresh/ETag
-behavior, and browser console state. Local fixtures are not evidence of live
-Project behavior.

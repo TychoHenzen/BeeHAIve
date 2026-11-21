@@ -38,9 +38,6 @@ dist/
 # review-pr temporary output
 .pytest-review-temp/
 
-# BeeHAIve runtime state
-.beehaiive/
-
 # Operating-system files
 .DS_Store
 Thumbs.db

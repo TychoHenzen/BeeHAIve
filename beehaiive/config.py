@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import os
-import shlex
-import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,30 +10,25 @@ class CoreConfigurationError(ValueError):
     pass
 
 
+def default_projects_dir() -> Path:
+    return Path.home() / ".claude" / "projects"
+
+
 @dataclass(frozen=True)
 class CoreConfig:
-    owner: str
-    owner_type: str
-    project_number: int
-    db_path: str | Path = ".beehaiive/hive.db"
-    github_token: str = ""
-    codex: str = "codex"
-    skills_dirs: tuple[Path, ...] = ()
-    refresh_seconds: float = 60.0
-    codex_args: tuple[str, ...] = ()
-    agent_step_timeout_seconds: float = 900.0
+    """Where to find Claude Code transcripts and how far back to look."""
+
+    projects_dir: Path
+    lookback_hours: float = 24.0
+    port: int = 8000
 
     def __post_init__(self) -> None:
-        if self.owner_type not in {"user", "org"}:
+        if not 0 < self.lookback_hours <= 24 * 30:
             raise CoreConfigurationError(
-                "BEEHAIIVE_PROJECT_OWNER_TYPE must be 'user' or 'org'"
+                "BEEHAIIVE_LOOKBACK_HOURS must be between 0 and 720"
             )
-        if self.project_number <= 0:
-            raise CoreConfigurationError("BEEHAIIVE_PROJECT_NUMBER must be positive")
-        if not 1 <= self.agent_step_timeout_seconds <= 900:
-            raise CoreConfigurationError(
-                "BEEHAIIVE_AGENT_STEP_TIMEOUT_SECONDS must be between 1 and 900"
-            )
+        if not 1 <= self.port <= 65535:
+            raise CoreConfigurationError("BEEHAIIVE_PORT must be a valid port")
 
     @classmethod
     def from_environment(
@@ -44,113 +37,36 @@ class CoreConfig:
         dotenv_path: str | Path = ".env",
     ) -> CoreConfig:
         values = _load_environment(environ, Path(dotenv_path))
-        owner = values.get("BEEHAIIVE_PROJECT_OWNER", "").strip()
-        if not owner:
-            raise CoreConfigurationError("BEEHAIIVE_PROJECT_OWNER is required")
-        owner_type = values.get("BEEHAIIVE_PROJECT_OWNER_TYPE", "user").strip().lower()
-        if owner_type not in {"user", "org"}:
-            raise CoreConfigurationError(
-                "BEEHAIIVE_PROJECT_OWNER_TYPE must be 'user' or 'org'"
-            )
-        raw_number = values.get("BEEHAIIVE_PROJECT_NUMBER", "").strip()
-        try:
-            project_number = int(raw_number)
-        except ValueError as error:
-            raise CoreConfigurationError(
-                "BEEHAIIVE_PROJECT_NUMBER must be an integer"
-            ) from error
-        if project_number <= 0:
-            raise CoreConfigurationError("BEEHAIIVE_PROJECT_NUMBER must be positive")
-        raw_refresh = values.get("BEEHAIIVE_PROJECT_REFRESH_SECONDS", "60")
-        try:
-            refresh_seconds = max(60.0, float(raw_refresh))
-        except ValueError as error:
-            raise CoreConfigurationError(
-                "BEEHAIIVE_PROJECT_REFRESH_SECONDS must be a number"
-            ) from error
-        raw_timeout = values.get("BEEHAIIVE_AGENT_STEP_TIMEOUT_SECONDS", "900")
-        try:
-            agent_step_timeout_seconds = float(raw_timeout)
-        except ValueError as error:
-            raise CoreConfigurationError(
-                "BEEHAIIVE_AGENT_STEP_TIMEOUT_SECONDS must be a number"
-            ) from error
-        if not 1 <= agent_step_timeout_seconds <= 900:
-            raise CoreConfigurationError(
-                "BEEHAIIVE_AGENT_STEP_TIMEOUT_SECONDS must be between 1 and 900"
-            )
-        raw_codex_args = values.get("BEEHAIIVE_CODEX_ARGS", "")
-        try:
-            codex_args = tuple(shlex.split(raw_codex_args))
-        except ValueError as error:
-            raise CoreConfigurationError(
-                "BEEHAIIVE_CODEX_ARGS must contain valid shell-like arguments"
-            ) from error
-        token = values.get("GITHUB_TOKEN", "").strip()
-        if not token:
-            token = values.get("GH_TOKEN", "").strip()
-        if not token:
-            token = _gh_auth_token()
-        skills_dirs = tuple(
-            Path(value)
-            for value in values.get("BEEHAIIVE_SKILLS_DIRS", "").split(os.pathsep)
-            if value
-        )
+        raw_dir = values.get("BEEHAIIVE_CLAUDE_PROJECTS", "").strip()
+        projects_dir = Path(raw_dir).expanduser() if raw_dir else default_projects_dir()
         return cls(
-            owner=owner,
-            owner_type=owner_type,
-            project_number=project_number,
-            db_path=values.get("BEEHAIIVE_DB") or ".beehaiive/hive.db",
-            github_token=token,
-            codex=values.get("BEEHAIIVE_CODEX", "codex") or "codex",
-            skills_dirs=skills_dirs,
-            refresh_seconds=refresh_seconds,
-            codex_args=codex_args,
-            agent_step_timeout_seconds=agent_step_timeout_seconds,
+            projects_dir=projects_dir,
+            lookback_hours=_number(values, "BEEHAIIVE_LOOKBACK_HOURS", 24.0),
+            port=int(_number(values, "BEEHAIIVE_PORT", 8000)),
         )
+
+
+def _number(values: Mapping[str, str], name: str, default: float) -> float:
+    raw = values.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError as error:
+        raise CoreConfigurationError(f"{name} must be a number") from error
 
 
 def _load_environment(
     environ: Mapping[str, str] | None, dotenv_path: Path
 ) -> dict[str, str]:
-    values = dict(_read_dotenv(dotenv_path))
-    values.update(dict(os.environ if environ is None else environ))
-    return values
-
-
-def _read_dotenv(path: Path) -> dict[str, str]:
-    if not path.is_file():
-        return {}
+    """Merge a local .env file under the real environment, which wins."""
     values: dict[str, str] = {}
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[7:].lstrip()
-        key, separator, value = line.partition("=")
-        if not separator or not key.strip():
-            continue
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-            value = value[1:-1]
-        values[key.strip()] = value
+    if dotenv_path.is_file():
+        for line in dotenv_path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, value = stripped.removeprefix("export ").split("=", 1)
+            values[key.strip()] = value.strip().strip("'\"")
+    values.update(os.environ if environ is None else environ)
     return values
-
-
-def _gh_auth_token() -> str:
-    try:
-        result = subprocess.run(
-            ["gh", "auth", "token"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError) as error:
-        raise CoreConfigurationError(
-            "GITHUB_TOKEN is missing and gh auth token could not be read"
-        ) from error
-    token = result.stdout.strip()
-    if not token:
-        raise CoreConfigurationError("gh auth token returned an empty token")
-    return token

@@ -1,7 +1,7 @@
 [project]
 name = "beehaiive"
 version = "0.1.0"
-description = "A small FastAPI application."
+description = "A local dashboard for Claude Code sessions and their subagents."
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "fastapi==0.162.0",
