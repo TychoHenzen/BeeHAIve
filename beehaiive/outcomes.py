@@ -7,7 +7,8 @@ import re
 _SKILL_LOADED = re.compile(r"^\s*Skill loaded:\s*\S+(?:\s*\([^)]*\))?\s*[.:]?\s*", re.I)
 _MARKUP = re.compile(r"\*{1,3}|`")
 # ASSUMPTION: dod-guard skills report an early stop as "Stop reason: <why>".
-_STOP = re.compile(r"\bstop reason\b\s*[:\-]?\s*(.+)", re.I)
+# Only a line that starts with it counts; prose that mentions it does not.
+_STOP = re.compile(r"^[ \t]*stop reason\b[ \t]*[:\-]?[ \t]*(.+)", re.I | re.M)
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
 _HASH_NUMBER = re.compile(r"#(\d{1,7})\b")
 # A bare number that is part of a date, a time or a version is not an issue.
@@ -30,7 +31,8 @@ def first_sentence(text: str, limit: int = 160) -> str:
 
 
 def stop_reason(text: str) -> str | None:
-    match = _STOP.search(clean(text))
+    # Strip emphasis but keep newlines: the match is anchored to a line start.
+    match = _STOP.search(_MARKUP.sub("", _SKILL_LOADED.sub("", text)))
     if not match:
         return None
     reason = first_sentence(match.group(1)).rstrip(".")
