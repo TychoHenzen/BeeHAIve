@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+
+from .archon.settings import ArchonSettings
 
 
 class CoreConfigurationError(ValueError):
@@ -21,6 +23,9 @@ class CoreConfig:
     projects_dir: Path
     lookback_hours: float = 24.0
     port: int = 8000
+    archon: ArchonSettings = field(
+        default_factory=lambda: ArchonSettings.from_values({})
+    )
 
     def __post_init__(self) -> None:
         if not 0 < self.lookback_hours <= 24 * 30:
@@ -43,6 +48,7 @@ class CoreConfig:
             projects_dir=projects_dir,
             lookback_hours=_number(values, "BEEHAIIVE_LOOKBACK_HOURS", 24.0),
             port=int(_number(values, "BEEHAIIVE_PORT", 8000)),
+            archon=ArchonSettings.from_values(values),
         )
 
 

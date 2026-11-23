@@ -4,26 +4,19 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>BeeHAIve</title>
-    <link rel="stylesheet" href="/web/styles.css">
+    <link rel="stylesheet" href="/web/console/console.css">
   </head>
   <body>
     <header class="topbar">
-      <h1>BeeHAIve</h1>
-      <span class="subtitle muted">Claude Code sessions on this machine</span>
-      <span id="refresh-state" class="muted" role="status"></span>
+      <a class="brand" href="#/runs">BeeHAIve</a>
+      <nav id="nav" class="nav" aria-label="Pages"></nav>
+      <span class="spacer"></span>
+      <span id="live-state" class="live-state muted small" role="status">Connecting...</span>
+      <a class="small" href="/sessions">Claude Code sessions</a>
+      <a id="archon-link" class="small" href="http://127.0.0.1:3090/console" target="_blank" rel="noreferrer"
+         title="Chat, the workflow builder, settings and metrics are still in Archon's own console">Archon console</a>
     </header>
-    <main class="layout">
-      <nav class="sessions" aria-label="Sessions">
-        <h2>Running now</h2>
-        <ul id="running-list" class="session-list"></ul>
-        <p id="running-empty" class="muted small" hidden>No session is working right now.</p>
-        <h2>Recent</h2>
-        <ul id="recent-list" class="recent-list"></ul>
-      </nav>
-      <section id="detail" class="detail" aria-label="Session detail">
-        <p class="muted">Pick a session on the left.</p>
-      </section>
-    </main>
-    <script type="module" src="/web/app.js"></script>
+    <main id="view" class="view" tabindex="-1"></main>
+    <script type="module" src="/web/console/main.js"></script>
   </body>
 </html>
