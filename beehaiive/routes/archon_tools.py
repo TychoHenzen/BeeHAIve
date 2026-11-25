@@ -2,6 +2,7 @@
 
 Triggers and schedules exist only in the CLI, so the console's Triggers page
 reads and writes binding files and runs fixed `archon trigger` commands here.
+The Pipeline page reads archon-home's ledger of where each open issue stands.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from ..archon.cli import ArchonCli, ArchonCliError
+from ..archon.pipeline import PipelineReader, pipelines
 from ..archon.settings import ArchonSettings
 from ..archon.triggers import (
     BindingError,
@@ -89,6 +91,14 @@ def _store(request: Request) -> TriggerStore:
 
 def _scheduler(request: Request) -> Scheduler:
     return cast(Scheduler, request.app.state.scheduler)
+
+
+def _pipeline(request: Request) -> PipelineReader:
+    return cast(PipelineReader, request.app.state.pipeline)
+
+
+class PipelineRead(BaseModel):
+    repository: str
 
 
 def _failed(
@@ -288,6 +298,40 @@ def install_schedule(name: str, request: Request) -> dict[str, object] | JSONRes
     except ArchonCliError as error:
         return _failed(error)
     return {"installed": True}
+
+
+@router.get("/pipeline", response_model=None)
+def pipeline(
+    request: Request, repository: str | None = None
+) -> dict[str, object] | JSONResponse:
+    """The repositories a pbi queue serves, and the kept reading of one of them.
+
+    A reading takes a GitHub snapshot and most of a minute, so a GET only
+    returns what was read in the last five minutes; the POST below reads.
+    """
+    served = pipelines(_store(request).summaries())
+    if repository is not None and repository not in served:
+        return JSONResponse(
+            {"error": "No pbi queue binding serves that repository."}, status_code=404
+        )
+    kept = _pipeline(request).kept(repository) if repository else None
+    return {"repositories": sorted(served), "ledger": kept}
+
+
+@router.post("/pipeline", response_model=None)
+def read_pipeline(
+    form: PipelineRead, request: Request
+) -> dict[str, object] | JSONResponse:
+    # The repository becomes a CLI argument, so only one a binding names will do.
+    cwd = pipelines(_store(request).summaries()).get(form.repository)
+    if cwd is None:
+        return JSONResponse(
+            {"error": "No pbi queue binding serves that repository."}, status_code=404
+        )
+    try:
+        return {"ledger": _pipeline(request).read(form.repository, cwd)}
+    except ArchonCliError as error:
+        return _failed(error)
 
 
 @router.delete("/triggers/bindings/{name}/schedule", response_model=None)

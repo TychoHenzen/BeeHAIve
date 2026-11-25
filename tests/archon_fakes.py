@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -13,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from beehaiive.app import create_app
 from beehaiive.archon.cli import ArchonCli, ArchonCliError, CliResult
+from beehaiive.archon.pipeline import PipelineReader
 from beehaiive.archon.settings import ArchonSettings
 from beehaiive.archon.triggers import Scheduler
 from beehaiive.config import CoreConfig
@@ -67,6 +69,7 @@ class ArchonHarness:
     client: TestClient
     runner: FakeRunner
     scheduler_runner: FakeRunner
+    pipeline_runner: FakeRunner
     home: Path
     seen: list[httpx2.Request]
 
@@ -76,6 +79,7 @@ def archon_harness(
     handler: Handler = not_found,
     *,
     platform: str = "win32",
+    clock: Callable[[], float] | None = None,
 ) -> ArchonHarness:
     home = tmp_path / "archon-home"
     home.mkdir()
@@ -90,6 +94,10 @@ def archon_harness(
 
     runner = FakeRunner()
     scheduler_runner = FakeRunner()
+    pipeline_runner = FakeRunner()
+    pipeline = PipelineReader(
+        home, runner=pipeline_runner, node="node", clock=clock or time.monotonic
+    )
     projects = tmp_path / "projects"
     projects.mkdir()
     index = SessionIndex(
@@ -105,7 +113,8 @@ def archon_harness(
         scheduler=Scheduler(
             settings.binary, runner=scheduler_runner, platform=platform
         ),
+        pipeline=pipeline,
     )
     # No context manager: the lifespan would start the session index thread.
     client = TestClient(app, base_url=LOCAL)
-    return ArchonHarness(client, runner, scheduler_runner, home, seen)
+    return ArchonHarness(client, runner, scheduler_runner, pipeline_runner, home, seen)

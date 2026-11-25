@@ -244,6 +244,22 @@ pre.error { color: var(--failed); }
 .binding-form > p, .binding-form > .row, .binding-form > label:has(textarea) { grid-column: 1 / -1; }
 .schedule { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
 
+/* Pipeline */
+.tone-stuck, .tone-stalled, .tone-blocked, .tone-silent, .tone-missing { color: var(--failed); }
+.tone-asking { color: var(--paused); }
+.tone-working { color: var(--running); }
+.tone-queued, .tone-idle { color: var(--info); }
+.pipeline-bar { margin: 0 0 0.9rem; }
+.summary { margin: 0 0 0.9rem; }
+.ledger { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.55rem; }
+.ledger > li { display: grid; grid-template-columns: 5.5rem minmax(0, 1fr); gap: 0.6rem; align-items: baseline; }
+.ledger .pill { justify-self: start; }
+.why { color: var(--muted); overflow-wrap: anywhere; margin-top: 0.1rem; }
+.cause { border-left: 3px solid var(--failed); padding-left: 0.8rem; margin-bottom: 0.9rem; }
+.cause-why { margin: 0 0 0.3rem; overflow-wrap: anywhere; }
+.issue-refs { margin: 0; padding-left: 1.1rem; }
+.issue-refs li { margin: 0.1rem 0; }
+
 @media (max-width: 720px) {
   .view { padding: 0.75rem 16px 2rem; }
   .launch { grid-template-columns: 1fr; }

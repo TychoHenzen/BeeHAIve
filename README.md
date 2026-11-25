@@ -26,6 +26,14 @@ on the command line:
   the gate's decisions.
 - **Attention**: every run paused on a person, the same queue as
   `archon workflow attention --all`, answerable in place.
+- **Pipeline**: for each repository a pbi queue binding serves, where every
+  open issue stands: worked by a live run, waiting in a queue, waiting on your
+  answer, or stuck, with the reason it is stuck. It also says whether each
+  queue's trigger can start a run, calls a run stalled when its step has
+  logged nothing for half an hour or run for three hours, and lists pull
+  requests no issue owns. It runs `ledger.mjs` from archon-home's pbi
+  workflows, which reads GitHub and takes about a minute, so the page keeps a
+  reading for five minutes and reads again on Read again.
 - **Launch**: pick a project and a workflow, fill its declared inputs, start it.
 - **Projects**: the projects Archon knows, with links to launch or schedule.
 - **Triggers**: the binding files in `~/.archon/triggers/` that
@@ -42,9 +50,10 @@ How it talks to Archon:
 
 - `/archon/api/*` is passed through to Archon's server unchanged, event
   streams included, so the page needs only one origin.
-- `/api/archon/*` is what BeeHAIve adds. Each route runs the Archon CLI with a
-  fixed argument list, or reads and writes binding files. A name from the
-  browser is checked before it becomes a file name or an argument.
+- `/api/archon/*` is what BeeHAIve adds. Each route runs the Archon CLI or
+  archon-home's `ledger.mjs` with a fixed argument list, or reads and writes
+  binding files. A name from the browser is checked before it becomes a file
+  name or an argument.
 - Every request must name this machine in its Host header, and a request that
   changes something must carry the `X-BeeHAIve` header. Another website
   therefore cannot use your browser to start, answer or cancel a run.

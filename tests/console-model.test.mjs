@@ -13,6 +13,7 @@ import {
   eventLine,
   expectedGate,
   formatInterval,
+  githubUrl,
   gateDecisions,
   isLive,
   joinPath,
@@ -20,11 +21,15 @@ import {
   missingRequiredInputs,
   needsPerson,
   pauseKey,
+  pipelineCounts,
   presetBinding,
+  queueProblems,
+  reasonHead,
   repoFromUrl,
   runActions,
   runTone,
   secondsBetween,
+  stuckGroups,
   toIso,
   toolDetail,
   toolOutput,
@@ -324,4 +329,48 @@ test("a tool call reads as what it works on, and shell output as its text", () =
   assert.equal(toolOutput("[1, 2]"), "[1, 2]");
   assert.equal(toolOutput({ ok: true }), '{\n  "ok": true\n}');
   assert.equal(toolOutput(undefined), "");
+});
+
+test("pipelineCounts names each nonzero state, stuck first", () => {
+  assert.equal(pipelineCounts({ stuck: 48, asking: 0, working: 1, queued: 1, done: 6 }), "48 stuck, 1 working, 1 queued, 6 done");
+  assert.equal(pipelineCounts({ stuck: 0, asking: 0, working: 0, queued: 0, done: 0 }), "No open issues.");
+  assert.equal(pipelineCounts(undefined), "No open issues.");
+});
+
+test("queueProblems keeps the queues that cannot run", () => {
+  const queues = ["working", "stalled", "idle", "blocked", "silent", "missing"].map((state) => ({ queue: state, state }));
+  assert.deepEqual(
+    queueProblems(queues).map((queue) => queue.state),
+    ["stalled", "blocked", "silent", "missing"],
+  );
+  assert.deepEqual(queueProblems(undefined), []);
+});
+
+test("stuckGroups shares one entry per reason, the largest first", () => {
+  const row = (issue, state, detail) => ({ issue, state, detail });
+  const groups = stuckGroups([
+    row(477, "stuck", "parked, and nothing is asking you: which format?"),
+    row(502, "stuck", "the refine queue cannot run"),
+    row(503, "stuck", "the refine queue cannot run"),
+    row(491, "working", "run cb2356da took it"),
+    row(452, "stuck", "the refine queue cannot run"),
+  ]);
+  assert.deepEqual(
+    groups.map((group) => [group.detail, group.rows.map((r) => r.issue)]),
+    [
+      ["the refine queue cannot run", [502, 503, 452]],
+      ["parked, and nothing is asking you: which format?", [477]],
+    ],
+  );
+});
+
+test("githubUrl links an issue or a pull request", () => {
+  assert.equal(githubUrl("o/repo", "issue", 7), "https://github.com/o/repo/issues/7");
+  assert.equal(githubUrl("o/repo", "pull", 8), "https://github.com/o/repo/pull/8");
+});
+
+test("reasonHead cuts a long reason at a word and leaves a short one whole", () => {
+  assert.equal(reasonHead("short reason"), null);
+  assert.equal(reasonHead("alpha beta gamma delta", 12), "alpha beta...");
+  assert.equal(reasonHead("x".repeat(30), 12), `${"x".repeat(12)}...`);
 });
