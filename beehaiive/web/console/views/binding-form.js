@@ -126,13 +126,14 @@ export function bindingFields(page, { self, selfPath, onProject = null }) {
         ? `Shared with ${chosen.sharedWith.join(", ")}: their runs count against one capacity.`
         : "Only this binding claims it, so its capacity limits its own runs.",
     );
-    const conflicts = capacityConflicts(bindings, { self, resource: resource(), capacity: Number(fields.capacity.value) });
+    const conflicts = capacityConflicts(bindings, { resource: resource(), capacity: Number(fields.capacity.value) });
+    const who = (c) => (c.name === self ? `this binding was saved with ${c.capacity}` : `${c.name} has ${c.capacity}`);
     capacityNote.className = conflicts.length ? "small warn" : "small muted";
     replace(
       capacityNote,
       conflicts.length
-        ? `${conflicts.map((c) => `${c.name} has ${c.capacity}`).join(", ")} on this resource. Archon keeps one capacity per resource, so make them match.`
-        : "How many runs on this resource may go at once.",
+        ? `On this resource ${conflicts.map(who).join(", ")}. Archon fixes a resource's capacity the first time a binding fires on it and rejects every fire that declares another. Keep ${conflicts[0].capacity}, or pick a new resource for a new capacity.`
+        : "How many runs on this resource may go at once. Archon fixes it the first time a binding fires on the resource.",
     );
   }
 

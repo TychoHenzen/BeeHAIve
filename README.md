@@ -41,7 +41,17 @@ on the command line:
   the SDLC pack's build queue, merge queue, discoveries and worktree cleanup),
   Fire now, the recent trigger receipts, and on Windows a Task Scheduler task
   per binding that fires it on its interval. Archon installs schedules itself
-  only on macOS.
+  only on macOS. The form's fields are choices wherever Archon or the other
+  bindings already know the answer: the project sets the folder, the folder
+  lists its workflows, the workflow declares its inputs, and the resource is a
+  new one or one another binding claims.
+- **Restart safely**, on the Triggers page: before you restart the machine,
+  Archon or BeeHAIve, pause the triggers. That disables every `Archon-` task, so
+  nothing new starts, while runs already going keep going. The panel lists those
+  runs and says when a restart is safe. A run whose archon process is gone still
+  holds its binding's resource, so every later fire of that binding is skipped;
+  the panel marks it interrupted and offers to cancel it. Every page says when
+  triggers are paused, until you resume them.
 
 Chat, the workflow builder, settings, metrics and adding projects are still in
 Archon's own console. The top bar links to it.
@@ -50,9 +60,9 @@ How it talks to Archon:
 
 - `/archon/api/*` is passed through to Archon's server unchanged, event
   streams included, so the page needs only one origin.
-- `/api/archon/*` is what BeeHAIve adds. Each route runs the Archon CLI or
-  archon-home's `ledger.mjs` with a fixed argument list, or reads and writes
-  binding files. A name from the browser is checked before it becomes a file
+- `/api/archon/*` is what BeeHAIve adds. Each route runs the Archon CLI,
+  archon-home's `ledger.mjs`, Task Scheduler's PowerShell cmdlets or
+  `tasklist.exe` with a fixed argument list, or reads and writes binding files. A name from the browser is checked before it becomes a file
   name or an argument.
 - Every request must name this machine in its Host header, and a request that
   changes something must carry the `X-BeeHAIve` header. Another website

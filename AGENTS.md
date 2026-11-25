@@ -16,7 +16,7 @@
 
 ## Archon
 
-- The console acts on Archon: it starts, answers, cancels and resumes runs, writes binding files under Archon's `triggers/` folder, and installs Windows scheduled tasks named `Archon-<binding>`. Those are the only writes it makes.
+- The console acts on Archon: it starts, answers, cancels and resumes runs, writes binding files under Archon's `triggers/` folder, and installs, removes, disables and enables Windows scheduled tasks named `Archon-<binding>`. Those are the only writes it makes. To tell a running run from one whose process is gone, it lists `archon*` processes with `tasklist.exe` and a fixed argument list.
 - `/archon/api/*` forwards Archon's own API unchanged. Anything Archon's API lacks goes in `beehaiive/routes/archon_tools.py`.
 - Run the Archon CLI only through `ArchonCli` with a fixed argument list, never a shell string. The Pipeline page runs archon-home's `ledger.mjs` the same way, through `PipelineReader`, and only for a repository a pbi trigger binding names; the ledger only reads. Check every value that comes from the browser (names, ids) against a pattern before it becomes a path or an argument, and refuse one that could read as an option.
 - `beehaiive/guard.py` refuses any request whose Host is not this machine, any foreign Origin, and any non-GET request without `X-BeeHAIve: 1`. Keep that header in step with `web/console/api.js`, and test with `TestClient(app, base_url="http://127.0.0.1")`.

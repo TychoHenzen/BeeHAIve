@@ -352,11 +352,14 @@ export function resourceChoices(bindings, { self, suggested, current }) {
   return choices;
 }
 
-// Other bindings on `resource` at a different capacity. Archon keeps one
-// capacity per resource, set by whichever of them fired last.
-export function capacityConflicts(bindings, { self, resource, capacity }) {
+// Saved bindings on `resource` at a different capacity, the edited binding's
+// own saved file included. Archon fixes a resource's capacity the first time
+// a binding claims it and rejects every later fire that declares another
+// (resource_capacity_conflict), so raising a binding's capacity on the
+// resource it already used stops it from ever starting.
+export function capacityConflicts(bindings, { resource, capacity }) {
   return (bindings ?? [])
-    .filter((b) => b?.name !== self && b?.resource === resource && Number.isInteger(b.capacity) && b.capacity !== capacity)
+    .filter((b) => b?.resource === resource && Number.isInteger(b.capacity) && b.capacity !== capacity)
     .map((b) => ({ name: b.name, capacity: b.capacity }));
 }
 

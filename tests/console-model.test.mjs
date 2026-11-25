@@ -401,11 +401,12 @@ test("resource choices put the suggestion first and say who shares each one", ()
   assert.deepEqual(agreed, [{ value: "pbi:g/o/cc:build", sharedWith: ["cc-build"], capacity: 1 }]);
 });
 
-test("a capacity that differs from another binding on the same resource is a conflict", () => {
-  assert.deepEqual(capacityConflicts(BINDINGS, { self: "cc-build", resource: "pbi:g/o/cc:build", capacity: 1 }), [
-    { name: "cc-build-2", capacity: 2 },
-  ]);
-  assert.deepEqual(capacityConflicts(BINDINGS, { self: "new", resource: "pbi:g/o/cc:merge", capacity: 1 }), []);
+test("a capacity that differs from any saved binding on the resource, its own file included, is a conflict", () => {
+  assert.deepEqual(capacityConflicts(BINDINGS, { resource: "pbi:g/o/cc:build", capacity: 1 }), [{ name: "cc-build-2", capacity: 2 }]);
+  // Raising a binding's own capacity on the resource it already fired on.
+  assert.deepEqual(capacityConflicts(BINDINGS, { resource: "pbi:g/o/cc:merge", capacity: 5 }), [{ name: "cc-merge", capacity: 1 }]);
+  assert.deepEqual(capacityConflicts(BINDINGS, { resource: "pbi:g/o/cc:merge", capacity: 1 }), []);
+  assert.deepEqual(capacityConflicts(BINDINGS, { resource: "pbi:g/o/cc:new", capacity: 3 }), []);
 });
 
 test("input rows follow the declared inputs and keep what the file has beyond them", () => {
