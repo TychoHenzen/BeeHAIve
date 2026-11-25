@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 from pathlib import Path
 
 import pytest
@@ -435,3 +436,60 @@ def test_an_edit_without_the_action_header_is_refused(tmp_path: Path) -> None:
     assert answer.status_code == 403
     written = json.loads((harness.home / BINDING_FILE).read_text("utf-8"))
     assert written["binding"]["capacity"] == 2
+
+
+def test_pause_and_resume_change_every_task(tmp_path: Path) -> None:
+    harness = archon_harness(tmp_path)
+    scheduler = harness.scheduler_runner
+    scheduler.answers["-Action Pause"] = CliResult(0, "7", "")
+    scheduler.answers["-Action Resume"] = CliResult(0, "7", "")
+
+    paused = harness.client.post("/api/archon/triggers/pause", headers=ACTION)
+    resumed = harness.client.post("/api/archon/triggers/resume", headers=ACTION)
+
+    assert paused.json() == {"paused": 7} and resumed.json() == {"resumed": 7}
+
+
+def test_pause_without_the_action_header_is_refused(tmp_path: Path) -> None:
+    harness = archon_harness(tmp_path)
+
+    answer = harness.client.post("/api/archon/triggers/pause")
+
+    assert answer.status_code == 403
+    assert harness.scheduler_runner.calls == []
+
+
+def test_a_refused_pause_is_a_502_with_its_output(tmp_path: Path) -> None:
+    harness = archon_harness(tmp_path)
+    harness.scheduler_runner.answers["-Action Pause"] = CliResult(1, "", "denied")
+
+    answer = harness.client.post("/api/archon/triggers/pause", headers=ACTION)
+
+    assert answer.status_code == 502
+    assert answer.json() == {"error": "Task Scheduler refused the change.", "detail": "denied"}
+
+
+def test_processes_name_this_host_and_its_archon_pids(tmp_path: Path) -> None:
+    harness = archon_harness(tmp_path)
+    listing = '"archon.exe","47492","Console","1","48.640 K"'
+    harness.scheduler_runner.answers["tasklist"] = CliResult(0, listing, "")
+
+    answer = harness.client.get("/api/archon/triggers/processes").json()
+
+    assert answer == {"supported": True, "host": socket.gethostname(), "pids": [47492]}
+
+
+def test_processes_off_windows_say_so_and_run_nothing(tmp_path: Path) -> None:
+    harness = archon_harness(tmp_path, platform="linux")
+
+    answer = harness.client.get("/api/archon/triggers/processes").json()
+
+    assert answer["supported"] is False and answer["pids"] == []
+    assert harness.scheduler_runner.calls == []
+
+
+def test_a_failed_process_listing_is_a_502(tmp_path: Path) -> None:
+    harness = archon_harness(tmp_path)
+    harness.scheduler_runner.answers["tasklist"] = CliResult(1, "", "denied")
+
+    assert harness.client.get("/api/archon/triggers/processes").status_code == 502

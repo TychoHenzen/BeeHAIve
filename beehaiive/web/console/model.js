@@ -130,6 +130,15 @@ export function answerReady(attention, picked, text) {
   return false;
 }
 
+// What a workflow does, in one line: the first sentence of its description.
+// Descriptions are hard-wrapped YAML text, so a line break is only a space.
+const SUMMARY_LIMIT = 200;
+export function workflowSummary(description) {
+  const paragraph = String(description ?? "").split(/\n\s*\n/)[0].replace(/\s+/g, " ").trim();
+  const sentence = paragraph.match(/^.*?[.!?](?=\s|$)/)?.[0] ?? paragraph;
+  return sentence.length > SUMMARY_LIMIT ? `${sentence.slice(0, SUMMARY_LIMIT).replace(/\s+\S*$/, "")}...` : sentence;
+}
+
 // Declared workflow inputs as a list, in declaration order.
 export function workflowInputs(workflow) {
   const inputs = workflow?.inputs;
@@ -196,6 +205,7 @@ const pbiQueue = (queue, intervalSeconds = 1800) => ({
 // runs, so it runs once a day.
 const perHost = (workflow, intervalSeconds, inputs) => ({
   workflow,
+  perHost: true,
   intervalSeconds,
   overlap: "skip",
   capacity: 1,
@@ -248,20 +258,29 @@ export const BINDING_PRESETS = {
   },
 };
 
+// A project's short name for binding names and resources: its repository's
+// name, else its own. A binding name must start with a letter or digit
+// (beehaiive/archon/triggers.py NAME).
+export function projectSlug(project) {
+  const repo = repoFromUrl(project?.repository_url);
+  const raw = (repo?.path || project?.name || "").split("/").pop().toLowerCase();
+  return raw.replace(/[^a-z0-9._-]+/g, "-").replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "") || "project";
+}
+
 // A binding form filled from a preset for one project.
 export function presetBinding(kind, { project, directory, hostId }) {
   const preset = BINDING_PRESETS[kind];
   const repo = repoFromUrl(project?.repository_url) ?? { host: "", path: "" };
-  // A binding name must start with a letter or digit (beehaiive/archon/triggers.py NAME).
-  const raw = (repo.path || project?.name || "").split("/").pop().toLowerCase();
-  const slug = raw.replace(/[^a-z0-9._-]+/g, "-").replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "") || "project";
+  const slug = projectSlug(project);
   const fileFor = (k) => joinPath(directory, `${slug}-${k}.json`);
   const name = `${slug}-${kind}`;
   return {
     name,
     workflow: preset.workflow,
     cwd: project?.default_cwd ?? "",
-    resource: preset.resource(repo, hostId),
+    // A repository's queue resource needs a repository; without one the
+    // project's own name stands in, as it does when no preset is chosen.
+    resource: suggestedResource(preset.workflow, project, hostId),
     hostId,
     intervalSeconds: preset.intervalSeconds,
     overlap: preset.overlap,
@@ -276,6 +295,168 @@ export function formatInterval(seconds) {
   if (seconds % 3600 === 0) return `every ${seconds / 3600} h`;
   if (seconds % 60 === 0) return `every ${seconds / 60} min`;
   return `every ${seconds} s`;
+}
+
+// The binding form's interval, in hours when it is whole hours.
+export function intervalParts(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return { amount: 30, unit: "minutes" };
+  return seconds % 3600 === 0 ? { amount: seconds / 3600, unit: "hours" } : { amount: seconds / 60, unit: "minutes" };
+}
+
+export function intervalSeconds({ amount, unit }) {
+  return Math.round(Number(amount) * (unit === "hours" ? 3600 : 60));
+}
+
+// Windows folder names ignore case, and a trailing separator changes nothing.
+const folderKey = (path) =>
+  typeof path === "string" && path.trim() ? path.trim().replaceAll("/", "\\").replace(/\\+$/, "").toLowerCase() : "";
+
+// The registered project whose folder a binding runs in, or null.
+export function projectForFolder(projects, cwd) {
+  const key = folderKey(cwd);
+  if (!key) return null;
+  return (projects ?? []).find((project) => folderKey(project?.default_cwd) === key) ?? null;
+}
+
+// The resource a new binding claims unless it shares another's: a preset's
+// for a workflow a preset knows, else the workflow on its repository.
+export function suggestedResource(workflow, project, hostId) {
+  if (!workflow) return "";
+  const repo = repoFromUrl(project?.repository_url);
+  const preset = Object.values(BINDING_PRESETS).find((p) => p.workflow === workflow);
+  if (preset && (repo || preset.perHost)) return preset.resource(repo, hostId);
+  return `${workflow}:${repo ? `${repo.host}/${repo.path}` : projectSlug(project)}`;
+}
+
+// The resources a binding can claim: the suggested one, the one it has, then
+// every resource another binding claims. Bindings on one resource share its
+// capacity, so each choice says who else is on it and, when they agree, at
+// what capacity.
+export function resourceChoices(bindings, { self, suggested, current }) {
+  const users = new Map();
+  for (const binding of bindings ?? []) {
+    if (!binding?.resource || binding.name === self) continue;
+    if (!users.has(binding.resource)) users.set(binding.resource, []);
+    users.get(binding.resource).push(binding);
+  }
+  const choices = [];
+  const add = (value) => {
+    if (!value || choices.some((choice) => choice.value === value)) return;
+    const sharing = users.get(value) ?? [];
+    const capacities = new Set(sharing.map((b) => b.capacity).filter(Number.isInteger));
+    choices.push({ value, sharedWith: sharing.map((b) => b.name), capacity: capacities.size === 1 ? [...capacities][0] : null });
+  };
+  add(suggested);
+  add(current);
+  [...users.keys()].sort().forEach(add);
+  return choices;
+}
+
+// Other bindings on `resource` at a different capacity. Archon keeps one
+// capacity per resource, set by whichever of them fired last.
+export function capacityConflicts(bindings, { self, resource, capacity }) {
+  return (bindings ?? [])
+    .filter((b) => b?.name !== self && b?.resource === resource && Number.isInteger(b.capacity) && b.capacity !== capacity)
+    .map((b) => ({ name: b.name, capacity: b.capacity }));
+}
+
+// An input row's value that stands for this binding's own file, whatever the
+// binding ends up named.
+export const SELF_BINDING = "@self";
+
+// The rows of a binding's inputs. Each input the workflow declares is a row,
+// and one named *_binding names a binding file, so it picks from the bindings.
+// An input the file has that the workflow does not declare stays as an extra
+// row, so an edit never drops it. With no declaration to go by (declared is
+// null), every input the file has is a plain row.
+export function inputRows(declared, current, selfPath) {
+  const rest = { ...(current ?? {}) };
+  const rows = (declared ?? []).map((input) => {
+    const value = String(rest[input.name] ?? "");
+    delete rest[input.name];
+    const names = input.name.endsWith("_binding");
+    return { ...input, kind: names ? "binding" : "text", extra: false, value: names && selfPath && value === selfPath ? SELF_BINDING : value };
+  });
+  for (const [name, value] of Object.entries(rest)) {
+    rows.push({ name, required: false, default: null, description: "", kind: "text", extra: declared !== null, value: String(value ?? "") });
+  }
+  return rows;
+}
+
+// The choices for an input that names a binding file: none (when optional),
+// this binding, the others, and the value it has even if no binding has that path.
+export function bindingInputOptions(bindings, { self, required, value }) {
+  const options = required ? [] : [{ value: "", label: "None" }];
+  options.push({ value: SELF_BINDING, label: "This binding" });
+  for (const binding of bindings ?? []) {
+    if (binding?.name === self || !binding?.path) continue;
+    options.push({ value: binding.path, label: binding.workflow ? `${binding.name} (${binding.workflow})` : binding.name });
+  }
+  if (value && !options.some((option) => option.value === value)) options.push({ value, label: `${value} (no such binding)` });
+  return options;
+}
+
+// The inputs a binding saves: filled rows only, so an empty optional input
+// takes the workflow's default, and SELF_BINDING becomes the binding's file.
+export function bindingInputs(rows, selfPath) {
+  const inputs = {};
+  for (const row of rows) {
+    const value = row.value === SELF_BINDING ? selfPath : String(row.value ?? "").trim();
+    if (value) inputs[row.name] = value;
+  }
+  return inputs;
+}
+
+// Whether the Windows tasks that fire bindings are paused: "none" when there
+// are no tasks, "active", "partial" when some are disabled, or "paused".
+export function pauseState(tasks) {
+  const total = (tasks ?? []).length;
+  const disabled = (tasks ?? []).filter((task) => task?.state === "Disabled").length;
+  const state = total === 0 ? "none" : disabled === 0 ? "active" : disabled === total ? "paused" : "partial";
+  return { state, disabled, total };
+}
+
+// A fire's run is claimed by its own archon process within seconds, so a run
+// still pending with no process after this long was never going to start.
+const UNCLAIMED_AFTER_SECONDS = 600;
+
+// What each live run means for a restart. Archon names the process that
+// executes a run in metadata.execution_owner ({ host, pid }).
+//   running: its process is alive, so a restart would cut it off.
+//   starting: pending, and its process may still claim it.
+//   waiting: paused on a person's answer, which Archon's server picks up, so
+//     a restart keeps it.
+//   interrupted: its process is gone. It still holds its binding's resource,
+//     so every later fire of that binding is skipped until it ends.
+// `processes` is what /api/archon/triggers/processes said.
+export function restartRuns(runs, processes, nowMs) {
+  return (runs ?? [])
+    .filter((run) => LIVE.has(run?.status))
+    .map((run) => ({ run, binding: run.metadata?.resource_start?.bindingId ?? null, state: restartState(run, processes, nowMs) }));
+}
+
+function restartState(run, processes, nowMs) {
+  // ASSUMPTION: a paused run holds no process; its answer resumes it through
+  // Archon's server. No paused run existed to confirm this on 2026-11-25.
+  if (run.status === "paused") return "waiting";
+  const owner = run.metadata?.execution_owner;
+  if (owner && processes?.supported && owner.host === processes.host && Number.isInteger(owner.pid)) {
+    return processes.pids.includes(owner.pid) ? "running" : "interrupted";
+  }
+  if (run.status === "pending" && !owner) {
+    const age = secondsBetween(run.started_at, null, nowMs);
+    return age !== null && age > UNCLAIMED_AFTER_SECONDS ? "interrupted" : "starting";
+  }
+  // A process on another host, or one this console cannot list, is taken to be alive.
+  return "running";
+}
+
+// Whether a restart is safe now: "busy" while a run is going, "unpaused" when
+// none is but a task can start one, "safe" when neither.
+export function restartVerdict(pause, entries) {
+  const busy = entries.filter((entry) => entry.state === "running" || entry.state === "starting").length;
+  if (busy > 0) return { verdict: "busy", busy };
+  return { verdict: pause.state === "active" || pause.state === "partial" ? "unpaused" : "safe", busy };
 }
 
 // One line for a run event in the timeline.
