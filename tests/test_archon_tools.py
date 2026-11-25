@@ -466,7 +466,10 @@ def test_a_refused_pause_is_a_502_with_its_output(tmp_path: Path) -> None:
     answer = harness.client.post("/api/archon/triggers/pause", headers=ACTION)
 
     assert answer.status_code == 502
-    assert answer.json() == {"error": "Task Scheduler refused the change.", "detail": "denied"}
+    assert answer.json() == {
+        "error": "Task Scheduler refused the change.",
+        "detail": "denied",
+    }
 
 
 def test_processes_name_this_host_and_its_archon_pids(tmp_path: Path) -> None:
