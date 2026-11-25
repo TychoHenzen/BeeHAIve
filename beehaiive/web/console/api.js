@@ -75,6 +75,8 @@ export const api = {
   identity: () => request("/api/archon/identity"),
   bindings: () => request("/api/archon/triggers/bindings"),
   createBinding: (form) => request("/api/archon/triggers/bindings", { method: "POST", body: form }),
+  // Everything but the name and run-as user, which an edit keeps.
+  updateBinding: (name, changes) => request(`/api/archon/triggers/bindings/${enc(name)}`, { method: "PUT", body: changes }),
   deleteBinding: (name) => request(`/api/archon/triggers/bindings/${enc(name)}`, { method: "DELETE" }),
   fire: (name) => request(`/api/archon/triggers/bindings/${enc(name)}/fire`, { method: "POST" }),
   receipts: (limit = 50) => request(`/api/archon/triggers/receipts${query({ limit })}`),

@@ -31,35 +31,46 @@ RECEIPT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_:.-]{0,127}")
 FIRE_TIMEOUT = 300.0
 
 
-class BindingForm(BaseModel):
-    name: str
+class BindingChanges(BaseModel):
+    """What an edit may change. The name, ids and run-as user stay fixed: the
+    name is also the file, the Windows task and what queue inputs point at."""
+
     workflow: str
     cwd: str
     resource: str
     host_id: str = Field(alias="hostId")
-    run_as_user_id: str = Field(alias="runAsUserId")
     interval_seconds: int = Field(alias="intervalSeconds")
     inputs: dict[str, str] = Field(default_factory=dict[str, str])
     overlap: str = "skip"
     capacity: int = 1
     isolation: str = "worktree"
-    run_at_load: bool = Field(default=False, alias="runAtLoad")
 
-    def binding(self) -> NewBinding:
+    def binding(
+        self, name: str, run_as_user_id: str, run_at_load: bool = False
+    ) -> NewBinding:
         return NewBinding(
-            name=self.name.strip(),
+            name=name.strip(),
             workflow=self.workflow.strip(),
             cwd=self.cwd.strip(),
             resource=self.resource,
             host_id=self.host_id.strip(),
-            run_as_user_id=self.run_as_user_id.strip(),
+            run_as_user_id=run_as_user_id.strip(),
             interval_seconds=self.interval_seconds,
             inputs=self.inputs,
             overlap=self.overlap,
             capacity=self.capacity,
             isolation=self.isolation,
-            run_at_load=self.run_at_load,
+            run_at_load=run_at_load,
         )
+
+
+class BindingForm(BindingChanges):
+    name: str
+    run_as_user_id: str = Field(alias="runAsUserId")
+    run_at_load: bool = Field(default=False, alias="runAtLoad")
+
+    def new_binding(self) -> NewBinding:
+        return self.binding(self.name, self.run_as_user_id, self.run_at_load)
 
 
 def _settings(request: Request) -> ArchonSettings:
@@ -119,10 +130,56 @@ def create_binding(
     form: BindingForm, request: Request
 ) -> dict[str, object] | JSONResponse:
     try:
-        path = _store(request).create(form.binding())
+        path = _store(request).create(form.new_binding())
     except BindingError as error:
         return _failed(error, 400)
     return {"binding": _store(request).summary(path.stem)}
+
+
+@router.put("/triggers/bindings/{name}", response_model=None)
+def update_binding(
+    name: str, changes: BindingChanges, request: Request
+) -> dict[str, object] | JSONResponse:
+    store, scheduler = _store(request), _scheduler(request)
+    try:
+        before = store.summary(name)
+    except (BindingError, KeyError) as error:
+        return _failed(error, 404)
+    run_as = before["runAsUserId"]
+    if before["error"] is not None or not isinstance(run_as, str):
+        return JSONResponse(
+            {"error": "This file is not a binding, so it cannot be edited."},
+            status_code=400,
+        )
+    try:
+        path = store.update(changes.binding(name, run_as))
+    except BindingError as error:
+        return _failed(error, 400)
+    after = store.summary(name)
+    # The Windows task keeps the interval and folder it was installed with, so
+    # a change to either reinstalls it. Every other field is read from the file
+    # each time the task fires.
+    interval, cwd = after["intervalSeconds"], after["cwd"]
+    moved = (interval, cwd) != (before["intervalSeconds"], before["cwd"])
+    rescheduled = False
+    if moved and scheduler.supported and isinstance(interval, int):
+        try:
+            scheduled = any(
+                task.get("name") == task_name(name) for task in scheduler.list()
+            )
+            if scheduled and isinstance(cwd, str):
+                scheduler.install(name, path, cwd, interval)
+                rescheduled = True
+        except ArchonCliError as error:
+            return JSONResponse(
+                {
+                    "error": "The binding is saved, but its Windows task still "
+                    "runs on the old schedule. Unschedule and schedule it again.",
+                    "detail": error.detail or str(error),
+                },
+                status_code=502,
+            )
+    return {"binding": after, "rescheduled": rescheduled}
 
 
 @router.delete("/triggers/bindings/{name}", response_model=None)

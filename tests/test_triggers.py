@@ -16,6 +16,7 @@ from beehaiive.archon.triggers import (
     TriggerStore,
     task_name,
 )
+from beehaiive.records import as_dict, dig
 from tests.archon_fakes import FakeRunner, printed
 
 
@@ -199,3 +200,38 @@ def test_scheduler_is_windows_only() -> None:
     with pytest.raises(ArchonCliError, match="only on Windows"):
         scheduler.list()
     assert runner.calls == []
+
+
+def test_an_edit_resets_isolation_only_when_its_kind_changes(tmp_path: Path) -> None:
+    document = binding(tmp_path).document()
+    launch = as_dict(dig(document, "binding", "launch"))
+    assert launch is not None
+    launch["isolation"] = {"kind": "worktree", "branch": "keep/me"}
+
+    same = binding(tmp_path, capacity=5).apply_to(document)
+    other = binding(tmp_path, isolation="in-place").apply_to(document)
+
+    isolation = ("binding", "launch", "isolation")
+    assert dig(same, *isolation) == {"kind": "worktree", "branch": "keep/me"}
+    assert dig(other, *isolation) == {"kind": "in-place"}
+    # The original document is never changed in place.
+    assert dig(document, *isolation) == {"kind": "worktree", "branch": "keep/me"}
+    assert dig(document, "binding", "capacity") == 2
+
+
+def test_store_update_validates_and_refuses_what_is_not_a_binding(
+    tmp_path: Path,
+) -> None:
+    store = TriggerStore(tmp_path / "triggers")
+    store.create(binding(tmp_path))
+    (tmp_path / "triggers" / "notes.json").write_text("[]", "utf-8")
+
+    with pytest.raises(BindingError, match="Capacity"):
+        store.update(binding(tmp_path, capacity=99))
+    with pytest.raises(KeyError):
+        store.update(binding(tmp_path, name="missing"))
+    with pytest.raises(BindingError, match="not JSON"):
+        store.update(binding(tmp_path, name="notes"))
+
+    store.update(binding(tmp_path, capacity=3))
+    assert store.summary("beehaiive-build-queue")["capacity"] == 3

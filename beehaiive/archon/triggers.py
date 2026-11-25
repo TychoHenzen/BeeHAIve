@@ -7,7 +7,9 @@ only on macOS, so on Windows a Task Scheduler task runs that command on a timer.
 
 from __future__ import annotations
 
+import copy
 import json
+import os
 import re
 import sys
 from collections.abc import Mapping
@@ -106,6 +108,37 @@ class NewBinding:
             },
         }
 
+    def apply_to(self, document: Record) -> Record:
+        """An existing binding file with this binding's editable fields set.
+
+        The ids, the run-as user, runAtLoad and every key this form does not
+        know stay as the file has them, so an edit never drops what Archon or
+        a person put there.
+        """
+        edited = copy.deepcopy(document)
+        binding = as_dict(edited.get("binding"))
+        if binding is None:
+            raise BindingError("This file is not a binding, so it cannot be edited.")
+        binding.update(
+            hostId=self.host_id,
+            resource=self.resource.strip(),
+            capacity=self.capacity,
+            overlap=self.overlap,
+        )
+        launch: Record = as_dict(binding.get("launch")) or {}
+        launch.update(
+            cwd=self.cwd, workflowName=self.workflow, inputs=dict(self.inputs)
+        )
+        # Archon checks each isolation kind's own keys, so a new kind starts bare.
+        isolation = as_dict(launch.get("isolation"))
+        if isolation is None or isolation.get("kind") != self.isolation:
+            launch["isolation"] = {"kind": self.isolation}
+        binding["launch"] = launch
+        schedule: Record = as_dict(edited.get("schedule")) or {"runAtLoad": False}
+        schedule["intervalSeconds"] = self.interval_seconds
+        edited["schedule"] = schedule
+        return edited
+
 
 class TriggerStore:
     def __init__(self, directory: Path) -> None:
@@ -146,6 +179,21 @@ class TriggerStore:
             ) from error
         return path
 
+    def update(self, binding: NewBinding) -> Path:
+        binding.validate()
+        path = self.existing(binding.name)
+        document = read_json_object(path)
+        if document is None:
+            raise BindingError(f"{path.name} is not JSON, so it cannot be edited.")
+        text = json.dumps(binding.apply_to(document), indent=2) + "\n"
+        # A scheduled task can fire while this writes, so it must never see half
+        # a file: write beside it, then swap. The temp name does not end in
+        # .json, so a listing never shows it.
+        temp = path.with_name(f".{path.name}.edit")
+        temp.write_text(text, encoding="utf-8")
+        os.replace(temp, path)
+        return path
+
 
 def summarize(path: Path) -> Record:
     document = read_json_object(path)
@@ -159,6 +207,7 @@ def summarize(path: Path) -> Record:
         "error": None if binding is not None else "This file is not a binding.",
         "bindingId": get_str(binding, "bindingId"),
         "hostId": get_str(binding, "hostId"),
+        "runAsUserId": get_str(binding, "runAsUserId"),
         "resource": get_str(binding, "resource"),
         "overlap": get_str(binding, "overlap"),
         "capacity": capacity if isinstance(capacity, int) else None,

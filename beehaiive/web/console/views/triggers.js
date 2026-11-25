@@ -36,13 +36,69 @@ function inputsText(inputs) {
     .join("\n");
 }
 
+const label = (text, control, hint) =>
+  el("label", { class: "field" }, el("span", {}, text), control, hint ? el("span", { class: "muted small" }, hint) : null);
+
+// The controls a new binding and an edit share. fill() sets them from a
+// binding's values; read() gives the request body without the name and user.
+function settingFields() {
+  const fields = {
+    workflow: el("input", { type: "text", required: true }),
+    cwd: el("input", { type: "text", required: true }),
+    resource: el("input", { type: "text", required: true }),
+    hostId: el("input", { type: "text", value: "local" }),
+    minutes: el("input", { type: "number", min: "1", value: "30" }),
+    overlap: el("select", {}, el("option", { value: "skip" }, "skip"), el("option", { value: "queue" }, "queue")),
+    capacity: el("input", { type: "number", min: "1", max: "32", value: "1" }),
+    isolation: el("select", {}, ["worktree", "default", "in-place"].map((kind) => el("option", { value: kind }, kind))),
+    inputs: el("textarea", { rows: "5", spellcheck: "false" }),
+  };
+  return {
+    fields,
+    fill(values) {
+      fields.workflow.value = values.workflow ?? "";
+      fields.cwd.value = values.cwd ?? "";
+      fields.resource.value = values.resource ?? "";
+      fields.hostId.value = values.hostId ?? "local";
+      fields.minutes.value = Number.isFinite(values.intervalSeconds) ? String(values.intervalSeconds / 60) : "30";
+      fields.overlap.value = values.overlap ?? "skip";
+      fields.capacity.value = String(values.capacity ?? 1);
+      fields.isolation.value = values.isolation ?? "worktree";
+      fields.inputs.value = inputsText(values.inputs);
+    },
+    read: () => ({
+      workflow: fields.workflow.value,
+      cwd: fields.cwd.value,
+      resource: fields.resource.value,
+      hostId: fields.hostId.value,
+      intervalSeconds: Math.round(Number(fields.minutes.value) * 60),
+      overlap: fields.overlap.value,
+      capacity: Number(fields.capacity.value),
+      isolation: fields.isolation.value,
+      inputs: parseInputs(fields.inputs.value),
+    }),
+    labels: () => [
+      label("Workflow", fields.workflow),
+      label("Runs in", fields.cwd, "The folder the workflow starts in."),
+      label("Resource", fields.resource, "Runs that share a resource share its capacity."),
+      label("Every (minutes)", fields.minutes),
+      label("Overlap", fields.overlap, "skip drops a start while the resource is full; queue waits for a slot."),
+      label("Capacity", fields.capacity, "How many runs on this resource may run at once."),
+      label("Isolation", fields.isolation, "worktree gives each run its own checkout; default uses the project's setting."),
+      label("Host id", fields.hostId, "Names this machine to archon trigger drain."),
+      label("Inputs", fields.inputs, "One name=value per line."),
+    ],
+  };
+}
+
 export default {
   id: "triggers",
   title: "Triggers",
   nav: true,
   match: (path) => (path === "/triggers" ? {} : null),
   mount(root, params, ctx) {
-    const state = { directory: "", bindings: [], tasks: new Map(), scheduling: true, identity: null, projects: [], defaultHome: true };
+    // saved: the binding an edit just saved, so its reloaded card can say so.
+    const state = { directory: "", bindings: [], tasks: new Map(), scheduling: true, identity: null, projects: [], defaultHome: true, saved: null };
     const bindingList = el("div", {});
     const formSlot = el("div", {});
     const receiptList = el("div", {});
@@ -89,8 +145,73 @@ export default {
       );
     }
 
+    // The card's facts, or in their place the same fields the New binding form
+    // has, filled from the file. Saving keeps the name, ids and run-as user.
+    function editForm(binding, close) {
+      const settings = settingFields();
+      settings.fill(binding);
+      const save = actionButton(
+        "Save changes",
+        async () => {
+          const { rescheduled } = await ctx.api.updateBinding(binding.name, settings.read());
+          state.saved = { name: binding.name, rescheduled };
+          await loadBindings();
+        },
+        { tone: "primary" },
+      );
+      return el(
+        "div",
+        { class: "binding-form" },
+        settings.labels(),
+        el(
+          "p",
+          { class: "muted small" },
+          "The name, binding id and run-as user stay. The next fire reads the saved file. A new interval or folder also reinstalls its Windows task.",
+        ),
+        el("div", { class: "row" }, save, el("button", { type: "button", onclick: close }, "Cancel")),
+      );
+    }
+
+    function facts(binding) {
+      return el(
+        "dl",
+        { class: "facts" },
+        el("dt", {}, "Runs in"),
+        el("dd", {}, el("code", {}, binding.cwd ?? "")),
+        el("dt", {}, "Resource"),
+        el("dd", {}, `${binding.resource ?? ""} (capacity ${binding.capacity ?? "?"}, overlap ${binding.overlap ?? "?"})`),
+        el("dt", {}, "Inputs"),
+        el("dd", {}, el("pre", { class: "inline" }, inputsText(binding.inputs) || "none")),
+        el("dt", {}, "File"),
+        el("dd", {}, el("code", {}, binding.path)),
+      );
+    }
+
+    function savedNotice(binding) {
+      if (state.saved?.name !== binding.name) return null;
+      const { rescheduled } = state.saved;
+      state.saved = null;
+      return notice(rescheduled ? `Saved. Its Windows task now fires ${formatInterval(binding.intervalSeconds)}.` : "Saved.");
+    }
+
     function bindingCard(binding) {
       const output = el("div", {});
+      const body = el("div", {}, binding.error ? notice(binding.error, "error") : facts(binding));
+      const edit = binding.error
+        ? null
+        : el("button", {
+            type: "button",
+            onclick: () => {
+              edit.hidden = true;
+              replace(
+                body,
+                editForm(binding, () => {
+                  edit.hidden = false;
+                  replace(body, facts(binding));
+                }),
+              );
+            },
+          }, "Edit");
       return el(
         "article",
         { class: "panel binding" },
@@ -101,23 +222,12 @@ export default {
           binding.workflow ? el("code", {}, binding.workflow) : null,
           el("span", { class: "muted small" }, formatInterval(binding.intervalSeconds)),
         ),
-        binding.error
-          ? notice(binding.error, "error")
-          : el(
-              "dl",
-              { class: "facts" },
-              el("dt", {}, "Runs in"),
-              el("dd", {}, el("code", {}, binding.cwd ?? "")),
-              el("dt", {}, "Resource"),
-              el("dd", {}, `${binding.resource ?? ""} (capacity ${binding.capacity ?? "?"}, overlap ${binding.overlap ?? "?"})`),
-              el("dt", {}, "Inputs"),
-              el("dd", {}, el("pre", { class: "inline" }, inputsText(binding.inputs) || "none")),
-              el("dt", {}, "File"),
-              el("dd", {}, el("code", {}, binding.path)),
-            ),
+        savedNotice(binding),
+        body,
         el(
           "div",
           { class: "row" },
+          edit,
           actionButton(
             "Fire now",
             async () => {
@@ -203,32 +313,15 @@ export default {
         Object.keys(BINDING_PRESETS).map((k) => el("option", { value: k }, PRESET_LABELS[k])),
         el("option", { value: "" }, "Custom"),
       );
-      const fields = {
-        name: el("input", { type: "text", required: true }),
-        workflow: el("input", { type: "text", required: true }),
-        cwd: el("input", { type: "text", required: true }),
-        resource: el("input", { type: "text", required: true }),
-        hostId: el("input", { type: "text", value: "local" }),
-        minutes: el("input", { type: "number", min: "1", value: "30" }),
-        overlap: el("select", {}, el("option", { value: "skip" }, "skip"), el("option", { value: "queue" }, "queue")),
-        capacity: el("input", { type: "number", min: "1", max: "32", value: "1" }),
-        isolation: el("select", {}, ["worktree", "default", "in-place"].map((kind) => el("option", { value: kind }, kind))),
-        inputs: el("textarea", { rows: "5", spellcheck: "false" }),
-      };
+      const settings = settingFields();
+      const fields = { ...settings.fields, name: el("input", { type: "text", required: true }) };
 
       function apply() {
         const chosen = state.projects.find((p) => p.id === project.value);
         if (!preset.value || !chosen) return;
         const filled = presetBinding(preset.value, { project: chosen, directory: state.directory, hostId: fields.hostId.value || "local" });
         fields.name.value = filled.name;
-        fields.workflow.value = filled.workflow;
-        fields.cwd.value = filled.cwd;
-        fields.resource.value = filled.resource;
-        fields.minutes.value = String(filled.intervalSeconds / 60);
-        fields.overlap.value = filled.overlap;
-        fields.capacity.value = String(filled.capacity);
-        fields.isolation.value = filled.isolation;
-        fields.inputs.value = inputsText(filled.inputs);
+        settings.fill(filled);
       }
 
       // A queue binding names its own file in its inputs; keep that in step with the name.
@@ -244,24 +337,11 @@ export default {
       preset.addEventListener("change", apply);
       apply();
 
-      const label = (text, control, hint) => el("label", { class: "field" }, el("span", {}, text), control, hint ? el("span", { class: "muted small" }, hint) : null);
       const save = actionButton(
         "Save binding",
         async () => {
           if (!state.identity?.runAsUserId) throw new Error("archon trigger whoami did not give a user id.");
-          await ctx.api.createBinding({
-            name: fields.name.value,
-            workflow: fields.workflow.value,
-            cwd: fields.cwd.value,
-            resource: fields.resource.value,
-            hostId: fields.hostId.value,
-            runAsUserId: state.identity.runAsUserId,
-            intervalSeconds: Math.round(Number(fields.minutes.value) * 60),
-            overlap: fields.overlap.value,
-            capacity: Number(fields.capacity.value),
-            isolation: fields.isolation.value,
-            inputs: parseInputs(fields.inputs.value),
-          });
+          await ctx.api.createBinding({ ...settings.read(), name: fields.name.value, runAsUserId: state.identity.runAsUserId });
           await loadBindings();
         },
         { tone: "primary" },
@@ -274,15 +354,7 @@ export default {
           label("Project", project),
           label("Preset", preset, "Fills the fields with that workflow's usual settings. Change anything before saving."),
           label("Name", fields.name, "The file name and the binding id."),
-          label("Workflow", fields.workflow),
-          label("Runs in", fields.cwd, "The folder the workflow starts in."),
-          label("Resource", fields.resource, "Runs that share a resource share its capacity."),
-          label("Every (minutes)", fields.minutes),
-          label("Overlap", fields.overlap, "skip drops a start while the resource is full; queue waits for a slot."),
-          label("Capacity", fields.capacity),
-          label("Isolation", fields.isolation, "worktree gives each run its own checkout; default uses the project's setting."),
-          label("Host id", fields.hostId, "Names this machine to archon trigger drain."),
-          label("Inputs", fields.inputs, "One name=value per line."),
+          settings.labels(),
           el("p", { class: "muted small" }, "Runs as ", el("code", {}, state.identity?.runAsUserId ?? "unknown"), state.identity?.cliIdentity ? ` (${state.identity.cliIdentity})` : ""),
           el(
             "p",

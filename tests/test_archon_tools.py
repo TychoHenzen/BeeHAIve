@@ -291,3 +291,124 @@ def test_schedule_errors_map_to_status_codes(tmp_path: Path) -> None:
     assert bad_name.status_code == 404
     assert remove_denied.status_code == 502
     assert list_denied.status_code == 502
+
+
+def edits(cwd: Path, **changes: object) -> dict[str, object]:
+    base = form(cwd)
+    for fixed in ("name", "runAsUserId"):
+        base.pop(fixed)
+    return base | changes
+
+
+def test_an_edit_changes_capacity_and_keeps_what_the_form_does_not_know(
+    tmp_path: Path,
+) -> None:
+    harness = with_binding(tmp_path)
+    path = harness.home / BINDING_FILE
+    document = json.loads(path.read_text("utf-8"))
+    document["binding"]["launch"]["discoveryCwd"] = str(tmp_path)
+    document["schedule"]["runAtLoad"] = True
+    path.write_text(json.dumps(document), "utf-8")
+
+    edited = harness.client.put(
+        BINDING, json=edits(tmp_path, capacity=4, overlap="queue"), headers=ACTION
+    ).json()
+
+    assert edited["rescheduled"] is False
+    assert edited["binding"]["capacity"] == 4
+    assert edited["binding"]["overlap"] == "queue"
+    written = json.loads(path.read_text("utf-8"))
+    assert written["binding"]["runAsUserId"] == "u1"
+    assert written["binding"]["bindingId"] == "repo-build-queue"
+    assert written["binding"]["launch"]["discoveryCwd"] == str(tmp_path)
+    assert written["schedule"] == {"intervalSeconds": 1800, "runAtLoad": True}
+    # Only the interval and folder live in the Windows task.
+    assert harness.scheduler_runner.calls == []
+    assert [p.name for p in path.parent.iterdir()] == ["repo-build-queue.json"]
+
+
+def test_a_new_interval_reinstalls_the_bindings_windows_task(tmp_path: Path) -> None:
+    harness = with_binding(tmp_path)
+    scheduler = harness.scheduler_runner
+    scheduler.answers["-Action List"] = printed([{"name": "Archon-repo-build-queue"}])
+    scheduler.answers["-Action Install"] = CliResult(0, "installed", "")
+
+    edited = harness.client.put(
+        BINDING, json=edits(tmp_path, intervalSeconds=3600), headers=ACTION
+    ).json()
+
+    assert edited["rescheduled"] is True
+    install = scheduler.calls[-1]
+    assert install[install.index("-IntervalSeconds") + 1] == "3600"
+    assert install[install.index("-Name") + 1] == "Archon-repo-build-queue"
+
+
+def test_a_new_interval_without_a_task_schedules_nothing(tmp_path: Path) -> None:
+    harness = with_binding(tmp_path)
+    harness.scheduler_runner.answers["-Action List"] = printed([])
+
+    edited = harness.client.put(
+        BINDING, json=edits(tmp_path, intervalSeconds=3600), headers=ACTION
+    ).json()
+
+    assert edited["rescheduled"] is False
+    assert edited["binding"]["intervalSeconds"] == 3600
+    assert not any("Install" in call for call in harness.scheduler_runner.calls)
+
+
+def test_a_task_that_will_not_reinstall_says_the_file_is_saved(tmp_path: Path) -> None:
+    harness = with_binding(tmp_path)
+    scheduler = harness.scheduler_runner
+    scheduler.answers["-Action List"] = printed([{"name": "Archon-repo-build-queue"}])
+    scheduler.answers["-Action Install"] = CliResult(1, "", "Access denied")
+
+    answer = harness.client.put(
+        BINDING, json=edits(tmp_path, intervalSeconds=3600), headers=ACTION
+    )
+
+    assert answer.status_code == 502
+    assert "saved" in answer.json()["error"]
+    assert answer.json()["detail"] == "Access denied"
+    written = json.loads((harness.home / BINDING_FILE).read_text("utf-8"))
+    assert written["schedule"]["intervalSeconds"] == 3600
+
+
+def test_a_bad_edit_is_a_400_and_leaves_the_file(tmp_path: Path) -> None:
+    harness = with_binding(tmp_path)
+    before = (harness.home / BINDING_FILE).read_text("utf-8")
+
+    answer = harness.client.put(
+        BINDING, json=edits(tmp_path, capacity=0), headers=ACTION
+    )
+
+    assert answer.status_code == 400
+    assert "Capacity" in answer.json()["error"]
+    assert (harness.home / BINDING_FILE).read_text("utf-8") == before
+
+
+def test_editing_a_missing_misnamed_or_broken_binding_is_refused(
+    tmp_path: Path,
+) -> None:
+    harness = archon_harness(tmp_path)
+    triggers = harness.home / "triggers"
+    triggers.mkdir()
+    (triggers / "loose.json").write_text("[]", "utf-8")
+    base = "/api/archon/triggers/bindings"
+
+    missing = harness.client.put(f"{base}/nope", json=edits(tmp_path), headers=ACTION)
+    bad_name = harness.client.put(f"{base}/..bad", json=edits(tmp_path), headers=ACTION)
+    loose = harness.client.put(f"{base}/loose", json=edits(tmp_path), headers=ACTION)
+
+    assert missing.status_code == 404 and bad_name.status_code == 404
+    assert loose.status_code == 400
+    assert (triggers / "loose.json").read_text("utf-8") == "[]"
+
+
+def test_an_edit_without_the_action_header_is_refused(tmp_path: Path) -> None:
+    harness = with_binding(tmp_path)
+
+    answer = harness.client.put(BINDING, json=edits(tmp_path, capacity=4))
+
+    assert answer.status_code == 403
+    written = json.loads((harness.home / BINDING_FILE).read_text("utf-8"))
+    assert written["binding"]["capacity"] == 2
