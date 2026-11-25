@@ -30,8 +30,8 @@ on the command line:
   open issue stands: worked by a live run, waiting in a queue, waiting on your
   answer, or stuck, with the reason it is stuck. It also says whether each
   queue's trigger can start a run, calls a run stalled when its step has
-  logged nothing for half an hour or run for three hours, and lists pull
-  requests no issue owns. It runs `ledger.mjs` from archon-home's pbi
+  logged nothing for half an hour or run for three hours, or when the run has
+  gone three hours with no commit, and lists pull requests no issue owns. It runs `ledger.mjs` from archon-home's pbi
   workflows, which reads GitHub and takes about a minute, so the page keeps a
   reading for five minutes and reads again on Read again.
 - **Launch**: pick a project and a workflow, fill its declared inputs, start it.
