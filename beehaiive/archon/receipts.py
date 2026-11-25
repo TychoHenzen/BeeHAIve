@@ -67,10 +67,10 @@ class Fire:
 @dataclass(frozen=True)
 class Held:
     """The capacity Archon holds for a resource, when a receipt proves it, and
-    how many receipts of the bindings that use it there were to look in."""
+    whether any fire BeeHAIve read declared the resource at all."""
 
     capacity: int | None
-    receipts: int
+    used: bool
 
 
 @dataclass(frozen=True)
@@ -168,20 +168,25 @@ class ReceiptReader:
         and by the one being saved. A deleted binding that used it under
         another name is not looked at.
         """
-        mine = [r for r in receipts if get_str(r, "sourceInstanceId") in bindings]
         with self._guard:
             kept = self._held.get(resource)
         if kept is not None:
-            return Held(kept, len(mine))
+            return Held(kept, True)
+        mine = [r for r in receipts if get_str(r, "sourceInstanceId") in bindings]
+        used = False
         for index in lookback(len(mine)):
             receipt = mine[index]
             found = self.fire(receipt, get_str(receipt, "sourceInstanceId") or "")
-            proven = found.proves(resource) if found else None
+            # A binding's fires on the resource it named before say nothing here.
+            if found is None or found.resource != resource:
+                continue
+            used = True
+            proven = found.proves(resource)
             if proven is not None:
                 with self._guard:
                     self._held[resource] = proven
-                return Held(proven, len(mine))
-        return Held(None, len(mine))
+                return Held(proven, True)
+        return Held(None, used)
 
 
 def _users(resource: str, others: Sequence[Record]) -> list[Record]:
@@ -205,7 +210,7 @@ def check_capacity(
     try:
         held = reader.held(resource, names, reader.recent())
     except ArchonCliError as error:
-        held = Held(None, 0)
+        held = Held(None, False)
         warnings.append(
             f"BeeHAIve could not ask Archon which capacity it holds for {resource} "
             f"({error.message}), so this capacity is unchecked."
@@ -219,7 +224,7 @@ def check_capacity(
             f"another number. Keep capacity {held.capacity}, or give this "
             "binding a new resource name."
         )
-    if held.receipts:
+    if held.used:
         warnings.append(
             f"No fire of {resource} that BeeHAIve read shows which capacity Archon "
             "holds, so this capacity is unchecked. If Archon refuses the next "

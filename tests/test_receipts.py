@@ -218,19 +218,20 @@ def test_fires_that_prove_nothing_leave_a_warning(tmp_path: Path) -> None:
     assert f"No fire of {RESOURCE} that BeeHAIve read shows" in edited["warning"]
 
 
-def test_a_fire_on_another_resource_proves_nothing_about_this_one(
+def test_moving_a_binding_to_a_new_resource_saves_without_a_word(
     tmp_path: Path,
 ) -> None:
-    # The binding used another resource before; those fires say nothing here.
+    # What the refusal advises. The binding's fires on its old resource say
+    # nothing about the new one, which no fire has used yet.
     harness = with_build_binding(tmp_path)
-    script(harness.runner, [fire(0, 3, resource="pbi:github.com/o/repo:old")])
+    script(harness.runner, [fire(0, 1), fire(1, 1)])
+    moved = edit_form(tmp_path, resource="pbi:github.com/o/repo:build-3", capacity=3)
 
-    edited = harness.client.put(
-        f"{BINDINGS}/{NAME}", json=edit_form(tmp_path, capacity=3), headers=ACTION
-    ).json()
+    edited = harness.client.put(f"{BINDINGS}/{NAME}", json=moved, headers=ACTION)
 
-    assert edited["binding"]["capacity"] == 3
-    assert "unchecked" in edited["warning"]
+    assert edited.status_code == 200
+    assert edited.json()["warning"] is None
+    assert saved_capacity(harness) == 3
 
 
 def test_a_new_binding_must_match_what_archon_holds_for_a_shared_resource(
