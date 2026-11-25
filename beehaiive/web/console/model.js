@@ -174,6 +174,21 @@ const pbiQueue = (queue, intervalSeconds = 1800) => ({
   inputs: () => ({}),
 });
 
+// dod-guard's two machine-wide workflows: one resource per host, since each
+// covers every project on this machine whichever checkout it starts in. The
+// pack's worktree-cleanup replaces the SDLC pack's archon-worktree-cleanup,
+// which fails on submodules and long paths. The daily review reads a day of
+// runs, so it runs once a day.
+const perHost = (workflow, intervalSeconds, inputs) => ({
+  workflow,
+  intervalSeconds,
+  overlap: "skip",
+  capacity: 1,
+  isolation: "default",
+  resource: (_repo, hostId) => `${workflow}:${hostId}`,
+  inputs: () => inputs,
+});
+
 // The rest are the SDLC pack's schedules, from its README.
 export const BINDING_PRESETS = {
   "pbi-refine-queue": pbiQueue("refine"),
@@ -181,6 +196,8 @@ export const BINDING_PRESETS = {
   "pbi-merge-queue": pbiQueue("merge"),
   "pbi-discovery-queue": pbiQueue("discovery", 14400),
   "pbi-upkeep-queue": pbiQueue("upkeep", 86400),
+  "worktree-cleanup": perHost("worktree-cleanup", 21600, { include_closed: "false" }),
+  "daily-review": perHost("daily-review", 86400, {}),
   "build-queue": {
     workflow: "archon-build-queue",
     intervalSeconds: 1800,
@@ -214,15 +231,6 @@ export const BINDING_PRESETS = {
     resource: (repo) => `discoveries:${repo.host}/${repo.path}`,
     inputs: (repo) => ({ repo_host: repo.host, repo_path: repo.path }),
   },
-  "worktree-cleanup": {
-    workflow: "archon-worktree-cleanup",
-    intervalSeconds: 21600,
-    overlap: "skip",
-    capacity: 1,
-    isolation: "default",
-    resource: (_repo, hostId) => `worktree-cleanup:${hostId}`,
-    inputs: () => ({ include_closed: "false" }),
-  },
 };
 
 // A binding form filled from a preset for one project.
@@ -238,7 +246,7 @@ export function presetBinding(kind, { project, directory, hostId }) {
     name,
     workflow: preset.workflow,
     cwd: project?.default_cwd ?? "",
-    resource: kind === "worktree-cleanup" ? preset.resource(repo, hostId) : preset.resource(repo),
+    resource: preset.resource(repo, hostId),
     hostId,
     intervalSeconds: preset.intervalSeconds,
     overlap: preset.overlap,

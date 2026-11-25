@@ -159,14 +159,23 @@ test("a merge queue preset points at its sibling build queue", () => {
   assert.equal(filled.inputs.build_queue_binding, "/t/x-build-queue.json");
 });
 
-test("the cleanup preset is per machine and every preset has a workflow", () => {
+test("the cleanup and daily review presets are per machine and every preset has a workflow", () => {
   const filled = presetBinding("worktree-cleanup", { project: { name: "My Repo!" }, directory: "/t", hostId: "pc1" });
+  assert.equal(filled.workflow, "worktree-cleanup");
   assert.equal(filled.resource, "worktree-cleanup:pc1");
   assert.equal(filled.name, "my-repo-worktree-cleanup");
+  assert.deepEqual(filled.inputs, { include_closed: "false" });
+  const project = { name: "archon-home", default_cwd: "C:\\src\\archon-home", repository_url: "https://github.com/o/archon-home" };
+  const review = presetBinding("daily-review", { project, directory: "/t", hostId: "pc1" });
+  assert.deepEqual(
+    [review.name, review.workflow, review.resource, review.intervalSeconds, review.capacity, review.overlap, review.isolation, review.cwd],
+    ["archon-home-daily-review", "daily-review", "daily-review:pc1", 86400, 1, "skip", "default", "C:\\src\\archon-home"],
+  );
+  assert.deepEqual(review.inputs, {});
   assert.equal(presetBinding("discoveries", { project: { name: "--" }, directory: "/t", hostId: "h" }).name, "project-discoveries");
   assert.equal(filled.cwd, "");
   for (const preset of Object.values(BINDING_PRESETS)) {
-    assert.match(preset.workflow, /^(archon|pbi)-/);
+    assert.match(preset.workflow, /^[a-z][a-z0-9-]+$/);
     assert.ok(preset.intervalSeconds >= 60);
   }
   assert.equal(presetBinding("discoveries", { project: null, directory: "/t", hostId: "h" }).name, "project-discoveries");

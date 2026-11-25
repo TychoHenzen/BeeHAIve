@@ -12,10 +12,11 @@ const PRESET_LABELS = {
   "pbi-merge-queue": "PBI merge queue (every 30 min)",
   "pbi-discovery-queue": "PBI discovery queue (every 4 h)",
   "pbi-upkeep-queue": "PBI upkeep queue (daily)",
+  "worktree-cleanup": "Worktree cleanup (every 6 h)",
+  "daily-review": "Daily review of Archon runs (daily)",
   "build-queue": "SDLC pack build queue (every 30 min)",
   "merge-queue": "SDLC pack merge queue (every 30 min)",
   discoveries: "SDLC pack discoveries (every 4 h)",
-  "worktree-cleanup": "Worktree cleanup (every 6 h)",
 };
 
 function parseInputs(text) {
