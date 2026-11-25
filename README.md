@@ -4,11 +4,65 @@
   <img src="docs/assets/beehaive-logo.png" alt="BeeHAIve logo" width="360">
 </p>
 
-BeeHAIve is a local, read-only dashboard for the Claude Code sessions you run
-from the desktop app or the CLI. The left column lists the sessions that are
-working now, each with the request or stage it is on, how long that has run,
-and one line per live subagent saying what it is doing. Below them is a short
-list of recent sessions.
+BeeHAIve is a local console for the agent work on this machine. It has two
+pages:
+
+- **The Archon console** (`/`) shows and drives the runs of a local
+  [Archon](https://archon.diy) install: every run, what each one is waiting
+  on, launching a workflow, and the trigger bindings and schedules that
+  Archon's own web UI does not expose.
+- **Claude Code sessions** (`/sessions`) is a read-only view of the Claude
+  Code sessions you run from the desktop app or the CLI.
+
+## The Archon console
+
+It covers what Archon's own console does for runs, plus what Archon offers only
+on the command line:
+
+- **Runs**: every run across every project, filtered by status, project and
+  text, updated live from Archon's event stream.
+- **Run detail**: nodes, events, cost, artifacts, the run's result, and Cancel,
+  Abandon or Resume. A paused run shows its question with the answer form or
+  the gate's decisions.
+- **Attention**: every run paused on a person, the same queue as
+  `archon workflow attention --all`, answerable in place.
+- **Launch**: pick a project and a workflow, fill its declared inputs, start it.
+- **Projects**: the projects Archon knows, with links to launch or schedule.
+- **Triggers**: the binding files in `~/.archon/triggers/` that
+  `archon trigger fire` reads, a form that writes a new one (with presets for
+  the SDLC pack's build queue, merge queue, discoveries and worktree cleanup),
+  Fire now, the recent trigger receipts, and on Windows a Task Scheduler task
+  per binding that fires it on its interval. Archon installs schedules itself
+  only on macOS.
+
+Chat, the workflow builder, settings, metrics and adding projects are still in
+Archon's own console. The top bar links to it.
+
+How it talks to Archon:
+
+- `/archon/api/*` is passed through to Archon's server unchanged, event
+  streams included, so the page needs only one origin.
+- `/api/archon/*` is what BeeHAIve adds. Each route runs the Archon CLI with a
+  fixed argument list, or reads and writes binding files. A name from the
+  browser is checked before it becomes a file name or an argument.
+- Every request must name this machine in its Host header, and a request that
+  changes something must carry the `X-BeeHAIve` header. Another website
+  therefore cannot use your browser to start, answer or cancel a run.
+
+Archon's server listens on all interfaces with no sign-in by default. BeeHAIve
+does not change that. Set Archon's own bind address if other machines can
+reach yours.
+
+A page is a module in `beehaiive/web/console/views/` listed in
+`console/main.js`. It exports `{ id, title, nav, match, mount }`; `mount` gets
+the API client and the live feed, and returns a cleanup function. Rules that
+need no DOM go in `console/model.js`, which `node --test` covers.
+
+## Claude Code sessions
+
+The left column lists the sessions that are working now, each with the request
+or stage it is on, how long that has run, and one line per live subagent saying
+what it is doing. Below them is a short list of recent sessions.
 
 Selecting a session shows what it did at the level you would describe it, not
 tool call by tool call:
@@ -28,16 +82,16 @@ tool call by tool call:
 Clicking a stage or subagent opens its result, its stop reason, its own
 subagents and, folded away, every tool call it made.
 
-BeeHAIve never starts, stops or steers an agent, and never writes to git or
-GitHub. You keep working in Claude Code; BeeHAIve only reads what Claude Code
-writes to disk.
+This page never starts, stops or steers a Claude Code session, and never
+writes to git or GitHub. It only reads what Claude Code writes to disk.
 
 ## Setup
 
-Use Python 3.13 and `uv`. The GitHub CLI (`gh`), signed in, is optional. For a
-goal-sdlc session it reads, over the REST API every five minutes, which issues
-and pull requests are still open and which of the owner's open Projects is
-named after the repository.
+Use Python 3.13 and `uv`. A local Archon install is needed for the console;
+without one its pages say Archon did not answer. The GitHub CLI (`gh`), signed
+in, is optional. For a goal-sdlc session it reads, over the REST API every five
+minutes, which issues and pull requests are still open and which of the
+owner's open Projects is named after the repository.
 
 ```powershell
 git clone https://github.com/TychoHenzen/BeeHAIve.git
@@ -57,8 +111,18 @@ the environment, which wins over `.env`:
   `~/.claude/projects`.
 - `BEEHAIIVE_LOOKBACK_HOURS`: how far back to show sessions, by default 24.
 - `BEEHAIIVE_PORT`: by default 8000.
+- `BEEHAIIVE_ARCHON_HOME`: Archon's home folder. By default `ARCHON_HOME`,
+  then `~/.archon`.
+- `BEEHAIIVE_ARCHON_URL`: Archon's server. By default
+  `http://127.0.0.1:<port>`, with the port from `server.json` in Archon's
+  home, or 3090.
+- `BEEHAIIVE_ARCHON_BIN`: the `archon` program. By default the `binary` named
+  in `install.json` in Archon's home.
 
-## How it works
+Scheduled tasks run `archon` with its default home, so keep the default home
+if you schedule bindings; the Triggers page warns when it is not.
+
+## How the sessions page works
 
 Claude Code writes each session to
 `~/.claude/projects/<project>/<session-id>.jsonl`, and each subagent to a

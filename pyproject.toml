@@ -1,10 +1,11 @@
 [project]
 name = "beehaiive"
 version = "0.1.0"
-description = "A local dashboard for Claude Code sessions and their subagents."
+description = "A local console for Archon runs, triggers and Claude Code sessions."
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "fastapi==0.162.0",
+    "httpx2==2.16.0",
     "uvicorn==0.54.0",
 ]
 
@@ -13,7 +14,6 @@ beehaiive = "beehaiive.__main__:main"
 
 [dependency-groups]
 dev = [
-    "httpx2==2.16.0",
     "pip-audit==2.10.1",
     "pyright==1.1.414",
     "pytest==9.2.0",

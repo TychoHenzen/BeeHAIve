@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>BeeHAIve</title>
+    <link rel="stylesheet" href="/web/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <h1>BeeHAIve</h1>
+      <span class="subtitle muted">Claude Code sessions on this machine</span>
+      <span id="refresh-state" class="muted" role="status"></span>
+      <a class="small" href="/">Archon console</a>
+    </header>
+    <main class="layout">
+      <nav class="sessions" aria-label="Sessions">
+        <h2>Running now</h2>
+        <ul id="running-list" class="session-list"></ul>
+        <p id="running-empty" class="muted small" hidden>No session is working right now.</p>
+        <h2>Recent</h2>
+        <ul id="recent-list" class="recent-list"></ul>
+      </nav>
+      <section id="detail" class="detail" aria-label="Session detail">
+        <p class="muted">Pick a session on the left.</p>
+      </section>
+    </main>
+    <script type="module" src="/web/app.js"></script>
+  </body>
+</html>
