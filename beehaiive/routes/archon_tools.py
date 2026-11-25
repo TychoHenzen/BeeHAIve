@@ -7,6 +7,7 @@ reads and writes binding files and runs fixed `archon trigger` commands here.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import cast
@@ -26,6 +27,7 @@ from ..archon.triggers import (
 )
 
 router = APIRouter(prefix="/api/archon")
+logger = logging.getLogger(__name__)
 
 RECEIPT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_:.-]{0,127}")
 FIRE_TIMEOUT = 300.0
@@ -89,9 +91,13 @@ def _scheduler(request: Request) -> Scheduler:
     return cast(Scheduler, request.app.state.scheduler)
 
 
-def _failed(error: Exception, status: int = 502) -> JSONResponse:
+def _failed(
+    error: BindingError | ArchonCliError | KeyError, status: int = 502
+) -> JSONResponse:
+    # A reply carries only BeeHAIve's own sentences and what a command printed,
+    # never the text of an exception from Python or a library.
+    message = "No such binding." if isinstance(error, KeyError) else error.message
     detail = error.detail if isinstance(error, ArchonCliError) else ""
-    message = str(error) if not isinstance(error, KeyError) else "No such binding."
     return JSONResponse({"error": message, "detail": detail}, status_code=status)
 
 
@@ -175,7 +181,7 @@ def update_binding(
                 {
                     "error": "The binding is saved, but its Windows task still "
                     "runs on the old schedule. Unschedule and schedule it again.",
-                    "detail": error.detail or str(error),
+                    "detail": error.detail or error.message,
                 },
                 status_code=502,
             )
@@ -200,8 +206,12 @@ def delete_binding(name: str, request: Request) -> dict[str, object] | JSONRespo
         return _failed(error, 404)
     except ArchonCliError as error:
         return _failed(error)
-    except OSError as error:
-        return _failed(error, 500)
+    except OSError:
+        logger.exception("A binding file could not be deleted.")
+        return JSONResponse(
+            {"error": "The binding file could not be deleted. BeeHAIve's log has why."},
+            status_code=500,
+        )
     return {"deleted": True, "unscheduled": scheduled}
 
 

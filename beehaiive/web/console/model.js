@@ -54,6 +54,21 @@ export function needsPerson(attention) {
   return PERSON_KINDS.has(attention?.kind);
 }
 
+// Names one pause, so a refresh keeps a half-typed answer only while the run
+// still waits at that pause. An approval gate carries no occurrence, so two
+// gates in a row differ only by their node and pause. `approval` is the run's
+// metadata.approval when the caller has it.
+export function pauseKey(attention, approval = null) {
+  if (!needsPerson(attention)) return null;
+  return JSON.stringify([
+    attention.kind,
+    attention.occurrence ?? null,
+    attention.node ?? approval?.nodeId ?? null,
+    approval?.pauseId ?? attention.pausedAt ?? null,
+    attention.calls?.length ?? null,
+  ]);
+}
+
 export function attentionText(attention) {
   if (!attention) return "";
   switch (attention.kind) {

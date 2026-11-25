@@ -78,4 +78,16 @@ def test_archon_being_down_is_a_502(tmp_path: Path) -> None:
     answer = harness.client.get("/archon/api/health")
 
     assert answer.status_code == 502
-    assert answer.json()["error"] == "Archon's server did not answer."
+    assert answer.json() == {
+        "error": "Archon's server did not answer. BeeHAIve's log has why."
+    }
+
+
+def test_an_escaped_artifact_name_reaches_archon_escaped(tmp_path: Path) -> None:
+    harness = archon_harness(tmp_path, lambda _request: httpx2.Response(200))
+
+    harness.client.get("/archon/api/artifacts/r1/notes/report%231%3F.md")
+
+    # `.path` is decoded, so only the raw path shows the "#" and "?" kept.
+    sent = harness.seen[0].url.raw_path
+    assert sent == b"/api/artifacts/r1/notes/report%231%3F.md"

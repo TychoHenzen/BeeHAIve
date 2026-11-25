@@ -101,18 +101,24 @@ export default {
 
     async function pickProject(id) {
       state.project = state.projects.find((p) => p.id === id) ?? state.projects[0] ?? null;
+      // The old project's list goes too, so typing in the filter cannot offer
+      // its workflows while the new list loads.
+      state.workflows = [];
       state.workflow = null;
       replace(workflowList, notice("Loading workflows..."));
       renderForm();
-      if (!state.project) return;
+      const project = state.project;
+      if (!project) return;
       try {
-        const listing = await ctx.api.workflows(state.project.default_cwd);
+        const listing = await ctx.api.workflows(project.default_cwd);
+        // The person may have picked another project while this was loading.
+        if (state.project !== project) return;
         state.workflows = (listing.workflows ?? []).map((entry) => entry.workflow).sort((a, b) => a.name.localeCompare(b.name));
         if (params.workflow) state.workflow = state.workflows.find((w) => w.name === params.workflow) ?? null;
         renderWorkflows();
         renderForm();
       } catch (error) {
-        replace(workflowList, notice(error.message, "error"));
+        if (state.project === project) replace(workflowList, notice(error.message, "error"));
       }
     }
 

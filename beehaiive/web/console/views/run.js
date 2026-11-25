@@ -3,7 +3,7 @@
 import { activityPanel } from "../activity-panel.js";
 import { attentionPanel } from "../attention-panel.js";
 import { actionButton, ago, badge, el, notice, replace, runDuration, section } from "../dom.js";
-import { agentNodes, eventLine, isLive, needsPerson, runActions, toIso } from "../model.js";
+import { agentNodes, eventLine, isLive, pauseKey, runActions, toIso } from "../model.js";
 
 const ACTION_LABELS = { cancel: "Cancel", resume: "Resume", abandon: "Abandon" };
 const ACTION_QUESTIONS = {
@@ -121,7 +121,8 @@ export default {
     const head = el("div", { class: "page-head" });
     const body = el("div", { class: "run-body" });
     replace(root, el("p", {}, el("a", { href: "#/runs" }, "All runs")), head, body);
-    let files = null;
+    let files = [];
+    let filesFinal = false;
     let projectNames = null;
     let attentionKey = null;
     let attentionNode = null;
@@ -131,7 +132,16 @@ export default {
       try {
         const detail = await ctx.api.run(id);
         const run = detail.run;
-        if (files === null) files = (await ctx.api.artifacts(id).catch(() => ({ files: [] }))).files ?? [];
+        // A live run adds files as it goes, so the listing is read on every
+        // refresh while it runs and once more after it ends. A failed read
+        // keeps the last listing and is tried again on the next refresh.
+        if (isLive(run) || !filesFinal) {
+          const listing = await ctx.api.artifacts(id).catch(() => null);
+          if (listing) {
+            files = listing.files ?? [];
+            filesFinal = !isLive(run);
+          }
+        }
         // The run detail names its project only by id.
         if (projectNames === null) {
           const projects = await ctx.api.projects().catch(() => []);
@@ -155,7 +165,7 @@ export default {
         );
         // Keep the same panel while the pause is the same one, so a refresh does
         // not wipe an answer that is half typed.
-        const key = needsPerson(run.attention) ? JSON.stringify([run.attention.kind, run.attention.occurrence ?? run.attention.calls?.length]) : null;
+        const key = pauseKey(run.attention, run.metadata?.approval);
         if (key !== attentionKey) {
           attentionKey = key;
           attentionNode = key

@@ -30,7 +30,11 @@ SCRIPT = Path(__file__).resolve().parent / "schedule.ps1"
 
 
 class BindingError(ValueError):
-    pass
+    """A binding the person has to fix. `message` is written for them."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
 
 
 def check_name(name: str) -> str:

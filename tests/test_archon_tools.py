@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from beehaiive.archon.cli import ArchonCliError, CliResult
 from tests.archon_fakes import ACTION, ArchonHarness, archon_harness, printed
 
@@ -236,6 +238,27 @@ def test_a_binding_whose_task_will_not_go_stays(tmp_path: Path) -> None:
     assert answer.status_code == 502
     assert answer.json()["detail"] == "Access denied"
     assert (harness.home / BINDING_FILE).is_file()
+
+
+def test_a_file_that_will_not_delete_is_logged_not_echoed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    harness = archon_harness(tmp_path, platform="linux")
+    harness.client.post(
+        "/api/archon/triggers/bindings", json=form(tmp_path), headers=ACTION
+    )
+
+    def refuse(_path: Path, missing_ok: bool = False) -> None:
+        raise PermissionError(13, "Access is denied", "C:/hidden/binding.json")
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+    answer = harness.client.delete(BINDING, headers=ACTION)
+
+    assert answer.status_code == 500
+    assert answer.json() == {
+        "error": "The binding file could not be deleted. BeeHAIve's log has why."
+    }
+    assert "hidden" in caplog.text
 
 
 def test_deleting_a_missing_or_misnamed_binding_is_a_404(tmp_path: Path) -> None:

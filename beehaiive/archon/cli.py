@@ -36,8 +36,12 @@ Runner = Callable[[Sequence[str], Path | None, float], CliResult]
 
 
 class ArchonCliError(RuntimeError):
+    """A command that failed. `message` is written for the person, and `detail`
+    is what the command printed. Neither holds an exception's own text."""
+
     def __init__(self, message: str, detail: str = "") -> None:
         super().__init__(message)
+        self.message = message
         self.detail = detail
 
 
@@ -57,7 +61,7 @@ def run_process(args: Sequence[str], cwd: Path | None, timeout: float) -> CliRes
             check=False,
         )
     except FileNotFoundError as error:
-        raise ArchonCliError(f"{args[0]} was not found.", str(error)) from error
+        raise ArchonCliError(f"{args[0]} was not found.") from error
     except subprocess.TimeoutExpired as error:
         raise ArchonCliError(
             f"{Path(args[0]).name} did not finish in {timeout:.0f}s."

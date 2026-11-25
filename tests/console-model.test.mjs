@@ -19,6 +19,7 @@ import {
   mergeActivity,
   missingRequiredInputs,
   needsPerson,
+  pauseKey,
   presetBinding,
   repoFromUrl,
   runActions,
@@ -63,6 +64,20 @@ test("runActions mirrors what the CLI allows", () => {
   }
   assert.deepEqual(runActions({ status: "failed" }), ["resume"]);
   assert.deepEqual(runActions({ status: "completed" }), []);
+});
+
+test("a pause key changes from one approval gate to the next", () => {
+  const gate = { kind: "awaiting_response" };
+  const first = pauseKey(gate, { nodeId: "review", pauseId: "p1" });
+  // The same gate, refreshed, keeps its key, so a half-typed answer survives.
+  assert.equal(pauseKey({ ...gate }, { nodeId: "review", pauseId: "p1" }), first);
+  assert.notEqual(pauseKey(gate, { nodeId: "approve", pauseId: "p2" }), first);
+  assert.notEqual(pauseKey(gate, { nodeId: "review", pauseId: "p3" }), first);
+  // A queue item has no approval metadata, so its node and pause time tell gates apart.
+  const queued = (node, pausedAt) => pauseKey({ ...gate, node, pausedAt });
+  assert.equal(queued("review", "t1"), queued("review", "t1"));
+  assert.notEqual(queued("review", "t1"), queued("approve", "t2"));
+  assert.equal(pauseKey({ kind: "usage_limit" }), null);
 });
 
 test("only some pauses need a person, and each has a sentence", () => {

@@ -1,6 +1,7 @@
 // Every paused run across the install that is waiting on a person.
 import { attentionPanel } from "../attention-panel.js";
 import { ago, el, notice, replace, short } from "../dom.js";
+import { pauseKey } from "../model.js";
 
 export default {
   id: "attention",
@@ -25,7 +26,7 @@ export default {
         const degraded = queue.degraded ?? [];
         const next = new Map();
         for (const item of items) {
-          const key = JSON.stringify([item.runId, item.occurrence ?? item.kind]);
+          const key = JSON.stringify([item.runId, pauseKey(item)]);
           next.set(key, cards.get(key) ?? card(item));
         }
         cards = next;

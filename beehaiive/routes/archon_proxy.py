@@ -7,14 +7,17 @@ reinterpret runs, it only adds what the API lacks (see archon_tools).
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from typing import cast
+from urllib.parse import quote
 
 import httpx2
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 REQUEST_HEADERS = ("accept", "content-type", "last-event-id")
 RESPONSE_HEADERS = ("cache-control", "content-disposition", "content-type")
@@ -42,9 +45,11 @@ async def _relay(upstream: httpx2.Response) -> AsyncIterator[bytes]:
 )
 async def forward(path: str, request: Request) -> Response:
     streaming = path.startswith("stream/") or path.endswith("/stream")
+    # FastAPI hands over the path decoded. Encoding it again keeps an escaped
+    # "#", "?" or "%" in an artifact name from reading as URL syntax upstream.
     upstream_request = _client(request).build_request(
         request.method,
-        f"/api/{path}",
+        f"/api/{quote(path, safe='/')}",
         params=request.url.query,
         headers={k: v for k in REQUEST_HEADERS if (v := request.headers.get(k))},
         content=await request.body() or None,
@@ -52,9 +57,11 @@ async def forward(path: str, request: Request) -> Response:
     )
     try:
         upstream = await _client(request).send(upstream_request, stream=True)
-    except httpx2.HTTPError as error:
+    except httpx2.HTTPError:
+        # The library's own error text goes to BeeHAIve's log, not the reply.
+        logger.warning("Archon's server did not answer.", exc_info=True)
         return JSONResponse(
-            {"error": "Archon's server did not answer.", "detail": str(error)},
+            {"error": "Archon's server did not answer. BeeHAIve's log has why."},
             status_code=502,
         )
     headers = {k: v for k in RESPONSE_HEADERS if (v := upstream.headers.get(k))}
