@@ -8,12 +8,13 @@ import { api, liveFeed } from "./api.js";
 import { el, replace } from "./dom.js";
 import attention from "./views/attention.js";
 import launch from "./views/launch.js";
+import pipeline from "./views/pipeline.js";
 import projects from "./views/projects.js";
 import run from "./views/run.js";
 import runs from "./views/runs.js";
 import triggers from "./views/triggers.js";
 
-const VIEWS = [runs, attention, launch, projects, triggers, run];
+const VIEWS = [runs, attention, pipeline, launch, projects, triggers, run];
 const HOME = "/runs";
 
 const root = document.getElementById("view");

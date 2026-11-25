@@ -11,6 +11,7 @@ from starlette.responses import Response
 from starlette.types import Scope
 
 from .archon.cli import ArchonCli
+from .archon.pipeline import PipelineReader
 from .archon.triggers import Scheduler, TriggerStore
 from .config import CoreConfig
 from .guard import LocalRequestGuard
@@ -35,6 +36,7 @@ def create_app(
     archon_http: httpx2.AsyncClient | None = None,
     archon_cli: ArchonCli | None = None,
     scheduler: Scheduler | None = None,
+    pipeline: PipelineReader | None = None,
 ) -> FastAPI:
     config = config or CoreConfig.from_environment()
     session_index = index or SessionIndex(
@@ -59,6 +61,7 @@ def create_app(
     app.state.archon_cli = archon_cli or ArchonCli(archon.binary)
     app.state.trigger_store = TriggerStore(archon.triggers_dir)
     app.state.scheduler = scheduler or Scheduler(archon.binary)
+    app.state.pipeline = pipeline or PipelineReader(archon.home)
     app.add_middleware(LocalRequestGuard)
     for router in ROUTERS:
         app.include_router(router)

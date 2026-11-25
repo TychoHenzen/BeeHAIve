@@ -429,3 +429,45 @@ export function activityEntries(records) {
   }
   return attempts.size > 1 ? entries : entries.filter((entry) => entry.kind !== "attempt");
 }
+
+// The Pipeline page reads archon-home's ledger (/api/archon/pipeline): each
+// open issue is stuck, asking, working or queued, and each queue can run or
+// cannot. Stuck issues with the same cause share one entry, so a queue that
+// cannot run reads as one problem instead of thirty.
+
+const COUNT_ORDER = ["stuck", "asking", "working", "queued", "done"];
+const QUEUE_PROBLEMS = new Set(["missing", "blocked", "silent", "stalled"]);
+
+export function pipelineCounts(counts) {
+  const parts = COUNT_ORDER.filter((state) => (counts?.[state] ?? 0) > 0).map((state) => `${counts[state]} ${state}`);
+  return parts.length ? parts.join(", ") : "No open issues.";
+}
+
+export function queueProblems(queues) {
+  return (queues ?? []).filter((queue) => QUEUE_PROBLEMS.has(queue.state));
+}
+
+// Stuck rows grouped by their exact reason, the largest group first.
+export function stuckGroups(issues) {
+  const groups = new Map();
+  for (const row of issues ?? []) {
+    if (row.state !== "stuck") continue;
+    const group = groups.get(row.detail) ?? { detail: row.detail, rows: [] };
+    group.rows.push(row);
+    groups.set(row.detail, group);
+  }
+  return [...groups.values()].sort((a, b) => b.rows.length - a.rows.length || a.rows[0].issue - b.rows[0].issue);
+}
+
+export function githubUrl(repository, kind, number) {
+  return `https://github.com/${repository}/${kind === "pull" ? "pull" : "issues"}/${number}`;
+}
+
+// A long reason's opening, cut at a word, or null when it is short enough to
+// show whole. Park reasons can hold a whole stack trace.
+export function reasonHead(text, limit = 280) {
+  const flat = String(text ?? "");
+  if (flat.length <= limit) return null;
+  const cut = flat.lastIndexOf(" ", limit);
+  return `${flat.slice(0, cut > limit / 2 ? cut : limit)}...`;
+}
