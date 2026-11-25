@@ -3,7 +3,7 @@
 // installs schedules on macOS, so here each binding can get a Windows Task
 // Scheduler task named Archon-<binding> that fires it on its interval.
 import { actionButton, ago, el, notice, replace, section } from "../dom.js";
-import { BINDING_PRESETS, formatInterval, joinPath, presetBinding } from "../model.js";
+import { BINDING_PRESETS, fireSummary, formatInterval, joinPath, presetBinding } from "../model.js";
 
 const SELF_INPUT = { "build-queue": "build_queue_binding", "merge-queue": "merge_queue_binding" };
 const PRESET_LABELS = {
@@ -84,7 +84,7 @@ function settingFields() {
       label("Resource", fields.resource, "Runs that share a resource share its capacity."),
       label("Every (minutes)", fields.minutes),
       label("Overlap", fields.overlap, "skip drops a start while the resource is full; queue waits for a slot."),
-      label("Capacity", fields.capacity, "How many runs on this resource may run at once."),
+      label("Capacity", fields.capacity, "How many runs on this resource may run at once. Archon fixes it the first time the resource runs."),
       label("Isolation", fields.isolation, "worktree gives each run its own checkout; default uses the project's setting."),
       label("Host id", fields.hostId, "Names this machine to archon trigger drain."),
       label("Inputs", fields.inputs, "One name=value per line."),
@@ -98,8 +98,10 @@ export default {
   nav: true,
   match: (path) => (path === "/triggers" ? {} : null),
   mount(root, params, ctx) {
-    // saved: the binding an edit just saved, so its reloaded card can say so.
-    const state = { directory: "", bindings: [], tasks: new Map(), scheduling: true, identity: null, projects: [], defaultHome: true, saved: null };
+    // saved: the binding a save just wrote, so its reloaded card can say so.
+    // fireSlots: each card's place for how its newest fire went, by binding name.
+    const state = { directory: "", bindings: [], tasks: new Map(), scheduling: true, identity: null, projects: [], defaultHome: true, saved: null, fireSlots: new Map() };
+    const healthNote = el("div", {});
     const bindingList = el("div", {});
     const formSlot = el("div", {});
     const receiptList = el("div", {});
@@ -116,7 +118,7 @@ export default {
           "On Windows a scheduled task named Archon-<binding> fires it on its interval.",
         ),
       ),
-      section("Bindings", bindingList),
+      section("Bindings", healthNote, bindingList),
       section("New binding", formSlot),
       section("Recent trigger receipts", receiptList),
     );
@@ -154,8 +156,8 @@ export default {
       const save = actionButton(
         "Save changes",
         async () => {
-          const { rescheduled } = await ctx.api.updateBinding(binding.name, settings.read());
-          state.saved = { name: binding.name, rescheduled };
+          const { rescheduled, warning } = await ctx.api.updateBinding(binding.name, settings.read());
+          state.saved = { name: binding.name, rescheduled, warning };
           await loadBindings();
         },
         { tone: "primary" },
@@ -188,15 +190,42 @@ export default {
       );
     }
 
+    // A save Archon may still refuse comes with a warning, shown until the next reload.
     function savedNotice(binding) {
       if (state.saved?.name !== binding.name) return null;
-      const { rescheduled } = state.saved;
+      const { rescheduled, warning } = state.saved;
       state.saved = null;
-      return notice(rescheduled ? `Saved. Its Windows task now fires ${formatInterval(binding.intervalSeconds)}.` : "Saved.");
+      return [
+        notice(rescheduled ? `Saved. Its Windows task now fires ${formatInterval(binding.intervalSeconds)}.` : "Saved."),
+        warning ? notice(warning, "error") : null,
+      ];
+    }
+
+    function fireNotice(health) {
+      const summary = fireSummary(health);
+      if (!summary) return null;
+      const lead = summary.lead ? [summary.lead, health.receivedAt ? [" ", ago(health.receivedAt)] : null, ": "] : null;
+      return el("p", { class: `notice ${summary.tone}` }, lead, summary.detail);
+    }
+
+    // Each receipt takes Archon about a second to read, so the cards show first
+    // and fill in how their last fire went when that arrives.
+    async function loadHealth() {
+      const slots = state.fireSlots;
+      try {
+        const { bindings } = await ctx.api.triggerHealth();
+        if (state.fireSlots !== slots) return;
+        replace(healthNote);
+        for (const [name, slot] of slots) replace(slot, fireNotice(bindings?.[name]));
+      } catch (error) {
+        if (state.fireSlots === slots) replace(healthNote, notice(`How the last fires went is unknown: ${error.message}`, "error"));
+      }
     }
 
     function bindingCard(binding) {
       const output = el("div", {});
+      const fired = el("div", {});
+      state.fireSlots.set(binding.name, fired);
       const body = el("div", {}, binding.error ? notice(binding.error, "error") : facts(binding));
       const edit = binding.error
         ? null
@@ -224,6 +253,7 @@ export default {
           el("span", { class: "muted small" }, formatInterval(binding.intervalSeconds)),
         ),
         savedNotice(binding),
+        fired,
         body,
         el(
           "div",
@@ -236,6 +266,7 @@ export default {
               const result = await ctx.api.fire(binding.name);
               replace(output, el("pre", { class: `inline ${result.ok ? "" : "error"}` }, result.output || (result.ok ? "Fired." : `Exit ${result.code}`)));
               loadReceipts();
+              loadHealth();
             },
             { confirm: `Fire ${binding.name} now? It starts ${binding.workflow} the same way its schedule would.` },
           ),
@@ -257,12 +288,14 @@ export default {
         state.defaultHome = listing.defaultHome !== false;
         state.scheduling = schedules.supported !== false;
         state.tasks = new Map((schedules.tasks ?? []).map((t) => [t.name, t]));
+        state.fireSlots = new Map();
         replace(
           bindingList,
           schedules.error ? notice(`Task Scheduler: ${schedules.error.message}`, "error") : null,
           state.defaultHome ? null : notice("ARCHON_HOME is not the default. Scheduled tasks run archon with the default home.", "error"),
           state.bindings.length ? state.bindings.map(bindingCard) : notice(`No bindings yet. They live in ${state.directory}.`),
         );
+        if (state.bindings.length) loadHealth();
       } catch (error) {
         replace(bindingList, notice(error.message, "error"));
       }
@@ -342,7 +375,8 @@ export default {
         "Save binding",
         async () => {
           if (!state.identity?.runAsUserId) throw new Error("archon trigger whoami did not give a user id.");
-          await ctx.api.createBinding({ ...settings.read(), name: fields.name.value, runAsUserId: state.identity.runAsUserId });
+          const { binding, warning } = await ctx.api.createBinding({ ...settings.read(), name: fields.name.value, runAsUserId: state.identity.runAsUserId });
+          state.saved = { name: binding.name, rescheduled: false, warning };
           await loadBindings();
         },
         { tone: "primary" },

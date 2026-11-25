@@ -12,6 +12,7 @@ import {
   collectSuppliedInputs,
   eventLine,
   expectedGate,
+  fireSummary,
   formatInterval,
   githubUrl,
   gateDecisions,
@@ -223,6 +224,18 @@ test("each pbi queue preset gets its own resource, one run at a time and no inpu
     assert.equal(binding.cwd, "C:\\src\\cc");
     assert.deepEqual(binding.inputs, {});
   }
+});
+
+test("fireSummary makes a refused fire the card's error and leaves the rest quiet", () => {
+  const stuck = { state: "stuck", detail: "Archon holds r at capacity 1.", receivedAt: "2026-11-25T18:58:30.267Z" };
+  assert.deepEqual(fireSummary(stuck), { tone: "error", lead: "Stuck: Archon refused its last fire", detail: "Archon holds r at capacity 1." });
+  assert.deepEqual(fireSummary({ state: "ok", detail: "Archon started its workflow.", receivedAt: "2026-11-25T18:58:30.267Z" }), {
+    tone: "muted",
+    lead: "Last fire",
+    detail: "Archon started its workflow.",
+  });
+  assert.deepEqual(fireSummary({ state: "quiet", detail: "No recent fire." }), { tone: "muted", lead: "", detail: "No recent fire." });
+  assert.equal(fireSummary(undefined), null);
 });
 
 test("formatInterval picks the largest whole unit", () => {
