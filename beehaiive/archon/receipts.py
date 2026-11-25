@@ -36,7 +36,9 @@ INSPECT_WORKERS = 4
 
 PLAIN_ERRORS = {
     "run_as_user_failed": "The Archon user this binding runs as no longer exists.",
-    "run_configuration_failed": "Archon could not read this binding's run configuration.",
+    "run_configuration_failed": (
+        "Archon could not read this binding's run configuration."
+    ),
     "launch_preparation_failed": "Archon could not prepare the workflow launch.",
 }
 STARTED = {
@@ -312,7 +314,10 @@ def binding_health(
             health[name] = {"state": "quiet", "detail": "No recent fire."}
             continue
         if found.status == "rejected":
-            sharing = {name, *(str(b.get("name")) for b in _users(found.resource, bindings))}
+            sharing = {
+                name,
+                *(str(b.get("name")) for b in _users(found.resource, bindings)),
+            }
             state, detail = "stuck", _stuck_reason(reader, found, sharing, receipts)
         elif found.status == "complete":
             state = "ok"

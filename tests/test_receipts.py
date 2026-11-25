@@ -10,7 +10,13 @@ from pathlib import Path
 from beehaiive.archon.cli import ArchonCli, CliResult
 from beehaiive.archon.receipts import MAX_INSPECTS, ReceiptReader, lookback
 from beehaiive.records import Record, dig
-from tests.archon_fakes import ACTION, ArchonHarness, FakeRunner, archon_harness, printed
+from tests.archon_fakes import (
+    ACTION,
+    ArchonHarness,
+    FakeRunner,
+    archon_harness,
+    printed,
+)
 
 NAME = "repo-pbi-build-queue"
 RESOURCE = "pbi:github.com/o/repo:build"
@@ -208,7 +214,9 @@ def test_a_listing_archon_marks_failed_is_not_read_as_no_fires(tmp_path: Path) -
 
 def test_fires_that_prove_nothing_leave_a_warning(tmp_path: Path) -> None:
     harness = with_build_binding(tmp_path)
-    script(harness.runner, [refused(0, 1), fire(1, 1, status="preparing", request=None)])
+    script(
+        harness.runner, [refused(0, 1), fire(1, 1, status="preparing", request=None)]
+    )
 
     edited = harness.client.put(
         f"{BINDINGS}/{NAME}", json=edit_form(tmp_path, capacity=2), headers=ACTION
@@ -281,7 +289,13 @@ def test_health_says_which_bindings_archon_refuses_and_why(tmp_path: Path) -> No
         assert made.status_code == 200
     fires = [
         refused(0, 3),
-        fire(1, 1, source="repo-pbi-merge-queue", resource="pbi:repo-pbi-merge-queue", request="skipped"),
+        fire(
+            1,
+            1,
+            source="repo-pbi-merge-queue",
+            resource="pbi:repo-pbi-merge-queue",
+            request="skipped",
+        ),
         refused(2, 3),
         fire(3, 1),
     ]
@@ -311,13 +325,18 @@ def test_health_says_which_bindings_archon_refuses_and_why(tmp_path: Path) -> No
 
 def test_health_names_other_refusals_in_plain_words(tmp_path: Path) -> None:
     harness = with_build_binding(tmp_path)
-    row, document = fire(0, 1, status="rejected", request=None, error="run_as_user_failed")
+    row, document = fire(
+        0, 1, status="rejected", request=None, error="run_as_user_failed"
+    )
     script(harness.runner, [(row, document)])
 
     health = harness.client.get("/api/archon/triggers/health").json()["bindings"]
 
     assert health[NAME]["state"] == "stuck"
-    assert health[NAME]["detail"] == "The Archon user this binding runs as no longer exists."
+    assert (
+        health[NAME]["detail"]
+        == "The Archon user this binding runs as no longer exists."
+    )
 
 
 def test_health_is_a_502_when_archon_cannot_list_its_fires(tmp_path: Path) -> None:
