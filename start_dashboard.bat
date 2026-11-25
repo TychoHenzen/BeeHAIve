@@ -32,22 +32,12 @@ if defined PORT_PID (
     exit /b 1
 )
 
-set "SERVER_PID="
-for /f "tokens=*" %%P in ('powershell -NoProfile -Command "$p = Start-Process -FilePath uv -ArgumentList @('run','python','-m','beehaiive') -WorkingDirectory '%CD%' -NoNewWindow -PassThru; $p.Id"') do set "SERVER_PID=%%P"
-if not defined SERVER_PID (
-    echo BeeHAIve could not start.
-    pause
-    exit /b 1
-)
-echo BeeHAIve is running at http://127.0.0.1:%PORT%/ (PID %SERVER_PID%).
-
-:wait_for_server
-timeout /t 2 /nobreak >nul
-tasklist /FI "PID eq %SERVER_PID%" | findstr /R /C:"%SERVER_PID%" >nul
-if not errorlevel 1 goto wait_for_server
-set "EXIT_CODE=0"
-
-:cleanup
-if defined SERVER_PID taskkill /PID %SERVER_PID% /T /F >nul 2>&1
+rem The server runs in the foreground as this script's child, so whatever
+rem stops the launcher (Ctrl+C, closing its window, Stop in an IDE) stops the
+rem server with it. Archon's runs are not in this process tree: Archon's own
+rem server and its scheduled tasks run them.
+echo BeeHAIve is starting at http://127.0.0.1:%PORT%/
+uv run python -m beehaiive
+set "EXIT_CODE=%ERRORLEVEL%"
 if not "%EXIT_CODE%"=="0" pause
 exit /b %EXIT_CODE%
