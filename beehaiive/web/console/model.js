@@ -130,6 +130,90 @@ export function answerReady(attention, picked, text) {
   return false;
 }
 
+// The pbi workflows write every question to the owner in one shape: an
+// opening paragraph, more paragraphs, lettered choices one per line ("(a)
+// ...", "(b) ..."), and a sentence that recommends one. The attention page
+// shows the opening, folds the rest, and turns the choices into buttons.
+// ASSUMPTION: that shape is the workflow's contract (archon-home
+// resolve.md "Declare", ask.mjs REPLIES); a message off it gets no buttons.
+const CHOICE = /^\(([a-z])\)\s+(\S.*)$/u;
+const RECOMMENDS = /\brecommend\w*\b[^()\n]{0,40}\(([a-z])\)/iu;
+export const HEADLINE_LIMIT = 280;
+
+// The opening paragraph cut to a headline, at a sentence end when one falls
+// in the second half of the limit, else at a word. `rest` is what was cut.
+function headlineOf(paragraph) {
+  if (paragraph.length <= HEADLINE_LIMIT) return { head: paragraph, rest: "" };
+  const window = paragraph.slice(0, HEADLINE_LIMIT);
+  const sentence = Math.max(window.lastIndexOf(". "), window.lastIndexOf("? "));
+  if (sentence >= HEADLINE_LIMIT / 2) {
+    return { head: paragraph.slice(0, sentence + 1), rest: paragraph.slice(sentence + 2) };
+  }
+  const word = window.lastIndexOf(" ") > 0 ? window.lastIndexOf(" ") : HEADLINE_LIMIT;
+  return { head: `${paragraph.slice(0, word)} ...`, rest: `... ${paragraph.slice(word + 1)}` };
+}
+
+// {headline, more, choices: [{key, says, line}], recommended, why}. Choices
+// count only when they run a, b, c... in order, at least two of them; with
+// `lettered: false` (a form that declares its own options) none are read.
+export function questionParts(message, { lettered = true } = {}) {
+  const text = String(message ?? "").replace(/\r\n?/gu, "\n").trim();
+  const lines = text.split("\n");
+  const found = lines.map((line) => (lettered ? CHOICE.exec(line.trim()) : null));
+  const choices = found.filter(Boolean).map(([line, key, says]) => ({ key, says: says.trim(), line: line.trim() }));
+  const inOrder = choices.length >= 2 && choices.every((choice, at) => choice.key === String.fromCharCode(97 + at));
+  const kept = inOrder ? lines.filter((_, at) => !found[at]) : lines;
+  const paragraphs = kept.join("\n").split(/\n\s*\n/u).map((part) => part.trim()).filter(Boolean);
+  const keys = new Set(inOrder ? choices.map((choice) => choice.key) : []);
+  const recommending = paragraphs.findLastIndex((part) => keys.has(RECOMMENDS.exec(part)?.[1]?.toLowerCase()));
+  const body = paragraphs.filter((_, at) => at !== recommending || paragraphs.length === 1);
+  const { head, rest } = headlineOf(body[0] ?? "");
+  return {
+    headline: head,
+    more: [rest, ...body.slice(1)].filter(Boolean).join("\n\n"),
+    choices: inOrder ? choices : [],
+    recommended: recommending >= 0 ? RECOMMENDS.exec(paragraphs[recommending])[1].toLowerCase() : null,
+    why: recommending >= 0 && paragraphs.length > 1 ? paragraphs[recommending] : "",
+  };
+}
+
+// A choice that asks the owner to write something ("Reply with how ...") is
+// not a one-tap answer: the page sends them to the text box instead.
+const WRITES = /\b(?:reply|answer|say|tell|write|explain)\b[^."]*\b(?:how|what|which|why|with)\b/iu;
+export function writesAnswer(choice) {
+  return WRITES.test(choice.says);
+}
+
+// Questions that offer the same choices, up to issue and other numbers, are
+// one question asked several times, and the page answers them together. A
+// question with no choices, or not in the message form, is never grouped.
+export function questionGroupKey(item) {
+  if (item?.kind !== "attention" || item.form !== "message") return null;
+  const { choices } = questionParts(item.message);
+  if (choices.length === 0) return null;
+  const said = choices.map((choice) => choice.line.toLowerCase().replace(/#?\d+/gu, "#").replace(/\s+/gu, " "));
+  return JSON.stringify([item.project?.key ?? "", item.workflow ?? "", said]);
+}
+
+// The queue as groups of items that ask the same question, biggest first;
+// items that share nothing stay one to a group, in queue order.
+export function questionGroups(items) {
+  const groups = [];
+  const byKey = new Map();
+  for (const item of items) {
+    const key = questionGroupKey(item);
+    const group = key === null ? undefined : byKey.get(key);
+    if (group) group.items.push(item);
+    else {
+      const fresh = { key, items: [item] };
+      groups.push(fresh);
+      if (key !== null) byKey.set(key, fresh);
+    }
+  }
+  // Array.prototype.sort is stable, so equal sizes keep queue order.
+  return groups.sort((a, b) => b.items.length - a.items.length);
+}
+
 // Declared workflow inputs as a list, in declaration order.
 export function workflowInputs(workflow) {
   const inputs = workflow?.inputs;

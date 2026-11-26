@@ -13,6 +13,7 @@ import {
   eventLine,
   expectedGate,
   formatInterval,
+  HEADLINE_LIMIT,
   githubUrl,
   gateDecisions,
   isLive,
@@ -23,6 +24,9 @@ import {
   pauseKey,
   pipelineCounts,
   presetBinding,
+  questionGroupKey,
+  questionGroups,
+  questionParts,
   queueProblems,
   reasonHead,
   repoFromUrl,
@@ -34,6 +38,7 @@ import {
   toolDetail,
   toolOutput,
   workflowInputs,
+  writesAnswer,
 } from "../beehaiive/web/console/model.js";
 
 test("toIso reads Archon's zone-less times as UTC", () => {
@@ -373,4 +378,100 @@ test("reasonHead cuts a long reason at a word and leaves a short one whole", () 
   assert.equal(reasonHead("short reason"), null);
   assert.equal(reasonHead("alpha beta gamma delta", 12), "alpha beta...");
   assert.equal(reasonHead("x".repeat(30), 12), `${"x".repeat(12)}...`);
+});
+
+// The shape the pbi resolver writes: what is stuck, what was tried, the
+// lettered choices, and the one it recommends.
+const RESOLVER_QUESTION = [
+  "Issue #546 is stuck. It asks to fix the quality scanner, which lives in another repository.",
+  "The workflow sent it back to refinement twice, and the stop came back each time.",
+  "(a) Reply \"keep\", and the workflow keeps the old API.\n(b) Reply \"drop\", and the workflow removes it.\n(c) Reply with how the workflow should go on instead.",
+  "I recommend (b): nothing calls the old API any more.",
+].join("\n\n");
+
+// The shape the workflow's own stop note has: no recommendation.
+const STOP_NOTE = (issue) =>
+  [
+    `The refine queue's run ended after 0 steps on #${issue}.`,
+    "(a) Reply \"retry\", and the workflow tries the issue again.\n(b) Fix what stopped it, then reply \"done\".\n(c) Reply with how the workflow should go on instead.",
+  ].join("\n\n");
+
+test("questionParts splits a resolver question into headline, details, choices and recommendation", () => {
+  const parts = questionParts(RESOLVER_QUESTION);
+  assert.equal(parts.headline, "Issue #546 is stuck. It asks to fix the quality scanner, which lives in another repository.");
+  assert.equal(parts.more, "The workflow sent it back to refinement twice, and the stop came back each time.");
+  assert.deepEqual(
+    parts.choices.map(({ key, says }) => [key, says]),
+    [
+      ["a", "Reply \"keep\", and the workflow keeps the old API."],
+      ["b", "Reply \"drop\", and the workflow removes it."],
+      ["c", "Reply with how the workflow should go on instead."],
+    ],
+  );
+  assert.equal(parts.choices[1].line, "(b) Reply \"drop\", and the workflow removes it.");
+  assert.equal(parts.recommended, "b");
+  assert.equal(parts.why, "I recommend (b): nothing calls the old API any more.");
+});
+
+test("questionParts reads no choices that skip a letter, stand alone, or belong to a declared form", () => {
+  assert.deepEqual(questionParts("Pick one.\n\n(a) Keep it.\n(c) Drop it.").choices, []);
+  assert.deepEqual(questionParts("Pick one.\n\n(a) Keep it.").choices, []);
+  const declared = questionParts(RESOLVER_QUESTION, { lettered: false });
+  assert.deepEqual(declared.choices, []);
+  assert.equal(declared.recommended, null);
+  assert.match(declared.more, /\(a\) Reply "keep"/u);
+  assert.equal(questionParts(STOP_NOTE(483)).recommended, null);
+  assert.equal(questionParts("I recommend (z), which is no choice.\n\n(a) x\n(b) y").recommended, null);
+});
+
+test("questionParts cuts a long opening at a sentence, or at a word, and keeps the rest under details", () => {
+  const sentence = `${"word ".repeat(40).trim()}. ${"more ".repeat(60).trim()}`;
+  const atSentence = questionParts(sentence);
+  assert.equal(atSentence.headline, `${"word ".repeat(40).trim()}.`);
+  assert.equal(atSentence.more, "more ".repeat(60).trim());
+  const run = "x".repeat(20) + " y".repeat(400);
+  const atWord = questionParts(run);
+  assert.ok(atWord.headline.length <= HEADLINE_LIMIT + 4);
+  assert.match(atWord.headline, / \.\.\.$/u);
+  assert.match(atWord.more, /^\.\.\. y/u);
+  assert.equal(questionParts("").headline, "");
+  assert.equal(questionParts("Short.\r\n\r\nSecond.").more, "Second.");
+});
+
+test("writesAnswer marks a choice that needs the owner's own words", () => {
+  const [retry, done, how] = questionParts(STOP_NOTE(1)).choices;
+  assert.equal(writesAnswer(retry), false);
+  assert.equal(writesAnswer(done), false);
+  assert.equal(writesAnswer(how), true);
+  assert.equal(writesAnswer({ says: "Tell the workflow which test to keep." }), true);
+});
+
+const asked = (runId, message, extra = {}) => ({
+  runId,
+  kind: "attention",
+  form: "message",
+  workflow: "pbi-ask",
+  project: { key: "o/r" },
+  message,
+  ...extra,
+});
+
+test("questions with the same choices, up to their numbers, group together, biggest group first", () => {
+  const items = [
+    asked("r1", RESOLVER_QUESTION),
+    asked("r2", STOP_NOTE(483)),
+    asked("r3", "A question with no choices."),
+    asked("r4", STOP_NOTE(481)),
+    asked("r5", STOP_NOTE(12), { project: { key: "o/other" } }),
+  ];
+  assert.equal(questionGroupKey(items[1]), questionGroupKey(items[3]));
+  assert.notEqual(questionGroupKey(items[1]), questionGroupKey(items[4]));
+  assert.equal(questionGroupKey(items[2]), null);
+  assert.equal(questionGroupKey({ ...items[1], form: "select" }), null);
+  assert.equal(questionGroupKey({ ...items[1], kind: "awaiting_response" }), null);
+  assert.deepEqual(
+    questionGroups(items).map((group) => group.items.map((item) => item.runId)),
+    [["r2", "r4"], ["r1"], ["r3"], ["r5"]],
+  );
+  assert.deepEqual(questionGroups([items[2], { ...items[2], runId: "r6" }]).length, 2);
 });

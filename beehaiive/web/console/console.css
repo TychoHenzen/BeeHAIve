@@ -228,6 +228,15 @@ pre.error { color: var(--failed); }
 .options { display: flex; flex-direction: column; gap: 0.35rem; margin: 0.5rem 0; }
 .option { display: flex; gap: 0.5rem; align-items: baseline; padding: 0.35rem 0.5rem; border: 1px solid var(--line); border-radius: 6px; cursor: pointer; }
 .option.recommended { border-color: var(--info); }
+.attention-headline { margin: 0 0 0.4rem; overflow-wrap: anywhere; }
+.attention-more > summary { cursor: pointer; color: var(--muted); }
+.attention-more > .attention-message { margin: 0.4rem 0 0; overflow-wrap: anywhere; }
+.choices { display: flex; flex-direction: column; align-items: stretch; gap: 0.35rem; margin: 0.5rem 0; }
+.choices > button { text-align: left; white-space: normal; }
+.choices > button.recommended { border-color: var(--info); border-width: 2px; }
+.attention-members { list-style: none; margin: 0.6rem 0 0; padding: 0; display: flex; flex-direction: column; gap: 0.4rem; }
+.attention-members > li { border-top: 1px solid var(--line); padding-top: 0.4rem; }
+.attention-members summary { cursor: pointer; overflow-wrap: anywhere; }
 
 /* Launch */
 .launch { display: grid; grid-template-columns: minmax(16rem, 22rem) minmax(0, 1fr); gap: 1rem; align-items: start; }
