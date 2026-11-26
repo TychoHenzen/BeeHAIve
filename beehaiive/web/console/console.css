@@ -237,6 +237,7 @@ pre.error { color: var(--failed); }
 .attention-members { list-style: none; margin: 0.6rem 0 0; padding: 0; display: flex; flex-direction: column; gap: 0.4rem; }
 .attention-members > li { border-top: 1px solid var(--line); padding-top: 0.4rem; }
 .attention-members summary { cursor: pointer; overflow-wrap: anywhere; }
+.attention-group.sending { opacity: 0.6; cursor: progress; }
 
 /* Launch */
 .launch { display: grid; grid-template-columns: minmax(16rem, 22rem) minmax(0, 1fr); gap: 1rem; align-items: start; }

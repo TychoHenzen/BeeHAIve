@@ -22,8 +22,13 @@ export default {
       list,
     );
 
-    // One card per pause or group, kept across refreshes so typed answers survive.
+    // One card per pause or group, kept across refreshes. Each run's answer
+    // panel is kept on its own, by run and pause, so a run that joins or
+    // leaves a group keeps whatever was typed into it.
     let cards = new Map();
+    let panels = new Map();
+    const pauseOf = (item) => JSON.stringify([item.runId, pauseKey(item)]);
+    const panelOf = (item) => panels.get(pauseOf(item));
     const refresh = () => (load(), ctx.refreshAttention());
 
     async function load() {
@@ -31,9 +36,10 @@ export default {
         const queue = await ctx.api.attention();
         const items = queue.items ?? [];
         const degraded = queue.degraded ?? [];
+        panels = new Map(items.map((item) => [pauseOf(item), panelOf(item) ?? attentionPanel(item.runId, item, null, ctx, refresh)]));
         const next = new Map();
         for (const group of questionGroups(items)) {
-          const key = JSON.stringify(group.items.map((item) => [item.runId, pauseKey(item)]));
+          const key = JSON.stringify(group.items.map(pauseOf));
           next.set(key, cards.get(key) ?? (group.items.length > 1 ? groupCard(group.items) : card(group.items[0])));
         }
         cards = next;
@@ -63,7 +69,7 @@ export default {
           el("span", { class: "muted" }, item.project?.key ?? ""),
           el("span", { class: "muted small" }, "paused ", ago(item.pausedAt)),
         ),
-        attentionPanel(item.runId, item, null, ctx, refresh),
+        panelOf(item),
       );
     }
 
@@ -76,15 +82,29 @@ export default {
       // A choice that needs the owner's own words is answered run by run.
       const oneTap = parts[0].choices.filter((choice) => !writesAnswer(choice));
       const shared = { ...parts[0], choices: oneTap, recommended: agreed };
+      // While one choice is being sent to every run, the whole card is inert:
+      // a second choice, or a run's own answer, could otherwise answer some
+      // runs one way and the rest another.
+      let sending = false;
       const answerAll = async (picked) => {
+        if (sending) throw new Error("This group is still sending an answer.");
+        sending = true;
+        article.inert = true;
+        article.classList.add("sending");
         const failed = [];
-        for (const [at, item] of items.entries()) {
-          const choice = parts[at].choices.find((own) => own.key === picked.key);
-          try {
-            await ctx.api.answer(item.runId, answerBody(item, [], choice.line));
-          } catch (error) {
-            failed.push(`${short(item.runId)}: ${error.message}`);
+        try {
+          for (const [at, item] of items.entries()) {
+            const choice = parts[at].choices.find((own) => own.key === picked.key);
+            try {
+              await ctx.api.answer(item.runId, answerBody(item, [], choice.line));
+            } catch (error) {
+              failed.push(`${short(item.runId)}: ${error.message}`);
+            }
           }
+        } finally {
+          sending = false;
+          article.inert = false;
+          article.classList.remove("sending");
         }
         refresh();
         if (failed.length) throw new Error(`${failed.length} of ${items.length} answers failed:\n${failed.join("\n")}`);
@@ -99,11 +119,11 @@ export default {
             {},
             el("summary", {}, parts[at].headline, " ", el("span", { class: "muted small" }, "paused ", ago(item.pausedAt))),
             el("div", { class: "item-head" }, runLink(item)),
-            attentionPanel(item.runId, item, null, ctx, refresh),
+            panelOf(item),
           ),
         ),
       );
-      return el(
+      const article = el(
         "article",
         { class: "panel attention-group" },
         el(
@@ -120,6 +140,7 @@ export default {
           el("ul", { class: "attention-members" }, members),
         ),
       );
+      return article;
     }
 
     load();
