@@ -2,12 +2,11 @@
 
 ## Delivery workflow
 
-- Ideas enter the linked GitHub Project through `/add-backlog-idea` as Backlog issues.
-- `/refine-backlog-item` researches an issue and moves the refined PBI to Todo.
-- `/next-ticket` implements one issue branch and pushes it.
-- `/submit-draft-pr` creates or updates the draft pull request.
-- Review is read-only until the user explicitly accepts the findings.
-- `/complete-pr` alone owns making a pull request ready, merging it, confirming the linked issue, and deleting the branch.
+- Work runs through Archon's bundled SDLC pack. Its settings are in `.archon/packs/sdlc.yaml` and its maintainers in `.archon/sdlc/policy/maintainers.json`. Runs read both from master on GitHub, so a change takes effect only once merged.
+- An issue states the problem, why it matters, the desired outcome, the invariants, and the acceptance criteria.
+- `archon-intake` triages the issue, `archon-build-queue` works it to a reviewed pull request, and `archon-merge-queue` merges it.
+- Both lanes are manual: no build starts and nothing merges until a maintainer answers on `archon workflow attention`.
+- Do not merge a pull request the build queue opened by hand. The merge queue's gate merges it pinned to its reviewed head.
 
 ## Transcript data
 

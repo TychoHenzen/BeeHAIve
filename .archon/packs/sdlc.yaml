@@ -1,0 +1,11 @@
+# Settings for Archon's bundled SDLC pack. Runs read this file from master on
+# GitHub, so a change takes effect only once it is merged.
+settings:
+  # Master has required checks, so the merge gate trusts them.
+  ci: forge
+  # Manual lanes: no build starts and nothing merges until a maintainer
+  # answers on `archon workflow attention`.
+  build_lane: manual
+  merge_lane: manual
+  # Changes to workflows or CI always wait for a person, even on auto lanes.
+  protected_paths: ".archon/**,.github/workflows/**"
