@@ -110,9 +110,12 @@ def find_queued(cli: ArchonCli, source_id: str, binding_id: str) -> Search:
     stops there. A skipped fire proves nothing: once a binding goes from queue
     back to skip, its newer fires are skipped behind the older queued ones.
 
-    ASSUMPTION: the binding kept the same launch (folder and isolation) while
-    it had starts queued. Archon passes over a queued start whose checkout is
-    busy, so a start with another launch could be admitted ahead of it.
+    ASSUMPTION: the binding kept the same resource and launch (folder and
+    isolation) while it had starts queued. The walk stops once every resource
+    it has seen has a started run, so starts queued on a resource the binding
+    has since left are not reached. And Archon passes over a queued start
+    whose checkout is busy, so a start with another launch could be admitted
+    ahead of it.
     """
     rows = _rows(cli)
     mine = [row for row in rows if get_str(row, "sourceInstanceId") == source_id]
