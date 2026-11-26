@@ -121,7 +121,10 @@ uv sync
 
 Open `http://127.0.0.1:8000/`. `uv run python -m beehaiive` starts the same
 server without the launcher. The launcher refuses a port that is already in
-use and stops the server process tree when it exits.
+use. It runs the server in the foreground as its own child, so stopping the
+launcher (Ctrl+C, closing its window, or Stop in an IDE) stops the server too.
+Archon's runs carry on, because Archon's own server and its scheduled tasks
+run them, not BeeHAIve.
 
 Every setting is optional. Put any of them in `.env` (see `.env.example`) or in
 the environment, which wins over `.env`:
