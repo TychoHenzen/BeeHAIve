@@ -355,6 +355,17 @@ export function presetBinding(kind, { project, directory, hostId }) {
   };
 }
 
+// How a binding's newest trigger fire went, for its card. `health` is one entry
+// of /api/archon/triggers/health. The card puts the fire's time after `lead`
+// when there is one. A fire Archon refused is the card's error: nothing else
+// says so, since the receipt listing calls it "matched".
+export function fireSummary(health) {
+  if (!health?.state) return null;
+  const detail = health.detail ?? "";
+  if (health.state === "stuck") return { tone: "error", lead: "Stuck: Archon refused its last fire", detail };
+  return { tone: "muted", lead: health.receivedAt ? "Last fire" : "", detail };
+}
+
 export function formatInterval(seconds) {
   if (!Number.isFinite(seconds) || seconds <= 0) return "";
   if (seconds % 3600 === 0) return `every ${seconds / 3600} h`;

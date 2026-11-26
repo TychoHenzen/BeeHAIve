@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from pathlib import Path
 from typing import cast
 
@@ -19,6 +18,13 @@ from pydantic import BaseModel, Field
 
 from ..archon.cli import ArchonCli, ArchonCliError
 from ..archon.pipeline import PipelineReader, pipelines
+from ..archon.receipts import (
+    RECEIPT_ID,
+    ReceiptReader,
+    Verdict,
+    binding_health,
+    check_capacity,
+)
 from ..archon.settings import ArchonSettings
 from ..archon.triggers import (
     BindingError,
@@ -31,7 +37,6 @@ from ..archon.triggers import (
 router = APIRouter(prefix="/api/archon")
 logger = logging.getLogger(__name__)
 
-RECEIPT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_:.-]{0,127}")
 FIRE_TIMEOUT = 300.0
 
 
@@ -97,6 +102,23 @@ def _pipeline(request: Request) -> PipelineReader:
     return cast(PipelineReader, request.app.state.pipeline)
 
 
+def _receipts(request: Request) -> ReceiptReader:
+    return cast(ReceiptReader, request.app.state.receipts)
+
+
+def _capacity(request: Request, binding: NewBinding) -> Verdict:
+    """Validates the binding, then asks whether Archon will take its capacity."""
+    binding.validate()
+    others = [s for s in _store(request).summaries() if s["name"] != binding.name]
+    return check_capacity(_receipts(request), binding, others)
+
+
+def _refused(verdict: Verdict) -> JSONResponse | None:
+    if verdict.refusal is None:
+        return None
+    return JSONResponse({"error": verdict.refusal, "detail": ""}, status_code=400)
+
+
 class PipelineRead(BaseModel):
     repository: str
 
@@ -145,11 +167,16 @@ def bindings(request: Request) -> dict[str, object]:
 def create_binding(
     form: BindingForm, request: Request
 ) -> dict[str, object] | JSONResponse:
+    binding = form.new_binding()
     try:
-        path = _store(request).create(form.new_binding())
+        verdict = _capacity(request, binding)
+        refused = _refused(verdict)
+        if refused is not None:
+            return refused
+        path = _store(request).create(binding)
     except BindingError as error:
         return _failed(error, 400)
-    return {"binding": _store(request).summary(path.stem)}
+    return {"binding": _store(request).summary(path.stem), "warning": verdict.warning}
 
 
 @router.put("/triggers/bindings/{name}", response_model=None)
@@ -167,8 +194,19 @@ def update_binding(
             {"error": "This file is not a binding, so it cannot be edited."},
             status_code=400,
         )
+    binding = changes.binding(name, run_as)
+    # Archon reads the capacity only for the resource a fire declares, so an
+    # edit that keeps both cannot be refused for them.
+    kept = (binding.resource.strip(), binding.capacity) == (
+        before["resource"],
+        before["capacity"],
+    )
     try:
-        path = store.update(changes.binding(name, run_as))
+        verdict = Verdict() if kept else _capacity(request, binding)
+        refused = _refused(verdict)
+        if refused is not None:
+            return refused
+        path = store.update(binding)
     except BindingError as error:
         return _failed(error, 400)
     after = store.summary(name)
@@ -195,7 +233,19 @@ def update_binding(
                 },
                 status_code=502,
             )
-    return {"binding": after, "rescheduled": rescheduled}
+    return {"binding": after, "rescheduled": rescheduled, "warning": verdict.warning}
+
+
+@router.get("/triggers/health", response_model=None)
+def health(request: Request) -> dict[str, object] | JSONResponse:
+    """How each binding's newest fire went. `archon trigger list` says
+    "matched" for a fire Archon then refused, so only its receipt shows it."""
+    try:
+        return {
+            "bindings": binding_health(_receipts(request), _store(request).summaries())
+        }
+    except ArchonCliError as error:
+        return _failed(error)
 
 
 @router.delete("/triggers/bindings/{name}", response_model=None)

@@ -12,6 +12,7 @@ from starlette.types import Scope
 
 from .archon.cli import ArchonCli
 from .archon.pipeline import PipelineReader
+from .archon.receipts import ReceiptReader
 from .archon.triggers import Scheduler, TriggerStore
 from .config import CoreConfig
 from .guard import LocalRequestGuard
@@ -62,6 +63,7 @@ def create_app(
     app.state.trigger_store = TriggerStore(archon.triggers_dir)
     app.state.scheduler = scheduler or Scheduler(archon.binary)
     app.state.pipeline = pipeline or PipelineReader(archon.home)
+    app.state.receipts = ReceiptReader(app.state.archon_cli)
     app.add_middleware(LocalRequestGuard)
     for router in ROUTERS:
         app.include_router(router)

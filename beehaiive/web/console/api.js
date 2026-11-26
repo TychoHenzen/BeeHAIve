@@ -79,6 +79,9 @@ export const api = {
   updateBinding: (name, changes) => request(`/api/archon/triggers/bindings/${enc(name)}`, { method: "PUT", body: changes }),
   deleteBinding: (name) => request(`/api/archon/triggers/bindings/${enc(name)}`, { method: "DELETE" }),
   fire: (name) => request(`/api/archon/triggers/bindings/${enc(name)}/fire`, { method: "POST" }),
+  // How each binding's newest fire went, read from its receipt: the listing
+  // says "matched" even for a fire Archon then refused.
+  triggerHealth: () => request("/api/archon/triggers/health"),
   receipts: (limit = 50) => request(`/api/archon/triggers/receipts${query({ limit })}`),
   receipt: (id) => request(`/api/archon/triggers/receipts/${enc(id)}`),
   schedules: () => request("/api/archon/triggers/schedules"),

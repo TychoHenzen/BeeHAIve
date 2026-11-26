@@ -41,7 +41,11 @@ on the command line:
   the SDLC pack's build queue, merge queue, discoveries and worktree cleanup),
   Fire now, the recent trigger receipts, and on Windows a Task Scheduler task
   per binding that fires it on its interval. Archon installs schedules itself
-  only on macOS.
+  only on macOS. Each binding card says how its last fire went, read from its
+  receipt, and calls it stuck when Archon refused it: `archon trigger list`
+  says "matched" either way. Archon fixes a resource's capacity the first time
+  it runs, so a save that declares another capacity is refused; a save
+  BeeHAIve cannot check against Archon goes ahead with a warning.
 
 Chat, the workflow builder, settings, metrics and adding projects are still in
 Archon's own console. The top bar links to it.
