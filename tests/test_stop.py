@@ -66,9 +66,11 @@ def live_run(binding: str, status: str, cause: str | None = None) -> dict[str, o
 
 
 def inspected(harness: ArchonHarness) -> list[str]:
-    return [
+    """The receipts inspected, sorted: a chunk's inspects run on parallel
+    threads, so the order they reach the runner differs from run to run."""
+    return sorted(
         call[3] for call in harness.runner.calls if call[1:3] == ["trigger", "inspect"]
-    ]
+    )
 
 
 def withdraws(harness: ArchonHarness) -> list[str]:
