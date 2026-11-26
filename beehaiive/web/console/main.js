@@ -2,10 +2,12 @@
 //
 // To add a page, write a module in views/ that exports
 //   { id, title, nav, match(path) -> params | null, mount(root, params, ctx) -> cleanup }
-// and list it in VIEWS. mount gets ctx = { api, live, navigate, refreshAttention }
-// and returns a function that undoes whatever it started (timers, live listeners).
+// and list it in VIEWS. mount gets ctx = { api, live, navigate, refreshAttention,
+// refreshTriggers } and returns a function that undoes whatever it started
+// (timers, live listeners).
 import { api, liveFeed } from "./api.js";
-import { el, replace } from "./dom.js";
+import { el, link, replace } from "./dom.js";
+import { pauseState } from "./model.js";
 import attention from "./views/attention.js";
 import launch from "./views/launch.js";
 import pipeline from "./views/pipeline.js";
@@ -21,6 +23,10 @@ const root = document.getElementById("view");
 const nav = document.getElementById("nav");
 const liveState = document.getElementById("live-state");
 const archonLink = document.getElementById("archon-link");
+const pausedBanner = document.getElementById("paused-banner");
+// Task Scheduler is slow to ask, and a pause only changes through the
+// Triggers page (which refreshes at once) or by hand in Task Scheduler.
+const TRIGGER_POLL_MS = 120000;
 
 const LIVE_TEXT = { live: "Live", reconnecting: "Reconnecting...", offline: "Archon offline" };
 const live = liveFeed((state) => {
@@ -47,6 +53,26 @@ async function refreshAttention() {
   }
 }
 
+// Triggers paused for a restart stay paused until someone resumes them, also
+// across the restart, so every page says so.
+async function refreshTriggers() {
+  let pause = null;
+  try {
+    const schedules = await api.schedules();
+    if (schedules?.supported !== false) pause = pauseState(schedules?.tasks ?? []);
+  } catch {
+    pause = null;
+  }
+  const paused = pause?.state === "paused" || pause?.state === "partial";
+  pausedBanner.hidden = !paused;
+  if (!paused) return replace(pausedBanner);
+  const what =
+    pause.state === "paused"
+      ? "Triggers are paused: no Archon task fires until you resume them."
+      : `${pause.disabled} of ${pause.total} trigger tasks are paused.`;
+  replace(pausedBanner, `${what} `, link("/triggers", "Resume on the Triggers page"));
+}
+
 function parseHash() {
   const raw = location.hash.replace(/^#/, "") || HOME;
   const at = raw.indexOf("?");
@@ -59,7 +85,7 @@ function navigate(path) {
   location.hash = `#${path}`;
 }
 
-const ctx = { api, live, navigate, refreshAttention };
+const ctx = { api, live, navigate, refreshAttention, refreshTriggers };
 let cleanup = () => {};
 
 function route() {
@@ -97,5 +123,7 @@ api
     if (settings?.url) archonLink.href = `${settings.url}/console`;
   })
   .catch(() => {});
+setInterval(refreshTriggers, TRIGGER_POLL_MS);
 refreshAttention();
+refreshTriggers();
 route();

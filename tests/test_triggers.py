@@ -199,7 +199,70 @@ def test_scheduler_is_windows_only() -> None:
     assert scheduler.supported is False
     with pytest.raises(ArchonCliError, match="only on Windows"):
         scheduler.list()
+    with pytest.raises(ArchonCliError, match="only on Windows"):
+        scheduler.pause()
+    with pytest.raises(ArchonCliError, match="only on Windows"):
+        scheduler.archon_processes()
     assert runner.calls == []
+
+
+def test_pause_and_resume_report_how_many_tasks_changed() -> None:
+    runner = FakeRunner(
+        {
+            "-Action Pause": CliResult(0, "3\r\n", ""),
+            "-Action Resume": CliResult(0, "0", ""),
+        }
+    )
+    scheduler = Scheduler(Path("archon.exe"), runner=runner, platform="win32")
+
+    assert scheduler.pause() == 3
+    assert scheduler.resume() == 0
+    assert [call[7:] for call in runner.calls] == [
+        ["-Action", "Pause"],
+        ["-Action", "Resume"],
+    ]
+
+
+def test_a_pause_without_a_count_is_an_error() -> None:
+    runner = FakeRunner({"-Action Pause": CliResult(0, "paused", "")})
+    scheduler = Scheduler(Path("archon.exe"), runner=runner, platform="win32")
+
+    with pytest.raises(ArchonCliError, match="how many"):
+        scheduler.pause()
+
+
+def test_archon_processes_are_read_from_tasklist() -> None:
+    listing = "\r\n".join(
+        [
+            '"archon.exe","31800","Console","1","11.328 K"',
+            '"archon-server-windows-x64.exe","56616","Console","1","247.508 K"',
+            "",
+        ]
+    )
+    runner = FakeRunner({"tasklist": CliResult(0, listing, "")})
+    scheduler = Scheduler(Path("archon.exe"), runner=runner, platform="win32")
+
+    assert scheduler.archon_processes() == [31800, 56616]
+    assert runner.calls == [
+        ["tasklist.exe", "/FI", "IMAGENAME eq archon*", "/FO", "CSV", "/NH"]
+    ]
+
+
+def test_no_archon_process_is_an_empty_list() -> None:
+    info = "INFO: No tasks are running which match the specified criteria."
+    runner = FakeRunner({"tasklist": CliResult(0, info, "")})
+    scheduler = Scheduler(Path("archon.exe"), runner=runner, platform="win32")
+
+    assert scheduler.archon_processes() == []
+
+
+def test_a_failed_tasklist_is_an_error() -> None:
+    runner = FakeRunner({"tasklist": CliResult(1, "", "ERROR: access denied")})
+    scheduler = Scheduler(Path("archon.exe"), runner=runner, platform="win32")
+
+    with pytest.raises(ArchonCliError, match="tasklist") as caught:
+        scheduler.archon_processes()
+    assert caught.value.detail == "ERROR: access denied"
 
 
 def test_an_edit_resets_isolation_only_when_its_kind_changes(tmp_path: Path) -> None:

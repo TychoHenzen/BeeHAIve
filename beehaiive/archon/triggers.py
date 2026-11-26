@@ -8,6 +8,7 @@ only on macOS, so on Windows a Task Scheduler task runs that command on a timer.
 from __future__ import annotations
 
 import copy
+import csv
 import json
 import os
 import re
@@ -27,6 +28,9 @@ OVERLAPS = ("skip", "queue")
 ISOLATIONS = ("worktree", "default", "in-place")
 TASK_PREFIX = "Archon-"
 SCRIPT = Path(__file__).resolve().parent / "schedule.ps1"
+# archon.exe (the CLI and each `trigger execute`) and archon-server-*.exe; a
+# run's metadata.execution_owner names the one that runs it.
+ARCHON_IMAGES = "IMAGENAME eq archon*"
 
 
 class BindingError(ValueError):
@@ -228,7 +232,11 @@ def task_name(binding_name: str) -> str:
 
 
 class Scheduler:
-    """Windows Task Scheduler entries named Archon-<binding>."""
+    """The Windows side of trigger bindings: the Task Scheduler entries named
+    Archon-<binding>, and which archon processes are alive to run what they fire.
+
+    A fire starts a separate `archon trigger execute` process for its run and
+    exits, so a task is back to Ready while its run goes on."""
 
     def __init__(
         self,
@@ -286,3 +294,31 @@ class Scheduler:
 
     def remove(self, binding_name: str) -> None:
         self._script("-Action", "Remove", "-Name", task_name(binding_name))
+
+    def pause(self) -> int:
+        """Disable every Archon- task, so no binding fires on its own until
+        resume(). Runs already going keep going. Returns how many changed."""
+        return _task_count(self._script("-Action", "Pause"))
+
+    def resume(self) -> int:
+        """Enable every disabled Archon- task. Returns how many changed."""
+        return _task_count(self._script("-Action", "Resume"))
+
+    def archon_processes(self) -> list[int]:
+        """The process ids of every archon program alive on this machine."""
+        if not self.supported:
+            raise ArchonCliError("Checking processes works only on Windows.")
+        command = ["tasklist.exe", "/FI", ARCHON_IMAGES, "/FO", "CSV", "/NH"]
+        result = self._runner(command, None, 30.0)
+        if not result.ok:
+            raise ArchonCliError("tasklist did not list processes.", result.output)
+        # No match prints one INFO line, which has no id column.
+        rows = csv.reader(result.stdout.splitlines())
+        return [int(row[1]) for row in rows if len(row) > 1 and row[1].isdigit()]
+
+
+def _task_count(text: str) -> int:
+    count = text.strip()
+    if not count.isdigit():
+        raise ArchonCliError("Task Scheduler did not say how many tasks changed.")
+    return int(count)

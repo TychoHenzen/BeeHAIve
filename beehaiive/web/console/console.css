@@ -92,6 +92,19 @@ h3 { font-size: 0.95rem; margin: 0.8rem 0 0.4rem; }
 .notice.error { color: var(--failed); white-space: pre-wrap; }
 .notice.ok { color: var(--running); }
 
+/* Triggers paused for a restart: said on every page, so nobody forgets to resume. */
+.paused-banner {
+  padding: 0.45rem 1.25rem;
+  border-bottom: 1px solid var(--paused);
+  background: var(--tint);
+  color: var(--paused);
+}
+.paused-banner a { color: inherit; font-weight: 600; }
+.paused-note { color: var(--paused); }
+.restart-runs { list-style: none; padding: 0; margin: 0.6rem 0 0; }
+.restart-runs li { padding: 0.5rem 0; border-top: 1px solid var(--line); }
+.restart-runs li p { margin: 0; }
+
 button, .button {
   font: inherit;
   padding: 0.35rem 0.8rem;
@@ -125,6 +138,11 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-
 }
 .field { display: flex; flex-direction: column; gap: 0.2rem; margin-bottom: 0.7rem; }
 .field input, .field select { width: 100%; }
+/* Several controls on one line inside a field, such as "Every [5] [minutes]". */
+.inline-fields { display: flex; gap: 0.5rem; }
+.field .inline-fields > * { width: auto; }
+.field .inline-fields > input { flex: 1; min-width: 0; }
+.warn { color: var(--failed); }
 fieldset { border: 1px solid var(--line); border-radius: 8px; padding: 0.6rem 0.8rem; margin: 0 0 0.7rem; }
 
 .pill {

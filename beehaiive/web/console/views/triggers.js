@@ -3,9 +3,10 @@
 // installs schedules on macOS, so here each binding can get a Windows Task
 // Scheduler task named Archon-<binding> that fires it on its interval.
 import { actionButton, ago, el, notice, replace, section } from "../dom.js";
-import { BINDING_PRESETS, formatInterval, joinPath, presetBinding } from "../model.js";
+import { BINDING_PRESETS, formatInterval, joinPath, pauseState, presetBinding } from "../model.js";
+import { bindingFields, label, workflowCache } from "./binding-form.js";
+import { restartPanel } from "./restart-panel.js";
 
-const SELF_INPUT = { "build-queue": "build_queue_binding", "merge-queue": "merge_queue_binding" };
 const PRESET_LABELS = {
   "pbi-refine-queue": "PBI refine queue (every 30 min)",
   "pbi-build-queue": "PBI build queue (every 30 min)",
@@ -19,77 +20,10 @@ const PRESET_LABELS = {
   discoveries: "SDLC pack discoveries (every 4 h)",
 };
 
-function parseInputs(text) {
-  const inputs = {};
-  for (const line of text.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    const at = trimmed.indexOf("=");
-    if (at <= 0) throw new Error(`"${trimmed}" is not name=value.`);
-    inputs[trimmed.slice(0, at).trim()] = trimmed.slice(at + 1).trim();
-  }
-  return inputs;
-}
-
 function inputsText(inputs) {
   return Object.entries(inputs ?? {})
     .map(([k, v]) => `${k}=${v}`)
     .join("\n");
-}
-
-const label = (text, control, hint) =>
-  el("label", { class: "field" }, el("span", {}, text), control, hint ? el("span", { class: "muted small" }, hint) : null);
-
-// The controls a new binding and an edit share. fill() sets them from a
-// binding's values; read() gives the request body without the name and user.
-function settingFields() {
-  const fields = {
-    workflow: el("input", { type: "text", required: true }),
-    cwd: el("input", { type: "text", required: true }),
-    resource: el("input", { type: "text", required: true }),
-    hostId: el("input", { type: "text", value: "local" }),
-    minutes: el("input", { type: "number", min: "1", value: "30" }),
-    overlap: el("select", {}, el("option", { value: "skip" }, "skip"), el("option", { value: "queue" }, "queue")),
-    capacity: el("input", { type: "number", min: "1", max: "32", value: "1" }),
-    isolation: el("select", {}, ["worktree", "default", "in-place"].map((kind) => el("option", { value: kind }, kind))),
-    inputs: el("textarea", { rows: "5", spellcheck: "false" }),
-  };
-  return {
-    fields,
-    fill(values) {
-      fields.workflow.value = values.workflow ?? "";
-      fields.cwd.value = values.cwd ?? "";
-      fields.resource.value = values.resource ?? "";
-      fields.hostId.value = values.hostId ?? "local";
-      fields.minutes.value = Number.isFinite(values.intervalSeconds) ? String(values.intervalSeconds / 60) : "30";
-      fields.overlap.value = values.overlap ?? "skip";
-      fields.capacity.value = String(values.capacity ?? 1);
-      fields.isolation.value = values.isolation ?? "worktree";
-      fields.inputs.value = inputsText(values.inputs);
-    },
-    read: () => ({
-      workflow: fields.workflow.value,
-      cwd: fields.cwd.value,
-      resource: fields.resource.value,
-      hostId: fields.hostId.value,
-      intervalSeconds: Math.round(Number(fields.minutes.value) * 60),
-      overlap: fields.overlap.value,
-      capacity: Number(fields.capacity.value),
-      isolation: fields.isolation.value,
-      inputs: parseInputs(fields.inputs.value),
-    }),
-    labels: () => [
-      label("Workflow", fields.workflow),
-      label("Runs in", fields.cwd, "The folder the workflow starts in."),
-      label("Resource", fields.resource, "Runs that share a resource share its capacity."),
-      label("Every (minutes)", fields.minutes),
-      label("Overlap", fields.overlap, "skip drops a start while the resource is full; queue waits for a slot."),
-      label("Capacity", fields.capacity, "How many runs on this resource may run at once."),
-      label("Isolation", fields.isolation, "worktree gives each run its own checkout; default uses the project's setting."),
-      label("Host id", fields.hostId, "Names this machine to archon trigger drain."),
-      label("Inputs", fields.inputs, "One name=value per line."),
-    ],
-  };
 }
 
 export default {
@@ -99,10 +33,19 @@ export default {
   match: (path) => (path === "/triggers" ? {} : null),
   mount(root, params, ctx) {
     // saved: the binding an edit just saved, so its reloaded card can say so.
-    const state = { directory: "", bindings: [], tasks: new Map(), scheduling: true, identity: null, projects: [], defaultHome: true, saved: null };
+    // paused: every Archon task is disabled, so nothing may fire or be scheduled.
+    const state = { directory: "", bindings: [], tasks: new Map(), scheduling: true, paused: false, identity: null, defaultHome: true, saved: null };
+    // What the binding forms choose from.
+    const page = { projects: [], bindings: [], workflowsFor: workflowCache(ctx.api) };
     const bindingList = el("div", {});
     const formSlot = el("div", {});
     const receiptList = el("div", {});
+    const restart = restartPanel(ctx, {
+      onChange: async () => {
+        await loadBindings();
+        ctx.refreshTriggers();
+      },
+    });
     replace(
       root,
       el(
@@ -116,6 +59,7 @@ export default {
           "On Windows a scheduled task named Archon-<binding> fires it on its interval.",
         ),
       ),
+      section("Restart safely", restart.root),
       section("Bindings", bindingList),
       section("New binding", formSlot),
       section("Recent trigger receipts", receiptList),
@@ -129,6 +73,7 @@ export default {
       if (!state.scheduling) return el("span", { class: "muted small" }, "Scheduling needs Windows.");
       const task = taskFor(binding.name);
       if (!task) {
+        if (state.paused) return el("span", { class: "muted small" }, "Resume the triggers to schedule it.");
         return actionButton("Schedule it", async () => (await ctx.api.installSchedule(binding.name), loadBindings()), {
           confirm: `Create the Windows task Archon-${binding.name}? It fires this binding ${formatInterval(binding.intervalSeconds)} while you are signed in.`,
           tone: "primary",
@@ -138,7 +83,7 @@ export default {
         "div",
         { class: "schedule" },
         el("span", { class: `pill tone-${task.state === "Ready" || task.state === "Running" ? "running" : "paused"}` }, task.state),
-        task.nextRun ? el("span", { class: "small" }, " next ", new Date(task.nextRun).toLocaleTimeString()) : null,
+        task.nextRun && task.state !== "Disabled" ? el("span", { class: "small" }, " next ", new Date(task.nextRun).toLocaleTimeString()) : null,
         task.lastRun ? el("span", { class: "small muted" }, " last ", ago(task.lastRun), ` (result ${task.lastResult})`) : null,
         actionButton("Unschedule", async () => (await ctx.api.removeSchedule(binding.name), loadBindings()), {
           confirm: `Delete the Windows task Archon-${binding.name}? The binding file stays.`,
@@ -149,7 +94,7 @@ export default {
     // The card's facts, or in their place the same fields the New binding form
     // has, filled from the file. Saving keeps the name, ids and run-as user.
     function editForm(binding, close) {
-      const settings = settingFields();
+      const settings = bindingFields(page, { self: binding.name, selfPath: () => binding.path });
       settings.fill(binding);
       const save = actionButton(
         "Save changes",
@@ -195,24 +140,44 @@ export default {
       return notice(rescheduled ? `Saved. Its Windows task now fires ${formatInterval(binding.intervalSeconds)}.` : "Saved.");
     }
 
+    function fireButton(binding, output) {
+      if (state.paused) {
+        return el("button", { type: "button", disabled: true, title: "Triggers are paused for a restart. Resume them to fire." }, "Fire now");
+      }
+      return actionButton(
+        "Fire now",
+        async () => {
+          replace(output, notice("Firing..."));
+          const result = await ctx.api.fire(binding.name);
+          replace(output, el("pre", { class: `inline ${result.ok ? "" : "error"}` }, result.output || (result.ok ? "Fired." : `Exit ${result.code}`)));
+          loadReceipts();
+        },
+        { confirm: `Fire ${binding.name} now? It starts ${binding.workflow} the same way its schedule would.` },
+      );
+    }
+
     function bindingCard(binding) {
       const output = el("div", {});
       const body = el("div", {}, binding.error ? notice(binding.error, "error") : facts(binding));
       const edit = binding.error
         ? null
-        : el("button", {
-            type: "button",
-            onclick: () => {
-              edit.hidden = true;
-              replace(
-                body,
-                editForm(binding, () => {
-                  edit.hidden = false;
-                  replace(body, facts(binding));
-                }),
-              );
+        : el(
+            "button",
+            {
+              type: "button",
+              onclick: () => {
+                edit.hidden = true;
+                replace(
+                  body,
+                  editForm(binding, () => {
+                    edit.hidden = false;
+                    replace(body, facts(binding));
+                  }),
+                );
+              },
             },
-          }, "Edit");
+            "Edit",
+          );
       return el(
         "article",
         { class: "panel binding" },
@@ -229,16 +194,7 @@ export default {
           "div",
           { class: "row" },
           edit,
-          actionButton(
-            "Fire now",
-            async () => {
-              replace(output, notice("Firing..."));
-              const result = await ctx.api.fire(binding.name);
-              replace(output, el("pre", { class: `inline ${result.ok ? "" : "error"}` }, result.output || (result.ok ? "Fired." : `Exit ${result.code}`)));
-              loadReceipts();
-            },
-            { confirm: `Fire ${binding.name} now? It starts ${binding.workflow} the same way its schedule would.` },
-          ),
+          fireButton(binding, output),
           scheduleCell(binding),
           actionButton("Delete", async () => (await ctx.api.deleteBinding(binding.name), loadBindings()), {
             confirm: `Delete the binding ${binding.name}? Its file goes, and so does its Windows task if it has one. Archon keeps the history of past fires.`,
@@ -254,9 +210,13 @@ export default {
         const [listing, schedules] = await Promise.all([ctx.api.bindings(), ctx.api.schedules().catch((error) => ({ supported: true, error }))]);
         state.directory = listing.directory;
         state.bindings = listing.bindings ?? [];
+        page.bindings = state.bindings;
         state.defaultHome = listing.defaultHome !== false;
         state.scheduling = schedules.supported !== false;
-        state.tasks = new Map((schedules.tasks ?? []).map((t) => [t.name, t]));
+        const tasks = schedules.tasks ?? [];
+        state.tasks = new Map(tasks.map((t) => [t.name, t]));
+        state.paused = pauseState(tasks).state === "paused";
+        restart.show(schedules.error ? null : tasks, schedules.error?.message);
         replace(
           bindingList,
           schedules.error ? notice(`Task Scheduler: ${schedules.error.message}`, "error") : null,
@@ -307,43 +267,38 @@ export default {
     }
 
     function renderForm() {
-      const project = el("select", { "aria-label": "Project" }, state.projects.map((p) => el("option", { value: p.id, selected: p.id === params.project }, p.name)));
       const preset = el(
         "select",
         { "aria-label": "Preset" },
         Object.keys(BINDING_PRESETS).map((k) => el("option", { value: k }, PRESET_LABELS[k])),
         el("option", { value: "" }, "Custom"),
       );
-      const settings = settingFields();
-      const fields = { ...settings.fields, name: el("input", { type: "text", required: true }) };
+      const name = el("input", { type: "text", required: true });
+      const selfPath = () => (name.value.trim() ? joinPath(state.directory, `${name.value.trim()}.json`) : "");
+      const settings = bindingFields(page, { self: null, selfPath, onProject: (project) => apply(project) });
 
-      function apply() {
-        const chosen = state.projects.find((p) => p.id === project.value);
-        if (!preset.value || !chosen) return;
-        const filled = presetBinding(preset.value, { project: chosen, directory: state.directory, hostId: fields.hostId.value || "local" });
-        fields.name.value = filled.name;
-        settings.fill(filled);
+      // A preset fills every field for the chosen project; Custom leaves them.
+      function apply(project) {
+        if (!preset.value || !project) return false;
+        const hostId = settings.fields.hostId.value.trim() || "local";
+        const filled = presetBinding(preset.value, { project, directory: state.directory, hostId });
+        name.value = filled.name;
+        settings.fill(filled, { picked: false });
+        return true;
       }
 
-      // A queue binding names its own file in its inputs; keep that in step with the name.
-      fields.name.addEventListener("input", () => {
-        const key = SELF_INPUT[preset.value];
-        if (!key) return;
-        const lines = fields.inputs.value.split("\n").map((line) =>
-          line.startsWith(`${key}=`) ? `${key}=${joinPath(state.directory, `${fields.name.value}.json`)}` : line,
-        );
-        fields.inputs.value = lines.join("\n");
-      });
-      project.addEventListener("change", apply);
-      preset.addEventListener("change", apply);
-      apply();
+      name.addEventListener("input", () => settings.renamed());
+      preset.addEventListener("change", () => apply(settings.project()));
+      const first = page.projects.find((p) => p.id === params.project) ?? page.projects[0] ?? null;
+      if (!apply(first)) settings.fill({ cwd: first?.default_cwd ?? "", hostId: "local" }, { picked: false });
 
       const save = actionButton(
         "Save binding",
         async () => {
           if (!state.identity?.runAsUserId) throw new Error("archon trigger whoami did not give a user id.");
-          await ctx.api.createBinding({ ...settings.read(), name: fields.name.value, runAsUserId: state.identity.runAsUserId });
+          await ctx.api.createBinding({ ...settings.read(), name: name.value.trim(), runAsUserId: state.identity.runAsUserId });
           await loadBindings();
+          renderForm();
         },
         { tone: "primary" },
       );
@@ -352,9 +307,8 @@ export default {
         el(
           "div",
           { class: "binding-form" },
-          label("Project", project),
           label("Preset", preset, "Fills the fields with that workflow's usual settings. Change anything before saving."),
-          label("Name", fields.name, "The file name and the binding id."),
+          label("Name", name, "The file name and the binding id."),
           settings.labels(),
           el("p", { class: "muted small" }, "Runs as ", el("code", {}, state.identity?.runAsUserId ?? "unknown"), state.identity?.cliIdentity ? ` (${state.identity.cliIdentity})` : ""),
           el(
@@ -368,11 +322,11 @@ export default {
     }
 
     Promise.all([ctx.api.projects().catch(() => []), ctx.api.identity().catch(() => ({ identity: null }))]).then(([projects, who]) => {
-      state.projects = Array.isArray(projects) ? projects : [];
+      page.projects = Array.isArray(projects) ? projects : [];
       state.identity = who.identity;
       loadBindings().then(renderForm);
     });
     loadReceipts();
-    return () => {};
+    return () => restart.stop();
   },
 };

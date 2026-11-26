@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import socket
 from pathlib import Path
 from typing import cast
 
@@ -343,3 +344,36 @@ def remove_schedule(name: str, request: Request) -> dict[str, object] | JSONResp
     except ArchonCliError as error:
         return _failed(error)
     return {"removed": True}
+
+
+# A safe restart: pause every task, wait until no run is left, restart, resume.
+# The console reads the runs from Archon's API and checks each one's
+# metadata.execution_owner against the processes listed here.
+
+
+@router.post("/triggers/pause", response_model=None)
+def pause_triggers(request: Request) -> dict[str, object] | JSONResponse:
+    try:
+        return {"paused": _scheduler(request).pause()}
+    except ArchonCliError as error:
+        return _failed(error)
+
+
+@router.post("/triggers/resume", response_model=None)
+def resume_triggers(request: Request) -> dict[str, object] | JSONResponse:
+    try:
+        return {"resumed": _scheduler(request).resume()}
+    except ArchonCliError as error:
+        return _failed(error)
+
+
+@router.get("/triggers/processes", response_model=None)
+def archon_processes(request: Request) -> dict[str, object] | JSONResponse:
+    # Archon records the host by its name, so only owners on this host can be checked.
+    scheduler, host = _scheduler(request), socket.gethostname()
+    if not scheduler.supported:
+        return {"supported": False, "host": host, "pids": []}
+    try:
+        return {"supported": True, "host": host, "pids": scheduler.archon_processes()}
+    except ArchonCliError as error:
+        return _failed(error)

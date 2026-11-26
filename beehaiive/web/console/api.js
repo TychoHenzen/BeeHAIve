@@ -84,6 +84,11 @@ export const api = {
   schedules: () => request("/api/archon/triggers/schedules"),
   installSchedule: (name) => request(`/api/archon/triggers/bindings/${enc(name)}/schedule`, { method: "PUT" }),
   removeSchedule: (name) => request(`/api/archon/triggers/bindings/${enc(name)}/schedule`, { method: "DELETE" }),
+  // Disable or enable every Archon- task at once, for a safe restart.
+  pauseTriggers: () => request("/api/archon/triggers/pause", { method: "POST" }),
+  resumeTriggers: () => request("/api/archon/triggers/resume", { method: "POST" }),
+  // { supported, host, pids }: which archon processes are alive on this machine.
+  archonProcesses: () => request("/api/archon/triggers/processes"),
   // The repositories a pbi queue serves, with the last reading of `repository`
   // if one is under five minutes old. Only the POST reads again.
   pipeline: (repository) => request(`/api/archon/pipeline${query({ repository })}`),

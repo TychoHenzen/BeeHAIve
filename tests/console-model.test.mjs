@@ -9,35 +9,49 @@ import {
   answerReady,
   attentionText,
   BINDING_PRESETS,
+  bindingInputOptions,
+  bindingInputs,
+  capacityConflicts,
   collectSuppliedInputs,
   eventLine,
   expectedGate,
   formatInterval,
-  HEADLINE_LIMIT,
-  githubUrl,
   gateDecisions,
+  githubUrl,
+  HEADLINE_LIMIT,
+  inputRows,
+  intervalParts,
+  intervalSeconds,
   isLive,
   joinPath,
   mergeActivity,
   missingRequiredInputs,
   needsPerson,
   pauseKey,
+  pauseState,
   pipelineCounts,
   presetBinding,
+  projectForFolder,
   questionGroupKey,
   questionGroups,
   questionParts,
   queueProblems,
   reasonHead,
   repoFromUrl,
+  resourceChoices,
+  restartRuns,
+  restartVerdict,
   runActions,
   runTone,
   secondsBetween,
+  SELF_BINDING,
   stuckGroups,
+  suggestedResource,
   toIso,
   toolDetail,
   toolOutput,
   workflowInputs,
+  workflowSummary,
   writesAnswer,
 } from "../beehaiive/web/console/model.js";
 
@@ -334,6 +348,171 @@ test("a tool call reads as what it works on, and shell output as its text", () =
   assert.equal(toolOutput("[1, 2]"), "[1, 2]");
   assert.equal(toolOutput({ ok: true }), '{\n  "ok": true\n}');
   assert.equal(toolOutput(undefined), "");
+});
+
+test("an interval shows in hours when it is whole hours, and reads back in seconds", () => {
+  assert.deepEqual(intervalParts(86400), { amount: 24, unit: "hours" });
+  assert.deepEqual(intervalParts(1800), { amount: 30, unit: "minutes" });
+  assert.deepEqual(intervalParts(null), { amount: 30, unit: "minutes" });
+  assert.equal(intervalSeconds({ amount: "4", unit: "hours" }), 14400);
+  assert.equal(intervalSeconds({ amount: "1.5", unit: "minutes" }), 90);
+});
+
+test("a binding's folder finds its project whatever the case or trailing separator", () => {
+  const projects = [{ id: "a", default_cwd: "C:\\Development\\Projects\\cardcleaner" }, { id: "b", default_cwd: "C:/src/BeeHAIve/" }];
+  assert.equal(projectForFolder(projects, "c:\\development\\projects\\CardCleaner\\")?.id, "a");
+  assert.equal(projectForFolder(projects, "C:\\src\\BeeHAIve")?.id, "b");
+  assert.equal(projectForFolder(projects, "C:\\elsewhere"), null);
+  assert.equal(projectForFolder(projects, ""), null);
+});
+
+test("the suggested resource follows a preset, else the workflow on the repository", () => {
+  const project = { name: "CardCleaner", repository_url: "https://github.com/o/CardCleaner.git" };
+  assert.equal(suggestedResource("pbi-build-queue", project, "local"), "pbi:github.com/o/CardCleaner:build");
+  assert.equal(suggestedResource("worktree-cleanup", { name: "x" }, "pc1"), "worktree-cleanup:pc1");
+  assert.equal(suggestedResource("my-flow", project, "local"), "my-flow:github.com/o/CardCleaner");
+  assert.equal(suggestedResource("pbi-build-queue", { name: "No Repo" }, "local"), "pbi-build-queue:no-repo");
+  assert.equal(suggestedResource("", project, "local"), "");
+});
+
+test("a workflow's summary is the first sentence of its hard-wrapped description", () => {
+  const wrapped = "Refine one PBI, or mend a Todo PBI, on\nthe linked Project. The PBIs are\nthe issues.\n\npick takes a Todo root.";
+  assert.equal(workflowSummary(wrapped), "Refine one PBI, or mend a Todo PBI, on the linked Project.");
+  assert.equal(workflowSummary("No full stop here"), "No full stop here");
+  assert.equal(workflowSummary(null), "");
+  const long = workflowSummary(`${"word ".repeat(60)}end.`);
+  assert.ok(long.endsWith("word..."));
+  assert.ok(long.length <= 203);
+});
+
+test("a repository preset on a project without a repository claims the project's own resource", () => {
+  const filled = presetBinding("pbi-refine-queue", { project: { name: ".archon", default_cwd: "C:\\a" }, directory: "/t", hostId: "local" });
+  assert.equal(filled.resource, "pbi-refine-queue:archon");
+});
+
+const BINDINGS = [
+  { name: "cc-build", workflow: "pbi-build-queue", path: "/t/cc-build.json", resource: "pbi:g/o/cc:build", capacity: 1 },
+  { name: "cc-build-2", workflow: "pbi-build-queue", path: "/t/cc-build-2.json", resource: "pbi:g/o/cc:build", capacity: 2 },
+  { name: "cc-merge", workflow: "pbi-merge-queue", path: "/t/cc-merge.json", resource: "pbi:g/o/cc:merge", capacity: 1 },
+];
+
+test("resource choices put the suggestion first and say who shares each one", () => {
+  const choices = resourceChoices(BINDINGS, { self: "cc-merge", suggested: "pbi:g/o/cc:merge", current: "pbi:g/o/cc:merge" });
+  assert.deepEqual(choices, [
+    { value: "pbi:g/o/cc:merge", sharedWith: [], capacity: null },
+    { value: "pbi:g/o/cc:build", sharedWith: ["cc-build", "cc-build-2"], capacity: null },
+  ]);
+  const agreed = resourceChoices(BINDINGS.slice(0, 1), { self: "new", suggested: "", current: "" });
+  assert.deepEqual(agreed, [{ value: "pbi:g/o/cc:build", sharedWith: ["cc-build"], capacity: 1 }]);
+});
+
+test("a capacity that differs from any saved binding on the resource, its own file included, is a conflict", () => {
+  assert.deepEqual(capacityConflicts(BINDINGS, { resource: "pbi:g/o/cc:build", capacity: 1 }), [{ name: "cc-build-2", capacity: 2 }]);
+  // Raising a binding's own capacity on the resource it already fired on.
+  assert.deepEqual(capacityConflicts(BINDINGS, { resource: "pbi:g/o/cc:merge", capacity: 5 }), [{ name: "cc-merge", capacity: 1 }]);
+  assert.deepEqual(capacityConflicts(BINDINGS, { resource: "pbi:g/o/cc:merge", capacity: 1 }), []);
+  assert.deepEqual(capacityConflicts(BINDINGS, { resource: "pbi:g/o/cc:new", capacity: 3 }), []);
+});
+
+test("input rows follow the declared inputs and keep what the file has beyond them", () => {
+  const declared = [
+    { name: "repo_host", required: true, default: null, description: "Host" },
+    { name: "build_queue_binding", required: false, default: null, description: "" },
+  ];
+  const rows = inputRows(declared, { repo_host: "github.com", build_queue_binding: "/t/me.json", legacy: "1" }, "/t/me.json");
+  assert.deepEqual(
+    rows.map((row) => [row.name, row.kind, row.value, row.extra]),
+    [
+      ["repo_host", "text", "github.com", false],
+      ["build_queue_binding", "binding", SELF_BINDING, false],
+      ["legacy", "text", "1", true],
+    ],
+  );
+  const unknown = inputRows(null, { a: "1" }, "");
+  assert.deepEqual(unknown.map((row) => [row.name, row.extra]), [["a", false]]);
+});
+
+test("saved inputs drop empty rows and turn this binding into its own file", () => {
+  const rows = [
+    { name: "a", value: " x " },
+    { name: "b", value: "" },
+    { name: "self", value: SELF_BINDING },
+  ];
+  assert.deepEqual(bindingInputs(rows, "/t/new-name.json"), { a: "x", self: "/t/new-name.json" });
+});
+
+test("a binding input offers this binding, the others, and a path no binding has", () => {
+  const options = bindingInputOptions(BINDINGS, { self: "cc-merge", required: false, value: "/t/gone.json" });
+  assert.deepEqual(
+    options.map((option) => option.value),
+    ["", SELF_BINDING, "/t/cc-build.json", "/t/cc-build-2.json", "/t/gone.json"],
+  );
+  assert.equal(options.at(-1).label, "/t/gone.json (no such binding)");
+  assert.equal(options[2].label, "cc-build (pbi-build-queue)");
+  assert.equal(bindingInputOptions([], { self: "x", required: true, value: "" })[0].value, SELF_BINDING);
+});
+
+test("pause state reads the tasks' Windows states", () => {
+  assert.deepEqual(pauseState([]), { state: "none", disabled: 0, total: 0 });
+  assert.equal(pauseState([{ state: "Ready" }, { state: "Running" }]).state, "active");
+  assert.equal(pauseState([{ state: "Ready" }, { state: "Disabled" }]).state, "partial");
+  assert.deepEqual(pauseState([{ state: "Disabled" }]), { state: "paused", disabled: 1, total: 1 });
+});
+
+const NOW = Date.parse("2026-11-25T13:00:00Z");
+const HOST = { supported: true, host: "BW_Laptop", pids: [47492] };
+const liveRun = (id, status, owner, started = "2026-11-25T12:58:00Z") => ({
+  id,
+  status,
+  started_at: started,
+  metadata: { resource_start: { bindingId: `${id}-binding` }, ...(owner ? { execution_owner: owner } : {}) },
+});
+
+test("a run whose archon process is alive is running, and one whose process is gone was interrupted", () => {
+  const entries = restartRuns(
+    [
+      liveRun("alive", "running", { host: "BW_Laptop", pid: 47492 }),
+      liveRun("dead", "running", { host: "BW_Laptop", pid: 1 }),
+      liveRun("done", "completed", { host: "BW_Laptop", pid: 1 }),
+    ],
+    HOST,
+    NOW,
+  );
+  assert.deepEqual(
+    entries.map((entry) => [entry.run.id, entry.binding, entry.state]),
+    [
+      ["alive", "alive-binding", "running"],
+      ["dead", "dead-binding", "interrupted"],
+    ],
+  );
+});
+
+test("a pending run nobody claimed is starting at first and interrupted after ten minutes", () => {
+  const entries = restartRuns(
+    [liveRun("young", "pending", null, "2026-11-25T12:55:00Z"), liveRun("stale", "pending", null, "2026-11-24 06:58:37")],
+    HOST,
+    NOW,
+  );
+  assert.deepEqual(entries.map((entry) => entry.state), ["starting", "interrupted"]);
+});
+
+test("a paused run waits, and a process this console cannot check counts as running", () => {
+  const owner = { host: "OtherPc", pid: 1 };
+  const states = restartRuns(
+    [liveRun("asking", "paused", owner), liveRun("remote", "running", owner), liveRun("unlisted", "running", { host: "BW_Laptop", pid: 1 })],
+    { ...HOST, supported: false },
+    NOW,
+  ).map((entry) => entry.state);
+  assert.deepEqual(states, ["waiting", "running", "running"]);
+});
+
+test("a restart is safe only when nothing runs and no task can start a run", () => {
+  const paused = { state: "paused" };
+  assert.deepEqual(restartVerdict(paused, [{ state: "running" }, { state: "waiting" }]), { verdict: "busy", busy: 1 });
+  assert.deepEqual(restartVerdict({ state: "active" }, [{ state: "interrupted" }]), { verdict: "unpaused", busy: 0 });
+  assert.deepEqual(restartVerdict({ state: "partial" }, []), { verdict: "unpaused", busy: 0 });
+  assert.deepEqual(restartVerdict(paused, [{ state: "waiting" }]), { verdict: "safe", busy: 0 });
+  assert.deepEqual(restartVerdict({ state: "none" }, [{ state: "starting" }]), { verdict: "busy", busy: 1 });
 });
 
 test("pipelineCounts names each nonzero state, stuck first", () => {
