@@ -2,8 +2,8 @@
 // A binding file says which workflow `archon trigger fire` starts. Archon only
 // installs schedules on macOS, so here each binding can get a Windows Task
 // Scheduler task named Archon-<binding> that fires it on its interval.
-import { actionButton, ago, el, notice, replace, section } from "../dom.js";
-import { BINDING_PRESETS, formatInterval, joinPath, presetBinding } from "../model.js";
+import { actionButton, ago, el, link, notice, replace, section, short } from "../dom.js";
+import { BINDING_PRESETS, formatInterval, joinPath, liveRunNote, presetBinding, stopLines } from "../model.js";
 
 const SELF_INPUT = { "build-queue": "build_queue_binding", "merge-queue": "merge_queue_binding" };
 const PRESET_LABELS = {
@@ -99,8 +99,12 @@ export default {
   match: (path) => (path === "/triggers" ? {} : null),
   mount(root, params, ctx) {
     // saved: the binding an edit just saved, so its reloaded card can say so.
-    const state = { directory: "", bindings: [], tasks: new Map(), scheduling: true, identity: null, projects: [], defaultHome: true, saved: null };
+    // stops: by binding name, what its last unschedule or failed delete did,
+    // kept until hidden so its live runs stay at hand.
+    const state = { directory: "", bindings: [], tasks: new Map(), scheduling: true, identity: null, projects: [], defaultHome: true, saved: null, stops: new Map() };
     const bindingList = el("div", {});
+    // What the last delete did, since its card is gone.
+    const deletedSlot = el("div", {});
     const formSlot = el("div", {});
     const receiptList = el("div", {});
     replace(
@@ -116,13 +120,100 @@ export default {
           "On Windows a scheduled task named Archon-<binding> fires it on its interval.",
         ),
       ),
-      section("Bindings", bindingList),
+      section("Bindings", deletedSlot, bindingList),
       section("New binding", formSlot),
       section("Recent trigger receipts", receiptList),
     );
 
     function taskFor(name) {
       return state.tasks.get(`Archon-${name}`) ?? null;
+    }
+
+    // A run the stopped binding started. Cancelling marks the run itself, so
+    // the kept report shows it cancelled when the bindings redraw.
+    function liveRun(run) {
+      const row = el("li", {});
+      const draw = () =>
+        replace(
+          row,
+          link(`/runs/${run.id}`, el("code", {}, short(run.id))),
+          run.workflow ? el("span", {}, run.workflow) : null,
+          run.cancelled ? el("span", { class: "muted small" }, "Cancelled.") : el("span", { class: "small" }, liveRunNote(run)),
+          run.startedAt ? el("span", { class: "muted small" }, "started ", ago(run.startedAt)) : null,
+          run.cancelled
+            ? null
+            : actionButton(
+                "Cancel run",
+                async () => {
+                  await ctx.api.cancel(run.id);
+                  run.cancelled = true;
+                  draw();
+                },
+                { confirm: `Cancel ${run.workflow ?? "this"} run ${short(run.id)}? It stops where it is.`, tone: "danger" },
+              ),
+        );
+      draw();
+      return row;
+    }
+
+    // report: { heading, tone, stop, retry }. Lists what was withdrawn, what
+    // could not be, and the runs the binding started that are still live.
+    function stopReport(report, hide) {
+      const { stop } = report;
+      const live = Array.isArray(stop?.live) ? stop.live : [];
+      return el(
+        "div",
+        { class: "stop-report" },
+        notice(report.heading, report.tone),
+        stopLines(stop).map((line) => notice(line.text, line.tone)),
+        live.length
+          ? [
+              el("p", { class: "notice" }, "Still live. Archon keeps these going until they end or you cancel them:"),
+              el("ul", { class: "live-runs" }, live.map(liveRun)),
+            ]
+          : null,
+        el(
+          "div",
+          { class: "row" },
+          report.retry && !stop?.stopped ? actionButton("Try again", report.retry, { tone: "primary" }) : null,
+          el("button", { type: "button", onclick: hide }, "Hide"),
+        ),
+      );
+    }
+
+    function cardReport(binding) {
+      const report = state.stops.get(binding.name);
+      if (!report) return null;
+      const node = stopReport(report, () => {
+        state.stops.delete(binding.name);
+        node.remove();
+      });
+      return node;
+    }
+
+    // Removing the task stops new fires; the server then withdraws the
+    // starts Archon still holds for the binding. Running it again is safe.
+    async function unschedule(name) {
+      const { removed, stop } = await ctx.api.removeSchedule(name);
+      const heading = removed ? `Its Windows task Archon-${name} is gone.` : `It has no Windows task any more.`;
+      state.stops.set(name, { heading, tone: "ok", stop, retry: () => unschedule(name) });
+      await loadBindings();
+    }
+
+    // The server keeps the file when a queued start could not be withdrawn,
+    // so the binding's card stays to say why and Delete can be tried again.
+    async function deleteBinding(name) {
+      try {
+        const { stop } = await ctx.api.deleteBinding(name);
+        state.stops.delete(name);
+        const hide = () => replace(deletedSlot);
+        replace(deletedSlot, stopReport({ heading: `Deleted ${name}.`, tone: "ok", stop, retry: null }, hide));
+      } catch (error) {
+        if (!error.data?.stop) throw error;
+        const heading = "Not deleted. The binding file stays, so Delete can try again.";
+        state.stops.set(name, { heading, tone: "error", stop: error.data.stop, retry: null });
+      }
+      await loadBindings();
     }
 
     function scheduleCell(binding) {
@@ -140,8 +231,8 @@ export default {
         el("span", { class: `pill tone-${task.state === "Ready" || task.state === "Running" ? "running" : "paused"}` }, task.state),
         task.nextRun ? el("span", { class: "small" }, " next ", new Date(task.nextRun).toLocaleTimeString()) : null,
         task.lastRun ? el("span", { class: "small muted" }, " last ", ago(task.lastRun), ` (result ${task.lastResult})`) : null,
-        actionButton("Unschedule", async () => (await ctx.api.removeSchedule(binding.name), loadBindings()), {
-          confirm: `Delete the Windows task Archon-${binding.name}? The binding file stays.`,
+        actionButton("Unschedule", () => unschedule(binding.name), {
+          confirm: `Delete the Windows task Archon-${binding.name} and withdraw the starts Archon still has queued for it? The binding file stays. Runs it already started keep going, and the page lists them so you can cancel them.`,
         }),
       );
     }
@@ -224,6 +315,7 @@ export default {
           el("span", { class: "muted small" }, formatInterval(binding.intervalSeconds)),
         ),
         savedNotice(binding),
+        cardReport(binding),
         body,
         el(
           "div",
@@ -240,8 +332,8 @@ export default {
             { confirm: `Fire ${binding.name} now? It starts ${binding.workflow} the same way its schedule would.` },
           ),
           scheduleCell(binding),
-          actionButton("Delete", async () => (await ctx.api.deleteBinding(binding.name), loadBindings()), {
-            confirm: `Delete the binding ${binding.name}? Its file goes, and so does its Windows task if it has one. Archon keeps the history of past fires.`,
+          actionButton("Delete", () => deleteBinding(binding.name), {
+            confirm: `Delete the binding ${binding.name}? Its Windows task goes, the starts Archon still has queued for it are withdrawn, and then its file goes. Runs it already started keep going. Archon keeps the history of past fires.`,
             tone: "danger",
           }),
         ),

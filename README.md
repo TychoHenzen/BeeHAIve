@@ -41,7 +41,9 @@ on the command line:
   the SDLC pack's build queue, merge queue, discoveries and worktree cleanup),
   Fire now, the recent trigger receipts, and on Windows a Task Scheduler task
   per binding that fires it on its interval. Archon installs schedules itself
-  only on macOS.
+  only on macOS. Unschedule and Delete also withdraw the starts Archon still
+  has queued for the binding, so no later fire admits them, and list the runs
+  it already started, with a button to cancel each.
 
 Chat, the workflow builder, settings, metrics and adding projects are still in
 Archon's own console. The top bar links to it.

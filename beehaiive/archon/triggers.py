@@ -209,6 +209,7 @@ def summarize(path: Path) -> Record:
         "name": path.stem,
         "path": str(path),
         "error": None if binding is not None else "This file is not a binding.",
+        "sourceInstanceId": get_str(document, "sourceInstanceId"),
         "bindingId": get_str(binding, "bindingId"),
         "hostId": get_str(binding, "hostId"),
         "runAsUserId": get_str(binding, "runAsUserId"),

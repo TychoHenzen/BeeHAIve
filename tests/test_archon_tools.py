@@ -6,7 +6,24 @@ from pathlib import Path
 import pytest
 
 from beehaiive.archon.cli import ArchonCliError, CliResult
-from tests.archon_fakes import ACTION, ArchonHarness, archon_harness, printed
+from tests.archon_fakes import (
+    ACTION,
+    ArchonHarness,
+    TriggerQueue,
+    archon_harness,
+    printed,
+)
+
+# What stopping a binding reports when Archon holds nothing for it.
+QUIET: dict[str, object] = {
+    "stopped": True,
+    "withdrawn": [],
+    "moved": [],
+    "failed": [],
+    "live": [],
+    "error": None,
+    "warnings": [],
+}
 
 
 def form(cwd: Path, **changes: object) -> dict[str, object]:
@@ -26,12 +43,14 @@ def form(cwd: Path, **changes: object) -> dict[str, object]:
     return base | changes
 
 
-def with_binding(tmp_path: Path) -> ArchonHarness:
-    harness = archon_harness(tmp_path)
+def with_binding(tmp_path: Path, platform: str = "win32") -> ArchonHarness:
+    """A harness with one binding, and an Archon that holds nothing for it."""
+    harness = archon_harness(tmp_path, platform=platform)
     made = harness.client.post(
         "/api/archon/triggers/bindings", json=form(tmp_path), headers=ACTION
     )
     assert made.status_code == 200
+    harness.runner.handler = TriggerQueue().answer
     return harness
 
 
@@ -189,7 +208,8 @@ def test_schedules_list_install_and_remove(tmp_path: Path) -> None:
     removed = harness.client.delete(path, headers=ACTION).json()
 
     assert listed == {"supported": True, "tasks": [{"name": "Archon-repo-build-queue"}]}
-    assert installed == {"installed": True} and removed == {"removed": True}
+    assert installed == {"installed": True}
+    assert removed == {"removed": True, "stop": QUIET}
     install = scheduler.calls[1]
     assert install[install.index("-IntervalSeconds") + 1] == "1800"
     assert install[install.index("-WorkingDirectory") + 1] == str(tmp_path)
@@ -207,7 +227,7 @@ def test_deleting_a_binding_removes_its_task_then_its_file(tmp_path: Path) -> No
 
     deleted = harness.client.delete(BINDING, headers=ACTION).json()
 
-    assert deleted == {"deleted": True, "unscheduled": True}
+    assert deleted == {"deleted": True, "unscheduled": True, "stop": QUIET}
     assert not (harness.home / BINDING_FILE).exists()
     remove = scheduler.calls[-1]
     assert remove[remove.index("-Name") + 1] == "Archon-repo-build-queue"
@@ -222,7 +242,7 @@ def test_deleting_an_unscheduled_binding_touches_no_task(tmp_path: Path) -> None
 
     deleted = harness.client.delete(BINDING, headers=ACTION).json()
 
-    assert deleted == {"deleted": True, "unscheduled": False}
+    assert deleted == {"deleted": True, "unscheduled": False, "stop": QUIET}
     assert not (harness.home / BINDING_FILE).exists()
     assert not any("Remove" in call for call in scheduler.calls)
 
@@ -243,10 +263,7 @@ def test_a_binding_whose_task_will_not_go_stays(tmp_path: Path) -> None:
 def test_a_file_that_will_not_delete_is_logged_not_echoed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    harness = archon_harness(tmp_path, platform="linux")
-    harness.client.post(
-        "/api/archon/triggers/bindings", json=form(tmp_path), headers=ACTION
-    )
+    harness = with_binding(tmp_path, platform="linux")
 
     def refuse(_path: Path, missing_ok: bool = False) -> None:
         raise PermissionError(13, "Access is denied", "C:/hidden/binding.json")
@@ -273,14 +290,11 @@ def test_deleting_a_missing_or_misnamed_binding_is_a_404(tmp_path: Path) -> None
 
 
 def test_deleting_a_binding_off_windows_asks_no_scheduler(tmp_path: Path) -> None:
-    harness = archon_harness(tmp_path, platform="linux")
-    harness.client.post(
-        "/api/archon/triggers/bindings", json=form(tmp_path), headers=ACTION
-    )
+    harness = with_binding(tmp_path, platform="linux")
 
     deleted = harness.client.delete(BINDING, headers=ACTION).json()
 
-    assert deleted == {"deleted": True, "unscheduled": False}
+    assert deleted == {"deleted": True, "unscheduled": False, "stop": QUIET}
     assert harness.scheduler_runner.calls == []
 
 
