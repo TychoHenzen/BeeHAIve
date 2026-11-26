@@ -4,10 +4,12 @@
 // requires so another site cannot make the browser act here.
 
 export class ApiError extends Error {
-  constructor(status, message, detail) {
+  // data: the parsed error body, for a page that reads more than its message.
+  constructor(status, message, detail, data = null) {
     super(detail ? `${message}\n\n${detail}` : message);
     this.status = status;
     this.detail = detail;
+    this.data = data;
   }
 }
 
@@ -30,7 +32,7 @@ async function request(url, { method = "GET", body } = {}) {
   }
   if (!response.ok) {
     const message = data?.error ?? data?.detail ?? (text.slice(0, 200) || `Request failed (${response.status})`);
-    throw new ApiError(response.status, String(message), typeof data?.detail === "string" ? data.detail : "");
+    throw new ApiError(response.status, String(message), typeof data?.detail === "string" ? data.detail : "", data);
   }
   return data;
 }

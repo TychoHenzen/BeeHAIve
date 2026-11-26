@@ -20,13 +20,16 @@ from pydantic import BaseModel, Field
 from ..archon.cli import ArchonCli, ArchonCliError
 from ..archon.pipeline import PipelineReader, pipelines
 from ..archon.settings import ArchonSettings
+from ..archon.stop import stop_binding
 from ..archon.triggers import (
     BindingError,
     NewBinding,
     Scheduler,
     TriggerStore,
+    check_name,
     task_name,
 )
+from ..records import Record, as_dict, as_list, get_str
 
 router = APIRouter(prefix="/api/archon")
 logger = logging.getLogger(__name__)
@@ -198,31 +201,74 @@ def update_binding(
     return {"binding": after, "rescheduled": rescheduled}
 
 
+def _scheduled(scheduler: Scheduler, name: str) -> bool:
+    return scheduler.supported and any(
+        task.get("name") == task_name(name) for task in scheduler.list()
+    )
+
+
+def _folder(summary: Record) -> Path | None:
+    cwd = summary.get("cwd")
+    return Path(cwd) if isinstance(cwd, str) and Path(cwd).is_dir() else None
+
+
+def _stop(request: Request, name: str, summary: Record) -> Record:
+    # The ids come from the file, since a hand-written binding need not be
+    # named after them. Without a file, the name is what the console writes.
+    return stop_binding(
+        _cli(request),
+        get_str(summary, "sourceInstanceId") or name,
+        get_str(summary, "bindingId") or name,
+        _folder(summary),
+    )
+
+
+def _not_stopped(stop: Record) -> JSONResponse:
+    failed = [as_dict(start) for start in as_list(stop.get("failed"))]
+    reason = get_str(stop, "error") or (
+        f"{len(failed)} queued start(s) of this binding could not be withdrawn."
+    )
+    return JSONResponse(
+        {
+            "error": f"{reason} The binding file stays, so Delete can try again.",
+            "detail": "\n".join(get_str(start, "error") or "" for start in failed),
+            "stop": stop,
+        },
+        status_code=502,
+    )
+
+
 @router.delete("/triggers/bindings/{name}", response_model=None)
 def delete_binding(name: str, request: Request) -> dict[str, object] | JSONResponse:
     # A Windows task left behind would keep firing a file that is gone, so the
     # task goes first, and a task that will not go keeps the file as well.
+    # Then the starts the binding queued are withdrawn, as Unschedule does.
+    # One that will not go keeps the file too: its ids are how they are found.
     # Archon's own history of past fires stays either way.
     store, scheduler = _store(request), _scheduler(request)
     try:
-        store.existing(name)
-        scheduled = scheduler.supported and any(
-            task.get("name") == task_name(name) for task in scheduler.list()
-        )
+        summary = store.summary(name)
+        scheduled = _scheduled(scheduler, name)
         if scheduled:
             scheduler.remove(name)
-        store.delete(name)
     except (BindingError, KeyError) as error:
         return _failed(error, 404)
     except ArchonCliError as error:
         return _failed(error)
+    stop = _stop(request, name, summary)
+    if stop["stopped"] is not True:
+        return _not_stopped(stop)
+    try:
+        store.delete(name)
+    except (BindingError, KeyError) as error:
+        return _failed(error, 404)
     except OSError:
         logger.exception("A binding file could not be deleted.")
         return JSONResponse(
             {"error": "The binding file could not be deleted. BeeHAIve's log has why."},
             status_code=500,
         )
-    return {"deleted": True, "unscheduled": scheduled}
+    return {"deleted": True, "unscheduled": scheduled, "stop": stop}
 
 
 @router.post("/triggers/bindings/{name}/fire", response_model=None)
@@ -230,11 +276,9 @@ def fire(name: str, request: Request) -> dict[str, object] | JSONResponse:
     try:
         path = _store(request).existing(name)
         # Run where the scheduled task runs: the binding's own folder.
-        cwd = _store(request).summary(name)["cwd"]
-        folder = Path(cwd) if isinstance(cwd, str) and Path(cwd).is_dir() else None
         result = _cli(request).run(
             ["trigger", "fire", "--config", str(path)],
-            cwd=folder,
+            cwd=_folder(_store(request).summary(name)),
             timeout=FIRE_TIMEOUT,
         )
     except (BindingError, KeyError) as error:
@@ -336,10 +380,26 @@ def read_pipeline(
 
 @router.delete("/triggers/bindings/{name}/schedule", response_model=None)
 def remove_schedule(name: str, request: Request) -> dict[str, object] | JSONResponse:
+    """Stop a binding: its Windows task, then the starts Archon queued for it.
+
+    Removing the task stops only this binding's own fires. A start it already
+    queued would still run, since any other binding's fire drains the whole
+    host. A task already gone goes straight to the withdrawal, so trying again
+    after a failed one is safe. A task that will not go stops here with
+    nothing withdrawn: the binding still fires, so it is not stopped.
+    """
+    scheduler = _scheduler(request)
     try:
-        _scheduler(request).remove(name)
+        check_name(name)
+        removed = _scheduled(scheduler, name)
+        if removed:
+            scheduler.remove(name)
     except BindingError as error:
         return _failed(error, 404)
     except ArchonCliError as error:
         return _failed(error)
-    return {"removed": True}
+    try:
+        summary = _store(request).summary(name)
+    except KeyError:
+        summary = {}
+    return {"removed": removed, "stop": _stop(request, name, summary)}

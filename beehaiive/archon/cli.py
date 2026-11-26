@@ -14,6 +14,8 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..records import as_dict, get_str
+
 
 @dataclass(frozen=True)
 class CliResult:
@@ -97,6 +99,32 @@ class ArchonCli:
             raise ArchonCliError(
                 f"archon {' '.join(args[:2])} did not print JSON.", result.output
             ) from error
+
+    def ask(self, args: Sequence[str], cwd: Path | None = None) -> object:
+        """Run a command in Archon's --json mode and parse its document.
+
+        In that mode Archon reports a failure as {"ok": false, "error": ...}
+        on stdout, and the exit code does not reliably agree: an unknown id
+        exits 1, a bad --limit exits 0. So the document decides, and a
+        nonzero exit counts only when the document does not say it failed.
+        """
+        result = self.run([*args, "--json"], cwd)
+        command = f"archon {' '.join(args[:2])}"
+        try:
+            loaded: object = json.loads(result.stdout)
+        except ValueError as error:
+            raise ArchonCliError(
+                _first_line(result) or f"{command} did not print JSON.", result.output
+            ) from error
+        document = as_dict(loaded)
+        if document is not None and document.get("ok") is False:
+            said = get_str(document, "error")
+            raise ArchonCliError(said or f"{command} failed.", result.output)
+        if not result.ok:
+            raise ArchonCliError(
+                f"{command} exited with code {result.code}.", result.output
+            )
+        return loaded
 
 
 def _first_line(result: CliResult) -> str:

@@ -91,6 +91,7 @@ h3 { font-size: 0.95rem; margin: 0.8rem 0 0.4rem; }
 .notice { margin: 0.4rem 0; }
 .notice.error { color: var(--failed); white-space: pre-wrap; }
 .notice.ok { color: var(--running); }
+.notice.warn { color: var(--paused); }
 
 button, .button {
   font: inherit;
@@ -253,6 +254,11 @@ pre.error { color: var(--failed); }
 .binding-form { display: grid; grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr)); gap: 0 1rem; }
 .binding-form > p, .binding-form > .row, .binding-form > label:has(textarea) { grid-column: 1 / -1; }
 .schedule { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
+/* What unscheduling or deleting a binding withdrew, and the runs it left live. */
+.stop-report { border-left: 3px solid var(--line); padding-left: 0.7rem; margin: 0.5rem 0; }
+.stop-report .notice { margin: 0.2rem 0; }
+.live-runs { list-style: none; margin: 0.3rem 0; padding: 0; }
+.live-runs li { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; margin: 0.2rem 0; }
 
 /* Pipeline */
 .tone-stuck, .tone-stalled, .tone-blocked, .tone-silent, .tone-missing { color: var(--failed); }

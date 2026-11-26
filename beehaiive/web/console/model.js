@@ -362,6 +362,40 @@ export function formatInterval(seconds) {
   return `every ${seconds} s`;
 }
 
+const starts = (count) => `${count} queued start${count === 1 ? "" : "s"}`;
+
+// What stopping a binding did, as { tone, text } lines. `stop` is the server's
+// report: { withdrawn, moved, failed, live, error, warnings }, where live is
+// null when Archon could not list the binding's runs.
+export function stopLines(stop) {
+  if (!stop) return [];
+  const lines = [];
+  if (stop.error) lines.push({ tone: "error", text: stop.error });
+  const withdrawn = stop.withdrawn?.length ?? 0;
+  const found = withdrawn + (stop.moved?.length ?? 0) + (stop.failed?.length ?? 0);
+  if (withdrawn) lines.push({ tone: "ok", text: `Withdrew ${starts(withdrawn)}, so Archon will not start ${withdrawn === 1 ? "it" : "them"}.` });
+  else if (!stop.error && !found) lines.push({ tone: "muted", text: "BeeHAIve found no queued start for it." });
+  for (const start of stop.moved ?? []) {
+    lines.push({ tone: "muted", text: `Start ${String(start.requestId).slice(0, 8)} was already ${start.status} when BeeHAIve reached it.` });
+  }
+  for (const start of stop.failed ?? []) {
+    lines.push({ tone: "error", text: `Start ${String(start.requestId || start.receiptId).slice(0, 8)} is still queued: ${start.error}` });
+  }
+  for (const warning of stop.warnings ?? []) lines.push({ tone: "warn", text: warning });
+  if (Array.isArray(stop.live) && stop.live.length === 0) {
+    lines.push({ tone: "muted", text: "Nothing it started is still running or paused." });
+  }
+  return lines;
+}
+
+// Why a run a stopped binding started is still live.
+export function liveRunNote(run) {
+  if (run?.status !== "paused") return run?.status ?? "unknown";
+  if (run.pauseCause === "quota") return "paused at the usage limit; Archon continues it by itself when the limit resets";
+  if (run.pauseCause === "wait") return "paused, waiting for an answer";
+  return "paused";
+}
+
 // One line for a run event in the timeline.
 export function eventLine(event) {
   const type = String(event?.event_type ?? "event").replaceAll("_", " ");

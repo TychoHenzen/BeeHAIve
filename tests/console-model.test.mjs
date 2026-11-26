@@ -18,6 +18,7 @@ import {
   gateDecisions,
   isLive,
   joinPath,
+  liveRunNote,
   mergeActivity,
   missingRequiredInputs,
   needsPerson,
@@ -33,6 +34,7 @@ import {
   runActions,
   runTone,
   secondsBetween,
+  stopLines,
   stuckGroups,
   toIso,
   toolDetail,
@@ -236,6 +238,56 @@ test("formatInterval picks the largest whole unit", () => {
   assert.equal(formatInterval(90), "every 90 s");
   assert.equal(formatInterval(0), "");
   assert.equal(formatInterval(null), "");
+});
+
+test("stopLines says what was withdrawn, what moved and what is still queued", () => {
+  const stop = {
+    withdrawn: [{ requestId: "req-1" }, { requestId: "req-2" }],
+    moved: [{ requestId: "req-3456789abc", status: "admitted" }],
+    failed: [{ requestId: "req-4", error: "Only untouched queued requests can be withdrawn." }],
+    live: [{ id: "run-1", status: "running" }],
+    error: null,
+    warnings: ["2 of this binding's fires could not be read from Archon."],
+  };
+
+  assert.deepEqual(stopLines(stop), [
+    { tone: "ok", text: "Withdrew 2 queued starts, so Archon will not start them." },
+    { tone: "muted", text: "Start req-3456 was already admitted when BeeHAIve reached it." },
+    { tone: "error", text: "Start req-4 is still queued: Only untouched queued requests can be withdrawn." },
+    { tone: "warn", text: "2 of this binding's fires could not be read from Archon." },
+  ]);
+});
+
+test("stopLines claims nothing is live only when Archon said so", () => {
+  const quiet = { withdrawn: [], moved: [], failed: [], live: [], error: null, warnings: [] };
+
+  assert.deepEqual(stopLines(quiet), [
+    { tone: "muted", text: "BeeHAIve found no queued start for it." },
+    { tone: "muted", text: "Nothing it started is still running or paused." },
+  ]);
+  assert.deepEqual(stopLines({ ...quiet, withdrawn: [{ requestId: "r" }], live: null }), [
+    { tone: "ok", text: "Withdrew 1 queued start, so Archon will not start it." },
+  ]);
+  assert.deepEqual(stopLines({ ...quiet, error: "BeeHAIve could not read this binding's fires.", live: null }), [
+    { tone: "error", text: "BeeHAIve could not read this binding's fires." },
+  ]);
+  assert.deepEqual(stopLines(null), []);
+});
+
+test("stopLines does not say it found nothing when a start is still queued", () => {
+  const stuck = { withdrawn: [], moved: [], failed: [{ requestId: "req-9", error: "refused" }], live: null, error: null, warnings: [] };
+
+  assert.deepEqual(stopLines(stuck), [{ tone: "error", text: "Start req-9 is still queued: refused" }]);
+});
+
+test("liveRunNote says why a stopped binding's run is still live", () => {
+  assert.equal(liveRunNote({ status: "running" }), "running");
+  assert.equal(
+    liveRunNote({ status: "paused", pauseCause: "quota" }),
+    "paused at the usage limit; Archon continues it by itself when the limit resets",
+  );
+  assert.equal(liveRunNote({ status: "paused", pauseCause: "wait" }), "paused, waiting for an answer");
+  assert.equal(liveRunNote({ status: "paused", pauseCause: null }), "paused");
 });
 
 test("eventLine names the event, its step and the reason", () => {
